@@ -1,0 +1,52 @@
+# 樹莓派 4 AI 推理引擎配置
+# 支持快速切換到 Jetson Orin（只需改 platform 和 precision）
+
+# ========== 平台配置 ==========
+platform: "rpi4"              # "rpi4" 或 "jetson_orin"
+model_precision: "int8"       # "int8" (RPi4) 或 "fp16" (Jetson)
+
+# ========== 基礎推理配置 ==========
+batch_size: 1                 # 單幀推理
+num_threads: 4                # RPi4 有 4 個 CPU 核心
+use_gpu: false                # RPi4 無 GPU，Jetson 時改為 true
+
+# ========== 模型路徑 ==========
+model_paths:
+  face_detector: "models/retinaface_int8.onnx"
+  face_recognizer: "models/arcface_int8.onnx"
+  emotion_analyzer: "models/efficientnet_b0_emotion.onnx"
+
+# ========== 推理引擎參數 ==========
+inference_params:
+  # 人臉檢測
+  face_detect_threshold: 0.7
+  face_detect_nms_threshold: 0.4
+
+  # 人臉識別
+  face_recognition_threshold: 0.6      # embedding 相似度閾值
+  embedding_dim: 128                   # ArcFace 輸出維度
+
+  # 幀率控制
+  frame_rate: 10                       # FPS 視覺處理速率
+  max_queue_size: 30                   # 幀隊列深度
+
+  # 性能優化
+  skip_frames: 1                       # 每 N 幀進行一次檢測（>=1
+  max_faces_per_frame: 5               # 單幀最多檢測人臉數
+
+# ========== 資料庫配置 ==========
+database:
+  type: "sqlite"
+  path: "database/ai_bank_robot.db"
+
+# ========== 日誌配置 ==========
+logging:
+  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+  log_file: "logs/inference.log"
+  max_log_size: 10485760     # 10MB
+
+# ========== 邊緣優化 ==========
+optimization:
+  enable_quantization: true
+  enable_threading: true
+  memory_pool_size: 2147483648        # 2GB 緩衝池
