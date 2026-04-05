@@ -11,10 +11,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Phase Status**:
 - ✅ Phase 1 (environment setup) completed
 - ✅ Phase 2a (real-time face detection) **COMPLETED** - 12-13 FPS with InsightFace buffalo_sc, 512D embeddings generated
-- 🔄 Phase 2b (face recognition + liveness checking) **IN PROGRESS** - Next: VIP database matching + blink/headshake liveness detection
-- ⏳ Phase 3+ (emotion analysis, speech, HMI, backend)
+- ✅ Phase 2b (face recognition + liveness detection) **COMPLETED** - VIP/blacklist matching + anti-spoofing (blink/headshake/mouth)
+- 🔄 Phase 3+ (emotion analysis, speech, HMI, backend) planning
 
-**Recent Achievement**: Successfully deployed InsightFace-based face detection at 12-13 FPS on RPi4 with GUI support. See `FEATURES.md` for complete feature list and `INSTALLATION_GUIDE.md` for deployment instructions.
+**Recent Achievement**: Successfully completed Phase 2b with integrated detection + recognition + liveness pipeline. Face embeddings now automatically matched against VIP database with confidence scoring. Anti-spoofing detects live faces vs static images/videos.
 
 ---
 
