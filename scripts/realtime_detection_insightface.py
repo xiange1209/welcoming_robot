@@ -17,6 +17,14 @@ import time
 from pathlib import Path
 from picamera2 import Picamera2
 import logging
+import os
+
+# 添加項目路徑，以便導入自定義模塊
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from vision_ai.face_recognizer import FaceRecognizer
+from vision_ai.liveness_detector import LivenessDetector
+from database.schema import DatabaseSchema
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -50,12 +58,10 @@ class RealtimeFaceDetectorInsightFace:
         # 初始化 InsightFace
         logger.info("初始化 InsightFace...")
         try:
-            # 使用 'buffalo_sc' 模型（輕量，樹莓派友善）
-            # 可選：'buffalo_sc' (小), 'buffalo_m' (中), 'buffalo_l' (大)
             self.face_app = FaceAnalysis(
                 name='buffalo_sc',
-                root='./insightface_models',  # 模型保存位置
-                providers=['CPUExecutionProvider']  # 樹莫派 CPU
+                root='./insightface_models',
+                providers=['CPUExecutionProvider']
             )
             self.face_app.prepare(ctx_id=-1, det_size=(512, 512))
             logger.info("✓ InsightFace 已初始化 (RetinaFace + ArcFace)")
@@ -63,8 +69,42 @@ class RealtimeFaceDetectorInsightFace:
             logger.error(f"✗ InsightFace 初始化失敗: {e}")
             sys.exit(1)
 
+        # 初始化人臉識別模組
+        logger.info("初始化人臉識別模組...")
+        try:
+            # 確保數據庫已初始化
+            db_schema = DatabaseSchema()
+            if not Path("database/ai_bank_robot.db").exists():
+                logger.info("初始化數據庫...")
+                db_schema.initialize()
+
+            self.face_recognizer = FaceRecognizer(
+                db_path="database/ai_bank_robot.db",
+                vip_threshold=0.65,
+                blacklist_threshold=0.60
+            )
+            logger.info(f"✓ 人臉識別已初始化 ({len(self.face_recognizer.vip_cache)} VIP, "
+                       f"{len(self.face_recognizer.blacklist_cache)} 黑名單)")
+        except Exception as e:
+            logger.error(f"✗ 人臉識別初始化失敗: {e}")
+            self.face_recognizer = None
+
+        # 初始化活體檢測模組
+        logger.info("初始化活體檢測模組...")
+        try:
+            self.liveness_detector = LivenessDetector(
+                detection_threshold=3,
+                eye_ar_threshold=0.2,
+                mouth_ar_threshold=0.5,
+                head_rotation_threshold=15.0
+            )
+            logger.info("✓ 活體檢測已初始化")
+        except Exception as e:
+            logger.warning(f"⚠ 活體檢測初始化失敗: {e}（將跳過活體檢測）")
+            self.liveness_detector = None
+
         # 跳幀設置
-        self.detect_interval = 3  # 每 3 幀檢測一次（樹莫派優化，降低 CPU 壓力）
+        self.detect_interval = 3
         self.frame_since_detect = 0
         self.last_detections = []
 
@@ -76,11 +116,11 @@ class RealtimeFaceDetectorInsightFace:
         self.paused = False
 
     def detect_faces_insightface(self, frame):
-        """使用 InsightFace 檢測人臉"""
+        """使用 InsightFace 檢測人臉並進行身份識別"""
         detections = []
 
         try:
-            # 執行人臉檢測和識別
+            # 執行人臉檢測
             faces = self.face_app.get(frame)
 
             for face in faces:
@@ -94,18 +134,35 @@ class RealtimeFaceDetectorInsightFace:
                 w = x2 - x1
                 h = y2 - y1
 
-                # 獲取置信度（face.det_score）
+                # 獲取置信度
                 confidence = float(face.det_score)
 
-                # 獲取人臉 embedding（128D，用於識別）
-                embedding = face.embedding  # (512,) 維向量
+                # 獲取 512D embedding
+                embedding = face.embedding.astype(np.float32)
 
-                detections.append({
+                # 執行人臉識別（如果識別模組可用）
+                recognition_result = None
+                if self.face_recognizer:
+                    recognition_result = self.face_recognizer.recognize_face(embedding)
+
+                # 執行活體檢測
+                liveness_result = None
+                if self.liveness_detector:
+                    face_roi = frame[max(0, y1):min(frame.shape[0], y2),
+                                     max(0, x1):min(frame.shape[1], x2)]
+                    if face_roi.size > 0:
+                        liveness_result = self.liveness_detector.check_liveness(face_roi)
+
+                detection = {
                     'box': (x, y, w, h),
-                    'confidence': confidence,
+                    'detection_confidence': confidence,
                     'embedding': embedding,
-                    'type': 'face'
-                })
+                    'type': 'face',
+                    'recognition': recognition_result,
+                    'liveness': liveness_result
+                }
+
+                detections.append(detection)
 
         except Exception as e:
             logger.error(f"檢測失敗: {e}")
@@ -113,19 +170,47 @@ class RealtimeFaceDetectorInsightFace:
         return detections
 
     def draw_detections(self, frame, detections):
-        """繪製檢測結果"""
+        """繪製檢測結果（包括識別和活體檢測）"""
         result = frame.copy()
+
         for det in detections:
             x, y, w, h = det['box']
-            confidence = det['confidence']
+            detection_conf = det['detection_confidence']
 
-            # 繪製邊界框（綠色）
-            cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # 基礎邊界框顏色取決於識別結果
+            color = (0, 255, 0)  # 默認綠色（訪客）
 
-            # 繪製標籤
-            label = f"Face {confidence:.2f}"
-            cv2.putText(result, label, (x, y - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # 識別結果
+            label_text = f"Face {detection_conf:.2f}"
+            if det['recognition']:
+                rec = det['recognition']
+                person_type = rec['person_type']
+                name = rec['name']
+                rec_conf = rec['confidence']
+
+                if person_type == 'vip':
+                    color = (0, 255, 255)  # 黃色 = VIP
+                    label_text = f"VIP: {name} ({rec_conf:.2f})"
+                elif person_type == 'blacklist':
+                    color = (0, 0, 255)  # 紅色 = 黑名單
+                    label_text = f"⚠ Blacklist: {name} ({rec_conf:.2f})"
+                else:
+                    label_text = f"Visitor ({rec_conf:.2f})"
+
+            # 繪製邊界框
+            cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
+
+            # 繪製主標籤
+            cv2.putText(result, label_text, (x, y - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # 活體檢測信息
+            if det['liveness']:
+                liveness = det['liveness']
+                is_alive = "✓ Alive" if liveness['is_alive'] else "✗ Spoofing?"
+                liveness_color = (0, 255, 0) if liveness['is_alive'] else (0, 0, 255)
+                cv2.putText(result, is_alive, (x, y - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, liveness_color, 1)
 
         return result
 
@@ -209,10 +294,17 @@ class RealtimeFaceDetectorInsightFace:
         """清理資源"""
         self.picam2.stop()
         self.picam2.close()
+
+        # 關閉識別和檢測模組
+        if self.face_recognizer:
+            self.face_recognizer.close()
+        if self.liveness_detector:
+            # MediaPipe 的資源由垃圾回收處理
+            pass
+
         try:
             cv2.destroyAllWindows()
         except cv2.error:
-            # 沒有 GUI 支援，忽略錯誤
             pass
 
         logger.info("=" * 70)
