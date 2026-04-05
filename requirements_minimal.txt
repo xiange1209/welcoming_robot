@@ -1,0 +1,32 @@
+# 智慧銀行AI服務機器人 - 最小化依賴清單
+# Raspberry Pi 4 專用
+# 使用方式：pip install -r requirements_minimal.txt
+
+# ===== 核心視覺AI套件 =====
+insightface==0.7.3          # 人臉檢測、識別、embedding
+opencv-python==4.13.0.92    # 圖像處理 + GUI (必須有 GTK 支援)
+onnxruntime==1.24.4         # ONNX 模型推理引擎
+numpy==2.2.4                # 數值計算
+pillow==11.1.0              # 圖像處理
+
+# ===== 攝像頭和硬件 =====
+picamera2==0.3.34           # Raspberry Pi Camera (libcamera)
+psutil==7.0.0               # 系統資源監控（CPU、內存、溫度）
+
+# ===== 後端服務 =====
+fastapi==0.135.3            # 輕量級 Web 框架
+uvicorn==0.43.0             # ASGI 服務器
+starlette==1.0.0            # 依賴
+
+# ===== 通訊 =====
+paho-mqtt==2.1.0            # MQTT 客戶端
+requests==2.32.3            # HTTP 請求
+
+# ===== 配置和工具 =====
+PyYAML==6.0.2               # YAML 配置文件解析
+pydantic==2.12.5            # 數據驗證
+python-dotenv==1.0.1        # .env 環境變數
+
+# ===== 輔助依賴（自動安裝，不需要手動指定） =====
+# scipy, scikit-learn, scikit-image, matplotlib 等
+# 由 insightface 依賴自動安裝
