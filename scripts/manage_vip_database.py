@@ -7,9 +7,20 @@ VIP 資料庫管理工具
 import sys
 import argparse
 import numpy as np
+import cv2
 from pathlib import Path
+
+# 添加項目路徑
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from database.schema import DatabaseSchema
 from vision_ai.face_recognizer import FaceRecognizer
+
+try:
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    INSIGHTFACE_AVAILABLE = False
 
 
 def init_database():
@@ -20,6 +31,65 @@ def init_database():
     print("✓ 數據庫已初始化")
 
 
+def extract_embedding_from_image(image_path: str) -> np.ndarray:
+    """
+    從圖像提取人臉 embedding
+
+    Args:
+        image_path: 圖像文件路徑
+
+    Returns:
+        512D embedding 向量
+    """
+    if not INSIGHTFACE_AVAILABLE:
+        print("✗ InsightFace 未安裝。請執行：pip install insightface")
+        return None
+
+    if not Path(image_path).exists():
+        print(f"✗ 圖像文件不存在：{image_path}")
+        return None
+
+    try:
+        # 讀取圖像
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"✗ 無法讀取圖像：{image_path}")
+            return None
+
+        print(f"  讀取圖像：{image_path} ({image.shape})")
+
+        # 初始化 InsightFace
+        print("  初始化 InsightFace...")
+        face_app = FaceAnalysis(
+            name='buffalo_sc',
+            root='./insightface_models',
+            providers=['CPUExecutionProvider']
+        )
+        face_app.prepare(ctx_id=-1, det_size=(512, 512))
+
+        # 檢測人臉
+        print("  檢測人臉...")
+        faces = face_app.get(image)
+
+        if len(faces) == 0:
+            print("✗ 圖像中未檢測到人臉")
+            return None
+
+        if len(faces) > 1:
+            print(f"⚠ 檢測到 {len(faces)} 張人臉，使用第一張")
+
+        # 提取第一個人臉的 embedding
+        embedding = faces[0].embedding.astype(np.float32)
+        confidence = faces[0].det_score
+
+        print(f"✓ 成功提取 embedding (檢測信心度: {confidence:.4f})")
+        return embedding
+
+    except Exception as e:
+        print(f"✗ 提取 embedding 失敗: {e}")
+        return None
+
+
 def add_vip_interactive():
     """交互式添加 VIP"""
     print("\n=== 添加 VIP ===")
@@ -27,17 +97,13 @@ def add_vip_interactive():
     phone = input("電話 (選填): ").strip() or None
     email = input("郵箱 (選填): ").strip() or None
     vip_level = input("等級 [standard/gold/platinum] (預設: standard): ").strip() or "standard"
-    embedding_path = input("Face embedding 文件路徑 (或留空生成測試用): ").strip()
+    image_path = input("人臉照片路徑 (或留空生成測試用): ").strip()
 
     # 生成或加載 embedding
-    if embedding_path and Path(embedding_path).exists():
-        try:
-            embedding = np.load(embedding_path).astype(np.float32)
-            if embedding.shape != (512,):
-                print(f"✗ Embedding 維度錯誤：{embedding.shape}，應為 (512,)")
-                return
-        except Exception as e:
-            print(f"✗ 加載 embedding 失敗: {e}")
+    if image_path and Path(image_path).exists():
+        print(f"\n提取 embedding 中...")
+        embedding = extract_embedding_from_image(image_path)
+        if embedding is None:
             return
     else:
         # 生成隨機 embedding（用於測試）
@@ -55,23 +121,38 @@ def add_vip_interactive():
     recognizer.close()
 
 
+def add_vip_from_image(name: str, image_path: str, phone: str = None,
+                       email: str = None, vip_level: str = 'standard'):
+    """從圖像添加 VIP"""
+    print(f"\n=== 從圖像添加 VIP: {name} ===")
+
+    # 提取 embedding
+    print("提取 embedding 中...")
+    embedding = extract_embedding_from_image(image_path)
+    if embedding is None:
+        return False
+
+    # 添加到資料庫
+    recognizer = FaceRecognizer()
+    success = recognizer.add_vip(name, embedding, phone, email, vip_level)
+    recognizer.close()
+
+    return success
+
+
 def add_blacklist_interactive():
     """交互式添加黑名單"""
     print("\n=== 添加黑名單 ===")
     name = input("姓名: ").strip()
     reason = input("原因 (選填): ").strip() or None
     risk_level = input("風險級別 [low/medium/high] (預設: medium): ").strip() or "medium"
-    embedding_path = input("Face embedding 文件路徑 (或留空生成測試用): ").strip()
+    image_path = input("人臉照片路徑 (或留空生成測試用): ").strip()
 
     # 生成或加載 embedding
-    if embedding_path and Path(embedding_path).exists():
-        try:
-            embedding = np.load(embedding_path).astype(np.float32)
-            if embedding.shape != (512,):
-                print(f"✗ Embedding 維度錯誤：{embedding.shape}，應為 (512,)")
-                return
-        except Exception as e:
-            print(f"✗ 加載 embedding 失敗: {e}")
+    if image_path and Path(image_path).exists():
+        print(f"\n提取 embedding 中...")
+        embedding = extract_embedding_from_image(image_path)
+        if embedding is None:
             return
     else:
         embedding = np.random.randn(512).astype(np.float32)
@@ -86,6 +167,25 @@ def add_blacklist_interactive():
         print(f"✗ 添加失敗")
 
     recognizer.close()
+
+
+def add_blacklist_from_image(name: str, image_path: str, reason: str = None,
+                            risk_level: str = 'medium'):
+    """從圖像添加黑名單"""
+    print(f"\n=== 從圖像添加黑名單: {name} ===")
+
+    # 提取 embedding
+    print("提取 embedding 中...")
+    embedding = extract_embedding_from_image(image_path)
+    if embedding is None:
+        return False
+
+    # 添加到資料庫
+    recognizer = FaceRecognizer()
+    success = recognizer.add_blacklist(name, embedding, reason, risk_level)
+    recognizer.close()
+
+    return success
 
 
 def list_vips():
@@ -239,8 +339,23 @@ def main():
     # 添加 VIP
     subparsers.add_parser("add-vip", help="添加 VIP（交互式）")
 
+    # 從圖像添加 VIP
+    add_vip_img = subparsers.add_parser("add-vip-image", help="從圖像添加 VIP")
+    add_vip_img.add_argument("name", help="VIP 名字")
+    add_vip_img.add_argument("image", help="人臉照片路徑")
+    add_vip_img.add_argument("--phone", help="電話 (選填)")
+    add_vip_img.add_argument("--email", help="郵箱 (選填)")
+    add_vip_img.add_argument("--level", default="standard", help="等級 [standard/gold/platinum]")
+
     # 添加黑名單
     subparsers.add_parser("add-blacklist", help="添加黑名單（交互式）")
+
+    # 從圖像添加黑名單
+    add_bl_img = subparsers.add_parser("add-blacklist-image", help="從圖像添加黑名單")
+    add_bl_img.add_argument("name", help="姓名")
+    add_bl_img.add_argument("image", help="人臉照片路徑")
+    add_bl_img.add_argument("--reason", help="原因 (選填)")
+    add_bl_img.add_argument("--risk", default="medium", help="風險級別 [low/medium/high]")
 
     # 列表
     subparsers.add_parser("list-vips", help="列出所有 VIP")
@@ -250,7 +365,7 @@ def main():
     subparsers.add_parser("test", help="測試識別功能")
 
     # 創建測試數據
-    subparsers.add_parser("create-test-data", help="創建測試數據")
+    subparsers.add_parser("create-test-data", help="創建測試數據（隨機 embedding）")
 
     args = parser.parse_args()
 
@@ -258,8 +373,12 @@ def main():
         init_database()
     elif args.command == "add-vip":
         add_vip_interactive()
+    elif args.command == "add-vip-image":
+        add_vip_from_image(args.name, args.image, args.phone, args.email, args.level)
     elif args.command == "add-blacklist":
         add_blacklist_interactive()
+    elif args.command == "add-blacklist-image":
+        add_blacklist_from_image(args.name, args.image, args.reason, args.risk)
     elif args.command == "list-vips":
         list_vips()
     elif args.command == "list-blacklist":
