@@ -17,17 +17,44 @@ python3 -c "import mediapipe; print('✓ MediaPipe ready')"
 ## 🗄️ 初始化 VIP 資料庫
 
 ```bash
-# 完整快速開始：初始化 + 添加測試數據
-python3 scripts/manage_vip_database.py create-test-data
+# 初始化空的數據庫
+python3 scripts/manage_vip_database.py init
+```
 
+## 📸 從照片添加 VIP（推薦方式）
+
+```bash
+# 添加 VIP（從真實人臉照片提取 embedding）
+python3 scripts/manage_vip_database.py add-vip-image "李美琪" photo.jpg \
+  --phone "0900123456" --email "lee@example.com" --level platinum
+
+# 添加黑名單（從照片）
+python3 scripts/manage_vip_database.py add-blacklist-image "詐騙犯" suspect.jpg \
+  --reason "Known fraud case" --risk high
+```
+
+**照片要求**：
+- ✅ 正面清晰人臉
+- ✅ 光線充足，無過度遮擋
+- ✅ 解析度 640x480 以上
+
+## 🧪 測試識別功能
+
+```bash
+# 測試：用已存儲的 VIP embedding 進行識別
+python3 scripts/manage_vip_database.py test
+
+# 輸出應顯示：識別結果、信心度等
+```
+
+## 📊 查看 VIP 和黑名單
+
+```bash
 # 查看 VIP 列表
 python3 scripts/manage_vip_database.py list-vips
 
 # 查看黑名單
 python3 scripts/manage_vip_database.py list-blacklist
-
-# 測試識別功能
-python3 scripts/manage_vip_database.py test
 ```
 
 ## 🎥 執行整合的人臉檢測 + 識別 + 活體檢測
@@ -51,37 +78,45 @@ python3 scripts/realtime_detection_insightface.py
 - **VIP**: 黃色邊框 + 「VIP: 名字 (信心度)」
 - **黑名單**: 紅色邊框 + 「⚠ Blacklist: 名字」
 - **訪客**: 綠色邊框 + 「Visitor」
-- **活體狀態**: ✓ Alive（通過活體檢測）或 ✗ Spoofing?
+- **活體狀態**: ✓ Alive 或 ✗ Spoofing?
 
 ## 🔍 故障排除
 
-### MediaPipe 找不到
+### 照片無法提取 embedding
 ```bash
-pip list | grep mediapipe
-# 如果沒有，重新安裝
-pip install --no-cache-dir mediapipe
+# 確保照片路徑正確、格式支持（JPG/PNG）
+file photo.jpg  # 檢查文件類型
+
+# 確保照片中有清晰的人臉
+# 可以用以下命令預覽檢測結果：
+python3 -c "
+import cv2
+from insightface.app import FaceAnalysis
+img = cv2.imread('photo.jpg')
+face_app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=-1, det_size=(512,512))
+faces = face_app.get(img)
+print(f'檢測到 {len(faces)} 張人臉')
+for i, face in enumerate(faces):
+    print(f'  人臉 {i+1}: 信心度 {face.det_score:.4f}')
+"
 ```
 
-### 數據庫不存在
-```bash
-# 初始化數據庫
-python3 scripts/manage_vip_database.py init
-```
+### FPS 太低
+- 確認檢測間隔設置（目前為每 3 幀檢測一次）
+- 檢查 CPU 溫度（可能需要冷卻）
 
 ### 活體檢測失敗
 - 確保光線充足
-- 確認人臉在攝像頭範圍內
-- 可能需要調整 `eye_ar_threshold` 和 `mouth_ar_threshold`
+- 確認人臉在攝像頭範圍內並清晰
+- MediaPipe 可能需要調整參數
 
-## 📝 自定義：添加特定人員
+## 📝 完整測試計畫
 
-```bash
-# 手動添加 VIP
-python3 scripts/manage_vip_database.py add-vip
-
-# 手動添加黑名單
-python3 scripts/manage_vip_database.py add-blacklist
-```
+詳見 **TEST_PLAN.md** 瞭解：
+- 完整的測試流程
+- 性能指標記錄
+- 邊界情況測試
 
 ---
 
@@ -89,11 +124,12 @@ python3 scripts/manage_vip_database.py add-blacklist
 
 - [x] Face Recognizer（embedding 相似度比對）
 - [x] Liveness Detector（眨眼/摇头/张嘴）
-- [x] realtime_detection_insightface.py（集成識別+活體檢測）
-- [x] VIP 資料庫管理工具
-- [ ] 在 Raspberry Pi 4 上實際測試
-- [ ] 性能優化（保持 10+ FPS）
-- [ ] 邊界情況測試（多人、側臉、低光）
+- [x] 整合的主程式
+- [x] VIP 管理工具（支持從照片添加）
+- [ ] 在 Raspberry Pi 4 上實際測試 ← **你來做**
+- [ ] 驗證 10+ FPS 性能
+- [ ] 驗證識別準確度
+- [ ] 驗證活體檢測有效性
 
 ---
 
@@ -102,3 +138,4 @@ python3 scripts/manage_vip_database.py add-blacklist
 - 表情分類（EfficientNet-B0）
 - LoRa 通知（檢測到 VIP → 通知行員）
 - 語音交互（Whisper STT + pyttsx3 TTS）
+
