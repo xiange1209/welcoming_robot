@@ -94,6 +94,7 @@ def add_vip_interactive():
     """交互式添加 VIP"""
     print("\n=== 添加 VIP ===")
     name = input("VIP 名字: ").strip()
+    gender = input("性別 [M/F/Other] (預設: Other): ").strip() or "Other"
     phone = input("電話 (選填): ").strip() or None
     email = input("郵箱 (選填): ").strip() or None
     vip_level = input("等級 [standard/gold/platinum] (預設: standard): ").strip() or "standard"
@@ -113,18 +114,18 @@ def add_vip_interactive():
 
     # 添加到資料庫
     recognizer = FaceRecognizer()
-    if recognizer.add_vip(name, embedding, phone, email, vip_level):
-        print(f"✓ VIP '{name}' 已添加")
+    if recognizer.add_vip(name, embedding, gender, phone, email, vip_level):
+        print(f"✓ VIP '{name}' ({gender}) 已添加")
     else:
         print(f"✗ 添加失敗")
 
     recognizer.close()
 
 
-def add_vip_from_image(name: str, image_path: str, phone: str = None,
+def add_vip_from_image(name: str, image_path: str, gender: str = 'Other', phone: str = None,
                        email: str = None, vip_level: str = 'standard'):
     """從圖像添加 VIP"""
-    print(f"\n=== 從圖像添加 VIP: {name} ===")
+    print(f"\n=== 從圖像添加 VIP: {name} ({gender}) ===")
 
     # 提取 embedding
     print("提取 embedding 中...")
@@ -134,7 +135,7 @@ def add_vip_from_image(name: str, image_path: str, phone: str = None,
 
     # 添加到資料庫
     recognizer = FaceRecognizer()
-    success = recognizer.add_vip(name, embedding, phone, email, vip_level)
+    success = recognizer.add_vip(name, embedding, gender, phone, email, vip_level)
     recognizer.close()
 
     return success
@@ -144,6 +145,7 @@ def add_blacklist_interactive():
     """交互式添加黑名單"""
     print("\n=== 添加黑名單 ===")
     name = input("姓名: ").strip()
+    gender = input("性別 [M/F/Other] (預設: Other): ").strip() or "Other"
     reason = input("原因 (選填): ").strip() or None
     risk_level = input("風險級別 [low/medium/high] (預設: medium): ").strip() or "medium"
     image_path = input("人臉照片路徑 (或留空生成測試用): ").strip()
@@ -161,18 +163,18 @@ def add_blacklist_interactive():
 
     # 添加到資料庫
     recognizer = FaceRecognizer()
-    if recognizer.add_blacklist(name, embedding, reason, risk_level):
-        print(f"✓ 黑名單 '{name}' 已添加")
+    if recognizer.add_blacklist(name, embedding, gender, reason, risk_level):
+        print(f"✓ 黑名單 '{name}' ({gender}) 已添加")
     else:
         print(f"✗ 添加失敗")
 
     recognizer.close()
 
 
-def add_blacklist_from_image(name: str, image_path: str, reason: str = None,
+def add_blacklist_from_image(name: str, image_path: str, gender: str = 'Other', reason: str = None,
                             risk_level: str = 'medium'):
     """從圖像添加黑名單"""
-    print(f"\n=== 從圖像添加黑名單: {name} ===")
+    print(f"\n=== 從圖像添加黑名單: {name} ({gender}) ===")
 
     # 提取 embedding
     print("提取 embedding 中...")
@@ -182,7 +184,7 @@ def add_blacklist_from_image(name: str, image_path: str, reason: str = None,
 
     # 添加到資料庫
     recognizer = FaceRecognizer()
-    success = recognizer.add_blacklist(name, embedding, reason, risk_level)
+    success = recognizer.add_blacklist(name, embedding, gender, reason, risk_level)
     recognizer.close()
 
     return success
@@ -201,7 +203,7 @@ def list_vips():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    cursor.execute('SELECT id, name, vip_level, phone, email, visit_count FROM vip_members WHERE is_active = 1')
+    cursor.execute('SELECT id, name, gender, vip_level, phone, email, visit_count FROM vip_members WHERE is_active = 1')
     rows = cursor.fetchall()
 
     if not rows:
@@ -209,11 +211,12 @@ def list_vips():
         return
 
     print("\n=== VIP 列表 ===")
-    print(f"{'ID':<4} {'名字':<15} {'等級':<10} {'電話':<15} {'郵箱':<20} {'造訪次數':<5}")
-    print("-" * 75)
+    print(f"{'ID':<4} {'名字':<15} {'性別':<4} {'等級':<10} {'電話':<15} {'郵箱':<20} {'造訪次數':<5}")
+    print("-" * 85)
 
     for row in rows:
-        print(f"{row['id']:<4} {row['name']:<15} {row['vip_level']:<10} "
+        gender_display = row['gender'] if row['gender'] else 'Other'
+        print(f"{row['id']:<4} {row['name']:<15} {gender_display:<4} {row['vip_level']:<10} "
               f"{row['phone'] or '-':<15} {row['email'] or '-':<20} {row['visit_count']:<5}")
 
     conn.close()
@@ -232,7 +235,7 @@ def list_blacklist():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    cursor.execute('SELECT id, name, risk_level, reason FROM blacklist WHERE is_active = 1')
+    cursor.execute('SELECT id, name, gender, risk_level, reason FROM blacklist WHERE is_active = 1')
     rows = cursor.fetchall()
 
     if not rows:
@@ -240,11 +243,12 @@ def list_blacklist():
         return
 
     print("\n=== 黑名單 ===")
-    print(f"{'ID':<4} {'名字':<15} {'風險級別':<10} {'原因':<30}")
-    print("-" * 60)
+    print(f"{'ID':<4} {'名字':<15} {'性別':<4} {'風險級別':<10} {'原因':<30}")
+    print("-" * 70)
 
     for row in rows:
-        print(f"{row['id']:<4} {row['name']:<15} {row['risk_level']:<10} {row['reason'] or '-':<30}")
+        gender_display = row['gender'] if row['gender'] else 'Other'
+        print(f"{row['id']:<4} {row['name']:<15} {gender_display:<4} {row['risk_level']:<10} {row['reason'] or '-':<30}")
 
     conn.close()
 

@@ -170,7 +170,7 @@ class RealtimeFaceDetectorInsightFace:
         return detections
 
     def draw_detections(self, frame, detections):
-        """繪製檢測結果（包括識別和活體檢測）"""
+        """繪製檢測結果（包括識別、性別和活體檢測）"""
         result = frame.copy()
 
         for det in detections:
@@ -186,16 +186,17 @@ class RealtimeFaceDetectorInsightFace:
                 rec = det['recognition']
                 person_type = rec['person_type']
                 name = rec['name']
+                gender = rec.get('gender', 'Other')
                 rec_conf = rec['confidence']
 
                 if person_type == 'vip':
                     color = (0, 255, 255)  # 黃色 = VIP
-                    label_text = f"VIP: {name} ({rec_conf:.2f})"
+                    label_text = f"VIP_{name}_{gender} ({rec_conf:.2f})"
                 elif person_type == 'blacklist':
                     color = (0, 0, 255)  # 紅色 = 黑名單
-                    label_text = f"⚠ Blacklist: {name} ({rec_conf:.2f})"
+                    label_text = f"黑名單_{name}_{gender} ({rec_conf:.2f})"
                 else:
-                    label_text = f"Visitor ({rec_conf:.2f})"
+                    label_text = f"訪客 ({rec_conf:.2f})"
 
             # 繪製邊界框
             cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
