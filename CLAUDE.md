@@ -10,23 +10,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Phase Status**:
 - ✅ Phase 1 (environment setup) completed
-- ✅ Phase 2a (real-time face detection) **COMPLETED** - 12-13 FPS with InsightFace buffalo_sc, 512D embeddings generated
-- ✅ Phase 2b (face recognition + liveness detection) **COMPLETED** - VIP/blacklist matching + anti-spoofing (blink/headshake/mouth)
-- 🔄 Phase 3+ (emotion analysis, speech, HMI, backend) planning
+- ✅ Phase 2a (real-time face detection) **VERIFIED** - 12-13 FPS with InsightFace buffalo_sc on RPi4, 512D embeddings generated
+- 🔄 Phase 2b (face recognition + liveness detection) **CODE READY** - Awaiting hardware testing. Single-sample VIP/blacklist matching with gender field support
+- 🔄 Phase 3+ (speech, HMI, ROS2 integration) planning
 
-**Recent Achievement**: Successfully completed Phase 2b with integrated detection + recognition + liveness pipeline. Face embeddings now automatically matched against VIP database with confidence scoring. Anti-spoofing detects live faces vs static images/videos.
+**Recent Update**: Phase 2b codebase enhanced with gender field (M/F/Other) for VIP/blacklist records. Gender parameter now required during registration but NOT auto-detected. Ready for testing on Raspberry Pi 4.
 
 ---
 
 ## Architecture Overview
 
-### 5 Core Modules
+### Current Module Structure (Python Single-Process)
 
-1. **Vision AI** (`vision_ai/`) - Face detection, liveness checking, face recognition, emotion analysis
-2. **Speech & HMI** (`speech_hmi/`) - Whisper STT, pyttsx3 TTS, intent classification, 7" touchscreen UI
-3. **Navigation** (`robot_navigation/`) - SLAM, Nav2, bottom layer control (teammate responsibility)
-4. **Communication** (`communication/`) - LoRa alerts, MQTT sync, UART to STM32
-5. **Core Workflow** (`core_workflow/`) - Main business logic, person type classification, alerts
+Currently Phase 2b uses single-process Python execution on Raspberry Pi OS. Modular architecture prepared for future ROS 2 migration:
+
+1. **Vision AI** (`vision_ai/`) - Face detection, recognition, liveness checking
+2. **Core Workflow** (`core_workflow/`) - Business logic (to be implemented)
+3. **Database** (`database/`) - SQLite schema for VIP/blacklist management
+4. **Robot Navigation** (`robot_navigation/`) - Placeholder for teammate's SLAM/Nav2 integration
+
+### Future: ROS 2 Package Structure (Phase 3+)
+
+Planned modular architecture for multi-process deployment:
+```
+ai_bank_robot_ws/src/
+├── vision_pkg/              # Node: Face detection + recognition
+├── speech_pkg/              # Node: STT + TTS (Phase 3)
+├── robot_control_pkg/       # Node: TurtleBot3 control
+└── core_orchestrator_pkg/   # Node: Main workflow coordinator
+```
 
 ### Design Patterns
 
@@ -37,20 +49,99 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Model Specifications
 
-- **Face Detection**: RetinaFace INT8 (<10MB, ~200ms latency)
-- **Face Recognition**: ArcFace INT8 (128D embedding, <20MB, ~300ms latency)
-- **Emotion Analysis**: EfficientNet-B0 (<15MB)
-- **Speech Model**: Whisper (quantized, edge version)
+- **Face Detection**: InsightFace RetinaFace (buffalo_sc model, ~50MB, produces 512D embeddings)
+- **Face Recognition**: Embedding-based similarity matching (cosine distance, no additional model needed)
+- **Liveness Detection**: MediaPipe Face Landmarks (when available on RPi4)
+- **Emotion Analysis**: Not yet implemented (Phase 3+)
 
 ### Database
 
 - **Local**: SQLite (edge storage, fast queries)
-  - `vip_members`: VIP list + face embeddings
-  - `blacklist`: Blacklisted persons
+  - `vip_members`: VIP list + face embeddings + **gender field** (M/F/Other)
+  - `blacklist`: Blacklisted persons + **gender field** (M/F/Other)
   - `visit_logs`: Visitor history
   - `security_alerts`: Safety incidents
-- **Cloud**: PostgreSQL (via MQTT sync)
+- **Cloud**: PostgreSQL (via MQTT sync) - Phase 5+
 - **Sync Strategy**: Hourly auto-sync; immediate sync for security alerts
+
+---
+
+## Phase 2b: Single-Sample Face Recognition (Current)
+
+### Recognition Flow
+
+```
+User Registration (Backend):
+  Photo + Name + Gender (M/F/Other) → Face embedding extraction → SQLite storage
+
+Runtime Detection (Real-time on RPi4):
+  Camera frame → Face detection → Extract face embedding
+                              ↓
+                    Check distance to VIP embeddings
+                              ↓
+  distance < threshold → Match VIP → Display: VIP_<name>_<gender> (confidence)
+  distance < threshold (blacklist) → Alert: 黑名單_<name>_<gender>
+  distance > threshold → Display: 訪客 (confidence)
+```
+
+### Key Implementation Details
+
+**Gender Field (Manual Input, Not Auto-Detected)**:
+- Format: 'M' (男), 'F' (女), 'Other'
+- Entered during backend VIP/blacklist registration
+- Stored in database alongside 512D face embedding
+- Displayed in GUI label for human verification
+
+**VIP Matching Algorithm**:
+- Similarity: `1.0 - (euclidean_distance / max_distance)` → 0-1 score
+- VIP threshold: 0.65 (tunable via `face_recognizer.py`)
+- Blacklist threshold: 0.60 (check blacklist first for security)
+- Search order: Blacklist (safety-first) → VIP → Else visitor
+
+**GUI Label Format**:
+```
+黃色框 (VIP):     VIP_<name>_<gender> (<confidence>)
+紅色框 (黑名單):   黑名單_<name>_<gender> (<confidence>)
+綠色框 (訪客):     訪客 (<confidence>)
+```
+
+### VIP Management CLI
+
+```bash
+# Initialize database
+python3 scripts/manage_vip_database.py init
+
+# Add VIP from photo (interactive)
+python3 scripts/manage_vip_database.py add-vip-interactive
+
+# Add VIP from image (CLI)
+python3 scripts/manage_vip_database.py add-vip \
+  --name "陳佳憲" --gender M --level platinum \
+  --phone "0900123456" --email "user@bank.com" \
+  path/to/photo.jpg
+
+# Add blacklist
+python3 scripts/manage_vip_database.py add-blacklist \
+  --name "李三" --gender F --risk high \
+  --reason "Failed background check" path/to/photo.jpg
+
+# List registered VIPs
+python3 scripts/manage_vip_database.py list-vips
+
+# List blacklisted persons
+python3 scripts/manage_vip_database.py list-blacklist
+```
+
+### Testing Phase 2b
+
+```bash
+# Test VIP recognition on current frame
+python3 scripts/test_vip_recognition.py path/to/test/photo.jpg
+
+# Run real-time detection with VIP overlay
+export DISPLAY=:1
+python3 scripts/realtime_detection_insightface.py
+```
 
 ---
 
@@ -79,12 +170,11 @@ bash setup_rpi4_quick.sh
 # Takes ~20-30 minutes total
 ```
 
-### Files Reference for Deployment
+### Files Reference for Development
 
-- **requirements_minimal.txt** - Curated list of only essential packages (no types-* packages)
+- **requirements_minimal.txt** - Curated list of only essential packages for Phase 2b
 - **setup_rpi4_quick.sh** - Fully automated 7-step deployment script
-- **INSTALLATION_GUIDE.md** - Detailed step-by-step guide with troubleshooting
-- **FEATURES.md** - Complete feature list and development roadmap
+- **vibe_coding流程.md** - Complete development workflow guide (Chinese)
 
 ---
 

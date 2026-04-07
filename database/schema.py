@@ -41,10 +41,11 @@ class DatabaseSchema:
             CREATE TABLE IF NOT EXISTS vip_members (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                gender TEXT,                                 -- 'M', 'F', 'Other'
                 phone TEXT,
                 email TEXT,
                 vip_level TEXT DEFAULT 'standard',          -- gold, platinum, standard
-                face_embedding BLOB NOT NULL,               -- 128D embedding 向量 (numpy float32)
+                face_embedding BLOB NOT NULL,               -- 512D embedding 向量 (numpy float32)
                 embedding_version TEXT DEFAULT '1.0',
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_visit TIMESTAMP,
@@ -60,6 +61,7 @@ class DatabaseSchema:
             CREATE TABLE IF NOT EXISTS blacklist (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                gender TEXT,                                 -- 'M', 'F', 'Other'
                 face_embedding BLOB NOT NULL,
                 reason TEXT,                                 -- 加入黑名單理由
                 risk_level TEXT DEFAULT 'medium',           -- low, medium, high
@@ -136,13 +138,13 @@ class DatabaseSchema:
         print("✓ 數據庫初始化完成")
 
     @staticmethod
-    def add_vip_member(conn, name: str, face_embedding, phone: str = None, email: str = None, vip_level: str = 'standard'):
+    def add_vip_member(conn, name: str, face_embedding, gender: str = 'Other', phone: str = None, email: str = None, vip_level: str = 'standard'):
         """添加 VIP 成員"""
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO vip_members (name, face_embedding, phone, email, vip_level)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, face_embedding, phone, email, vip_level))
+            INSERT INTO vip_members (name, gender, face_embedding, phone, email, vip_level)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (name, gender, face_embedding, phone, email, vip_level))
         conn.commit()
         return cursor.lastrowid
 
