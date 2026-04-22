@@ -141,7 +141,8 @@ class FaceRecognitionNode(Node):
         """更新特徵向量快取
 
         從資料庫載入所有已註冊人員的特徵向量，
-        並計算每個人員的平均特徵向量作為代表
+        並計算每個人員的平均特徵向量作為代表，
+        同時快取性別和人員類型資訊
         """
         try:
             all_embeddings = self.db_manager.get_all_embeddings()
@@ -152,13 +153,20 @@ class FaceRecognitionNode(Node):
                 if person_info:
                     self.embedding_cache[person_uuid] = {
                         "person_name": person_info["person_name"],
+                        "gender": person_info.get("gender", "Other"),
+                        "person_type": person_info.get("person_type", "VIP"),
                         "embeddings": embeddings,
                         # 計算平均特徵向量作為人員代表
                         "mean_embedding": np.mean(embeddings, axis=0).astype(np.float32),
                     }
 
             num_persons = len(self.embedding_cache)
-            self.get_logger().info(f"✓ 特徵向量快取已更新: {num_persons} 個已註冊人員")
+            vip_count = sum(1 for info in self.embedding_cache.values() if info["person_type"] == "VIP")
+            blacklist_count = sum(1 for info in self.embedding_cache.values() if info["person_type"] == "BLACKLIST")
+
+            self.get_logger().info(
+                f"✓ 特徵向量快取已更新: {num_persons} 人 (VIP: {vip_count}, 黑名單: {blacklist_count})"
+            )
         except Exception as e:
             self.get_logger().warning(f"特徵向量快取更新失敗: {e}")
 
@@ -182,18 +190,28 @@ class FaceRecognitionNode(Node):
                 self.get_logger().debug(f"偵測到 {len(faces)} 張臉部")
 
                 for idx, face in enumerate(faces):
-                    # 執行身份識別
-                    person_uuid, confidence = self._recognize_face(face.embedding)
+                    # 執行身份識別（優先檢查黑名單）
+                    person_uuid, person_type, gender, confidence = self._recognize_face(face.embedding)
 
                     if person_uuid:
                         person_name = self.embedding_cache[person_uuid]["person_name"]
                         face.person_name = person_name
                         face.confidence = confidence
-                        self.get_logger().info(f"臉部 {idx}: 已識別 = {person_name} " f"(置信度: {confidence:.3f})")
+                        face.person_type = person_type
+                        face.gender = gender
+
+                        type_icon = "🔴 黑名單" if person_type == "BLACKLIST" else "🟢 VIP"
+                        self.get_logger().info(
+                            f"臉部 {idx}: [{type_icon}] {person_name} ({gender}) "
+                            f"(置信度: {confidence:.3f})"
+                        )
                     else:
                         face.person_name = "Unknown"
                         face.confidence = confidence
-                        self.get_logger().debug(f"臉部 {idx}: 未知人員 (最高相似度: {confidence:.3f})")
+                        face.person_type = "VISITOR"
+                        face.gender = ""
+
+                        self.get_logger().debug(f"臉部 {idx}: 訪客 (最高相似度: {confidence:.3f})")
             else:
                 self.get_logger().debug("未偵測到臉部")
 
@@ -207,41 +225,74 @@ class FaceRecognitionNode(Node):
         except Exception as e:
             self.get_logger().error(f"影像處理錯誤: {e}")
 
-    def _recognize_face(self, embedding: np.ndarray) -> tuple[Optional[str], float]:
+    def _recognize_face(self, embedding: np.ndarray) -> tuple[Optional[str], str, str, float]:
         """識別臉部身份
 
-        將輸入特徵向量與快取中所有已註冊人員的平均特徵向量比較，
-        返回相似度最高的人員 (若超過閾值)
+        將輸入特徵向量與快取中所有已註冊人員的平均特徵向量比較。
+        優先檢查黑名單（安全優先），再檢查VIP。
+        返回人員資訊、身份類型、性別和相似度。
 
         Args:
-            np.ndarray: 臉部特徵向量
+            embedding: 臉部特徵向量
 
         Returns:
-            tuple[Optional[str], float]:
-            若相似度超過閾值則返回 UUID 與相似度，否則返回 None 與相似度
+            tuple[Optional[str], str, str, float]:
+            (person_uuid, person_type, gender, max_similarity)
+            - person_uuid: 匹配的人員UUID (若無匹配返回None)
+            - person_type: VIP/BLACKLIST/VISITOR
+            - gender: 性別 (M/F/Other)
+            - max_similarity: 最高相似度分數
         """
         if not self.embedding_cache:
-            return None, 0.0
+            return None, "VISITOR", "", 0.0
 
         max_similarity = 0.0
         best_match_uuid = None
+        best_match_person_type = None
+        best_match_gender = None
 
-        # 與所有已註冊人員比較
+        # ⚠️ 優先檢查黑名單（安全優先）
         for person_uuid, cache_info in self.embedding_cache.items():
-            mean_embedding = cache_info["mean_embedding"]
+            if cache_info["person_type"] != "BLACKLIST":
+                continue
 
-            # 計算相似度 (餘弦距離)
+            mean_embedding = cache_info["mean_embedding"]
             similarity = self.engine.compute_similarity(embedding, mean_embedding)
 
             if similarity > max_similarity:
                 max_similarity = similarity
                 best_match_uuid = person_uuid
+                best_match_person_type = "BLACKLIST"
+                best_match_gender = cache_info["gender"]
 
-        # 判定是否超過閾值
+        # 若黑名單有高相似度匹配（>閾值），立即返回
+        if max_similarity >= self.recognition_threshold and best_match_person_type == "BLACKLIST":
+            return best_match_uuid, best_match_person_type, best_match_gender, max_similarity
+
+        # 重置相似度，檢查VIP
+        max_similarity = 0.0
+        best_match_uuid = None
+        best_match_person_type = None
+        best_match_gender = None
+
+        for person_uuid, cache_info in self.embedding_cache.items():
+            if cache_info["person_type"] != "VIP":
+                continue
+
+            mean_embedding = cache_info["mean_embedding"]
+            similarity = self.engine.compute_similarity(embedding, mean_embedding)
+
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_match_uuid = person_uuid
+                best_match_person_type = "VIP"
+                best_match_gender = cache_info["gender"]
+
+        # 判定是否超過VIP閾值
         if max_similarity >= self.recognition_threshold:
-            return best_match_uuid, max_similarity
+            return best_match_uuid, best_match_person_type, best_match_gender, max_similarity
         else:
-            return None, max_similarity
+            return None, "VISITOR", "", max_similarity
 
     def refresh_cache_callback(self, request: Empty.Request, response: Empty.Response) -> Empty.Response:
         """刷新資料庫快取

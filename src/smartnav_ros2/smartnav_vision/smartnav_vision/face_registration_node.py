@@ -182,10 +182,24 @@ class FaceRegistrationNode(Node):
 
         try:
             person_name = request.person_name.strip()
+            gender = request.gender.strip() if request.gender else "Other"
+            person_type = request.person_type.strip() if request.person_type else "VIP"
 
             if not person_name:
                 response.success = False
                 response.message = "人員名稱不能為空"
+                return response
+
+            # 驗證 gender
+            if gender not in ["M", "F", "Other"]:
+                response.success = False
+                response.message = "性別只能是 M/F/Other"
+                return response
+
+            # 驗證 person_type
+            if person_type not in ["VIP", "BLACKLIST"]:
+                response.success = False
+                response.message = "人員類型只能是 VIP/BLACKLIST"
                 return response
 
             # 檢查該人員是否已註冊過
@@ -203,13 +217,15 @@ class FaceRegistrationNode(Node):
 
             # 開始新的註冊流程
             num_samples = request.num_samples if request.num_samples > 0 else self.samples_per_person
-            person_uuid = self.start_registration(person_name, num_samples)
+            person_uuid = self.start_registration(person_name, gender, person_type, num_samples)
 
             if person_uuid:
                 response.success = True
                 response.person_uuid = person_uuid
-                response.message = f"已開始採集 {person_name} 的人臉樣本 (目標: {num_samples} 個)"
-                self.get_logger().info(f"✓ 服務請求：開始註冊 {person_name} (目標: {num_samples} 個)")
+                response.message = (
+                    f"已開始採集 {person_name} ({gender}) [{person_type}] 的人臉樣本 (目標: {num_samples} 個)"
+                )
+                self.get_logger().info(f"✓ 服務請求：開始註冊 {person_name} ({gender}) [{person_type}] (目標: {num_samples} 個)")
             else:
                 response.success = False
                 response.message = "註冊流程啟動失敗"
@@ -221,13 +237,21 @@ class FaceRegistrationNode(Node):
 
         return response
 
-    def start_registration(self, person_name: str, num_samples: Optional[int] = None) -> Optional[str]:
+    def start_registration(
+        self,
+        person_name: str,
+        gender: str = "Other",
+        person_type: str = "VIP",
+        num_samples: Optional[int] = None,
+    ) -> Optional[str]:
         """開始新的人臉註冊流程
 
         在資料庫中註冊新人員，並初始化採集狀態
 
         Args:
             person_name: 人員名稱
+            gender: 性別 (M/F/Other)
+            person_type: 人員類型 (VIP/BLACKLIST)
             num_samples: 目標樣本數，若無則使用預設值
 
         Returns:
@@ -235,7 +259,7 @@ class FaceRegistrationNode(Node):
         """
         try:
             # 在資料庫中註冊新人員
-            person_uuid = self.db_manager.register_person(person_name)
+            person_uuid = self.db_manager.register_person(person_name, gender, person_type)
 
             # 若未指定樣本數，使用預設值
             target_samples = num_samples if num_samples and num_samples > 0 else self.samples_per_person
@@ -244,12 +268,16 @@ class FaceRegistrationNode(Node):
             self.current_registration = {
                 "person_uuid": person_uuid,
                 "person_name": person_name,
+                "gender": gender,
+                "person_type": person_type,
                 "collected_samples": 0,
                 "target_samples": target_samples,
                 "created_at": str(self.get_clock().now().to_msg().sec),
             }
 
-            self.get_logger().info(f"✓ 開始採集 {person_name} 的人臉樣本 (目標: {target_samples} 個)...")
+            self.get_logger().info(
+                f"✓ 開始採集 {person_name} ({gender}) [{person_type}] 的人臉樣本 (目標: {target_samples} 個)..."
+            )
             return person_uuid
 
         except Exception as e:

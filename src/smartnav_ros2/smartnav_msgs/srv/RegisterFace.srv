@@ -6,6 +6,12 @@
 # 人員名稱
 string person_name
 
+# 性別 (M/F/Other)
+string gender
+
+# 人員類型 (VIP/BLACKLIST)
+string person_type
+
 # 採集的臉部影像數量
 int32 num_samples
 
