@@ -26,6 +26,7 @@ class FaceResult:
     age: Optional[float] = None
     gender: Optional[str] = None
     person_name: str = "Unknown"
+    person_type: str = "VISITOR"  # VIP / BLACKLIST / VISITOR
 
 
 class FaceEngine:
@@ -224,7 +225,12 @@ class FaceEngine:
     ) -> np.ndarray:
         """在影像上繪製臉部檢測結果
 
-        繪製內容包括邊界框、人員名稱/ID、檢測信心、年齡、性別與臉部關鍵點
+        繪製內容包括邊界框、人員名稱、性別、檢測信心、年齡、身份類型與臉部關鍵點
+
+        邊界框顏色編碼：
+        - 🟢 綠色 (VIP)
+        - 🔴 紅色 (黑名單)
+        - 🔵 藍色 (訪客)
 
         Args:
             image: BGR 格式的輸入影像
@@ -240,34 +246,60 @@ class FaceEngine:
         for i, face in enumerate(faces):
             x1, y1, x2, y2 = map(int, face.bbox)
             confidence = face.confidence
-
-            # 若有識別結果，優先顯示人員名稱；否則顯示檢測信心
             person_name = face.person_name
-            if person_name != "Unknown":
-                text = f"{person_name} ({confidence:.2f})"
-                color = (0, 255, 0)
-            else:
-                text = f"ID:{i} Unknown ({confidence:.2f})"
-                color = (0, 0, 255)
+            person_type = getattr(face, "person_type", "VISITOR")
+            gender = getattr(face, "gender", "")
 
+            # 根據身份類型選擇顏色
+            if person_type == "BLACKLIST":
+                color = (0, 0, 255)  # 紅色 (BGR)
+                type_label = "🔴 黑名單"
+            elif person_type == "VIP":
+                color = (0, 255, 0)  # 綠色 (BGR)
+                type_label = "🟢 VIP"
+            else:  # VISITOR
+                color = (255, 0, 0)  # 藍色 (BGR)
+                type_label = "🔵 訪客"
+
+            # 繪製邊界框
             cv2.rectangle(image_copy, (x1, y1), (x2, y2), color, 2)
 
             if draw_info:
+                # 主標籤：人員名稱、性別、身份類型
+                if person_name != "Unknown":
+                    gender_str = f"_{gender}" if gender else ""
+                    text = f"{person_name}{gender_str} ({confidence:.2f})"
+                else:
+                    text = f"訪客 ({confidence:.2f})"
+
                 cv2.putText(
                     image_copy,
                     text,
-                    (x1, max(y1 - 10, 25)),
+                    (x1, max(y1 - 30, 25)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     color,
                     2,
                 )
 
+                # 身份類型標籤
+                cv2.putText(
+                    image_copy,
+                    type_label,
+                    (x1, max(y1 - 10, 25)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                )
+
+                # 年齡和性別資訊 (偵測到時顯示)
                 info_text = []
                 if face.age is not None:
                     info_text.append(f"Age: {int(face.age)}")
-                if face.gender is not None:
-                    info_text.append(f"Gender: {face.gender}")
+                if face.gender is not None and person_name == "Unknown":
+                    # 未識別時才顯示自動偵測的性別
+                    info_text.append(f"Det: {face.gender}")
 
                 if info_text:
                     info_str = ", ".join(info_text)
@@ -278,7 +310,7 @@ class FaceEngine:
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
                         color,
-                        2,
+                        1,
                     )
 
             if draw_keypoints and face.keypoints is not None:

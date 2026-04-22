@@ -93,11 +93,18 @@ class DatabaseManager:
             self.logger.error(f"索引表儲存失敗: {e}")
             return False
 
-    def register_person(self, person_name: str) -> str:
+    def register_person(
+        self,
+        person_name: str,
+        gender: str = "Other",
+        person_type: str = "VIP",
+    ) -> str:
         """註冊新人員
 
         Args:
             person_name: 人員名稱
+            gender: 性別 (M/F/Other)
+            person_type: 人員類型 (VIP/BLACKLIST)
 
         Returns:
             str: 分配的人員 UUID
@@ -106,16 +113,28 @@ class DatabaseManager:
             Exception: 當註冊失敗時
         """
         try:
+            # 驗證輸入
+            if not person_name.strip():
+                raise ValueError("人員名稱不能為空")
+            if gender not in ["M", "F", "Other"]:
+                raise ValueError("性別只能是 M/F/Other")
+            if person_type not in ["VIP", "BLACKLIST"]:
+                raise ValueError("人員類型只能是 VIP/BLACKLIST")
+
             person_uuid = str(uuid.uuid4())
 
             self.registry[person_uuid] = {
                 "person_name": person_name,
+                "gender": gender,
+                "person_type": person_type,
                 "created_at": datetime.now().isoformat(),
                 "samples": [],
             }
 
             self._save_registry()
-            self.logger.info(f"✓ 人員已註冊: {person_name} (UUID: {person_uuid})")
+            self.logger.info(
+                f"✓ 人員已註冊: {person_name} ({gender}) [{person_type}] (UUID: {person_uuid})"
+            )
             return person_uuid
 
         except Exception as e:
@@ -310,16 +329,23 @@ class DatabaseManager:
         total_persons = len(self.registry)
         total_samples = sum(len(info["samples"]) for info in self.registry.values())
 
+        vip_count = sum(1 for info in self.registry.values() if info.get("person_type") == "VIP")
+        blacklist_count = sum(1 for info in self.registry.values() if info.get("person_type") == "BLACKLIST")
+
         persons_stats = {}
         for person_uuid, info in self.registry.items():
             persons_stats[person_uuid] = {
                 "person_name": info["person_name"],
+                "gender": info.get("gender", "Other"),
+                "person_type": info.get("person_type", "VIP"),
                 "num_samples": len(info["samples"]),
                 "created_at": info["created_at"],
             }
 
         return {
             "total_persons": total_persons,
+            "vip_count": vip_count,
+            "blacklist_count": blacklist_count,
             "total_samples": total_samples,
             "persons": persons_stats,
         }
@@ -331,15 +357,18 @@ class DatabaseManager:
         """
         stats = self.get_statistics()
 
-        self.logger.info("\n" + "=" * 60)
+        self.logger.info("\n" + "=" * 70)
         self.logger.info("臉部資料庫統計")
-        self.logger.info("=" * 60)
-        self.logger.info(f"總人數: {stats['total_persons']}")
+        self.logger.info("=" * 70)
+        self.logger.info(f"總人數: {stats['total_persons']} (VIP: {stats['vip_count']}, 黑名單: {stats['blacklist_count']})")
         self.logger.info(f"總樣本數: {stats['total_samples']}")
 
         for person_uuid, person_stats in stats["persons"].items():
-            self.logger.info(f"  {person_stats['person_name']} ({person_uuid})")
+            person_type_str = "🟢 VIP" if person_stats["person_type"] == "VIP" else "🔴 黑名單"
+            self.logger.info(
+                f"  {person_stats['person_name']} ({person_stats['gender']}) [{person_type_str}] ({person_uuid})"
+            )
             self.logger.info(f"    - 樣本數: {person_stats['num_samples']}")
             self.logger.info(f"    - 建立時間: {person_stats['created_at']}")
 
-        self.logger.info("=" * 60)
+        self.logger.info("=" * 70)
