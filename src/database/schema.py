@@ -12,11 +12,13 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+_DEFAULT_DB = str(Path(__file__).parent.parent.parent / "database" / "ai_bank_robot.db")
+
 class DatabaseSchema:
     """數據庫初始化和管理"""
 
-    def __init__(self, db_path: str = "database/ai_bank_robot.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str = None):
+        self.db_path = Path(db_path or _DEFAULT_DB)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = None
 
