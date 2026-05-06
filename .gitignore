@@ -57,7 +57,13 @@ Thumbs.db
 temp/
 cache/
 
-# Temporary test images
+# InsightFace 自動下載的模型（~50MB，不納入 repo）
+insightface_models/
+
+# 資料庫（運行時生成）
+database/
+
+# Test images / personal photos
 *.jpg
 *.jpeg
 *.png

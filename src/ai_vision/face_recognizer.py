@@ -12,22 +12,17 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 預設 DB 路徑：src/ai_vision/ → src/ → PROJECT_ROOT/database/
+_DEFAULT_DB = str(Path(__file__).parent.parent.parent / "database" / "ai_bank_robot.db")
+
 
 class FaceRecognizer:
     """基於 embedding 的人臉識別"""
 
-    def __init__(self, db_path: str = "database/ai_bank_robot.db",
-                 vip_threshold: float = 0.65,
-                 blacklist_threshold: float = 0.60):
-        """
-        初始化人臉識別器
-
-        Args:
-            db_path: SQLite 數據庫路徑
-            vip_threshold: VIP 匹配信心度閾值 (0-1, 越高越嚴格)
-            blacklist_threshold: 黑名單匹配信心度閾值
-        """
-        self.db_path = db_path
+    def __init__(self, db_path: str = None,
+                 vip_threshold: float = 0.30,
+                 blacklist_threshold: float = 0.25):
+        self.db_path = db_path or _DEFAULT_DB
         self.vip_threshold = vip_threshold
         self.blacklist_threshold = blacklist_threshold
         self.conn = None
@@ -120,8 +115,7 @@ class FaceRecognizer:
         best_blacklist_gender = None
 
         for name, (blk_embedding, gender) in self.blacklist_cache.items():
-            distance = self.euclidean_distance(face_embedding, blk_embedding)
-            confidence = self.similarity_from_distance(distance)
+            confidence = self.cosine_similarity(face_embedding, blk_embedding)
 
             if confidence > best_blacklist_confidence:
                 best_blacklist_confidence = confidence
@@ -141,7 +135,7 @@ class FaceRecognizer:
             result['risk_level'] = blk_row['risk_level'] if blk_row else 'medium'
             result['details'] = {
                 'reason': blk_row['reason'] if blk_row else 'Unknown',
-                'distance': self.euclidean_distance(face_embedding, self.blacklist_cache[best_blacklist_match][0])
+                'distance': self.cosine_similarity(face_embedding, self.blacklist_cache[best_blacklist_match][0])
             }
             return result
 
@@ -151,8 +145,7 @@ class FaceRecognizer:
         best_vip_gender = None
 
         for name, (vip_embedding, gender) in self.vip_cache.items():
-            distance = self.euclidean_distance(face_embedding, vip_embedding)
-            confidence = self.similarity_from_distance(distance)
+            confidence = self.cosine_similarity(face_embedding, vip_embedding)
 
             if confidence > best_vip_confidence:
                 best_vip_confidence = confidence
@@ -173,7 +166,7 @@ class FaceRecognizer:
             result['details'] = {
                 'phone': vip_row['phone'] if vip_row else None,
                 'email': vip_row['email'] if vip_row else None,
-                'distance': self.euclidean_distance(face_embedding, self.vip_cache[best_vip_match][0])
+                'cosine_similarity': self.cosine_similarity(face_embedding, self.vip_cache[best_vip_match][0])
             }
             return result
 

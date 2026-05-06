@@ -15,19 +15,95 @@ import numpy as np
 import sys
 import time
 from pathlib import Path
-from picamera2 import Picamera2
 import logging
 import os
 
-# 添加項目路徑，以便導入自定義模塊
-sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
-from vision_ai.face_recognizer import FaceRecognizer
-from vision_ai.liveness_detector import LivenessDetector
+
+def _find_cjk_font() -> str | None:
+    """動態搜尋系統中支援中文的字型檔"""
+    # 先試常見固定路徑
+    from pathlib import Path as _P
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ]
+    for p in candidates:
+        if _P(p).exists():
+            return p
+    # fc-list 動態搜尋
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["fc-list", ":lang=zh", "-f", "%{file}\\n"],
+            capture_output=True, text=True, timeout=3
+        ).stdout
+        for line in out.splitlines():
+            f = line.strip()
+            if f and _P(f).exists():
+                return f
+    except Exception:
+        pass
+    # glob 最後手段
+    try:
+        for p in _P("/usr/share/fonts").rglob("*"):
+            n = p.name.lower()
+            if ("cjk" in n or "wqy" in n or "noto" in n) and p.suffix in (".ttc", ".ttf", ".otf"):
+                return str(p)
+    except Exception:
+        pass
+    return None
+
+
+_CJK_FONT = _find_cjk_font() if PIL_AVAILABLE else None
+_FONT_CACHE: dict = {}  # {font_size: ImageFont}
+
+
+def _get_font(font_size: int):
+    if font_size not in _FONT_CACHE:
+        _FONT_CACHE[font_size] = ImageFont.truetype(_CJK_FONT, font_size)
+    return _FONT_CACHE[font_size]
+
+
+# 添加 src/ 到路徑
+_SRC_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SRC_DIR.parent
+sys.path.insert(0, str(_SRC_DIR))
+
+DB_PATH = str(_PROJECT_ROOT / "database" / "ai_bank_robot.db")
+
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except ImportError:
+    PICAMERA2_AVAILABLE = False
+
+from ai_vision.face_recognizer import FaceRecognizer
+from ai_vision.liveness_detector import LivenessDetector
 from database.schema import DatabaseSchema
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
+
+if _CJK_FONT:
+    logger.info(f"✓ 中文字型: {_CJK_FONT}")
+else:
+    logger.warning("⚠ 未找到中文字型，標籤將顯示英文。安裝：sudo apt install fonts-noto-cjk")
+
+try:
+    import onnxruntime as _ort
+    _ort.set_default_logger_severity(3)
+except Exception:
+    pass
 
 try:
     from insightface.app import FaceAnalysis
@@ -45,15 +121,25 @@ class RealtimeFaceDetectorInsightFace:
             logger.error("✗ InsightFace 未安裝。請執行：pip install insightface")
             sys.exit(1)
 
-        logger.info("初始化 Picamera2...")
-        self.picam2 = Picamera2()
-        config = self.picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "XBGR8888"}
-        )
-        self.picam2.configure(config)
-        self.picam2.start()
-        time.sleep(1)
-        logger.info("✓ Picamera2 已初始化 (640x480)")
+        self.picam2 = None
+        self.cap = None
+
+        if PICAMERA2_AVAILABLE:
+            logger.info("初始化 Picamera2...")
+            self.picam2 = Picamera2()
+            config = self.picam2.create_preview_configuration(
+                main={"size": (640, 480), "format": "XBGR8888"}
+            )
+            self.picam2.configure(config)
+            self.picam2.start()
+            time.sleep(1)
+            logger.info("✓ Picamera2 已初始化 (640x480)")
+        else:
+            logger.info("Picamera2 不可用，使用 USB 攝像頭...")
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            logger.info("✓ USB 攝像頭已初始化 (640x480)")
 
         # 初始化 InsightFace
         logger.info("初始化 InsightFace...")
@@ -63,7 +149,7 @@ class RealtimeFaceDetectorInsightFace:
                 root='./insightface_models',
                 providers=['CPUExecutionProvider']
             )
-            self.face_app.prepare(ctx_id=-1, det_size=(512, 512))
+            self.face_app.prepare(ctx_id=-1, det_size=(320, 320))
             logger.info("✓ InsightFace 已初始化 (RetinaFace + ArcFace)")
         except Exception as e:
             logger.error(f"✗ InsightFace 初始化失敗: {e}")
@@ -72,16 +158,15 @@ class RealtimeFaceDetectorInsightFace:
         # 初始化人臉識別模組
         logger.info("初始化人臉識別模組...")
         try:
-            # 確保數據庫已初始化
-            db_schema = DatabaseSchema()
-            if not Path("database/ai_bank_robot.db").exists():
+            db_schema = DatabaseSchema(DB_PATH)
+            if not Path(DB_PATH).exists():
                 logger.info("初始化數據庫...")
                 db_schema.initialize()
 
             self.face_recognizer = FaceRecognizer(
-                db_path="database/ai_bank_robot.db",
-                vip_threshold=0.65,
-                blacklist_threshold=0.60
+                db_path=DB_PATH,
+                vip_threshold=0.25,
+                blacklist_threshold=0.20
             )
             logger.info(f"✓ 人臉識別已初始化 ({len(self.face_recognizer.vip_cache)} VIP, "
                        f"{len(self.face_recognizer.blacklist_cache)} 黑名單)")
@@ -104,9 +189,13 @@ class RealtimeFaceDetectorInsightFace:
             self.liveness_detector = None
 
         # 跳幀設置
-        self.detect_interval = 3
+        self.detect_interval = 5
         self.frame_since_detect = 0
         self.last_detections = []
+
+        # 連續確認（避免單次高分誤判）
+        self._confirm_last = None   # (name, person_type)
+        self._confirm_count = 0
 
         # 統計信息
         self.frame_count = 0
@@ -114,6 +203,27 @@ class RealtimeFaceDetectorInsightFace:
         self.start_time = time.time()
         self.save_dir = Path("/tmp")
         self.paused = False
+
+    def _apply_temporal_filter(self, result: dict) -> dict:
+        """需要連續 2 次偵測才確認 VIP/黑名單，防止單次誤判"""
+        ptype = result['person_type']
+        if ptype in ('vip', 'blacklist'):
+            key = (result['name'], ptype)
+            if key == self._confirm_last:
+                self._confirm_count += 1
+            else:
+                self._confirm_count = 1
+                self._confirm_last = key
+            if self._confirm_count >= 2:
+                return result
+            # 尚未確認，顯示為訪客
+            return {'person_type': 'visitor', 'name': None, 'gender': None,
+                    'confidence': result['confidence'], 'vip_level': None,
+                    'risk_level': None, 'details': {}}
+        else:
+            self._confirm_last = None
+            self._confirm_count = 0
+            return result
 
     def detect_faces_insightface(self, frame):
         """使用 InsightFace 檢測人臉並進行身份識別"""
@@ -143,7 +253,8 @@ class RealtimeFaceDetectorInsightFace:
                 # 執行人臉識別（如果識別模組可用）
                 recognition_result = None
                 if self.face_recognizer:
-                    recognition_result = self.face_recognizer.recognize_face(embedding)
+                    raw = self.face_recognizer.recognize_face(embedding)
+                    recognition_result = self._apply_temporal_filter(raw)
 
                 # 執行活體檢測
                 liveness_result = None
@@ -172,16 +283,15 @@ class RealtimeFaceDetectorInsightFace:
     def draw_detections(self, frame, detections):
         """繪製檢測結果（包括識別、性別和活體檢測）"""
         result = frame.copy()
+        text_items = []  # [(text, pos, font_size, color)]
 
         for det in detections:
             x, y, w, h = det['box']
             detection_conf = det['detection_confidence']
 
-            # 基礎邊界框顏色取決於識別結果
-            color = (0, 255, 0)  # 默認綠色（訪客）
+            color = (0, 255, 0)
+            label_text = f"Visitor ({detection_conf:.2f})"
 
-            # 識別結果
-            label_text = f"Face {detection_conf:.2f}"
             if det['recognition']:
                 rec = det['recognition']
                 person_type = rec['person_type']
@@ -190,28 +300,36 @@ class RealtimeFaceDetectorInsightFace:
                 rec_conf = rec['confidence']
 
                 if person_type == 'vip':
-                    color = (0, 255, 255)  # 黃色 = VIP
-                    label_text = f"VIP_{name}_{gender} ({rec_conf:.2f})"
+                    color = (0, 255, 255)
+                    label_text = f"VIP {name} ({gender}) {rec_conf:.2f}"
                 elif person_type == 'blacklist':
-                    color = (0, 0, 255)  # 紅色 = 黑名單
-                    label_text = f"黑名單_{name}_{gender} ({rec_conf:.2f})"
+                    color = (0, 0, 255)
+                    label_text = f"黑名單 {name} ({gender}) {rec_conf:.2f}"
                 else:
-                    label_text = f"訪客 ({rec_conf:.2f})"
+                    label_text = f"訪客 {rec_conf:.2f}"
 
-            # 繪製邊界框
             cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
+            text_items.append((label_text, (x, max(0, y - 30)), 20, color))
 
-            # 繪製主標籤
-            cv2.putText(result, label_text, (x, y - 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-            # 活體檢測信息
             if det['liveness']:
                 liveness = det['liveness']
-                is_alive = "✓ Alive" if liveness['is_alive'] else "✗ Spoofing?"
-                liveness_color = (0, 255, 0) if liveness['is_alive'] else (0, 0, 255)
-                cv2.putText(result, is_alive, (x, y - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, liveness_color, 1)
+                is_text = "Alive" if liveness['is_alive'] else "Spoofing?"
+                lv_color = (0, 255, 0) if liveness['is_alive'] else (0, 0, 255)
+                text_items.append((is_text, (x, max(0, y - 5)), 16, lv_color))
+
+        # 所有文字一次 PIL round-trip（避免每張臉各做一次）
+        if text_items:
+            if PIL_AVAILABLE and _CJK_FONT:
+                pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil)
+                for text, pos, font_size, color in text_items:
+                    draw.text(pos, text, font=_get_font(font_size),
+                              fill=(color[2], color[1], color[0]))
+                result = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            else:
+                for text, pos, font_size, color in text_items:
+                    cv2.putText(result, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                                font_size / 30, color, 2)
 
         return result
 
@@ -229,13 +347,17 @@ class RealtimeFaceDetectorInsightFace:
         try:
             while True:
                 # 讀取幀
-                frame_xbgr = self.picam2.capture_array()
-                if frame_xbgr is None:
-                    logger.error("✗ 讀取幀失敗")
-                    break
-
-                # 色彩轉換：XBGR8888 → BGR
-                frame_bgr = cv2.cvtColor(frame_xbgr, cv2.COLOR_RGBA2BGR)
+                if self.picam2:
+                    frame_xbgr = self.picam2.capture_array()
+                    if frame_xbgr is None:
+                        logger.error("✗ 讀取幀失敗")
+                        break
+                    frame_bgr = cv2.cvtColor(frame_xbgr, cv2.COLOR_RGBA2BGR)
+                else:
+                    ret, frame_bgr = self.cap.read()
+                    if not ret:
+                        logger.error("✗ 讀取幀失敗")
+                        break
 
                 if not self.paused:
                     self.frame_count += 1
@@ -293,8 +415,11 @@ class RealtimeFaceDetectorInsightFace:
 
     def cleanup(self):
         """清理資源"""
-        self.picam2.stop()
-        self.picam2.close()
+        if self.picam2:
+            self.picam2.stop()
+            self.picam2.close()
+        if self.cap:
+            self.cap.release()
 
         # 關閉識別和檢測模組
         if self.face_recognizer:
