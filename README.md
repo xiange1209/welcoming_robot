@@ -1,342 +1,171 @@
-# 智慧銀行 VIP 迎賓與安全通報系統
+﻿# 智慧銀行 VIP 迎賓與安全通報系統
 
-**Raspberry Pi 4 + TurtleBot3 邊緣 AI 迎賓機器人**
+部署於 Raspberry Pi 4 與筆電協作的邊緣 AI 專案。人臉辨識在 RPi4 本機執行，LLM 決策由筆電上的 Ollama + FastAPI 提供，目標場景是銀行入口的 VIP 迎賓、訪客引導與黑名單警示。
 
----
+## 專案現況
 
-## 📖 專題簡介
+| 項目 | 狀態 | 說明 |
+|------|------|------|
+| Phase 1 環境建置 | 已完成並驗證 | RPi4 Ubuntu 24.04、InsightFace、OpenCV、ONNX Runtime 可安裝與啟動 |
+| Phase 2a 即時人臉檢測 | 已完成並驗證 | InsightFace buffalo_sc 於 RPi4 實機約 12-15 FPS |
+| Phase 2b VIP / 黑名單辨識 | 代碼完成，待端對端驗證 | 已有資料庫、註冊 CLI、即時辨識顯示，但仍需完整實機流程驗證 |
+| Phase 3a 筆電 LLM API Server | 代碼完成，待 LAN 驗證 | FastAPI、狀態頁、聊天頁、JSON 回應格式已完成，仍需驗證 RPi4 實際呼叫 |
+| Phase 3b Whisper STT | 未開始 | 僅保留規劃 |
+| Phase 3c TTS 回覆 | 未開始 | 僅保留規劃 |
+| Phase 4 ROS 2 / 導航 / LoRa / 雲端 | 代碼大幅完成，待整合與實機驗證 | 2026-07-01：已整併孫同學 ROS2 專案，smartnav_audio（語音）、smartnav_brain（地圖/導航）、smartnav_llm（LangChain Agent）都已有實作，但彼此尚未串接、尚未在實機測試 |
 
-部署於樹莓派 4 的邊緣 AI 系統，實現銀行門前的 VIP 迎賓與安全通報功能。全部推理在本機執行，無需上傳人臉照片，隱私優先。
+> 目前最重要的待驗證項目：
+>
+> 1. 照片註冊 VIP 後，能否在 RPi4 即時偵測流程穩定辨識。
+> 2. RPi4 能否透過區網穩定呼叫筆電上的 /api/chat。
+> 3. liveness_detector.py 在 ARM64 上是否可穩定初始化。
+> 4. （新增）ROS2 端的 smartnav_audio / smartnav_brain / smartnav_llm 能否在真正的 ROS2 Jazzy 環境下 `colcon build` 成功並實機運作。
 
-### ✅ 目前已實現（Phase 2b，已在 RPi4 驗證）
+## 依專題實務目標對齊
 
-| 功能 | 說明 |
-|------|------|
-| **實時人臉檢測** | InsightFace buffalo_sc，15+ FPS，512D embedding |
-| **VIP 識別** | 餘弦相似度比對，一張照片即可註冊 |
-| **黑名單告警** | 安全優先：先檢查黑名單，再比對 VIP |
-| **性別記錄** | M/F/Other 手動輸入，顯示在識別標籤 |
-| **防誤判過濾** | 連續 2 次偵測才確認 VIP/黑名單，避免短暫誤判 |
-| **VIP/黑名單管理** | 新增、刪除、查詢（照片或攝影機即時拍攝） |
-| **統一主選單** | `main.py` 一鍵啟動所有功能 |
+你的最終目標不是單一 demo，而是一個以 ROS2 為主架構的智慧銀行機器人系統。依照目前 repo 的實際內容，這個專案現在處於「單程序流程可展示、ROS2 架構過渡中」的階段。
 
-### 🔄 規劃中（Phase 3+）
+| 子系統 | 最終目標 | 目前進度 |
+|------|----------|----------|
+| 人臉辨識 | 單張大頭照註冊後能辨識 VIP / 訪客 / 黑名單並觸發動作 | 已確認以孫同學實際維護的 GitHub 版本（swient/smartnav-bot）為基礎，本專案的 gender/person_type 欄位是正確的銀行場景擴充（非分岔），待補準確率與端對端驗證 |
+| 語音辨識 + LLM | 多語音輸入 -> LLM 分析 -> 固定 JSON 給 ROS2 | 已決策：終局為 ROS2 smartnav_llm（LangChain Agent），現階段 Ollama 運算仍在筆電；筆電 FastAPI 保留為非 ROS2 驗證流程的並行橋接 |
+| ROS2 主架構 | vision / brain / audio / action / UI 都走 ROS2 | smartnav_msgs、smartnav_vision、smartnav_brain、smartnav_audio、smartnav_llm 都已有實作，但彼此尚未串接、無統一 bringup 總入口、尚未實機驗證 |
+| 機器人動作與地圖 | 地圖建立、帶領、跟隨、語音提示 | smartnav_brain 已有 CreateMap（含自動探索）與 Navigate action，但只有到點導航，無帶領/跟隨語意層，且缺移動底盤可實測 |
+| 前端 UI | 顯示辨識、LLM、系統狀態與功能頁 | 筆電端已有 Web 監控與聊天頁，機器人本體 UI 尚未完成 |
 
-| 功能 | 說明 |
-|------|------|
-| **活體檢測** | 眨眼/搖頭/張嘴（MediaPipe，待 ARM64 驗證） |
-| **語音銀行助手** | Whisper STT + 本機 LLM (Qwen/Gemma) + TTS |
-| **人臉數據增強** | 單樣本生成多角度樣本，提升識別率 |
-| **ROS 2 節點** | 多進程架構，face/voice/brain 分離 |
+如果用一句話描述現在的 repo：非 ROS2 的「人臉辨識 + 筆電 LLM 決策 + 基礎 Web UI」主幹已可展示；ROS2 端已確定為終局主架構（smartnav_llm LangChain Agent + smartnav_vision 銀行客製化），但還沒有串接成一條可實機運行的完整 ROS2 主流程。 
 
----
+## 現行架構
 
-## 📂 專案結構
+- RPi4 端
+  - src/scripts/realtime_detection_insightface.py：即時偵測與辨識 GUI
+  - src/scripts/manage_vip_database.py：VIP / 黑名單註冊、查詢、刪除
+  - src/ai_vision/face_recognizer.py：512D embedding 比對
+  - src/database/schema.py：SQLite schema
+- 筆電端
+  - src/llm_server/main.py：FastAPI Server
+  - src/llm_server/llm_client.py：Ollama 呼叫與 JSON 解析
+  - src/llm_server/static/index.html：狀態監控頁
+  - src/llm_server/static/chat.html：互動測試頁
+- ROS2 工作區（src/smartnav_ros2，2026-07-01 整併孫同學專案後）
+  - smartnav_vision：人臉偵測/識別/註冊，已確認以孫同學 GitHub 維護版為基礎，再加上本專案銀行場景擴充（gender/person_type，非分岔）
+  - smartnav_audio：語音喚醒、sherpa-onnx ASR、sherpa-onnx TTS（整併自孫同學）
+  - smartnav_brain：地圖服務、地點服務、Nav2 導航動作（整併自孫同學）
+  - smartnav_llm：**終局 LLM 決策架構**，LangChain + Ollama 對話式 Agent，可呼叫 ROS2 服務（整併自孫同學，新增 launch/llm.launch.py 可指定筆電 Ollama 位址）
+  - smartnav_msgs：訊息/服務/動作定義，已合併雙方介面
+  - smartnav_bringup：仍為空壳，尚無涵蓋全部套件的總 launch
 
-```
-專題/
-├── README.md
-├── CLAUDE.md                          # Claude Code 開發指南
-├── requirements_minimal.txt           # Python 依賴清單
-├── setup_ubuntu.sh                    # Ubuntu 24.04 一鍵部署腳本
-├── config/
-│   └── inference_config.yaml          # 推理配置（平台/模型/閾值）
-├── docs/
-│   ├── 專題計畫.md                    # 完整計畫書（8 階段）
-│   ├── 實作工作流程.md
-│   └── vibe_coding流程.md             # Windows ↔ RPi4 開發循環
-└── src/
-    ├── ai_vision/
-    │   ├── face_recognizer.py          # VIP/黑名單 embedding 比對
-    │   ├── face_detector.py
-    │   ├── liveness_detector.py        # 活體檢測（規劃中）
-    │   └── inference_engine.py         # ONNX Runtime 抽象層
-    ├── database/
-    │   └── schema.py                   # SQLite 表結構
-    ├── scripts/
-    │   ├── main.py                     # ⭐ 統一主選單入口
-    │   ├── realtime_detection_insightface.py  # 實時人臉檢測 GUI
-    │   ├── manage_vip_database.py      # VIP/黑名單 CLI 管理工具
-    │   ├── test_vip_recognition.py     # 單幀照片識別測試
-    │   └── benchmark.py                # 性能基準測試
-    └── smartnav_ros2/                  # ROS 2 多進程架構（Phase 3）
-        ├── smartnav_vision/
-        ├── smartnav_audio/
-        └── smartnav_brain/
-```
+詳細比較與差異談見 docs/專題計畫.md 的「功能/架構對照表」。
 
----
+## 快速開始
 
-## 🚀 快速開始
-
-### 1. 環境部署（首次在 RPi4 執行）
+### 1. 啟動筆電端 LLM API Server
 
 ```bash
-# 下載代碼
+ollama pull qwen2.5:3b
+ollama create qwen-bank -f Modelfile_qwen
+python -m pip install fastapi uvicorn pydantic
+python src/llm_server/main.py --host 0.0.0.0 --port 8000
+```
+
+啟動後可直接開啟：
+
+- http://localhost:8000/
+- http://localhost:8000/chat
+- http://localhost:8000/health
+
+可選模型：
+
+```bash
+ollama create gemma3-bank -f Modelfile_gemma3
+ollama create gemma4e2b-bank -f Modelfile_gemma4e2b
+ollama create gemma4e4b-bank -f Modelfile_gemma4e4b
+```
+
+### 2. 部署 RPi4 環境
+
+```bash
 git clone https://github.com/xiange1209/welcoming_robot.git ai_bank_robot
-cd ~/ai_bank_robot
-
-# 一鍵安裝（Ubuntu 24.04 aarch64，約 40-60 分鐘）
+cd ai_bank_robot
 bash setup_ubuntu.sh
-
-# 啟動虛擬環境
 source ~/ai_bank_robot_env/bin/activate
 ```
 
-> 安裝內容：libcamera 0.3.0（修復 OV5647 bug）、Python venv、InsightFace、OpenCV、ONNXRuntime 等
+相容入口 setup_rpi4_quick.sh 仍保留，但現在只會轉接到 setup_ubuntu.sh。
 
-### 2. 啟動主選單
-
-```bash
-source ~/ai_bank_robot_env/bin/activate
-export DISPLAY=:1     # VNC 使用
-cd ~/ai_bank_robot
-python3 src/scripts/main.py
-```
-
-選單畫面：
-
-```
-╔══════════════════════════════════════════════╗
-║      智慧銀行 VIP 迎賓與安全通報系統          ║
-║      Phase 2b  |  RPi4 Edge Computing       ║
-╚══════════════════════════════════════════════╝
-
-── 人臉識別 ──────────────────────────────────
-  [1] 啟動實時人臉檢測 (GUI)            ✅ 已實作
-  [2] 單幀照片識別測試                   ✅ 已實作
-
-── VIP 管理 ──────────────────────────────────
-  [3] 新增 VIP（照片路徑）               ✅ 已實作
-  [4] 新增 VIP（攝影機即時拍攝）         ✅ 已實作
-  [5] 查看所有 VIP 名單                  ✅ 已實作
-
-── 黑名單管理 ────────────────────────────────
-  [6] 新增黑名單（照片路徑）             ✅ 已實作
-  [7] 新增黑名單（攝影機即時拍攝）       ✅ 已實作
-  [8] 查看黑名單                         ✅ 已實作
-
-── 系統工具 ──────────────────────────────────
-  [9]  性能基準測試                      ✅ 已實作
-  [10] 初始化資料庫                      ✅ 已實作
-  [11] 刪除 VIP                          ✅ 已實作
-  [12] 刪除黑名單                        ✅ 已實作
-
-── 規劃中 (Phase 3+) ─────────────────────────
-  [13] 語音銀行助手                      🔄 規劃中
-  [14] 人臉數據增強                      🔄 規劃中
-  [15] ROS 2 節點管理                    🔄 規劃中
-
-  [0] 退出
-```
-
----
-
-## 👤 VIP / 黑名單管理
-
-### 初始化資料庫（首次執行）
+### 3. 初始化資料庫與新增測試 VIP
 
 ```bash
 python3 src/scripts/manage_vip_database.py init
-```
-
-### 新增 VIP
-
-```bash
-# 方法 1：交互式（提示輸入名字、性別、照片路徑）
-python3 src/scripts/manage_vip_database.py add-vip
-
-# 方法 2：CLI 直接輸入
-python3 src/scripts/manage_vip_database.py add-vip-image "陳佳憲" photo.jpg \
-  --gender M --level platinum --phone "0900123456"
-
-# 方法 3：攝影機即時拍攝 5 張樣本（效果最佳）
-export DISPLAY=:1
-python3 src/scripts/manage_vip_database.py add-vip-camera
-```
-
-### 新增黑名單
-
-```bash
-python3 src/scripts/manage_vip_database.py add-blacklist
-python3 src/scripts/manage_vip_database.py add-blacklist-image "李三" photo.jpg \
-  --gender M --risk high --reason "Known fraud"
-python3 src/scripts/manage_vip_database.py add-blacklist-camera
-```
-
-### 查詢 / 刪除
-
-```bash
+python3 src/scripts/manage_vip_database.py add-vip-image "測試VIP" photo.jpg --gender M --level gold
 python3 src/scripts/manage_vip_database.py list-vips
-python3 src/scripts/manage_vip_database.py list-blacklist
-python3 src/scripts/manage_vip_database.py delete-vip       # 交互式，軟刪除
-python3 src/scripts/manage_vip_database.py delete-blacklist
 ```
 
----
+目前人臉註冊支援兩種正規方式：
 
-## 🎥 實時人臉檢測
+- 單張大頭照註冊：`add-vip-image` / `add-blacklist-image`
+- 攝影機即時註冊：`add-vip-camera` / `add-blacklist-camera`
+
+註冊流程已改為只接受真實照片或攝影機樣本，不再允許建立隨機測試 embedding，以免資料庫出現假人臉資料。
+
+### 4. 啟動即時辨識
 
 ```bash
 export DISPLAY=:1
 python3 src/scripts/realtime_detection_insightface.py
-
-# 控制鍵：Q 退出 | S 保存當前幀 | 空白鍵 暫停
 ```
 
-識別標籤格式：
-- 🟡 **VIP**：`VIP 陳佳憲 (M) 0.82`（黃框）
-- 🔴 **黑名單**：`黑名單 李三 (M) 0.75`（紅框）
-- 🟢 **訪客**：`訪客 0.12`（綠框）
+### 5. 啟用 RPi4 到筆電的 LLM API 整合
 
----
+即時辨識腳本現在已可在辨識到 VIP / 黑名單 / 訪客時，背景呼叫筆電端的 /api/chat，並把 reply / action 疊到畫面上。
 
-## ⚙️ 識別參數說明
+預設為關閉，請先修改 config/inference_config.yaml：
 
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `vip_threshold` | 0.25 | 餘弦相似度閾值，超過此值識別為 VIP |
-| `blacklist_threshold` | 0.20 | 黑名單閾值（寬鬆以確保安全） |
-| `detect_interval` | 5 | 每 5 幀做一次完整偵測（提升 FPS） |
-| 確認次數 | 2 | 連續 2 次偵測相同結果才顯示（防誤判） |
-
-> **同一人不同條件下**（戴眼鏡、素顏、不同光線）餘弦相似度約 0.2–0.5；
-> 建議使用攝影機多樣本（5 張）註冊以提升識別率。
-
----
-
-## 📊 性能表現（RPi4 8GB）
-
-| 指標 | 數值 |
-|------|------|
-| 偵測 FPS | 15+ FPS（detect_interval=5） |
-| 單幀推理延遲 | 100–150ms |
-| 記憶體用量 | ~350–400MB |
-| CPU 使用率 | ~60–70% |
-| 模型大小 | ~50MB（buffalo_sc） |
-
----
-
-## 🔧 開發工作流程（Windows ↔ RPi4）
-
+```yaml
+llm_api:
+  enabled: true
+  base_url: "http://<筆電IP>:8000"
 ```
-[Windows] Claude Code 修改代碼
-        ↓  SCP 傳輸
-[RPi4]  測試與驗證
-        ↓  回報結果
-[Windows] 分析改進
-```
+
+或在啟動前直接用環境變數覆蓋：
 
 ```bash
-# 傳輸代碼到 RPi4
-cd C:\Users\陳佳憲\Desktop\專題
-scp -r src/ setup_ubuntu.sh requirements_minimal.txt \
-    xiange@192.168.1.125:~/ai_bank_robot/
-
-# SSH 進入 RPi4 測試
-ssh xiange@192.168.1.125
-source ~/ai_bank_robot_env/bin/activate
-cd ~/ai_bank_robot
-python3 src/scripts/main.py
+export BANK_LLM_API_ENABLED=1
+export BANK_LLM_API_URL="http://192.168.1.xxx:8000"
+python3 src/scripts/realtime_detection_insightface.py
 ```
 
----
+如果 API Server 暫時連不到，腳本會自動退回 fallback 回應，並暫時停止重試，不會每一幀都卡在網路請求上。
 
-## 🐛 常見問題
+## 模型選擇摘要
 
-### 1. 攝影機視窗出現黑畫面
+下表屬於目前整理出的規劃數據與使用建議，其中只有 qwen2.5:3b 是目前 repo 預設主模型；其餘模型仍待實測補齊延遲與 JSON 穩定度。
 
-InsightFace 初始化需要 200–300ms，導致視窗渲染不及。已在程式碼中加入 20 幀預熱解決，重新執行即可。
+| 模型 | 角色 | 估計 GPU 佔用 | 適合 RTX 3050 4GB | 目前狀態 |
+|------|------|---------------|-------------------|----------|
+| qwen2.5:3b | 預設主模型 | 約 2.2 GB | 是 | 已配置，建議優先使用 |
+| gemma3:4b | 備用比較模型 | 約 3-4 GB | 勉強可用，可能部分 CPU 卸載 | 已補 Modelfile，待實測 |
+| gemma4:e2b | 輕量替代模型 | 約 1.5-2.0 GB | 是 | 已有 Modelfile，待實測 |
+| gemma4:e4b | 中型替代模型 | 約 2.5-3.5 GB | 接近上限 | 已有 Modelfile，待實測 |
 
-### 2. ORT GPU 警告訊息
+完整比較與驗證建議請看 docs/LLM規劃書.md。
 
-```
-[W:onnxruntime:Default, device_discovery.cc:325] GPU device discovery failed
-```
+## 文件索引
 
-正常現象（RPi4 無 GPU），已設定 `set_default_logger_severity(3)` 抑制，不影響功能。
+- docs/部署與重現指南.md：給組員最快速的部署與 smoke test 流程
+- docs/專題計畫.md：目前有效的企畫、里程碑、驗證矩陣與下一步
+- docs/LLM規劃書.md：Qwen / Gemma 模型比較、估計資源需求與建議測試方式
 
-### 3. VIP 識別不出來
+## 目前限制
 
-- 確認使用的是 **餘弦相似度閾值**（0.25），不是歐氏距離
-- 嘗試降低 `vip_threshold` 到 0.20（在 `realtime_detection_insightface.py` 修改）
-- 建議用攝影機拍攝 5 張不同角度樣本（`add-vip-camera`）
+- 活體檢測流程仍未在 RPi4 ARM64 完整驗證。
+- 筆電 API Server 與 RPi4 的區網整合仍待實機測試。
+- ROS 2 套件目前只是骨架，不應視為已可部署功能。
+- src/scripts/benchmark.py 已修正為現行模組路徑，但若要做 ONNX 模型基準，仍需先提供 config/inference_config.yaml 指向的模型檔。
+- 目前硬體只有 RPi4、鏡頭與 RTX 3050 筆電，因此地圖建立、跟隨、帶領等導航功能暫時只能先規劃或改用模擬環境驗證。
 
-### 4. OpenCV GUI 錯誤
+## 建議的下一個驗證順序
 
-```
-The function is not implemented. Rebuild with GTK+ support
-```
-
-```bash
-pip uninstall opencv-python-headless -y
-pip install --no-cache-dir opencv-python
-```
-
-### 5. Picamera2 找不到
-
-確認 venv 用 `--system-site-packages` 建立：
-
-```bash
-python3 -m venv --system-site-packages ~/ai_bank_robot_env
-```
-
-### 6. FPS 過低（< 10）
-
-```bash
-vcgencmd measure_temp    # 確認溫度 < 70°C
-# 如過熱：加散熱片/風扇
-# 或調高 detect_interval（預設 5，可調到 8）
-```
-
----
-
-## 🏗️ ROS 2 架構規劃（Phase 3+）
-
-```
-                 ┌─────────────────────────────┐
-                 │      smartnav_brain          │
-                 │   (決策與狀態機 orchestrator) │
-                 └──────────┬──────────────────┘
-                            │ ROS 2 Topics
-           ┌────────────────┼────────────────┐
-           ▼                ▼                ▼
-  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-  │smartnav_vision│  │smartnav_audio│  │  TurtleBot3  │
-  │(人臉識別節點) │  │(語音助手節點) │  │  (導航節點)  │
-  └──────────────┘  └──────────────┘  └──────────────┘
-```
-
----
-
-## 👥 分工
-
-| 成員 | 負責模組 |
-|------|---------|
-| 陳佳憲 | 人臉識別（ai_vision）、資料庫、主選單、系統整合 |
-| 孫瑋廷 | ROS 2 架構（smartnav_ros2）、導航 |
-
----
-
-## 📋 依賴安裝
-
-```bash
-# RPi4 推薦使用 setup_ubuntu.sh（自動處理 libcamera + venv）
-bash setup_ubuntu.sh
-
-# 或手動安裝 Python 套件
-pip install -r requirements_minimal.txt
-# 注意：picamera2 需透過 setup_ubuntu.sh 安裝（非 pip 標準版）
-```
-
----
-
-## 📅 Phase 進度
-
-| 階段 | 狀態 | 說明 |
-|------|------|------|
-| Phase 1 | ✅ 完成 | 環境建置（RPi4 + InsightFace） |
-| Phase 2a | ✅ 完成 | 實時人臉檢測，12-13 FPS 驗證 |
-| Phase 2b | ✅ 完成 | VIP 識別、黑名單、管理介面，FPS 15+ |
-| Phase 3 | 🔄 規劃中 | 語音助手、ROS 2 多進程 |
-| Phase 4+ | ⏳ 未開始 | LoRa 告警、雲端同步、HMI |
+1. 先在筆電端用 /chat 頁面驗證 qwen2.5:3b JSON 回應是否穩定。
+2. 再在 RPi4 上完成 add-vip-image -> realtime_detection_insightface 的端對端驗證。
+3. 最後驗證 RPi4 呼叫筆電 /api/chat，確認 LAN、延遲與 fallback 行為。

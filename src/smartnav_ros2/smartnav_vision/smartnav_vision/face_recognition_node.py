@@ -4,6 +4,7 @@
 訂閱相機影像，執行臉部檢測與識別，發佈識別結果
 """
 
+import time
 from typing import Optional
 import numpy as np
 
@@ -15,6 +16,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from cv_bridge import CvBridge
 from std_srvs.srv import Empty
 
+from smartnav_msgs.msg import RecognitionResult
 from smartnav_vision.face_engine import FaceEngine
 from smartnav_vision.database_manager import DatabaseManager
 
@@ -29,6 +31,7 @@ class FaceRecognitionNode(Node):
 
     Publishers:
         /face_recognition/debug_image (sensor_msgs/Image): 除錯影像 (可選)
+        /face_recognition/result (smartnav_msgs/RecognitionResult): 身分辨識結果 (狀態改變時發佈)
     """
 
     def __init__(self) -> None:
@@ -69,6 +72,11 @@ class FaceRecognitionNode(Node):
             False,
             ParameterDescriptor(description="發佈除錯影像"),
         )
+        self.declare_parameter(
+            "result_republish_interval",
+            15.0,
+            ParameterDescriptor(description="同一身分持續出現時，重新發佈結果的最小間隔秒數"),
+        )
 
         # 讀取與驗證參數
         image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
@@ -77,6 +85,9 @@ class FaceRecognitionNode(Node):
         enable_gpu = self.get_parameter("enable_gpu").get_parameter_value().bool_value
         self.recognition_threshold = self.get_parameter("recognition_threshold").get_parameter_value().double_value
         self.publish_debug_image = self.get_parameter("publish_debug_image").get_parameter_value().bool_value
+        self.result_republish_interval = (
+            self.get_parameter("result_republish_interval").get_parameter_value().double_value
+        )
 
         # 初始化臉部引擎
         try:
@@ -122,6 +133,16 @@ class FaceRecognitionNode(Node):
         self.refresh_service = self.create_service(
             Empty, "/face_recognition/refresh_cache", self.refresh_cache_callback
         )
+
+        # 發佈身分辨識結果 (供其他節點，如 smartnav_llm 的橋接節點訂閱)
+        self.result_publisher = self.create_publisher(
+            RecognitionResult,
+            "/face_recognition/result",
+            qos_profile=10,
+        )
+        # 狀態去抖動：避免同一身分每一幀都重複發佈
+        self._last_published_key: Optional[tuple] = None
+        self._last_published_time: float = 0.0
 
         # 發佈除錯影像 (可選)
         if self.publish_debug_image:
@@ -206,12 +227,24 @@ class FaceRecognitionNode(Node):
                             f"(置信度: {confidence:.3f})"
                         )
                     else:
-                        face.person_name = "Unknown"
+                        person_name = "Unknown"
+                        face.person_name = person_name
                         face.confidence = confidence
                         face.person_type = "VISITOR"
                         face.gender = ""
 
                         self.get_logger().debug(f"臉部 {idx}: 訪客 (最高相似度: {confidence:.3f})")
+
+                    # 只針對畫面中第一張臉發佈辨識結果 (銀行迎賓場景一次以一位訪客為主)
+                    if idx == 0:
+                        self._maybe_publish_result(
+                            person_uuid=person_uuid or "",
+                            person_name=person_name,
+                            gender=face.gender,
+                            person_type=face.person_type,
+                            confidence=confidence,
+                            bbox=face.bbox,
+                        )
             else:
                 self.get_logger().debug("未偵測到臉部")
 
@@ -224,6 +257,52 @@ class FaceRecognitionNode(Node):
 
         except Exception as e:
             self.get_logger().error(f"影像處理錯誤: {e}")
+
+    def _maybe_publish_result(
+        self,
+        person_uuid: str,
+        person_name: str,
+        gender: str,
+        person_type: str,
+        confidence: float,
+        bbox: np.ndarray,
+    ) -> None:
+        """視狀態變化發佈辨識結果，避免同一身分每一幀都重複發佈
+
+        身分（person_uuid + person_type）改變時立即發佈；
+        若身分持續不變，則每隔 result_republish_interval 秒重新發佈一次，
+        讓下游（例如 smartnav_llm 的文字橋接節點）知道這個人仍在現場。
+
+        Args:
+            person_uuid: 匹配到的人員 UUID，未匹配則為空字串
+            person_name: 人員名稱，未匹配則為 "Unknown"
+            gender: 性別 (M/F/Other)，未匹配則為空字串
+            person_type: VIP/BLACKLIST/VISITOR
+            confidence: 相似度信心分數
+            bbox: 臉部邊界框 [x1, y1, x2, y2]
+        """
+        now = time.time()
+        current_key = (person_uuid, person_type)
+
+        is_state_change = current_key != self._last_published_key
+        is_heartbeat_due = (now - self._last_published_time) >= self.result_republish_interval
+
+        if not (is_state_change or is_heartbeat_due):
+            return
+
+        msg = RecognitionResult()
+        msg.person_uuid = person_uuid
+        msg.person_name = person_name
+        msg.gender = gender
+        msg.person_type = person_type
+        msg.confidence = float(confidence)
+        msg.timestamp = int(now)
+        msg.bbox = [float(v) for v in bbox]
+
+        self.result_publisher.publish(msg)
+        self._last_published_key = current_key
+        self._last_published_time = now
+
 
     def _recognize_face(self, embedding: np.ndarray) -> tuple[Optional[str], str, str, float]:
         """識別臉部身份

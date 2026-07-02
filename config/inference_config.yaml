@@ -50,3 +50,12 @@ optimization:
   enable_quantization: true
   enable_threading: true
   memory_pool_size: 2147483648        # 2GB 緩衝池
+
+# ========== LLM API 整合 ==========
+llm_api:
+  enabled: false
+  base_url: "http://127.0.0.1:8000"
+  timeout_sec: 2.0
+  cooldown_sec: 8.0
+  offline_backoff_sec: 30.0
+  display_ttl_sec: 8.0

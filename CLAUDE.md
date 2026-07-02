@@ -8,41 +8,83 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Key Constraint**: Raspberry Pi 4 with 8GB RAM, 32GB SD card. All models are INT8 quantized, inference latency target is <500ms @ 10 FPS.
 
-**Phase Status**:
-- ✅ Phase 1 (environment setup) completed
-- ✅ Phase 2a (real-time face detection) **VERIFIED** - 12-13 FPS with InsightFace buffalo_sc on RPi4, 512D embeddings generated
-- 🔄 Phase 2b (face recognition + liveness detection) **CODE READY** - Awaiting hardware testing. Single-sample VIP/blacklist matching with gender field support
-- 🔄 Phase 3+ (speech, HMI, ROS2 integration) planning
+**Phase Status** (Updated 2026-05-26):
+- ✅ Phase 1: Environment setup (Raspberry Pi OS, dependencies)
+- ✅ Phase 2a: Real-time face detection (InsightFace buffalo_sc) **VERIFIED** - 15+ FPS on RPi4
+- ✅ Phase 2b: Face recognition + gender field (Code complete, **⚠️ awaiting end-to-end verification**)
+  - VIP/blacklist identification with 512D embeddings
+  - Gender field support (M/F/Other)
+  - GUI display with confidence scores
+- ✅ Phase 3a: LLM API Server on laptop (Code complete, **⚠️ awaiting RPi4 connection test**)
+  - FastAPI Server + Ollama integration (qwen2.5:3b recommended)
+  - Web monitoring dashboard + chat interface
+  - Multi-language reply support
+- ❌ Phase 3b: Voice input (Whisper STT) - Not started
+- ❌ Phase 3c: Voice output (TTS) - Not started
+- ❌ Phase 4+: ROS 2 integration, LoRa alerts, cloud sync - Not started
 
-**Recent Update**: Phase 2b codebase enhanced with gender field (M/F/Other) for VIP/blacklist records. Gender parameter now required during registration but NOT auto-detected. Ready for testing on Raspberry Pi 4.
+**Critical Items Awaiting Verification**:
+- Phase 2b: End-to-end flow (photo registration → real-time detection → match)
+- Phase 3a: RPi4 calling laptop API over LAN
+- Liveness detection (MediaPipe ARM64 compatibility)
 
 ---
 
 ## Architecture Overview
 
-### Current Module Structure (Python Single-Process → ROS 2 Migration)
+### Current Module Structure
 
-**Phase 2b** (Current): Single-process Python execution on Raspberry Pi OS.
-
-**Phase 3+** (In Progress): Multi-process ROS 2 architecture with unified src/ directory:
+**Phase 2b-3a (Current)**: Hybrid architecture - RPi4 face recognition + Laptop LLM decision-making:
 
 ```
 專題/
 ├── src/
-│   ├── ai_vision/           # Face detection, recognition, liveness (陳佳憲)
-│   ├── database/            # SQLite schema for VIP/blacklist management
-│   ├── scripts/             # Testing, benchmarking, database management
-│   └── smartnav_ros2/       # ROS 2 multi-package system (孫瑋廷)
-│       ├── smartnav_msgs/    # Message definitions
-│       ├── smartnav_vision/  # Vision node (InsightFace + face recognition)
-│       ├── smartnav_audio/   # Speech recognition/synthesis (Phase 3)
-│       ├── smartnav_brain/   # Decision logic orchestrator
-│       └── smartnav_bringup/ # Launch configurations
-├── docs/                    # Documentation & planning
-├── config/                  # System configuration
-├── README.md
-├── requirements_minimal.txt # Curated dependencies
-└── setup_rpi4_quick.sh     # One-command deployment
+│   ├── ai_vision/              # Face detection, recognition, liveness (陳佳憲)
+│   │   ├── face_detector.py    # InsightFace RetinaFace detection
+│   │   ├── face_recognizer.py  # VIP/blacklist 512D embedding matching
+│   │   └── liveness_detector.py # MediaPipe (Phase 3, code ready)
+│   ├── database/               # SQLite schema (RPi4 local storage)
+│   │   └── schema.py           # vip_members, blacklist, visit_logs, security_alerts
+│   ├── scripts/                # Testing & management tools
+│   │   ├── main.py             # Unified menu (12 functions)
+│   │   ├── realtime_detection_insightface.py # ✅ VERIFIED 15+ FPS
+│   │   ├── manage_vip_database.py # VIP/blacklist CLI
+│   │   ├── test_vip_recognition.py # Single-frame testing
+│   │   └── benchmark.py        # Performance analysis
+│   ├── llm_server/             # ⭐ NEW - LLM API Server (Windows laptop)
+│   │   ├── main.py             # FastAPI server (:8000)
+│   │   ├── llm_client.py       # Ollama integration (qwen2.5:3b)
+│   │   ├── models.py           # Pydantic schemas (NAVIGATION/COMMAND/CHAT)
+│   │   └── static/             # Web UI (monitoring + chat interface)
+│   └── smartnav_ros2/          # ROS 2 multi-process (Phase 4, not active)
+├── Modelfile_qwen              # qwen2.5:3b Ollama config (recommended)
+├── Modelfile_gemma4e2b/e4b     # Alternative Gemma 4 configs
+├── config/inference_config.yaml # Runtime configuration
+├── docs/                       # Documentation
+│   ├── LLM規劃書.md             # LLM model selection & performance analysis
+│   ├── 專題計畫.md              # Complete 8-phase specification
+│   ├── vibe_coding流程.md       # Windows ↔ RPi4 development workflow
+│   └── 實作工作流程.md          # Implementation procedures
+├── README.md                   # **See for quick deployment (10 steps)**
+├── requirements_minimal.txt    # Minimal Python packages (RPi4)
+├── setup_ubuntu.sh             # One-command RPi4 deployment
+└── photo.jpg                   # Sample image (demo use)
+```
+
+**System Communication**:
+```
+┌──────────────────────┐                    ┌──────────────────────┐
+│  Raspberry Pi 4      │                    │   Windows Laptop     │
+│  (Ubuntu 24.04)      │                    │   (RTX 3050 4GB)     │
+│                      │                    │                      │
+│ 📷 InsightFace       │  HTTP API          │ 🤖 Ollama LLM        │
+│ 🎤 Voice input       │  /api/chat         │ 🌐 FastAPI :8000     │
+│ 🎥 Camera frames     ├──────────────────→ │ 📊 Web monitoring    │
+│                      │                    │                      │
+│ ← JSON response      │  (qwen2.5:3b)      │ Decision making      │
+│   (intent/action/    │                    │ (NAVIGATION/         │
+│    target/reply)     │                    │  COMMAND/CHAT)       │
+└──────────────────────┘                    └──────────────────────┘
 ```
 
 ### Design Principles
@@ -73,23 +115,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
-## Phase 2b: Single-Sample Face Recognition (Current)
+## Phase 2b: Single-Sample Face Recognition (Current - Code Complete, ⚠️ Verification Pending)
+
+**Status**: Code complete. VIP/blacklist identification working. **Awaiting end-to-end verification on RPi4.**
 
 ### Recognition Flow
 
 ```
-User Registration (Backend):
-  Photo + Name + Gender (M/F/Other) → Face embedding extraction → SQLite storage
+User Registration (Backend - RPi4):
+  Photo + Name + Gender (M/F/Other) 
+    → Face embedding extraction (InsightFace buffalo_sc, 512D)
+    → SQLite storage in vip_members or blacklist table
 
 Runtime Detection (Real-time on RPi4):
-  Camera frame → Face detection → Extract face embedding
-                              ↓
-                    Check distance to VIP embeddings
-                              ↓
-  distance < threshold → Match VIP → Display: VIP_<name>_<gender> (confidence)
-  distance < threshold (blacklist) → Alert: 黑名單_<name>_<gender>
-  distance > threshold → Display: 訪客 (confidence)
+  Camera frame 
+    → InsightFace RetinaFace detection 
+    → Extract 512D face embedding
+    → Compare with VIP/blacklist database
+    → Generate labels with confidence scores
 ```
+
+### JSON Response Format (Phase 3a LLM Decision)
+
+When RPi4 calls laptop LLM API `/api/chat`:
+
+```json
+{
+  "intent": "NAVIGATION",  # or COMMAND, CHAT
+  "action": "navigate_to_vip_lounge",
+  "target": "VIP貴賓室",
+  "reply": "歡迎光臨！貴賓室已為您準備好。"
+}
+```
+
+**Intent meanings**:
+- `NAVIGATION`: Move robot to location (VIP greeting, visitor guidance)
+- `COMMAND`: Execute system command (alert staff for blacklist)
+- `CHAT`: Voice-only response (general greeting, question answering)
+
+---
+
+## Phase 3a: LLM API Server on Laptop (Current - Code Complete, ⚠️ Connection Test Pending)
 
 ### Key Implementation Details
 
