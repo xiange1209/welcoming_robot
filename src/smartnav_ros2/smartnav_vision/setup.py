@@ -31,6 +31,7 @@ setup(
         "console_scripts": [
             "face_recognition = smartnav_vision.face_recognition_node:main",
             "face_registration = smartnav_vision.face_registration_node:main",
+            "recognition_text_bridge = smartnav_vision.recognition_text_bridge_node:main",
         ],
     },
 )

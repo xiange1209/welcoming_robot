@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 # 設置 Python 路徑以導入項目模組
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from vision_ai.inference_engine import InferenceEngine
-from vision_ai.face_detector import FaceDetector
+from ai_vision.inference_engine import InferenceEngine
+from ai_vision.face_detector import FaceDetector
 from database.schema import DatabaseSchema
 
 

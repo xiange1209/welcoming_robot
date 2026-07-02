@@ -19,6 +19,13 @@ import logging
 import os
 
 try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
+
+try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
 except ImportError:
@@ -80,6 +87,7 @@ _PROJECT_ROOT = _SRC_DIR.parent
 sys.path.insert(0, str(_SRC_DIR))
 
 DB_PATH = str(_PROJECT_ROOT / "database" / "ai_bank_robot.db")
+CONFIG_PATH = _PROJECT_ROOT / "config" / "inference_config.yaml"
 
 try:
     from picamera2 import Picamera2
@@ -90,6 +98,7 @@ except ImportError:
 from ai_vision.face_recognizer import FaceRecognizer
 from ai_vision.liveness_detector import LivenessDetector
 from database.schema import DatabaseSchema
+from llm_api_client import LLMApiClient
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -204,6 +213,67 @@ class RealtimeFaceDetectorInsightFace:
         self.save_dir = Path("/tmp")
         self.paused = False
 
+        self.current_llm_signature = None
+        self.current_llm_decision = None
+        self.llm_config = self._load_llm_config()
+        self.llm_display_ttl_sec = float(self.llm_config['display_ttl_sec'])
+        self._last_llm_log_marker = None
+        self.llm_api = LLMApiClient(
+            base_url=self.llm_config['base_url'],
+            enabled=bool(self.llm_config['enabled']),
+            timeout_sec=float(self.llm_config['timeout_sec']),
+            cooldown_sec=float(self.llm_config['cooldown_sec']),
+            offline_backoff_sec=float(self.llm_config['offline_backoff_sec']),
+        )
+        if self.llm_api.enabled:
+            logger.info(f"✓ LLM API 整合已啟用：{self.llm_config['base_url']}")
+        else:
+            logger.info("ℹ LLM API 整合已停用，可在 config/inference_config.yaml 或環境變數啟用")
+
+    @staticmethod
+    def _to_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+    def _load_llm_config(self) -> dict:
+        config = {
+            'enabled': False,
+            'base_url': 'http://127.0.0.1:8000',
+            'timeout_sec': 2.0,
+            'cooldown_sec': 8.0,
+            'offline_backoff_sec': 30.0,
+            'display_ttl_sec': 8.0,
+        }
+
+        if YAML_AVAILABLE and CONFIG_PATH.exists():
+            try:
+                with open(CONFIG_PATH, 'r', encoding='utf-8') as handle:
+                    loaded = yaml.safe_load(handle) or {}
+                llm_api_config = loaded.get('llm_api', {}) or {}
+                config.update({k: llm_api_config[k] for k in config.keys() if k in llm_api_config})
+            except Exception as exc:
+                logger.warning(f"⚠ 讀取 LLM API 配置失敗：{exc}")
+
+        env_overrides = {
+            'enabled': os.environ.get('BANK_LLM_API_ENABLED'),
+            'base_url': os.environ.get('BANK_LLM_API_URL'),
+            'timeout_sec': os.environ.get('BANK_LLM_TIMEOUT_SEC'),
+            'cooldown_sec': os.environ.get('BANK_LLM_COOLDOWN_SEC'),
+            'offline_backoff_sec': os.environ.get('BANK_LLM_OFFLINE_BACKOFF_SEC'),
+            'display_ttl_sec': os.environ.get('BANK_LLM_DISPLAY_TTL_SEC'),
+        }
+        for key, value in env_overrides.items():
+            if value is None or value == '':
+                continue
+            config[key] = value
+
+        config['enabled'] = self._to_bool(config['enabled'])
+        for key in ('timeout_sec', 'cooldown_sec', 'offline_backoff_sec', 'display_ttl_sec'):
+            config[key] = float(config[key])
+
+        return config
+
     def _apply_temporal_filter(self, result: dict) -> dict:
         """需要連續 2 次偵測才確認 VIP/黑名單，防止單次誤判"""
         ptype = result['person_type']
@@ -280,6 +350,123 @@ class RealtimeFaceDetectorInsightFace:
 
         return detections
 
+    def _select_primary_event(self, detections):
+        best_rank = None
+        best_payload = None
+
+        for det in detections:
+            recognition = det.get('recognition') or {}
+            person_type = recognition.get('person_type', 'visitor')
+            confidence = recognition.get('confidence', det.get('detection_confidence', 0.0))
+
+            payload = {
+                'face_recognition': person_type,
+                'person_name': recognition.get('name'),
+                'vip_level': recognition.get('vip_level'),
+                'risk_level': recognition.get('risk_level'),
+                'gender': recognition.get('gender'),
+                'customer_input': '',
+            }
+
+            priority = {'blacklist': 0, 'vip': 1, 'visitor': 2}.get(person_type, 3)
+            rank = (priority, -confidence)
+
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_payload = payload
+
+        if best_payload is None:
+            return None, None
+
+        signature = ':'.join([
+            best_payload['face_recognition'],
+            best_payload.get('person_name') or '-',
+            best_payload.get('vip_level') or '-',
+            best_payload.get('risk_level') or '-',
+        ])
+        return signature, best_payload
+
+    @staticmethod
+    def _wrap_overlay_text(text: str, width: int = 30):
+        if len(text) <= width:
+            return [text]
+
+        lines = []
+        current = ''
+        for char in text:
+            current += char
+            if len(current) >= width:
+                lines.append(current)
+                current = ''
+        if current:
+            lines.append(current)
+        return lines
+
+    def _log_llm_decision(self, signature: str):
+        if not self.current_llm_decision:
+            return
+
+        marker = (signature, self.current_llm_decision.source, self.current_llm_decision.received_at)
+        if marker == self._last_llm_log_marker:
+            return
+
+        self._last_llm_log_marker = marker
+        reply = self.current_llm_decision.reply or '(empty)'
+        logger.info(
+            f"🤖 LLM {self.current_llm_decision.source}: {self.current_llm_decision.intent} | "
+            f"action={self.current_llm_decision.action or '-'} | reply={reply}"
+        )
+
+    def _update_llm_decision(self, detections):
+        if not self.llm_api.enabled:
+            return
+
+        now = time.time()
+        if not detections:
+            if self.current_llm_decision and now - self.current_llm_decision.received_at > self.llm_display_ttl_sec:
+                self.current_llm_decision = None
+                self.current_llm_signature = None
+            return
+
+        signature, payload = self._select_primary_event(detections)
+        if not signature or not payload:
+            return
+
+        latest = self.llm_api.submit_if_due(payload, signature)
+        if latest is None:
+            latest = self.llm_api.get_latest_decision(signature)
+
+        if latest is not None:
+            self.current_llm_signature = signature
+            self.current_llm_decision = latest
+            self._log_llm_decision(signature)
+        elif signature != self.current_llm_signature:
+            self.current_llm_signature = signature
+            self.current_llm_decision = None
+
+        if self.current_llm_decision and now - self.current_llm_decision.received_at > self.llm_display_ttl_sec:
+            self.current_llm_decision = None
+
+    def _build_llm_overlay(self):
+        if self.current_llm_decision is None:
+            return []
+
+        age = time.time() - self.current_llm_decision.received_at
+        if age > self.llm_display_ttl_sec:
+            return []
+
+        header_color = (255, 255, 0) if self.current_llm_decision.source == 'api' else (0, 180, 255)
+        lines = [
+            (f"LLM {self.current_llm_decision.source.upper()} | {self.current_llm_decision.intent}", header_color),
+            (f"Action: {self.current_llm_decision.action or '-'} | Target: {self.current_llm_decision.target or '-'}", (255, 255, 255)),
+        ]
+
+        reply = self.current_llm_decision.reply.strip() or '無語音回覆'
+        for line in self._wrap_overlay_text(f"Reply: {reply}", width=34):
+            lines.append((line, (255, 255, 255)))
+
+        return lines
+
     def draw_detections(self, frame, detections):
         """繪製檢測結果（包括識別、性別和活體檢測）"""
         result = frame.copy()
@@ -316,6 +503,23 @@ class RealtimeFaceDetectorInsightFace:
                 is_text = "Alive" if liveness['is_alive'] else "Spoofing?"
                 lv_color = (0, 255, 0) if liveness['is_alive'] else (0, 0, 255)
                 text_items.append((is_text, (x, max(0, y - 5)), 16, lv_color))
+
+        llm_lines = self._build_llm_overlay()
+        if llm_lines:
+            panel_x = 10
+            panel_y = 44
+            panel_width = min(result.shape[1] - 20, 620)
+            panel_height = 12 + len(llm_lines) * 24
+            overlay = result.copy()
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_width, panel_y + panel_height),
+                          (24, 24, 24), -1)
+            cv2.addWeighted(overlay, 0.45, result, 0.55, 0, result)
+
+            text_y = panel_y + 8
+            for line, color in llm_lines:
+                text_items.append((line, (panel_x + 10, text_y), 18, color))
+                text_y += 24
 
         # 所有文字一次 PIL round-trip（避免每張臉各做一次）
         if text_items:
@@ -370,6 +574,7 @@ class RealtimeFaceDetectorInsightFace:
                         self.max_faces = max(self.max_faces, len(self.last_detections))
 
                     detections = self.last_detections
+                    self._update_llm_decision(detections)
                     result = self.draw_detections(frame_bgr, detections)
                 else:
                     result = frame_bgr

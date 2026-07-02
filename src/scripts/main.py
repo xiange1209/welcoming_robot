@@ -100,10 +100,10 @@ def print_menu():
     print(f"  {WHITE}[11]{RESET} 刪除 VIP                          {GREEN}✅ 已實作{RESET}")
     print(f"  {WHITE}[12]{RESET} 刪除黑名單                        {GREEN}✅ 已實作{RESET}")
     print()
-    print(f"{BOLD}{GRAY}── 規劃中 (Phase 3+，尚未實作) ──────────────{RESET}")
-    print(f"  {GRAY}[13]{RESET} {GRAY}語音銀行助手 (Gemma / 本機 LLM)   🔄 規劃中{RESET}")
-    print(f"  {GRAY}[14]{RESET} {GRAY}人臉數據增強 (多樣本生成)          🔄 規劃中{RESET}")
-    print(f"  {GRAY}[15]{RESET} {GRAY}ROS 2 節點管理                     🔄 規劃中{RESET}")
+    print(f"{BOLD}{GRAY}── 待驗證 / 待實作 ───────────────────────{RESET}")
+    print(f"  {GRAY}[13]{RESET} {GRAY}LLM API / 語音整合                  ⚠️ 待驗證 / 待做{RESET}")
+    print(f"  {GRAY}[14]{RESET} {GRAY}人臉數據增強 (多樣本生成)          ❌ 待做{RESET}")
+    print(f"  {GRAY}[15]{RESET} {GRAY}ROS 2 節點管理                     ❌ 待做{RESET}")
     print()
     print(f"  {WHITE}[0]{RESET} 退出")
     print()
@@ -218,10 +218,10 @@ ACTIONS = {
     "11": action_delete_vip,
     "12": action_delete_blacklist,
     "13": lambda: action_planned(
-        "語音銀行助手",
-        "計畫：Whisper STT (語音輸入) → 本機 LLM / Gemma API (對話) → pyttsx3 TTS (語音輸出)\n"
-        "  全邊緣運算目標：Qwen2.5-1.5B INT4 在 RPi4 本機跑\n"
-        "  若速度不足：LLM 在電腦端，透過 ROS 2 Topic 傳遞"
+        "LLM API / 語音整合",
+        "目前狀態：筆電端 LLM API Server 已完成代碼，但仍待 RPi4 區網串接驗證。\n"
+        "  待做：Whisper STT、TTS，以及把 /api/chat 真正接回即時辨識流程。\n"
+        "  建議順序：先驗證 qwen2.5:3b，再比較 gemma3 / gemma4。"
     ),
     "14": lambda: action_planned(
         "人臉數據增強",
@@ -231,10 +231,9 @@ ACTIONS = {
     ),
     "15": lambda: action_planned(
         "ROS 2 節點管理",
-        "計畫：face_recognition_node + voice_banking_node + brain_node\n"
-        "  ROS 2 消息已定義：RecognitionResult.msg, RegisterFace.srv\n"
-        "  節點已實作：face_recognition_node.py, face_registration_node.py\n"
-        "  待完成：smartnav_brain (決策), smartnav_audio (語音)"
+        "目前狀態：smartnav_ros2 底下已有 package 骨架與部分 vision node。\n"
+        "  已有：RecognitionResult.msg、RegisterFace.srv、vision 相關節點。\n"
+        "  待做：brain、audio、bringup 與整體流程整合。"
     ),
 }
 

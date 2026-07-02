@@ -1,3 +1,0 @@
-cd ~/ai_bank_robot
-source ~/ai_bank_robot_env/bin/activate
-python3 src/scripts/main.py

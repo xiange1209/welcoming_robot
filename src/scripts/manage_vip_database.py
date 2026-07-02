@@ -9,8 +9,14 @@ import os
 import time
 import argparse
 import numpy as np
-import cv2
 from pathlib import Path
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    CV2_AVAILABLE = False
 
 # 添加 src/ 到路徑
 _SRC_DIR = Path(__file__).parent.parent
@@ -55,6 +61,10 @@ def extract_embedding_from_image(image_path: str) -> np.ndarray:
     """
     if not INSIGHTFACE_AVAILABLE:
         print("✗ InsightFace 未安裝。請執行：pip install insightface")
+        return None
+
+    if not CV2_AVAILABLE:
+        print("✗ OpenCV 未安裝。請先安裝 opencv-python")
         return None
 
     if not Path(image_path).exists():
@@ -111,6 +121,10 @@ def capture_face_embeddings_from_camera(n_samples: int = 5,
     """
     if not os.environ.get("DISPLAY"):
         os.environ["DISPLAY"] = ":1"
+
+    if not CV2_AVAILABLE:
+        print("✗ OpenCV 未安裝，無法使用攝影機註冊")
+        return []
 
     if not INSIGHTFACE_AVAILABLE:
         print("✗ InsightFace 未安裝")
@@ -281,26 +295,31 @@ def add_blacklist_from_camera():
 
 
 def add_vip_interactive():
-    """交互式添加 VIP"""
+    """交互式添加 VIP（單張照片註冊）"""
     print("\n=== 添加 VIP ===")
     name = input("VIP 名字: ").strip()
+    if not name:
+        print("✗ 未輸入名字")
+        return
+
     gender = input("性別 [M/F/Other] (預設: Other): ").strip() or "Other"
     phone = input("電話 (選填): ").strip() or None
     email = input("郵箱 (選填): ").strip() or None
     vip_level = input("等級 [standard/gold/platinum] (預設: standard): ").strip() or "standard"
-    image_path = input("人臉照片路徑 (或留空生成測試用): ").strip()
+    image_path = input("人臉照片路徑: ").strip()
 
-    # 生成或加載 embedding
-    if image_path and Path(image_path).exists():
-        print(f"\n提取 embedding 中...")
-        embedding = extract_embedding_from_image(image_path)
-        if embedding is None:
-            return
-    else:
-        # 生成隨機 embedding（用於測試）
-        embedding = np.random.randn(512).astype(np.float32)
-        embedding = embedding / (np.linalg.norm(embedding) + 1e-6)  # 正規化
-        print("⚠ 生成隨機測試 embedding（實際應使用真實人臉圖像）")
+    if not image_path:
+        print("✗ 未輸入照片路徑。若要用攝影機註冊，請改用 add-vip-camera")
+        return
+
+    if not Path(image_path).exists():
+        print(f"✗ 找不到照片：{image_path}")
+        return
+
+    print(f"\n提取 embedding 中...")
+    embedding = extract_embedding_from_image(image_path)
+    if embedding is None:
+        return
 
     # 添加到資料庫
     recognizer = FaceRecognizer(DB_PATH)
@@ -332,24 +351,30 @@ def add_vip_from_image(name: str, image_path: str, gender: str = 'Other', phone:
 
 
 def add_blacklist_interactive():
-    """交互式添加黑名單"""
+    """交互式添加黑名單（單張照片註冊）"""
     print("\n=== 添加黑名單 ===")
     name = input("姓名: ").strip()
+    if not name:
+        print("✗ 未輸入名字")
+        return
+
     gender = input("性別 [M/F/Other] (預設: Other): ").strip() or "Other"
     reason = input("原因 (選填): ").strip() or None
     risk_level = input("風險級別 [low/medium/high] (預設: medium): ").strip() or "medium"
-    image_path = input("人臉照片路徑 (或留空生成測試用): ").strip()
+    image_path = input("人臉照片路徑: ").strip()
 
-    # 生成或加載 embedding
-    if image_path and Path(image_path).exists():
-        print(f"\n提取 embedding 中...")
-        embedding = extract_embedding_from_image(image_path)
-        if embedding is None:
-            return
-    else:
-        embedding = np.random.randn(512).astype(np.float32)
-        embedding = embedding / (np.linalg.norm(embedding) + 1e-6)
-        print("⚠ 生成隨機測試 embedding")
+    if not image_path:
+        print("✗ 未輸入照片路徑。若要用攝影機註冊，請改用 add-blacklist-camera")
+        return
+
+    if not Path(image_path).exists():
+        print(f"✗ 找不到照片：{image_path}")
+        return
+
+    print(f"\n提取 embedding 中...")
+    embedding = extract_embedding_from_image(image_path)
+    if embedding is None:
+        return
 
     # 添加到資料庫
     recognizer = FaceRecognizer(DB_PATH)
