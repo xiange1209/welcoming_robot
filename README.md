@@ -113,7 +113,8 @@ smartnav_llm Agent（LangChain + Ollama）
 | [`smartnav_navigation`](src/smartnav_navigation/) | ament_python | 地圖/地點/導航（2026-07-01 由原 smartnav_brain 重構拆出）。節點：`map_service_node`、`waypoint_service_node`、`navigation_action_node`。Launch：`brain.launch.py`（三節點 + AMCL + slam_toolbox + frontier_explorer + map_server）、`nav2.launch.py`（完整 Nav2 棧 + RViz）。設定：`config/burger.yaml`、`config/empty_map` |
 | [`smartnav_brain`](src/smartnav_brain/) | ament_python | 空殼套件，保留給未來 orchestrator / 多模態決策（如黑名單通報策略） |
 | [`smartnav_hmi`](src/smartnav_hmi/) | ament_python | 空殼套件，保留給未來人機介面 |
-| [`smartnav_bringup`](src/smartnav_bringup/) | ament_cmake | 統一啟動。`launch/smartnav.launch.py` 一次啟動 vision + audio + llm + navigation |
+| [`smartnav_bringup`](src/smartnav_bringup/) | ament_cmake | 統一啟動。`launch/smartnav.launch.py` 一次啟動 vision + audio + llm + navigation（＋可選 WHEELTEC 底盤與雙版本方案，見下） |
+| [`src/wheeltec/`](src/wheeltec/) | 混合（17 套件） | WHEELTEC 廠商套件精選子集（2026-07-06 整合，Jazzy 修正後）：底盤驅動、URDF、雷達/相機驅動、各車型 Nav2 參數、麥克風陣列、輕量 Ollama 對話。細節與捨棄清單 → [`docs/架構參考.md`](docs/架構參考.md) |
 
 工作區以外的輔助檔案：
 
@@ -236,6 +237,9 @@ ros2 launch smartnav_bringup smartnav.launch.py \
 | `use_sim_time` | `false` | 是否使用模擬時間（Gazebo） |
 | `enable_vision` / `enable_audio` / `enable_llm` / `enable_navigation` | `true` | 各模組開關，硬體未就緒可個別關閉 |
 | `enable_nav2` | `false` | 是否啟動完整 Nav2 棧 + RViz（需 TurtleBot3 或模擬環境） |
+| `enable_chassis` | `false` | WHEELTEC 實體底盤驅動（車型先改 `src/wheeltec/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`） |
+| `audio_stack` | `smartnav` | 語音方案：`smartnav`（sherpa-onnx 自由語句）／`wheeltec`（麥克風陣列＋離線命令詞，免金鑰但為固定語法） |
+| `llm_stack` | `smartnav` | LLM 方案：`smartnav`（LangChain Agent 含導航工具）／`wheeltec`（ollama_ros_chat 單輪對話，經橋接節點接管線） |
 
 範例——只測「人臉辨識 → LLM」串接，不啟動語音與導航：
 
@@ -407,6 +411,7 @@ ros2 run smartnav_vision face_recognition --ros-args --params-file face_recognit
   - `smartnav_audio` 語音管線（喚醒 / ASR / TTS / 播放）在 RPi4 上的效能
   - `smartnav_navigation` + Nav2 + TurtleBot3 實機導航
   - RPi4 跨區網呼叫筆電 Ollama 的實際延遲與穩定性
+  - **WHEELTEC 整合全部內容**（2026-07-06）：`src/wheeltec/` 17 套件的建置、底盤驅動、`audio_stack` / `llm_stack` 兩條 wheeltec 鏈、astra 相機在 Ubuntu 24.04 的相容性——僅通過語法與依賴靜態檢查，驗證步驟見 [`docs/驗證與實作清單.md`](docs/驗證與實作清單.md) B11
 
 ## ⚠️ 已知限制
 
@@ -414,6 +419,9 @@ ros2 run smartnav_vision face_recognition --ros-args --params-file face_recognit
 - **frontier_exploration_ros2 未內含**：自動探索建圖需另外 clone（見[安裝與建置](#-安裝與建置)），否則 `brain.launch.py` 的 frontier_explorer 無法啟動。
 - **黑名單通報僅到「事件定位」層**：辨識結果會標示 BLACKLIST 並發布事件，但實際通報管道（LoRa / 訊息推播）尚未實作。
 - **bringup 預設模型不適合本硬體**：`model_name` 預設 `gemma4:e2b`，在 4GB VRAM 筆電上實測極慢，請覆寫為 `qwen2.5:3b`。
+- **兩條導航鏈不可混用**：WHEELTEC 鏈（底盤 EKF、SLAM、Nav2 參數）全程用 `odom_combined` frame，`smartnav_navigation`（TB3/模擬）用 `odom`。實體機建圖/導航用 wheeltec 官方 launch（它們**自帶底盤啟動**，勿與 `enable_chassis:=true` 同開）。
+- **wheeltec 語音是固定命令詞**：`audio_stack:=wheeltec` 的本地離線辨識綁定語法檔，非自由語句；自由對話請用預設 `smartnav` 方案。銀行場景詞彙需重編語法檔。
+- **額外依賴 rosdep 蓋不到**：`llm_stack:=wheeltec` 需 `pip install openai`；astra 相機需 `apt install libuvc-dev libgoogle-glog-dev`（見部署指南）。
 
 ## 🛠️ 故障排除
 

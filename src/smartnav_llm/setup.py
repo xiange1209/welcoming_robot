@@ -36,6 +36,7 @@ setup(
     entry_points={
         "console_scripts": [
             "llm_service = smartnav_llm.llm_service_node:main",
+            "ollama_chat_bridge = smartnav_llm.ollama_chat_bridge:main",
         ],
     },
 )

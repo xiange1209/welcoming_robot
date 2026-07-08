@@ -55,9 +55,12 @@ log/
 # 廠商原始碼原始壓縮包內容（2.2GB，保留為本地素材庫；精選子集在 src/wheeltec/）
 wheeltec_ros2_src_20260518/
 
-# 大型二進位 SDK 與網格檔不進 git（部署用 scp，見 docs/部署與重現指南.md）
-src/wheeltec/wheeltec_robot_urdf/meshes_by_model/
-src/wheeltec/ros2_astra_camera/astra_camera/openni2_redist/
+# 大型網格/暫存檔不進 git（部署用 scp 補齊，見 docs/部署與重現指南.md）
+src/wheeltec/wheeltec_robot_urdf/meshes/
+src/wheeltec/wheeltec_mic_ros2/tmp/
+
+# 審計工作檔（暫存）
+wheeltec_audit_full.json
 
 # Claude Code 個人設定不進 git
 .claude/settings.local.json

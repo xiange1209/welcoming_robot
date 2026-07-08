@@ -1,0 +1,645 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.5.1-0-g916b5db  Build Version: 1.5.7152.31018
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot name="4wd_arm_urdf">
+    <link name="base_footprint">
+        
+<inertial>
+            <origin xyz="0.0560159662948603 0.000798286377036106 0.0465" rpy="0 0 0" />
+            <mass value="0.171256197920355" />
+            <inertia ixx="0.000556315681094618" ixy="-2.69656288538491E-07" ixz="-7.83248625928234E-20" iyy="0.00138230969964423" iyz="2.20618272992873E-20" izz="0.00193836849644197" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/base_footprint.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/base_footprint.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <link name="laser_link_">
+        
+<inertial>
+            <origin xyz="0.00702376363498063 0.000112406518639155 -0.0616" rpy="0 0 0" />
+            <mass value="0.000583282064961358" />
+            <inertia ixx="6.20515707260465E-09" ixy="-1.95164187951678E-24" ixz="5.59401252368482E-25" iyy="6.20515707260465E-09" iyz="-1.63830632796329E-26" izz="2.68894639585334E-09" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/laser.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/laser.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="laser_joint" type="fixed">
+        <origin xyz="0.1039 0.00098983 0.1776" rpy="0 0 3.1416" />
+        <parent link="base_footprint" />
+        <child link="laser_link_" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="camera_link">
+        
+<inertial>
+            <origin xyz="-0.0214828600979126 0.00068797114482283 -0.00907346890589457" rpy="0 0 0" />
+            <mass value="0.069163128450904" />
+            <inertia ixx="0.000130041258911224" ixy="8.8485775621063E-08" ixz="3.08250240395029E-07" iyy="1.76373482771194E-05" iyz="-1.39502543896147E-08" izz="0.000135450032949344" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/camera_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/camera_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="camera_joint" type="fixed">
+        <origin xyz="0.20193 0.000257 0.14625" rpy="0 0 0" />
+        <parent link="base_footprint" />
+        <child link="camera_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="gyro_link">
+        
+<inertial>
+            <origin xyz="1.73472347597681E-18 -1.38777878078145E-17 -0.0125440831031229" rpy="0 0 0" />
+            <mass value="0.112242743338823" />
+            <inertia ixx="3.95443284089364E-05" ixy="-3.38014056255545E-22" ixz="5.94991873875544E-24" iyy="5.79553250973316E-05" iyz="1.57872044476701E-21" izz="8.56596970693901E-05" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/gyro_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="0.286274509803922 0.662745098039216 0.329411764705882 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/gyro_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="gyro_link_joint" type="fixed">
+        <origin xyz="0.023453 0.014377 0.083" rpy="0 0 0" />
+        <parent link="base_footprint" />
+        <child link="gyro_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="base_link">
+        
+<inertial>
+            <origin xyz="0.00932144145533099 -0.00960295646147256 0.0773298481048665" rpy="0 0 0" />
+            <mass value="1.22529930349066" />
+            <inertia ixx="0.00182856793749946" ixy="-7.40409057487328E-06" ixz="-2.4397687674385E-09" iyy="0.00352542666464638" iyz="-9.91945935533617E-10" izz="0.00509771221957547" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/base_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/base_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="base_footprint_joint" type="fixed">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="base_footprint" />
+        <child link="base_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="arm_A_Link">
+        
+<inertial>
+            <origin xyz="-0.0355028230565692 -0.000442555904298189 0.0699233978686822" rpy="0 0 0" />
+            <mass value="0.581339625806442" />
+            <inertia ixx="0.000432467407512303" ixy="1.08567690035925E-06" ixz="2.19660825393071E-05" iyy="0.000327457867987236" iyz="2.09267539182469E-07" izz="0.000367510469896245" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_A_Link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_A_Link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="arm_A_joint" type="revolute">
+        <origin xyz="-0.12452 0.00087742 0.113" rpy="0 0 0" />
+        <parent link="base_link" />
+        <child link="arm_A_Link" />
+        <axis xyz="0 0 1" />
+        <limit lower="-2" upper="2" effort="100" velocity="3" />
+    </joint>
+    <link name="arm_B_link">
+        
+<inertial>
+            <origin xyz="0.0124280982031535 0.0031684324024719 0.0576377426773259" rpy="0 0 0" />
+            <mass value="0.0608331642576154" />
+            <inertia ixx="8.34890225414498E-05" ixy="-1.03293238136962E-07" ixz="-1.19823898129646E-07" iyy="9.36824277665509E-05" iyz="3.02306270825138E-09" izz="1.12539395708687E-05" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_B_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_B_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="arm_B_joint" type="revolute">
+        <origin xyz="-0.0599505814780842 -0.00511056013405344 0.0920000000000002" rpy="0 0 0" />
+        <parent link="arm_A_Link" />
+        <child link="arm_B_link" />
+        <axis xyz="-0.0102910790532785 0.999947045443867 0" />
+        <limit lower="-1.571" upper="0" effort="100" velocity="3" />
+    </joint>
+    <link name="arm_C_link">
+        
+<inertial>
+            <origin xyz="-0.0341457713261606 -0.000833303370514821 -0.0471097558495935" rpy="0 0 0" />
+            <mass value="0.0521809675704963" />
+            <inertia ixx="0.000127011981331755" ixy="-2.93057280396648E-07" ixz="-4.54591961331511E-05" iyy="0.000155484284564794" iyz="-4.67848955878672E-07" izz="2.8784398911937E-05" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_C_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_C_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="arm_C_joint" type="revolute">
+        <origin xyz="-2.56590904373355E-05 0.00249320129997338 0.14" rpy="0 0 0" />
+        <parent link="arm_B_link" />
+        <child link="arm_C_link" />
+        <axis xyz="-0.0102910790532792 0.999947045443867 0" />
+        <limit lower="0" upper="1.9063" effort="100" velocity="3" />
+    </joint>
+    <link name="arm_D_link">
+        
+<inertial>
+            <origin xyz="0.0458486173462659 -3.88432247037662E-05 0.0316991137734113" rpy="0 0 0" />
+            <mass value="0.0319055890738024" />
+            <inertia ixx="1.35217920910944E-05" ixy="9.75083323043451E-09" ixz="-2.29768264355428E-06" iyy="1.01297865613627E-05" iyz="-1.95021000935488E-09" izz="7.75776648638408E-06" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_D_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/arm_D_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="arm_D_link" type="revolute">
+        <origin xyz="-0.0610919308779795 -0.000628735184575402 -0.147876234309874" rpy="0 0 -3.13130139287949" />
+        <parent link="arm_C_link" />
+        <child link="arm_D_link" />
+        <axis xyz="0 -1 0" />
+        <limit lower="-3.14" upper="3.14" effort="0" velocity="0" />
+    </joint>
+    <link name="hand_left_link">
+        
+<inertial>
+            <origin xyz="-0.00736892573221831 -0.0164341687823058 0.00199562356219687" rpy="0 0 0" />
+            <mass value="0.00273071796024518" />
+            <inertia ixx="1.98655345623091E-07" ixy="-2.05875100712841E-07" ixz="1.92748179277698E-10" iyy="3.11709164573916E-07" iyz="1.29363539037007E-10" izz="5.06268191702633E-07" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_left_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_left_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="hand_left_joint" type="revolute">
+        <origin xyz="0.0525135568297138 0.0124999999991739 -0.021767322969515" rpy="0 0 3.13130139287949" />
+        <parent link="arm_D_link" />
+        <child link="hand_left_link" />
+        <axis xyz="-0.000622339485848568 0 -0.999999806346669" />
+        <limit lower="-3.14" upper="3.14" effort="0" velocity="0" />
+    </joint>
+    <link name="hand_left2_link">
+        
+<inertial>
+            <origin xyz="0.0181137536275008 -0.00379260996936226 -0.0106718986492436" rpy="0 0 0" />
+            <mass value="0.00956820475679984" />
+            <inertia ixx="6.48519235153012E-07" ixy="3.12204908392235E-07" ixz="6.78198877684364E-13" iyy="2.20549750987914E-06" iyz="-1.287597782145E-13" izz="2.51777420890252E-06" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_left2_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_left2_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="hand_left2_joint" type="revolute">
+        <origin xyz="-0.032704434318044 -0.0307595524129903 0.0151205521173129" rpy="0 -0.000622339678497506 -3.13130139287974" />
+        <parent link="hand_left_link" />
+        <child link="hand_left2_link" />
+        <axis xyz="0 0 0.999999999976606" />
+        <limit lower="-3.14" upper="3.14" effort="0" velocity="0" />
+    </joint>
+    <link name="hand_right_link">
+        
+<inertial>
+            <origin xyz="-0.00715411987798098 0.0150964002201539 0.00203485611296458" rpy="0 0 0" />
+            <mass value="0.00294647468969656" />
+            <inertia ixx="2.00855565261342E-07" ixy="2.13977602375023E-07" ixz="2.05927033259023E-10" iyy="3.37531195600275E-07" iyz="-1.31901635840956E-10" izz="5.33966794217046E-07" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_right_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_right_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="hand_right_joint" type="revolute">
+        <origin xyz="0.0525136812977368 -0.0125000000008442 -0.0219673229308027" rpy="0 0 3.13130139287949" />
+        <parent link="arm_D_link" />
+        <child link="hand_right_link" />
+        <axis xyz="-0.000622339485852834 0 -0.999999806346669" />
+        <limit lower="-3.14" upper="3.14" effort="0" velocity="0" />
+    </joint>
+    <link name="hand_right2_link">
+        
+<inertial>
+            <origin xyz="0.0181148557506238 0.00378636746464579 -0.0106718986783635" rpy="0 0 0" />
+            <mass value="0.00956820542750678" />
+            <inertia ixx="6.48506367197582E-07" ixy="-3.12169649895122E-07" ixz="6.89616094283286E-13" iyy="2.20551040194033E-06" iyz="7.33446261165981E-14" izz="2.51777422046766E-06" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_right2_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/hand_right2_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="hand_right2_joint" type="revolute">
+        <origin xyz="-0.0333304470895522 0.0300799462405712 0.0153205520786001" rpy="0 -0.000622339678497506 -3.13130139287974" />
+        <parent link="hand_right_link" />
+        <child link="hand_right2_link" />
+        <axis xyz="0 0 0.999999999976606" />
+        <limit lower="-3.14" upper="3.14" effort="0" velocity="0" />
+    </joint>
+    <link name="grasper_Link">
+        
+<inertial>
+            <origin xyz="0 0 -2.77555756156289E-17" rpy="0 0 0" />
+            <mass value="6.54498469497874E-05" />
+            <inertia ixx="1.63624617374468E-10" ixy="-5.04870979341448E-28" ixz="-2.90052368158506E-27" iyy="1.63624617374468E-10" iyz="5.29858148514323E-27" izz="1.63624617374468E-10" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/grasper_Link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/grasper_Link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="grasper_joint" type="revolute">
+        <origin xyz="0.109009483404694 0 -0.0149321619970638" rpy="0 -0.000622339678523636 0" />
+        <parent link="arm_D_link" />
+        <child link="grasper_Link" />
+        <axis xyz="0 1 0" />
+        <limit lower="-3.14" upper="3.14" effort="0" velocity="0" />
+    </joint>
+    <link name="left_back_link">
+        
+<inertial>
+            <origin xyz="7.00577530793334E-06 -0.0198232023908819 1.36486837762351E-07" rpy="0 0 0" />
+            <mass value="0.700024496850347" />
+            <inertia ixx="0.00126075785202671" ixy="5.28587253326258E-08" ixz="1.20688788309637E-08" iyy="0.00230174516643065" iyz="1.39388340695582E-08" izz="0.00126073858459395" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/left_back_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/left_back_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="left_back_joint" type="fixed">
+        <origin xyz="-0.15202 0.18328 0.076" rpy="0 0 0" />
+        <parent link="base_link" />
+        <child link="left_back_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="left_front_link">
+        
+<inertial>
+            <origin xyz="7.00577533241376E-06 -0.0198232023908819 1.36486837713778E-07" rpy="0 0 0" />
+            <mass value="0.700024496850347" />
+            <inertia ixx="0.00126075785202671" ixy="5.28587240507711E-08" ixz="1.20688788309618E-08" iyy="0.00230174516643065" iyz="1.39388340691178E-08" izz="0.00126073858459395" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/left_front_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/left_front_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="left_front_joint" type="fixed">
+        <origin xyz="0.16198 0.18438 0.076" rpy="0 0 0" />
+        <parent link="base_link" />
+        <child link="left_front_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="right_back_link">
+        
+<inertial>
+            <origin xyz="-7.00577530798885E-06 0.0198232023908821 1.36486837727656E-07" rpy="0 0 0" />
+            <mass value="0.700024496850345" />
+            <inertia ixx="0.00126075785202671" ixy="5.2858725332269E-08" ixz="-1.20688788309268E-08" iyy="0.00230174516643064" iyz="-1.39388340690174E-08" izz="0.00126073858459395" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/right_back_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/right_back_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="right_back_joint" type="fixed">
+        <origin xyz="-0.15202 -0.18152 0.076" rpy="0 0 0" />
+        <parent link="base_link" />
+        <child link="right_back_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    <link name="right_front_link">
+        
+<inertial>
+            <origin xyz="-7.0057753080166E-06 0.0198232023908821 1.3648683776929E-07" rpy="0 0 0" />
+            <mass value="0.700024496850345" />
+            <inertia ixx="0.00126075785202671" ixy="5.2858725332461E-08" ixz="-1.20688788309204E-08" iyy="0.00230174516643065" iyz="-1.39388340696453E-08" izz="0.00126073858459395" />
+        </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/right_front_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="1 1 1 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://wheeltec_robot_urdf/meshes/R550A_PLUS_4wd_arm_robot_meshes/right_front_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="right_front_joint" type="fixed">
+        <origin xyz="0.16198 -0.18262 0.076" rpy="0 0 0" />
+        <parent link="base_link" />
+        <child link="right_front_link" />
+        <axis xyz="0 0 0" />
+    </joint>
+    
+<transmission name="trans_arm_A_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="arm_A_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="arm_A_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_arm_B_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="arm_B_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="arm_B_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_arm_C_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="arm_C_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="arm_C_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_arm_D_link">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="arm_D_link">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="arm_D_link_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_hand_left_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="hand_left_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="hand_left_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_hand_left2_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="hand_left2_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="hand_left2_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_hand_right_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="hand_right_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="hand_right_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_hand_right2_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="hand_right2_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="hand_right2_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_grasper_joint">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="grasper_joint">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="grasper_joint_motor">
+            <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <gazebo>
+        <plugin name="gazebo_ros_control" filename="libgazebo_ros_control.so">
+            <robotNamespace>/</robotNamespace>
+        </plugin>
+    </gazebo>
+</robot>

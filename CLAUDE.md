@@ -20,9 +20,10 @@
 **智慧銀行 VIP 迎賓與安全通報系統** — 以同學的 ROS 2 專案 [swient/smartnav-bot](https://github.com/swient/smartnav-bot) 為主體，整合人臉辨識（InsightFace）、語音（sherpa-onnx）、LLM 對話 Agent（LangChain + Ollama）與 Nav2 導航的雙機系統。
 
 **關鍵約束**：
-- **RPi4（8GB RAM, Ubuntu 24.04, ROS 2 Jazzy）**：跑 vision / audio / navigation / bringup + TurtleBot3
+- **RPi4（8GB RAM, Ubuntu 24.04, ROS 2 Jazzy）**：跑 vision / audio / navigation / bringup；機器人本體為 **WHEELTEC 底盤**（2026-07-06 起，driver 在 `src/wheeltec/`；TurtleBot3 流程保留於 `smartnav_navigation` 供模擬）
 - **Windows 筆電（RTX 3050 4GB VRAM）**：跑 Ollama；RPi4 的 `smartnav_llm` 透過 `ollama_base_url` 連到筆電
 - 2026-07-02 專案重組：**舊的單機 Python 原型已全部刪除**（`src/ai_vision/`、`src/database/`、`src/llm_server/`、`src/scripts/`、`config/inference_config.yaml`、`setup_rpi4_quick.sh` 等皆不存在，不可再引用）
+- 2026-07-06 WHEELTEC 整合：廠商原始碼（Humble 世代，97 套件）精選 **17 套件**修正後放入 `src/wheeltec/`；原始壓縮包內容在 `wheeltec_ros2_src_20260518/`（已 gitignore，僅本地素材庫，不可直接 build——內含會撞 Jazzy 的 navigation2-humble）
 
 ## 目前狀態（2026-07-02 起，異動時更新本節）
 
@@ -33,6 +34,7 @@
 **已實作、待實機驗證**：
 - 整個 ROS 2 workspace 尚未在 RPi4 實機 `colcon build` / 運行過
 - vision → LLM 橋接（`/user_text`）、bringup 統一啟動、audio、navigation 皆屬此類
+- WHEELTEC 整合（2026-07-06）：底盤驅動、雙版本語音/LLM 選項、`ollama_chat_bridge`——僅通過語法與依賴靜態檢查，未實機建置
 
 **未實作**：
 - 銀行場景 LLM 工具（帶 VIP 到貴賓室、通報行員）— 目前工具集全為導航導向
@@ -41,7 +43,12 @@
 ## Architecture
 
 **結構總覽**（完整樹狀圖、各套件節點/話題/參數細節 → `docs/架構參考.md`）：
-`src/` 下 8 個 ROS 2 套件——`smartnav_msgs`（介面定義）、`smartnav_vision`（人臉辨識）、`smartnav_audio`（語音）、`smartnav_llm`（LLM Agent）、`smartnav_navigation`（地圖/導航）、`smartnav_brain`／`smartnav_hmi`（空殼預留）、`smartnav_bringup`（統一啟動）；根目錄另有 `scripts/`、`docs/`、四個 Modelfile 與 `benchmark_llm_results.json`。
+`src/` 下 8 個自有 ROS 2 套件——`smartnav_msgs`（介面定義）、`smartnav_vision`（人臉辨識）、`smartnav_audio`（語音）、`smartnav_llm`（LLM Agent＋`ollama_chat_bridge`）、`smartnav_navigation`（地圖/導航，TB3/模擬）、`smartnav_brain`／`smartnav_hmi`（空殼預留）、`smartnav_bringup`（統一啟動）；`src/wheeltec/` 下 17 個廠商套件（底盤 `turn_on_wheeltec_robot`、URDF、serial、雷達 ldlidar/lslidar、相機 astra、麥克風陣列 `wheeltec_mic_ros2`、導航參數 `wheeltec_robot_nav2`、slam 封裝、巡邏 `nav2_waypoint_cycle`、`ollama_ros_chat` 等）。
+
+**雙版本可選方案**（bringup launch 參數選擇，重疊功能各保留兩版）：
+- 語音：`audio_stack:=smartnav`（sherpa-onnx 自由語句，預設）｜`wheeltec`（麥克風陣列＋本地離線命令詞，免金鑰；`voice_words` 經 topic_tools relay 轉 `/user_text`）
+- LLM：`llm_stack:=smartnav`（LangChain Agent 含導航工具，預設）｜`wheeltec`（`ollama_ros_chat` 單輪對話，經 `ollama_chat_bridge` 接 `/user_text` 與 `/speech_text`）
+- 底盤：`enable_chassis:=true` 啟動 WHEELTEC 驅動（車型改 `src/wheeltec/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`）
 
 ### 雙機通訊
 
@@ -126,6 +133,9 @@ Windows（Claude Code 修改程式）→ git push 或 scp 到 RPi4 → RPi4 `col
 5. **ROS 2 workspace 未經實機驗證**：改動時不要假設既有行為已通過測試；文件需誠實區分「已驗證」與「已實作待驗證」。
 6. **`enable_gpu` 在 RPi4 上應設 false**：RPi4 無 CUDA，InsightFace 需用 CPUExecutionProvider（launch 預設為 true，實機啟動時覆寫 `enable_gpu:=false`）。
 7. **RPi4 效能參考**（舊架構實測）：buffalo_sc 檢測 15+ FPS、推理延遲約 100-150ms/幀、記憶體約 350-400MB。
+8. **兩條導航鏈不可混用**：WHEELTEC 鏈全程用 `odom_combined` frame（EKF 輸出），`smartnav_navigation`（TB3/模擬）用 `odom`。實體機建圖/導航走 wheeltec 官方 launch（`wheeltec_nav2.launch.py` **自帶底盤啟動**，勿與 `enable_chassis:=true` 同開造成雙重啟動）。
+9. **wheeltec 語音是固定命令詞不是自由語句**：本地離線辨識綁 `config/msc` 語法檔，銀行場景詞彙需重編語法；自由對話請用 `audio_stack:=smartnav`。
+10. **RPi4 需 pip 裝 `openai`**（`llm_stack:=wheeltec` 用）與 apt 裝 `libuvc-dev libgoogle-glog-dev`（astra 相機用），rosdep 蓋不到，見部署指南。
 
 ## 參考檔案
 
