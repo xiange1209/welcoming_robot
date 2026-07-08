@@ -3,9 +3,10 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -24,6 +25,16 @@ def generate_launch_description():
     enable_llm = LaunchConfiguration("enable_llm")
     enable_navigation = LaunchConfiguration("enable_navigation")
     enable_nav2 = LaunchConfiguration("enable_nav2")
+    enable_chassis = LaunchConfiguration("enable_chassis")
+    audio_stack = LaunchConfiguration("audio_stack")
+    llm_stack = LaunchConfiguration("llm_stack")
+
+    # 雙版本選擇器的組合條件（enable 開關 + stack 選擇要同時成立）
+    audio_smartnav = IfCondition(PythonExpression(["'", enable_audio, "' == 'true' and '", audio_stack, "' == 'smartnav'"]))
+    audio_wheeltec = IfCondition(PythonExpression(["'", enable_audio, "' == 'true' and '", audio_stack, "' == 'wheeltec'"]))
+    audio_any = IfCondition(enable_audio)
+    llm_smartnav = IfCondition(PythonExpression(["'", enable_llm, "' == 'true' and '", llm_stack, "' == 'smartnav'"]))
+    llm_wheeltec = IfCondition(PythonExpression(["'", enable_llm, "' == 'true' and '", llm_stack, "' == 'wheeltec'"]))
 
     return LaunchDescription(
         [
@@ -49,6 +60,25 @@ def generate_launch_description():
                 "enable_nav2",
                 default_value="false",
                 description="是否啟動完整 Nav2 導航棧 + RViz (需要 TurtleBot3 或模擬環境)",
+            ),
+            DeclareLaunchArgument(
+                "enable_chassis",
+                default_value="false",
+                description=(
+                    "是否啟動 WHEELTEC 實體底盤驅動（車型在 src/wheeltec/turn_on_wheeltec_robot/"
+                    "config/wheeltec_param.yaml 的 car_mode 設定；建圖/導航請用 wheeltec 官方 launch，"
+                    "不要與 enable_navigation 的 TurtleBot3 流程同時開）"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "audio_stack",
+                default_value="smartnav",
+                description="語音方案：smartnav（sherpa-onnx 自由語句 ASR）或 wheeltec（麥克風陣列＋本地離線命令詞）",
+            ),
+            DeclareLaunchArgument(
+                "llm_stack",
+                default_value="smartnav",
+                description="LLM 方案：smartnav（LangChain Agent，含導航工具）或 wheeltec（ollama_ros_chat 輕量單輪對話）",
             ),
             # ── smartnav_vision ───────────────────────────────────────
             Node(
@@ -84,43 +114,94 @@ def generate_launch_description():
                 output="screen",
                 condition=IfCondition(enable_vision),
             ),
-            # ── smartnav_audio ────────────────────────────────────────
+            # ── 語音輸入：smartnav 方案（sherpa-onnx 自由語句）────────────
             Node(
                 package="smartnav_audio",
                 executable="voice_trigger",
                 name="voice_trigger_node",
                 output="screen",
-                condition=IfCondition(enable_audio),
+                condition=audio_smartnav,
             ),
             Node(
                 package="smartnav_audio",
                 executable="speech_recognizer",
                 name="speech_recognizer_node",
                 output="screen",
-                condition=IfCondition(enable_audio),
+                condition=audio_smartnav,
             ),
+            # ── 語音輸入：wheeltec 方案（麥克風陣列＋離線命令詞，免金鑰）──
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    PathJoinSubstitution([FindPackageShare("wheeltec_mic_ros2"), "launch", "base.launch.py"])
+                ),
+                condition=audio_wheeltec,
+            ),
+            Node(
+                # 把 wheeltec 的辨識文字話題 voice_words 轉發到 /user_text（型別同為 String）
+                package="topic_tools",
+                executable="relay",
+                name="voice_words_relay",
+                arguments=["voice_words", "/user_text"],
+                output="screen",
+                condition=audio_wheeltec,
+            ),
+            # ── 語音輸出（TTS＋播放）：兩種輸入方案共用 ────────────────
             Node(
                 package="smartnav_audio",
                 executable="speech_synthesizer",
                 name="speech_synthesizer_node",
                 output="screen",
-                condition=IfCondition(enable_audio),
+                condition=audio_any,
             ),
             Node(
                 package="smartnav_audio",
                 executable="voice_playback",
                 name="voice_playback_node",
                 output="screen",
-                condition=IfCondition(enable_audio),
+                condition=audio_any,
             ),
-            # ── smartnav_llm (沿用既有 launch/llm.launch.py) ──────────
+            # ── LLM：smartnav 方案（LangChain Agent，含導航工具）─────────
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(os.path.join(smartnav_llm_share, "launch", "llm.launch.py")),
                 launch_arguments={
                     "ollama_base_url": ollama_base_url,
                     "model_name": model_name,
                 }.items(),
-                condition=IfCondition(enable_llm),
+                condition=llm_smartnav,
+            ),
+            # ── LLM：wheeltec 方案（ollama_ros_chat 單輪對話＋橋接節點）──
+            Node(
+                package="ollama_ros_chat",
+                executable="topic_server",
+                name="ollama_topic_server",
+                output="screen",
+                parameters=[
+                    {
+                        # ollama_ros_chat 走 OpenAI 相容端點，需要 /v1 尾綴
+                        "base_url": [ollama_base_url, "/v1"],
+                        "api_key": "ollama",
+                        # 務必顯式指定模型，避免它自動選到清單第一個模型
+                        "use_model": model_name,
+                    }
+                ],
+                condition=llm_wheeltec,
+            ),
+            Node(
+                # /user_text（純文字）↔ chat_message/chat_response（JSON）格式橋接
+                package="smartnav_llm",
+                executable="ollama_chat_bridge",
+                name="ollama_chat_bridge_node",
+                output="screen",
+                condition=llm_wheeltec,
+            ),
+            # ── WHEELTEC 實體底盤驅動（odom/TF/cmd_vel；預設關閉）────────
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    PathJoinSubstitution(
+                        [FindPackageShare("turn_on_wheeltec_robot"), "launch", "turn_on_wheeltec_robot.launch.py"]
+                    )
+                ),
+                condition=IfCondition(enable_chassis),
             ),
             # ── smartnav_navigation：地圖/地點/導航動作服務 (沿用既有 brain.launch.py) ──
             IncludeLaunchDescription(
