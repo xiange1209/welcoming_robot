@@ -1,648 +1,132 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件提供 Claude Code (claude.ai/code) 在此儲存庫工作時的指南。
+
+## ⚡ 每個 session 先讀（30 秒）
+
+**制度手冊在 `.claude/handbook/`**（七份）：harness 診斷 → `01-diagnosis.md`｜派工與模型選擇 → `02-dispatch.md`｜判斷 rubric（何時升級/何時算完成/何時停下問/何時換路）→ `03-judgment.md`｜模板（搜尋/實作/重構/研究/審查/HANDOFF 交接）→ `04-templates.md`｜改手冊的規則 → `05-maintenance.md`｜交接信與未竟事項 → `06-letter.md`｜黃金任務驗收 → `07-benchmark.md`。非 trivial 任務動手前先掃 02 與 03；若存在 `.claude/handbook/HANDOFF.md`，最先讀它。
+**派工授權**：02-dispatch.md 第 1 節「指揮官不下場」是使用者的常設授權（2026-07-03 訂立）——列於該表的工作型態預設派 subagent，此指示覆寫 Agent 工具「僅使用者要求時派工」的預設限制。
+
+**環境速查卡**（每條都是實測踩過的坑，違反必炸）：
+- Python 用 `python`，絕不用 `python3`（Microsoft Store 空殼，靜默失敗 exit 49）
+- PowerShell 5.1 沒有 `&&`/`||`；需要 POSIX 語法改用 Bash 工具
+- 路徑含中文：shell 命令一律加雙引號；讀檔/搜尋優先用 Read/Grep/Glob 工具（避開編碼與跳脫亂碼）
+- 破壞性操作（刪檔、reset、大規模搬移）前先 commit 快照：先 `git status` 確認範圍，用具名路徑 `git add`（避免 `-A` 誤收機密或大型檔案）
+- 狀態的單一事實來源是本檔＋docs/；memory 只放使用者偏好與教訓，不寫進度
+- 改完任何制度檔跑 `python scripts/check_handbook.py`
 
 ## Project Overview
 
-**Smart Bank AI Service Robot** (智慧銀行 VIP 迎賓與安全通報系統) - A comprehensive AI system integrating face recognition, speech processing, and HMI on a Raspberry Pi 4 + TurtleBot3 platform.
+**智慧銀行 VIP 迎賓與安全通報系統** — 以同學的 ROS 2 專案 [swient/smartnav-bot](https://github.com/swient/smartnav-bot) 為主體，整合人臉辨識（InsightFace）、語音（sherpa-onnx）、LLM 對話 Agent（LangChain + Ollama）與 Nav2 導航的雙機系統。
 
-**Key Constraint**: Raspberry Pi 4 with 8GB RAM, 32GB SD card. All models are INT8 quantized, inference latency target is <500ms @ 10 FPS.
+**關鍵約束**：
+- **RPi4（8GB RAM, Ubuntu 24.04, ROS 2 Jazzy）**：跑 vision / audio / navigation / bringup + TurtleBot3
+- **Windows 筆電（RTX 3050 4GB VRAM）**：跑 Ollama；RPi4 的 `smartnav_llm` 透過 `ollama_base_url` 連到筆電
+- 2026-07-02 專案重組：**舊的單機 Python 原型已全部刪除**（`src/ai_vision/`、`src/database/`、`src/llm_server/`、`src/scripts/`、`config/inference_config.yaml`、`setup_rpi4_quick.sh` 等皆不存在，不可再引用）
 
-**Phase Status** (Updated 2026-05-26):
-- ✅ Phase 1: Environment setup (Raspberry Pi OS, dependencies)
-- ✅ Phase 2a: Real-time face detection (InsightFace buffalo_sc) **VERIFIED** - 15+ FPS on RPi4
-- ✅ Phase 2b: Face recognition + gender field (Code complete, **⚠️ awaiting end-to-end verification**)
-  - VIP/blacklist identification with 512D embeddings
-  - Gender field support (M/F/Other)
-  - GUI display with confidence scores
-- ✅ Phase 3a: LLM API Server on laptop (Code complete, **⚠️ awaiting RPi4 connection test**)
-  - FastAPI Server + Ollama integration (qwen2.5:3b recommended)
-  - Web monitoring dashboard + chat interface
-  - Multi-language reply support
-- ❌ Phase 3b: Voice input (Whisper STT) - Not started
-- ❌ Phase 3c: Voice output (TTS) - Not started
-- ❌ Phase 4+: ROS 2 integration, LoRa alerts, cloud sync - Not started
+## 目前狀態（2026-07-02 起，異動時更新本節）
 
-**Critical Items Awaiting Verification**:
-- Phase 2b: End-to-end flow (photo registration → real-time detection → match)
-- Phase 3a: RPi4 calling laptop API over LAN
-- Liveness detection (MediaPipe ARM64 compatibility)
+**已驗證**：
+- RPi4 上 InsightFace buffalo_sc 即時人臉檢測 15+ FPS（於舊架構驗證，引擎與 ROS 2 版相同）
+- 筆電 LLM 延遲基準（`scripts/benchmark_llm_models.py`，摘要見下；明細與解讀在 `docs/架構參考.md`）
 
----
+**已實作、待實機驗證**：
+- 整個 ROS 2 workspace 尚未在 RPi4 實機 `colcon build` / 運行過
+- vision → LLM 橋接（`/user_text`）、bringup 統一啟動、audio、navigation 皆屬此類
 
-## Architecture Overview
+**未實作**：
+- 銀行場景 LLM 工具（帶 VIP 到貴賓室、通報行員）— 目前工具集全為導航導向
+- HMI（`smartnav_hmi` 為空殼）、多模態決策 orchestrator（`smartnav_brain` 為空殼）
 
-### Current Module Structure
+## Architecture
 
-**Phase 2b-3a (Current)**: Hybrid architecture - RPi4 face recognition + Laptop LLM decision-making:
+**結構總覽**（完整樹狀圖、各套件節點/話題/參數細節 → `docs/架構參考.md`）：
+`src/` 下 8 個 ROS 2 套件——`smartnav_msgs`（介面定義）、`smartnav_vision`（人臉辨識）、`smartnav_audio`（語音）、`smartnav_llm`（LLM Agent）、`smartnav_navigation`（地圖/導航）、`smartnav_brain`／`smartnav_hmi`（空殼預留）、`smartnav_bringup`（統一啟動）；根目錄另有 `scripts/`、`docs/`、四個 Modelfile 與 `benchmark_llm_results.json`。
+
+### 雙機通訊
 
 ```
-專題/
-├── src/
-│   ├── ai_vision/              # Face detection, recognition, liveness (陳佳憲)
-│   │   ├── face_detector.py    # InsightFace RetinaFace detection
-│   │   ├── face_recognizer.py  # VIP/blacklist 512D embedding matching
-│   │   └── liveness_detector.py # MediaPipe (Phase 3, code ready)
-│   ├── database/               # SQLite schema (RPi4 local storage)
-│   │   └── schema.py           # vip_members, blacklist, visit_logs, security_alerts
-│   ├── scripts/                # Testing & management tools
-│   │   ├── main.py             # Unified menu (12 functions)
-│   │   ├── realtime_detection_insightface.py # ✅ VERIFIED 15+ FPS
-│   │   ├── manage_vip_database.py # VIP/blacklist CLI
-│   │   ├── test_vip_recognition.py # Single-frame testing
-│   │   └── benchmark.py        # Performance analysis
-│   ├── llm_server/             # ⭐ NEW - LLM API Server (Windows laptop)
-│   │   ├── main.py             # FastAPI server (:8000)
-│   │   ├── llm_client.py       # Ollama integration (qwen2.5:3b)
-│   │   ├── models.py           # Pydantic schemas (NAVIGATION/COMMAND/CHAT)
-│   │   └── static/             # Web UI (monitoring + chat interface)
-│   └── smartnav_ros2/          # ROS 2 multi-process (Phase 4, not active)
-├── Modelfile_qwen              # qwen2.5:3b Ollama config (recommended)
-├── Modelfile_gemma4e2b/e4b     # Alternative Gemma 4 configs
-├── config/inference_config.yaml # Runtime configuration
-├── docs/                       # Documentation
-│   ├── LLM規劃書.md             # LLM model selection & performance analysis
-│   ├── 專題計畫.md              # Complete 8-phase specification
-│   ├── vibe_coding流程.md       # Windows ↔ RPi4 development workflow
-│   └── 實作工作流程.md          # Implementation procedures
-├── README.md                   # **See for quick deployment (10 steps)**
-├── requirements_minimal.txt    # Minimal Python packages (RPi4)
-├── setup_ubuntu.sh             # One-command RPi4 deployment
-└── photo.jpg                   # Sample image (demo use)
+┌────────────────────────────┐              ┌────────────────────────┐
+│ Raspberry Pi 4             │  HTTP        │ Windows 筆電            │
+│ (Ubuntu 24.04, ROS2 Jazzy) │  Ollama API  │ (RTX 3050 4GB VRAM)    │
+│ vision / audio / llm /     ├─────────────→│ Ollama :11434          │
+│ navigation + TurtleBot3    │←─────────────┤ (qwen2.5:3b /          │
+│                            │  串流回覆     │  gemma3:4b 可即時)      │
+└────────────────────────────┘              └────────────────────────┘
 ```
 
-**System Communication**:
-```
-┌──────────────────────┐                    ┌──────────────────────┐
-│  Raspberry Pi 4      │                    │   Windows Laptop     │
-│  (Ubuntu 24.04)      │                    │   (RTX 3050 4GB)     │
-│                      │                    │                      │
-│ 📷 InsightFace       │  HTTP API          │ 🤖 Ollama LLM        │
-│ 🎤 Voice input       │  /api/chat         │ 🌐 FastAPI :8000     │
-│ 🎥 Camera frames     ├──────────────────→ │ 📊 Web monitoring    │
-│                      │                    │                      │
-│ ← JSON response      │  (qwen2.5:3b)      │ Decision making      │
-│   (intent/action/    │                    │ (NAVIGATION/         │
-│    target/reply)     │                    │  COMMAND/CHAT)       │
-└──────────────────────┘                    └──────────────────────┘
-```
-
-### Design Principles
-
-- **Edge-first**: All face recognition inference runs locally on Raspberry Pi (privacy + latency)
-- **Configuration-driven**: `config/inference_config.yaml` controls platform (RPi4 vs Jetson Orin), precision (INT8 vs FP16), model paths
-- **Queue-based multi-threading**: Separate threads for face detection, recognition, decision logic, I/O (prevents bottlenecks)
-- **ROS 2 Ready**: Single-process code can be deployed as-is now; ROS 2 packages in `src/smartnav_ros2/` provide alternative multi-process architecture
-- **Graceful degradation**: Core packages always install; optional Whisper may fail without blocking setup; Whisper can be installed later
-
-
-### Model Specifications
-
-- **Face Detection**: InsightFace RetinaFace (buffalo_sc model, ~50MB, produces 512D embeddings)
-- **Face Recognition**: Embedding-based similarity matching (cosine distance, no additional model needed)
-- **Liveness Detection**: MediaPipe Face Landmarks (when available on RPi4)
-- **Emotion Analysis**: Not yet implemented (Phase 3+)
-
-### Database
-
-- **Local**: SQLite (edge storage, fast queries)
-  - `vip_members`: VIP list + face embeddings + **gender field** (M/F/Other)
-  - `blacklist`: Blacklisted persons + **gender field** (M/F/Other)
-  - `visit_logs`: Visitor history
-  - `security_alerts`: Safety incidents
-- **Cloud**: PostgreSQL (via MQTT sync) - Phase 5+
-- **Sync Strategy**: Hourly auto-sync; immediate sync for security alerts
-
----
-
-## Phase 2b: Single-Sample Face Recognition (Current - Code Complete, ⚠️ Verification Pending)
-
-**Status**: Code complete. VIP/blacklist identification working. **Awaiting end-to-end verification on RPi4.**
-
-### Recognition Flow
+### 事件流（vision → LLM）
 
 ```
-User Registration (Backend - RPi4):
-  Photo + Name + Gender (M/F/Other) 
-    → Face embedding extraction (InsightFace buffalo_sc, 512D)
-    → SQLite storage in vip_members or blacklist table
-
-Runtime Detection (Real-time on RPi4):
-  Camera frame 
-    → InsightFace RetinaFace detection 
-    → Extract 512D face embedding
-    → Compare with VIP/blacklist database
-    → Generate labels with confidence scores
+相機 /image_raw
+  → face_recognition_node（InsightFace 512D embedding 比對）
+  → /face_recognition/result (smartnav_msgs/RecognitionResult)
+  → recognition_text_bridge_node（轉自然語言）
+  → /user_text (std_msgs/String)          ← speech_recognizer_node（ASR）也發到同一話題
+  → llm_service_node（LangChain Agent，可呼叫導航工具）
+  → /llm_response、/llm_stream、/speech_text
+  → speech_synthesizer_node（TTS）→ /audio_out → voice_playback_node
 ```
 
-### JSON Response Format (Phase 3a LLM Decision)
+## LLM 模型選擇（2026-07-02 實測結論）
 
-When RPi4 calls laptop LLM API `/api/chat`:
+qwen2.5:3b 最快（TTFT 2.2 秒/總 3.1 秒）、gemma3:4b 次之（2.3/4.7 秒）；gemma4:e2b/e4b 模型檔超出 4GB VRAM 被 CPU 卸載、慢 20~40 倍，**不適合即時互動**。完整表格與測試方法在 `docs/架構參考.md`，原始數據在 `benchmark_llm_results.json`。bringup 預設 `model_name` 仍是 `gemma4:e2b`，實際啟動時應覆寫。
 
-```json
-{
-  "intent": "NAVIGATION",  # or COMMAND, CHAT
-  "action": "navigate_to_vip_lounge",
-  "target": "VIP貴賓室",
-  "reply": "歡迎光臨！貴賓室已為您準備好。"
-}
-```
+## Common Commands
 
-**Intent meanings**:
-- `NAVIGATION`: Move robot to location (VIP greeting, visitor guidance)
-- `COMMAND`: Execute system command (alert staff for blacklist)
-- `CHAT`: Voice-only response (general greeting, question answering)
-
----
-
-## Phase 3a: LLM API Server on Laptop (Current - Code Complete, ⚠️ Connection Test Pending)
-
-### Key Implementation Details
-
-**Gender Field (Manual Input, Not Auto-Detected)**:
-- Format: 'M' (男), 'F' (女), 'Other'
-- Entered during backend VIP/blacklist registration
-- Stored in database alongside 512D face embedding
-- Displayed in GUI label for human verification
-
-**VIP Matching Algorithm**:
-- Similarity: `1.0 - (euclidean_distance / max_distance)` → 0-1 score
-- VIP threshold: 0.65 (tunable via `face_recognizer.py`)
-- Blacklist threshold: 0.60 (check blacklist first for security)
-- Search order: Blacklist (safety-first) → VIP → Else visitor
-
-**GUI Label Format**:
-```
-黃色框 (VIP):     VIP_<name>_<gender> (<confidence>)
-紅色框 (黑名單):   黑名單_<name>_<gender> (<confidence>)
-綠色框 (訪客):     訪客 (<confidence>)
-```
-
-### VIP Management CLI
+### 建置（RPi4）
 
 ```bash
-# Initialize database
-python3 src/scripts/manage_vip_database.py init
-
-# Add VIP from photo (interactive)
-python3 src/scripts/manage_vip_database.py add-vip-interactive
-
-# Add VIP from image (CLI)
-python3 src/scripts/manage_vip_database.py add-vip \
-  --name "陳佳憲" --gender M --level platinum \
-  --phone "0900123456" --email "user@bank.com" \
-  path/to/photo.jpg
-
-# Add blacklist
-python3 src/scripts/manage_vip_database.py add-blacklist \
-  --name "李三" --gender F --risk high \
-  --reason "Failed background check" path/to/photo.jpg
-
-# List registered VIPs
-python3 src/scripts/manage_vip_database.py list-vips
-
-# List blacklisted persons
-python3 src/scripts/manage_vip_database.py list-blacklist
+cd ~/smartnav-bot          # workspace 根目錄（含 src/）
+colcon build --symlink-install
+source install/setup.bash
 ```
 
-### Testing Phase 2b
+### 統一啟動（RPi4）
 
 ```bash
-# Test VIP recognition on current frame
-python3 src/scripts/test_vip_recognition.py path/to/test/photo.jpg
+# 完整啟動，LLM 連到筆電 Ollama
+ros2 launch smartnav_bringup smartnav.launch.py ollama_base_url:=http://192.168.1.xxx:11434
 
-# Run real-time detection with VIP overlay
-export DISPLAY=:1
-python3 src/scripts/realtime_detection_insightface.py
+# 只跑視覺 + LLM（關閉 audio/navigation）
+ros2 launch smartnav_bringup smartnav.launch.py \
+  enable_audio:=false enable_navigation:=false \
+  ollama_base_url:=http://192.168.1.xxx:11434 model_name:=qwen2.5:3b
 ```
 
----
-
-## Quick Development Setup
-
-### For Rapid Prototyping (Recommended)
-
-Use the minimal requirements file for faster installation:
+### 人臉註冊（取代舊的 manage_vip_database.py）
 
 ```bash
-# Install minimal dependencies (20 packages, ~1.5GB)
-pip install --no-cache-dir -r requirements_minimal.txt
-
-# Takes ~5-10 minutes vs ~30 minutes for full setup
+ros2 service call /face_registration/register smartnav_msgs/srv/RegisterFace \
+  "{person_name: '陳佳憲', gender: 'M', person_type: 'VIP', num_samples: 10}"
+# 黑名單：person_type: 'BLACKLIST'；手動刷新快取：
+ros2 service call /face_recognition/refresh_cache std_srvs/srv/Empty
 ```
 
-### For Complete Environment
-
-Use the automated setup script:
+### 除錯觀察
 
 ```bash
-# One-command 7-step deployment
-bash setup_rpi4_quick.sh
-
-# Handles: system packages, venv, GTK+ libs, disk cleanup, pip packages
-# Takes ~20-30 minutes total
+ros2 topic echo /face_recognition/result
+ros2 topic echo /user_text
+ros2 topic echo /llm_response
 ```
 
-### Files Reference for Development
+個別節點啟動、LLM 基準測試、語音模型下載、scp 傳輸 → 指令大全在 `docs/架構參考.md`。
 
-- **requirements_minimal.txt** - Curated list of only essential packages for Phase 2b
-- **setup_rpi4_quick.sh** - Fully automated 7-step deployment script
-- **vibe_coding流程.md** - Complete development workflow guide (Chinese)
+## Development Workflow
 
----
+Windows（Claude Code 修改程式）→ git push 或 scp 到 RPi4 → RPi4 `colcon build` 實機測試 → 回報輸出/FPS/錯誤 → 分析修正循環。詳細指令在 `docs/架構參考.md`。
 
-## Common Development Commands
+## 已知限制與注意事項
 
-### Running Face Detection
+1. **LLM 沒有銀行場景工具**：工具集全為導航導向；`system_prompt.txt` 是導航設定。人臉事件進 `/user_text` 後只會被當一般對話處理。這是後續開發重點。
+2. **frontier_exploration_ros2 需手動 clone**：`brain.launch.py` 依賴它；`git clone https://github.com/mertgulerx/frontier_exploration_ros2` 到 `src/`。
+3. **gemma4 在 4GB VRAM 不可行**：實測 CPU 卸載、首次輸出 42~95 秒。即時互動用 `qwen2.5:3b` 或 `gemma3:4b`。
+4. **Windows 上用 `python` 不要用 `python3`**：後者是 Microsoft Store 空殼。
+5. **ROS 2 workspace 未經實機驗證**：改動時不要假設既有行為已通過測試；文件需誠實區分「已驗證」與「已實作待驗證」。
+6. **`enable_gpu` 在 RPi4 上應設 false**：RPi4 無 CUDA，InsightFace 需用 CPUExecutionProvider（launch 預設為 true，實機啟動時覆寫 `enable_gpu:=false`）。
+7. **RPi4 效能參考**（舊架構實測）：buffalo_sc 檢測 15+ FPS、推理延遲約 100-150ms/幀、記憶體約 350-400MB。
 
-```bash
-# Activate environment
-source ~/ai_bank_robot_env/bin/activate
-cd ~/ai_bank_robot
+## 參考檔案
 
-# Set display for VNC/HDMI
-export DISPLAY=:1
-
-# Run InsightFace detection (working, 12-13 FPS)
-python3 src/scripts/realtime_detection_insightface.py
-
-# Controls
-# Q - Quit
-# S - Save current frame to /tmp/
-# Space - Pause/Resume
-```
-
-### Testing and Verification
-
-```bash
-# Test InsightFace import
-python3 -c "from insightface.app import FaceAnalysis; print('✓ InsightFace ready')"
-
-# Test all core packages
-python3 << 'EOF'
-import cv2, numpy, insightface, onnxruntime, picamera2
-print(f'✓ OpenCV {cv2.__version__}')
-print('✓ All packages installed')
-EOF
-
-# Performance monitoring (during detection run)
-watch -n 1 'free -h; echo "---"; vcgencmd measure_temp'
-
-# Check disk space (need >5GB for installation)
-df -h
-```
-
-### Database Testing
-
-```bash
-# Initialize SQLite schema
-python3 -c "from src.database.schema import DatabaseSchema; DatabaseSchema().initialize(); print('✓ Database ready')"
-
-# Test database operations
-python3 -c "
-from src.database.schema import DatabaseSchema
-schema = DatabaseSchema()
-conn = schema.connect()
-schema.log_visit(conn, 'test_visitor', 'visitor_1', confidence=0.95)
-conn.close()
-print('✓ Database operations working')
-"
-```
-
----
-
-## Raspberry Pi Specific Notes
-
-### Storage Constraints
-- **Total**: 32GB SD card
-- **Used by OS+System**: ~7.9GB
-- **Available for dev**: ~22GB (after setup_rpi4_dev.sh cleanup)
-- **Core packages size**: ~3-4GB (numpy, OpenCV, ONNX, FastAPI, etc.)
-- **Models size**: ~100MB (RetinaFace + ArcFace INT8 combined)
-- **Whisper optional**: ~1GB (installs if disk space available after core packages)
-
-### Performance Targets
-- **Face detection + recognition**: <500ms total @ 10 FPS
-- **Memory peak during inference**: <2GB (with INT8 quantized models)
-- **CPU usage**: ~60-80% during active processing (4 cores, ARM architecture)
-
-### Known Issues & Workarounds
-
-1. **OpenCV GUI Error**: `The function is not implemented. Rebuild with GTK+ support`
-   - **Cause**: `opencv-python-headless` was installed instead of full `opencv-python`
-   - **Fix**:
-   ```bash
-   pip uninstall opencv-python-headless -y
-   pip install --no-cache-dir opencv-python
-   ```
-
-2. **InsightFace Model Download Fails**: HTTP 404 errors
-   - **Cause**: GitHub release URLs are outdated
-   - **Fix**: Models auto-download from HuggingFace on first run (more reliable)
-
-3. **Picamera2 Not Found**: `ModuleNotFoundError: No module named 'picamera2'`
-   - **Cause**: Virtual environment created without `--system-site-packages`
-   - **Fix**:
-   ```bash
-   python3 -m venv --system-site-packages ~/ai_bank_robot_env
-   source ~/ai_bank_robot_env/bin/activate
-   # Must install libcap-dev first: sudo apt-get install -y libcap-dev
-   ```
-
-4. **Low FPS** (<5 FPS)
-   - **Cause**: CPU overload or thermal throttling
-   - **Check**:
-   ```bash
-   vcgencmd measure_temp  # Should be <70°C
-   top -b -n 1 | head -15  # Check CPU usage
-   ```
-   - **Fix**: Increase `detect_interval` in script (detect every 4-5 frames instead of 3)
-
-5. **Disk Space Issues**: `[Errno 28] No space left on device`
-   - **Fix**:
-   ```bash
-   sudo apt-get clean
-   rm -rf ~/.cache/pip/*
-   sudo journalctl --vacuum-size=50M
-   df -h  # Verify >5GB available
-   ```
-
----
-
----
-
----
-
-## Development Workflow with Claude Code
-
-### Quick Overview
-
-For detailed step-by-step guide, see **`vibe_coding流程.md`** (in Chinese)
-
-```
-Windows (Code changes)
-         ↓ (SCP transfer)
-Raspberry Pi (Test & validate)
-         ↓ (Report results)
-Claude (Analyze & improve)
-         ↓ (Loop back)
-```
-
-### Typical Development Cycle
-
-1. **You describe a problem** (in Windows or feedback from RPi)
-   - Specific error messages
-   - Performance metrics (CPU, memory, latency)
-   - Test results and observations
-
-2. **Claude reads code and designs solution**
-   - Analyzes CLAUDE.md and architecture
-   - Reads relevant files
-   - Generates/modifies code in Windows directory
-
-3. **You transfer updated code to Raspberry Pi**
-   ```bash
-   cd C:\Users\陳佳憲\Desktop\專題
-   scp -r . xiange@192.168.1.125:~/ai_bank_robot/
-   ```
-
-4. **You test on Raspberry Pi**
-   ```bash
-   ssh xiange@192.168.1.125
-   cd ~/ai_bank_robot && source ~/ai_bank_robot_env/bin/activate
-   python3 scripts/realtime_detection_insightface.py
-   ```
-
-5. **You report results back to Claude**
-   - Copy-paste test output
-   - Mention performance improvements or issues
-   - Request next iteration
-
-### Key Files for Development
-
-- **docs/vibe_coding流程.md**: Complete Chinese workflow guide
-- **docs/計畫書_2026-04-22.md**: Current project plan with technical challenges
-- **docs/專題計畫.md**: Complete 8-phase specification
-- **CLAUDE.md** (this file): Architecture for Claude Code
-
----
-
-## Development Phases & Roadmap
-
-### Current Status (Phase 2b)
-- ✅ **Phase 1**: Environment setup (Raspberry Pi OS, dependencies)
-- ✅ **Phase 2a**: Real-time face detection (InsightFace, 12-13 FPS verified)
-- 🔄 **Phase 2b**: Face recognition + gender field (code complete, awaiting RPi4 verification)
-  - Face embedding similarity matching (512D vectors)
-  - Single-sample VIP/blacklist matching
-  - Gender field support (M/F/Other)
-- 🔄 **Phase 3**: ROS 2 integration (smartnav_ros2 packages prepared)
-  - Multi-process architecture in `src/smartnav_ros2/`
-  - Vision node with face recognition
-  - Audio node (Phase 3+)
-  - Brain/orchestrator node (Phase 3+)
-- ⏳ **Phase 4+**: LoRa alerts, cloud sync, HMI UI
-
-### Critical Testing Needed Before RPi4 Deployment
-
-1. **VIP Recognition Verification**: Can a single employee photo reliably match 40+ times?
-   - Test with same person, different poses/lighting
-   - Verify gender field displays correctly
-   - Measure confidence scores
-
-2. **Cross-device Recognition**: Recognition model trained on iPhone camera
-   - Must work on RPi camera module, USB cameras, IP cameras
-   - May need feature normalization (ISP differences)
-
-3. **Single-Sample Learning**: Improve from 40% to 75%+ recognition rate
-   - Test with multi-scale features
-   - Consider feature augmentation (rotation, scaling)
-   - Dynamic threshold tuning
-
----
-
----
-
-## Configuration System
-
-**File**: `config/inference_config.yaml`
-
-```yaml
-platform: "rpi4"              # or "jetson_orin" (easy platform switch)
-model_precision: "int8"       # or "fp16" for Jetson
-batch_size: 1
-num_threads: 4
-use_gpu: false                # true only for Jetson
-model_paths:
-  face_detector: "models/retinaface_int8.onnx"
-  face_recognizer: "models/arcface_int8.onnx"
-inference_params:
-  face_detect_threshold: 0.7
-  face_recognition_threshold: 0.6
-  frame_rate: 10              # FPS for vision processing
-  max_queue_size: 30          # Queue depth for frame buffer
-```
-
-**Key Design**: All inference engine logic (`InferenceEngine` class) reads this config to select model backends (ONNX vs TensorFlow Lite), optimize tensor operations, and manage memory. Changing platform requires only config modification, not code changes.
-
----
-
-## Key Files Reference
-
-| File | Purpose |
-|------|---------|
-| **docs/計畫書_2026-04-22.md** | Current project plan with phase progress and technical challenges |
-| **docs/vibe_coding流程.md** | Complete development workflow with Claude Code (read this for dev process!) |
-| **docs/專題計畫.md** | Complete project specification (8 phases, hardware specs, risk assessment) |
-| **docs/進度統整報告_2026-04-22.md** | Comprehensive progress report (Phase 1-3 status, team effort tracking) |
-| **config/inference_config.yaml** | Inference engine configuration (platform, model paths, thresholds, precision) |
-| **src/database/schema.py** | SQLite table definitions (vip_members, blacklist, visit_logs, security_alerts, robot_status_log) |
-| **src/ai_vision/inference_engine.py** | ONNX Runtime abstraction layer for multi-platform support (RPi4 vs Jetson Orin) |
-| **src/ai_vision/face_recognizer.py** | VIP/blacklist matching with gender field support (512D embedding similarity) |
-| **src/scripts/realtime_detection_insightface.py** | ✅ **WORKING** - Real-time face detection (InsightFace buffalo_sc, 12-13 FPS, GUI support) |
-| **src/scripts/manage_vip_database.py** | Interactive CLI for VIP registration, blacklist management, database initialization |
-| **src/scripts/benchmark.py** | Full performance testing (inference latency, CPU, memory, temperature, database) |
-| **src/smartnav_ros2/smartnav_vision/** | ROS 2 vision node with InsightFace integration (孫瑋廷, Phase 3) |
-| **requirements_minimal.txt** | Minimal pip dependencies (20 packages, ~1.5GB), optimized for RPi4 |
-| **setup_rpi4_quick.sh** | One-command environment deployment (all 7 steps automated) |
-
----
-
-## Face Detection Implementation - CURRENT STATUS
-
-### ✅ InsightFace (ACTIVE - Recommended for Phase 2+)
-
-**Status**: **WORKING and OPTIMIZED** - Achieved 12-13 FPS on RPi4 with buffalo_sc model
-
-**Script**: `src/scripts/realtime_detection_insightface.py`
-
-```bash
-# Install InsightFace
-pip install --no-cache-dir insightface
-
-# Run real-time detection
-export DISPLAY=:1
-python3 scripts/realtime_detection_insightface.py
-```
-
-**Performance (RPi4)**:
-- **FPS**: 12-13 (exceeds 10 FPS target)
-- **Inference latency**: 100-150ms per frame
-- **Memory usage**: ~350-400MB
-- **CPU usage**: ~60-70%
-- **Model size**: ~50MB (buffalo_sc, lightweight version)
-
-**Advantages**:
-- ✅ Excellent accuracy (RetinaFace ONNX detection)
-- ✅ Side-face detection support
-- ✅ Generates face embeddings (512D) for VIP recognition
-- ✅ GUI support with OpenCV
-- ✅ Automatic model download on first run
-- ✅ Frame skipping optimization (every 3 frames)
-
-**Usage**:
-```python
-from insightface.app import FaceAnalysis
-
-face_app = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
-faces = face_app.get(frame)  # Returns detected faces with embeddings
-for face in faces:
-    bbox = face.bbox  # [x1, y1, x2, y2]
-    confidence = face.det_score
-    embedding = face.embedding  # 512D vector for recognition
-```
-
----
-
-### Alternative Option A: MediaPipe (Fast but less accurate)
-
-**Status**: Ready to use, no model download needed
-
-```bash
-pip install --no-cache-dir mediapipe -q
-```
-
-**Disadvantages for Phase 2+**:
-- No embedding generation (can't do VIP recognition without additional model)
-- Lower accuracy than InsightFace
-- Limited side-face detection
-
----
-
-### Alternative Option B: ONNX Models (Advanced, WIP)
-
-**Status**: URLs outdated (404 errors), requires manual setup
-
-Not recommended unless InsightFace performance becomes insufficient.
-
-
-
-1. **Memory Management**: With 8GB RAM and 4 ARM cores, avoid large batch processing. Single-image inference is the norm (batch_size: 1).
-
-2. **Disk Space**: Always run cleanup before major installations. Monitor with `df -h`. Leave >5GB free.
-
-3. **Model Quantization**: INT8 precision is mandatory for RPi4 storage/inference speed. Jetson Orin can support FP16/FP32 via config change.
-
-4. **Frame Rate Coupling**: Vision processing at 10 FPS, navigation at 20 Hz, HMI at 10 FPS. Carefully manage threads to avoid frame drops.
-
-5. **Network Reliability**: Design for intermittent connectivity (LoRa/MQTT may fail). MQTT uses local SQLite queue for offline buffering; sync on reconnect.
-
-6. **Privacy-First**: Never upload raw face images to cloud. Only upload face embedding vectors (128D), person ID, metadata, alerts.
-
-7. **Error Handling**: Graceful degradation on sensor failures (e.g., if face detection fails, show "Please move closer" rather than crashing).
-
----
-
-## Debugging Tips
-
-**SSHing to Raspberry Pi for development**:
-```bash
-ssh xiange@192.168.1.125
-source ~/ai_bank_robot_env/bin/activate
-cd ~/ai_bank_robot
-python3 -c "import sys; print(sys.path)"  # Verify venv is active
-```
-
-**Monitor resource usage**:
-```bash
-# Real-time memory + CPU
-top -b -n 1 | head -15
-
-# Disk usage
-du -sh ~/* | sort -h
-
-# Temperature
-vcgencmd measure_temp
-
-# GPU memory (if applicable)
-free -h
-```
-
-**Test individual components**:
-```python
-# Test face detection alone
-from src.ai_vision.face_detector import FaceDetector
-detector = FaceDetector("models/retinaface_int8.onnx")
-detections = detector.detect(frame)
-
-# Test inference engine abstraction
-from src.ai_vision.inference_engine import InferenceEngine
-engine = InferenceEngine(config="config/inference_config.yaml")
-```
-
----
-
-## Related Resources
-
-- **Project Plan**: `docs/專題計畫.md` - Full 8-phase roadmap, hardware specs, risk assessment
-- **Development Workflow**: `docs/vibe_coding流程.md` - Windows-RPi4 development cycle
-- **Progress Reports**: `docs/計畫書_2026-04-22.md` and `docs/進度統整報告_2026-04-22.md`
-- **Official Docs**:
-  - [ONNX Runtime](https://onnxruntime.ai/)
-  - [OpenCV Python](https://docs.opencv.org/4.x/d6/d00/tutorial_py_root.html)
-  - [OpenAI Whisper](https://github.com/openai/whisper)
-  - [pyttsx3](https://pyttsx3.readthedocs.io/)
-  - [ROS 2 Jazzy](https://docs.ros.org/en/jazzy/)
-- **Raspberry Pi**:
-  - [Raspberry Pi OS Setup](https://www.raspberrypi.com/software/)
-  - [ROS 2 on Raspberry Pi](https://docs.ros.org/en/foxy/Guides/Linux-Install-Debians.html)
+各套件節點/話題/服務/參數、Key Files 對照表、LLM 實測明細、指令大全 → `docs/架構參考.md`。部署步驟 → `docs/部署與重現指南.md`。驗證狀態與待辦 → `docs/驗證與實作清單.md`。

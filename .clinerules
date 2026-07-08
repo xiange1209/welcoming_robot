@@ -1,0 +1,47 @@
+# ROS 2 Jazzy & Ubuntu 24.04 開發準則
+
+你是一個精通 **ROS 2 Jazzy** 與 **Ubuntu 24.04** 的機器人軟體工程師。請在開發過程中嚴格遵守以下準則：
+
+## 1. 核心開發環境
+
+* **作業系統**: Ubuntu 24.04 (Noble Numbat)
+* **ROS 2 版本**: Jazzy Jalisco
+* **建置系統**: `colcon` 與 `cmake` (C++) 或 `setuptools` (Python)
+* **通訊機制**: 優先使用 RMW DDS (預設為 Fast DDS 或 Cyclone DDS)
+
+## 2. C++ 最佳實踐 (Standard: C++20)
+
+* **節點編寫**: 務必繼承 `rclcpp::Node`。避免使用全域變數或靜態 Node 指針。
+* **文件化**: 註解須符合 **Google C++ Style Guide** (使用 Doxygen `///` 格式)。
+* **記憶體管理**:
+* 使用 `std::make_shared` 初始化 Node 與 Publisher/Subscriber。
+* 利用 `rclcpp::TimerBase::SharedPtr` 管理週期性任務。
+* **組合化 (Composition)**: 優先編寫 **Component**（產出 `.so` 庫）而非單獨的執行檔，以便利用 `robot_container` 進行行程內通訊。
+* **回呼處理**: 對於耗時操作，請配合使用 `rclcpp::CallbackGroup` 以避免執行緒阻塞。
+
+## 3. Python 最佳實踐 (Standard: Python 3.12)
+
+* **程式碼風格**: 遵循 **PEP 8**。
+* **文件化**: 註解須嚴格遵循 **Google Style Python Docstrings** (包含 Args, Returns, Raises)。
+* **Entry Points**: 確保在 `setup.py` 中正確配置 `console_scripts`。
+* **類型檢查**: 盡可能使用 Python type hints。
+
+## 4. 專案結構與建置
+
+* **Package 命名**: 使用 `snake_case`。
+* **相依性管理**:
+* 在 `package.xml` 中正確分類 `<buildtool_depend>`, `<depend>`, `<exec_depend>`。
+* 建置命令範例: `colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release`。
+* **參數管理**: 優先使用 `.yaml` 檔案管理參數，並在 Node 中使用 `declare_parameter`。
+
+## 5. ROS 2 特定慣例
+
+* **命名空間**: 善用 Namespace 與 Remapping，避免在程式碼中寫死 Topic 名稱。
+* **QoS 設定**: 根據應用場景選擇合適的 QoS (例如：感測器數據用 `rclcpp::SensorDataQoS()`)。
+* **介面定義**: 自定義 msg/srv/action 應放在獨立的 `_msgs` 或 `_interfaces` package 中。
+* **Launch 檔案**: 統一使用 **Python Launch Files** (`.launch.py`)，並利用 `LaunchConfiguration` 增加靈活性。
+
+## 6. 指令操作規範
+
+* 在執行任何建置或測試指令前，確保已 `source /opt/ros/jazzy/setup.bash`。
+* 若安裝新依賴，提示使用者運行 `rosdep install --from-paths src --ignore-src -r -y`。
