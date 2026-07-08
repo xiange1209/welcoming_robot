@@ -2,7 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
+# 注意：不可加全域 *.so 或 lib/ 規則——src/wheeltec 的廠商預編譯二進位
+# （wheeltec_mic_ros2/lib/arm64、astra_camera/openni2_redist/arm64）必須進 git
 .Python
 build/
 develop-eggs/
@@ -10,8 +11,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
