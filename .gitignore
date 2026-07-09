@@ -71,10 +71,15 @@ wheeltec_audit_full.json
 # Claude Code 本地檔案（制度手冊與個人設定）不進 GitHub——2026-07-09 使用者決定
 .claude/
 
-# 專案根目錄的個人文件（課程報告等）不進 git；套件內的廠商文件不受此限
-/*.pdf
-/*.pptx
-/*.docx
+# 簡報/文件一律不進 git（2026-07-09 使用者政策：GitHub 上不放 pdf/pptx，含廠商手冊）
+*.pdf
+*.pptx
+*.ppt
+*.docx
+
+# SD 卡映像等大型二進位絕不進 git
+*.img
+*.iso
 
 # OS
 .DS_Store
