@@ -30,7 +30,7 @@
 **已驗證**：
 - RPi4 上 InsightFace buffalo_sc 即時人臉檢測 15+ FPS（於舊架構驗證，引擎與 ROS 2 版相同）
 - 筆電 LLM 延遲基準（`scripts/benchmark_llm_models.py`，摘要見下；明細與解讀在 `docs/架構參考.md`）
-- 全 workspace `colcon build`：x86-64 Jazzy VM 24/24（2026-07-08，含 launch smoke test；Jazzy/gcc-13 修正 commit `c23ffbf`+`fab0db1`）＋ **arm64 QEMU 容器 25/25 含 wheeltec_mic_ros2**（2026-07-09，執行檔驗證為 aarch64；產物搬 RPi4 即用，見部署指南路線 D）
+- 全 workspace `colcon build`：x86-64 Jazzy VM 24/24（2026-07-08，含 launch smoke test；Jazzy/gcc-13 修正 commit `0039541`+`6186c3a`）＋ **arm64 QEMU 容器 25/25 含 wheeltec_mic_ros2**（2026-07-09，執行檔驗證為 aarch64；產物搬 RPi4 即用，見部署指南路線 D）
 
 **已實作、待實機驗證**：
 - RPi4 實機運行（arm64 產物已建好，首次啟動驗證見 docs/驗證與實作清單.md B11 (1c)）
