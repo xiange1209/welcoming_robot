@@ -53,8 +53,13 @@ logs/
 install/
 log/
 
-# 廠商原始碼原始壓縮包內容（2.2GB，保留為本地素材庫；精選子集在 src/wheeltec/）
+# 廠商原始碼素材庫（本地參考用，不進 git；精選子集在 src/wheeltec/）
 wheeltec_ros2_src_20260518/
+樹5_wheeltec_ros2_src_20260518/
+F103RCT6_阿克曼_移動機器人STM32源碼/
+
+# 樹莓派 SD 卡映像備份（數十 GB）
+*.img
 
 # 大型網格/暫存檔不進 git（部署用 scp 補齊，見 docs/部署與重現指南.md）
 # meshes 只擋內容、保留 .gitkeep 佔位（CMake install(DIRECTORY) 需要目錄存在）
