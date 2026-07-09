@@ -3,12 +3,14 @@
 <package format="3">
   <name>smartnav_hmi</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>平板/瀏覽器 HMI：rosbridge websocket + 靜態網頁（辨識結果、對話、相機串流）</description>
   <maintainer email="swient@todo.todo">swient</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>smartnav_msgs</depend>
+  <!-- 瀏覽器↔ROS 橋接（apt: ros-jazzy-rosbridge-server） -->
+  <exec_depend>rosbridge_server</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -29,6 +29,7 @@ def generate_launch_description():
     enable_chassis = LaunchConfiguration("enable_chassis")
     enable_web_video = LaunchConfiguration("enable_web_video")
     web_video_port = LaunchConfiguration("web_video_port")
+    enable_hmi = LaunchConfiguration("enable_hmi")
     audio_stack = LaunchConfiguration("audio_stack")
     llm_stack = LaunchConfiguration("llm_stack")
 
@@ -79,6 +80,11 @@ def generate_launch_description():
                 description="是否啟動 web_video_server（瀏覽器看影像：http://<機器人IP>:<port>/stream?topic=/image_raw）",
             ),
             DeclareLaunchArgument("web_video_port", default_value="8080", description="web_video_server 的 HTTP 埠"),
+            DeclareLaunchArgument(
+                "enable_hmi",
+                default_value="false",
+                description="是否啟動平板 HMI（rosbridge :9090＋網頁 :8081；平板瀏覽 http://<機器人IP>:8081，影像需同開 enable_web_video）",
+            ),
             DeclareLaunchArgument(
                 "audio_stack",
                 default_value="smartnav",
@@ -202,6 +208,13 @@ def generate_launch_description():
                 name="ollama_chat_bridge_node",
                 output="screen",
                 condition=llm_wheeltec,
+            ),
+            # ── 平板 HMI：rosbridge + 網頁（辨識結果/對話/相機串流；預設關閉）──
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    PathJoinSubstitution([FindPackageShare("smartnav_hmi"), "launch", "hmi.launch.py"])
+                ),
+                condition=IfCondition(enable_hmi),
             ),
             # ── web_video_server：瀏覽器即時看影像話題（apt 二進位；預設關閉）──
             Node(
