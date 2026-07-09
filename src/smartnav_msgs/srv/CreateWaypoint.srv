@@ -1,8 +1,0 @@
-# 建立地點服務
-
-string waypoint_name            # 地點名稱
-string map_id                   # 地圖 ID
----
-WaypointInfo waypoint_info
-bool success                    # 是否成功
-string message                  # 訊息 (成功或錯誤描述)
