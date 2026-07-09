@@ -240,6 +240,8 @@ ros2 launch smartnav_bringup smartnav.launch.py \
 | `enable_chassis` | `false` | WHEELTEC 實體底盤驅動（車型先改 `src/wheeltec/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`） |
 | `audio_stack` | `smartnav` | 語音方案：`smartnav`（sherpa-onnx 自由語句）／`wheeltec`（麥克風陣列＋離線命令詞，免金鑰但為固定語法） |
 | `llm_stack` | `smartnav` | LLM 方案：`smartnav`（LangChain Agent 含導航工具）／`wheeltec`（ollama_ros_chat 單輪對話，經橋接節點接管線） |
+| `enable_web_video` | `false` | 瀏覽器即時看影像（apt: `ros-jazzy-web-video-server`）：開啟後瀏覽 `http://<機器人IP>:8080/stream?topic=/image_raw` |
+| `web_video_port` | `8080` | web_video_server 的 HTTP 埠 |
 
 範例——只測「人臉辨識 → LLM」串接，不啟動語音與導航：
 
@@ -405,13 +407,12 @@ ros2 run smartnav_vision face_recognition --ros-args --params-file face_recognit
 
 ### 已實作、待實機驗證
 
-- **整個 ROS 2 workspace 尚未在 RPi4 實機 `colcon build` 與運行過**，以下皆屬此類：
+- **建置已驗證、實機運行未驗證**（2026-07-09 起）：全 workspace `colcon build` 已在 x86-64 Jazzy VM（24/24）與 arm64 QEMU 容器（25/25，含 wheeltec_mic_ros2）通過，arm64 產物可直接部署 RPi4（見部署指南路線 D）。以下**運行面**仍待實機：
   - vision → recognition_text_bridge → LLM 的完整事件流
-  - `smartnav_bringup` 一鍵啟動
   - `smartnav_audio` 語音管線（喚醒 / ASR / TTS / 播放）在 RPi4 上的效能
   - `smartnav_navigation` + Nav2 + TurtleBot3 實機導航
   - RPi4 跨區網呼叫筆電 Ollama 的實際延遲與穩定性
-  - **WHEELTEC 整合全部內容**（2026-07-06）：`src/wheeltec/` 17 套件的建置、底盤驅動、`audio_stack` / `llm_stack` 兩條 wheeltec 鏈、astra 相機在 Ubuntu 24.04 的相容性——僅通過語法與依賴靜態檢查，驗證步驟見 [`docs/驗證與實作清單.md`](docs/驗證與實作清單.md) B11
+  - **WHEELTEC 硬體鏈**：底盤驅動、`audio_stack` / `llm_stack` 兩條 wheeltec 鏈、astra 相機實機接入——步驟見 [`docs/驗證與實作清單.md`](docs/驗證與實作清單.md) B11
 
 ## ⚠️ 已知限制
 
