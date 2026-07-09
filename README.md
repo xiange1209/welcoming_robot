@@ -242,6 +242,7 @@ ros2 launch smartnav_bringup smartnav.launch.py \
 | `llm_stack` | `smartnav` | LLM 方案：`smartnav`（LangChain Agent 含導航工具）／`wheeltec`（ollama_ros_chat 單輪對話，經橋接節點接管線） |
 | `enable_web_video` | `false` | 瀏覽器即時看影像（apt: `ros-jazzy-web-video-server`）：開啟後瀏覽 `http://<機器人IP>:8080/stream?topic=/image_raw` |
 | `web_video_port` | `8080` | web_video_server 的 HTTP 埠 |
+| `enable_hmi` | `false` | 平板 HMI（apt: `ros-jazzy-rosbridge-server`）：平板瀏覽 `http://<機器人IP>:8081` 顯示辨識結果/對話/相機畫面（影像需同開 `enable_web_video`） |
 
 範例——只測「人臉辨識 → LLM」串接，不啟動語音與導航：
 

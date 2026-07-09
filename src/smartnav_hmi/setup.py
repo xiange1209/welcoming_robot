@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = "smartnav_hmi"
@@ -9,12 +11,14 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/launch", glob("launch/*.py")),
+        ("share/" + package_name + "/web", glob("web/*")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="swient",
     maintainer_email="swient@todo.todo",
-    description="TODO: Package description",
+    description="平板/瀏覽器 HMI：rosbridge websocket + 靜態網頁（辨識結果、對話、相機串流）",
     license="MIT",
     extras_require={
         "test": [

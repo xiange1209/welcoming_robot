@@ -13,7 +13,7 @@
 
   # R550A_PLUS_4wd_arm/R550A_PLUS_mec_arm    
 
-car_mode: mini_mec
+car_mode: senior_akm
       
 # 底盘超声波避障功能的开启与关闭  false关闭 true开启
 # 此项配置仅对有超声波硬件的车型有效
@@ -29,7 +29,7 @@ ultrasonic_avoid: false
   # ldstl19p ldstl06nbj ldstl19n rplidar_c1  
   # lscx
 
-lidar_type: ls_N10Plus_uart     
+lidar_type: ls_N10_uart
 
 # ls_M10/ls_N10系列单线雷达可修改内容
 x10:

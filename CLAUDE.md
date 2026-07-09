@@ -39,7 +39,7 @@
 
 **未實作**：
 - 銀行場景 LLM 工具（帶 VIP 到貴賓室、通報行員）— 目前工具集全為導航導向
-- HMI（`smartnav_hmi` 為空殼）、多模態決策 orchestrator（`smartnav_brain` 為空殼）
+- 多模態決策 orchestrator（`smartnav_brain` 為空殼；`smartnav_hmi` 已於 2026-07-10 實作為平板網頁 UI——rosbridge＋自含網頁，`enable_hmi:=true` 啟用，屬待實機驗證）
 
 ## Architecture
 
