@@ -20,6 +20,8 @@
   <exec_depend>wheeltec_mic_ros2</exec_depend>
   <exec_depend>ollama_ros_chat</exec_depend>
   <exec_depend>topic_tools</exec_depend>
+  <!-- 瀏覽器即時影像串流（apt: ros-jazzy-web-video-server），enable_web_video:=true 啟用 -->
+  <exec_depend>web_video_server</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

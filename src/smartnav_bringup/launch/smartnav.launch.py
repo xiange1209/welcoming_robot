@@ -6,6 +6,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
@@ -26,6 +27,8 @@ def generate_launch_description():
     enable_navigation = LaunchConfiguration("enable_navigation")
     enable_nav2 = LaunchConfiguration("enable_nav2")
     enable_chassis = LaunchConfiguration("enable_chassis")
+    enable_web_video = LaunchConfiguration("enable_web_video")
+    web_video_port = LaunchConfiguration("web_video_port")
     audio_stack = LaunchConfiguration("audio_stack")
     llm_stack = LaunchConfiguration("llm_stack")
 
@@ -70,6 +73,12 @@ def generate_launch_description():
                     "不要與 enable_navigation 的 TurtleBot3 流程同時開）"
                 ),
             ),
+            DeclareLaunchArgument(
+                "enable_web_video",
+                default_value="false",
+                description="是否啟動 web_video_server（瀏覽器看影像：http://<機器人IP>:<port>/stream?topic=/image_raw）",
+            ),
+            DeclareLaunchArgument("web_video_port", default_value="8080", description="web_video_server 的 HTTP 埠"),
             DeclareLaunchArgument(
                 "audio_stack",
                 default_value="smartnav",
@@ -193,6 +202,15 @@ def generate_launch_description():
                 name="ollama_chat_bridge_node",
                 output="screen",
                 condition=llm_wheeltec,
+            ),
+            # ── web_video_server：瀏覽器即時看影像話題（apt 二進位；預設關閉）──
+            Node(
+                package="web_video_server",
+                executable="web_video_server",
+                name="web_video_server",
+                output="screen",
+                condition=IfCondition(enable_web_video),
+                parameters=[{"port": ParameterValue(web_video_port, value_type=int)}],
             ),
             # ── WHEELTEC 實體底盤驅動（odom/TF/cmd_vel；預設關閉）────────
             IncludeLaunchDescription(
