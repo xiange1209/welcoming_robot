@@ -90,6 +90,8 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
+RPi4 免編譯替代：x86 機器上 QEMU 容器交叉建置 arm64 產物再搬 install/（`scripts/build_arm64.sh`，步驟見 `docs/部署與重現指南.md` 路線 D）。
+
 ### 統一啟動（RPi4）
 
 ```bash
