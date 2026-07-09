@@ -78,6 +78,7 @@ add_executable(lslidar_driver_node src/lslidar_driver_node.cpp)
 target_link_libraries(lslidar_driver_node
   lslidar_driver
   ${Boost_LIBRARIES}
+  ${PCL_LIBRARIES}
 )
 
 ament_target_dependencies(lslidar_driver_node
