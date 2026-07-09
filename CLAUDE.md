@@ -30,10 +30,10 @@
 **已驗證**：
 - RPi4 上 InsightFace buffalo_sc 即時人臉檢測 15+ FPS（於舊架構驗證，引擎與 ROS 2 版相同）
 - 筆電 LLM 延遲基準（`scripts/benchmark_llm_models.py`，摘要見下；明細與解讀在 `docs/架構參考.md`）
-- 全 workspace `colcon build` 於 x86-64 Jazzy 虛擬機通過（2026-07-08，24/24 套件＋launch smoke test；4 類 Jazzy/gcc-13 修正見 commit `c23ffbf`+`fab0db1`；例外：`wheeltec_mic_ros2` 綁 arm64 預編譯庫，x86 需 `--packages-skip`）
+- 全 workspace `colcon build`：x86-64 Jazzy VM 24/24（2026-07-08，含 launch smoke test；Jazzy/gcc-13 修正 commit `c23ffbf`+`fab0db1`）＋ **arm64 QEMU 容器 25/25 含 wheeltec_mic_ros2**（2026-07-09，執行檔驗證為 aarch64；產物搬 RPi4 即用，見部署指南路線 D）
 
 **已實作、待實機驗證**：
-- RPi4（arm64）實機 `colcon build` 與運行——x86 VM 建置通過不等於 ARM 通過（見 docs/驗證與實作清單.md B11 (1b)）
+- RPi4 實機運行（arm64 產物已建好，首次啟動驗證見 docs/驗證與實作清單.md B11 (1c)）
 - vision → LLM 橋接（`/user_text`）、bringup 統一啟動、audio、navigation 的實際運行皆屬此類
 - WHEELTEC 硬體鏈（2026-07-06 整合）：底盤、麥克風陣列、astra 相機、雙版本語音/LLM 切換——建置過但從未接硬體
 
