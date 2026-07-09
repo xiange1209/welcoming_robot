@@ -142,4 +142,4 @@ Windows（Claude Code 修改程式）→ git push 或 scp 到 RPi4 → RPi4 `col
 
 ## 參考檔案
 
-各套件節點/話題/服務/參數、Key Files 對照表、LLM 實測明細、指令大全 → `docs/架構參考.md`。部署步驟 → `docs/部署與重現指南.md`。驗證狀態與待辦 → `docs/驗證與實作清單.md`。
+各套件節點/話題/服務/參數、Key Files 對照表、LLM 實測明細、指令大全 → `docs/架構參考.md`。部署步驟 → `docs/部署與重現指南.md`。驗證狀態與待辦 → `docs/驗證與實作清單.md`。STM32 韌體/串口協議/car_mode 對應/阿克曼導航差異 → `docs/底盤與韌體分析.md`。
