@@ -68,8 +68,13 @@ src/wheeltec.zip
 # 審計工作檔（暫存）
 wheeltec_audit_full.json
 
-# Claude Code 個人設定不進 git
-.claude/settings.local.json
+# Claude Code 本地檔案（制度手冊與個人設定）不進 GitHub——2026-07-09 使用者決定
+.claude/
+
+# 專案根目錄的個人文件（課程報告等）不進 git；套件內的廠商文件不受此限
+/*.pdf
+/*.pptx
+/*.docx
 
 # OS
 .DS_Store
