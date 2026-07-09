@@ -1,7 +1,0 @@
-# 全域定位服務
-
----
-geometry_msgs/Pose pose
-bool success                    # 是否成功
-string message                  # 訊息 (成功或錯誤描述)
----
