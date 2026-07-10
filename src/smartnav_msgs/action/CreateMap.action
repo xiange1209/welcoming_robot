@@ -1,8 +1,0 @@
-# 建立地圖服務
-
-string map_name                 # 地圖名稱
----
-MapInfo map_info
-bool success                    # 是否成功
-string message                  # 訊息 (成功或錯誤描述)
----
