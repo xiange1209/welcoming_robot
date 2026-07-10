@@ -32,11 +32,11 @@
 - RPi4 上 InsightFace buffalo_sc 即時人臉檢測 15+ FPS（於舊架構驗證，引擎與 ROS 2 版相同）
 - 筆電 LLM 延遲基準（`scripts/benchmark_llm_models.py`，摘要見下；明細與解讀在 `docs/架構參考.md`）
 - 全 workspace `colcon build`：x86-64 Jazzy VM 24/24（2026-07-08，含 launch smoke test；Jazzy/gcc-13 修正 commit `0039541`+`6186c3a`）＋ **arm64 QEMU 容器 25/25 含 wheeltec_mic_ros2**（2026-07-09，執行檔驗證為 aarch64；產物搬 RPi4 即用，見部署指南路線 D）
+- **RPi4 實機首次啟動**（2026-07-10，真實 RPi4B 4GB `wheeltec-r680`）：arm64 產物解壓即用，8 個 smartnav 套件可見，HMI（rosbridge :9090＋網頁 :8081 HTTP 200）與 web_video_server 實跑通過；workspace 在 Pi 的 `~/smartnav_ws`，細節見 B11 (1c)
 
 **已實作、待實機驗證**：
-- RPi4 實機運行（arm64 產物已建好，首次啟動驗證見 docs/驗證與實作清單.md B11 (1c)）
-- vision → LLM 橋接（`/user_text`）、bringup 統一啟動、audio、navigation 的實際運行皆屬此類
-- WHEELTEC 硬體鏈（2026-07-06 整合）：底盤、麥克風陣列、astra 相機、雙版本語音/LLM 切換——建置過但從未接硬體
+- vision → LLM 橋接（`/user_text`）、bringup 統一啟動、audio、navigation 的實際運行皆屬此類（vision/audio 的 pip 依賴尚未裝在 Pi 上）
+- WHEELTEC 硬體鏈（2026-07-06 整合）：底盤、麥克風陣列、astra 相機、雙版本語音/LLM 切換——建置過但硬體未上電測過（2026-07-10 檢查 Pi 無任何 ttyUSB/ttyACM 裝置）
 
 **未實作**：
 - 銀行場景 LLM 工具（帶 VIP 到貴賓室、通報行員）— 目前工具集全為導航導向
