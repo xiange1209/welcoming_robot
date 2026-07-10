@@ -66,9 +66,9 @@
 
 ## 目前程式碼實際支援的點（smartnav_llm ROS 2 節點）
 
-LLM 已改為 ROS 2 節點架構（`src/smartnav_llm/`），舊的 FastAPI server（src/llm_server/）已刪除。
+LLM 已改為 ROS 2 節點架構（`smartnav-bot/src/smartnav_llm/`），舊的 FastAPI server（src/llm_server/）已刪除。
 
-- `src/smartnav_llm/smartnav_llm/llm_service_node.py`：LangChain + Ollama（`ChatOllama`）的對話式 Agent 節點。
+- `smartnav-bot/src/smartnav_llm/smartnav_llm/llm_service_node.py`：LangChain + Ollama（`ChatOllama`）的對話式 Agent 節點。
 - 訂閱 `/user_text`（std_msgs/String）作為使用者輸入；回應發布到 `llm_response`，逐 token 串流發布到 `llm_stream`，斷句後的語音文字發布到 `speech_text`。
 - 參數：`ollama_base_url`（預設 `http://localhost:11434`）、`model_name`（預設 `gemma4:e2b`）、`temperature`（預設 0.0）。
 - 雙機部署：RPi4 上啟動時以 `ollama_base_url:=http://<筆電IP>:11434` 指向筆電的 Ollama，並可同時覆寫模型：

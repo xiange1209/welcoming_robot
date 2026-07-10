@@ -1,0 +1,76 @@
+==========================================================
+ 智慧銀行迎賓機器人 常用指令（虛擬機交叉編譯版，RPi4 免編譯）
+ 適用：x86 Ubuntu 虛擬機負責編譯 → RPi4 只執行
+ 原理：QEMU 模擬 arm64 容器內編譯，產物與 RPi4 原生等效
+ （細節見 docs/部署與重現指南.md 路線 D）
+==========================================================
+
+■ 虛擬機端（x86 Ubuntu，只做編譯）
+
+V1. 一次性環境
+----------------------------------------------------------
+sudo apt install -y docker.io qemu-user-static binfmt-support
+sudo docker run --rm --platform linux/arm64 ros:jazzy uname -m   # 應輸出 aarch64
+
+V2. 取得程式碼
+----------------------------------------------------------
+git clone --recursive https://github.com/xiange1209/welcoming_robot.git ~/arm64_ws
+cd ~/arm64_ws
+mkdir -p src/wheeltec_robot_urdf/meshes    # meshes 不在 git，佔位即可編譯
+cp scripts/build_arm64.sh ~/arm64_ws/
+# 之後更新：git pull && git submodule update --init --recursive
+
+V3. 全量編譯（第一次，QEMU 下約 1.5~3 小時；中斷可續跑）
+----------------------------------------------------------
+sudo docker run -d --name smartnav_arm64_build --platform linux/arm64 \
+  -v ~/arm64_ws:/ws ros:jazzy bash /ws/build_arm64.sh
+sudo docker logs -f smartnav_arm64_build      # 看進度（Ctrl-C 離開不中斷編譯）
+sudo docker start smartnav_arm64_build        # 斷電/中斷後續跑（已完成套件不重編）
+# 完成標誌：log 出現 ARM64_BUILD_DONE，產物 ~/arm64_ws/smartnav_arm64_install.tar.gz
+
+V4. 日常增量編譯（改完程式後，這才是常用路徑）
+----------------------------------------------------------
+sudo docker run --rm --platform linux/arm64 -v ~/arm64_ws:/ws ros:jazzy bash -c \
+  "source /opt/ros/jazzy/setup.bash && cd /ws && colcon build --packages-select smartnav_llm"
+cd ~/arm64_ws && tar czf smartnav_arm64_install.tar.gz install
+
+V5. 傳到 RPi4
+----------------------------------------------------------
+scp ~/arm64_ws/smartnav_arm64_install.tar.gz <帳號>@<RPi4-IP>:~/smartnav_ws/
+
+■ RPi4 端（只執行，永不編譯）
+
+P1. 一次性：取得原始碼（rosdep 解執行依賴要用）＋udev
+----------------------------------------------------------
+git clone --recursive https://github.com/xiange1209/welcoming_robot.git ~/smartnav_ws
+cd ~/smartnav_ws
+sudo rosdep init; rosdep update
+rosdep install --from-paths src smartnav-bot/src --ignore-src -r -y   # 只裝依賴不編譯
+sudo apt install ros-jazzy-web-video-server ros-jazzy-rosbridge-server \
+  ros-jazzy-teleop-twist-keyboard libuvc-dev libgoogle-glog-dev
+sudo bash src/turn_on_wheeltec_robot/wheeltec_udev.sh   # 跑完重插 USB
+pip install openai --break-system-packages              # llm_stack:=wheeltec 用
+
+P2. 部署新產物（每次收到壓縮包後）
+----------------------------------------------------------
+cd ~/smartnav_ws && tar xzf smartnav_arm64_install.tar.gz
+source /opt/ros/jazzy/setup.bash && source install/setup.bash
+# 注意：此 install/ 非 symlink 版，改 src/ 不會生效——改程式回到 V4 重編再傳
+
+P3. 執行（與自編版完全相同）
+----------------------------------------------------------
+# 統一啟動（視覺+LLM+底盤+平板HMI）：
+ros2 launch smartnav_bringup smartnav.launch.py \
+  ollama_base_url:=http://<筆電IP>:11434 model_name:=qwen2.5:3b enable_gpu:=false \
+  enable_chassis:=true enable_navigation:=false enable_hmi:=true enable_web_video:=true
+# 建圖/導航（wheeltec 官方鏈，自帶底盤）：
+ros2 launch wheeltec_slam_toolbox online_async_launch.py
+ros2 launch wheeltec_nav2 save_map.launch.py
+ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py
+# 其餘（人臉註冊、topic 觀察、疑難排解）同「常用指令_樹莓派自編版.txt」第 8、9 節
+
+■ 兩版怎麼選
+----------------------------------------------------------
+- 只改 Python/設定、要快速迭代 → 虛擬機版 V4 增量（數十秒）+scp
+- 沒有 x86 電腦在手邊 → 樹莓派自編版（第一次慢，之後增量也快）
+- 兩版可混用：同一份 git，RPi4 上重編單一套件覆蓋壓縮包版本也行

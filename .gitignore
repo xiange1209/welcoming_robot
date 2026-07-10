@@ -53,7 +53,7 @@ logs/
 install/
 log/
 
-# 廠商原始碼素材庫（本地參考用，不進 git；精選子集在 src/wheeltec/）
+# 廠商原始碼素材庫（本地參考用，不進 git；精選子集在 src/）
 wheeltec_ros2_src_20260518/
 樹5_wheeltec_ros2_src_20260518/
 F103RCT6_阿克曼_移動機器人STM32源碼/
@@ -63,9 +63,9 @@ F103RCT6_阿克曼_移動機器人STM32源碼/
 
 # 大型網格/暫存檔不進 git（部署用 scp 補齊，見 docs/部署與重現指南.md）
 # meshes 只擋內容、保留 .gitkeep 佔位（CMake install(DIRECTORY) 需要目錄存在）
-src/wheeltec/wheeltec_robot_urdf/meshes/*
-!src/wheeltec/wheeltec_robot_urdf/meshes/.gitkeep
-src/wheeltec/wheeltec_mic_ros2/tmp/
+src/wheeltec_robot_urdf/meshes/*
+!src/wheeltec_robot_urdf/meshes/.gitkeep
+src/wheeltec_mic_ros2/tmp/
 
 # 使用者的本地備份壓縮檔
 src/wheeltec.zip
