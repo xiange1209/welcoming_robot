@@ -1,7 +1,0 @@
-# 導航動作
-
-string waypoint_id
----
-bool success                    # 是否成功
-string message                  # 訊息
----

@@ -1,7 +1,0 @@
-# 查詢地點服務
-
-string waypoint_id
----
-WaypointInfo waypoint_info
-bool success                    # 是否成功
-string message                  # 訊息 (成功或錯誤描述)
