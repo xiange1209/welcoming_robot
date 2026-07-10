@@ -158,12 +158,15 @@ sudo apt install ros-jazzy-desktop python3-colcon-common-extensions python3-rosd
 
 ```bash
 cd ~
-git clone --recursive https://github.com/xiange1209/welcoming_robot.git smartnav_ws
+git clone https://github.com/xiange1209/welcoming_robot.git smartnav_ws
 cd smartnav_ws
 ```
 
-> ⚠️ **一定要加 `--recursive`**：自有 smartnav 套件由子模組 `smartnav-bot/` 提供（其內部又以子模組帶
-> frontier_exploration_ros2）。已 clone 過的工作區補：`git submodule update --init --recursive`。
+> ⚠️ **frontier_exploration_ros2 需另外 clone**（自動探索建圖用）：
+>
+> ```bash
+> git clone https://github.com/mertgulerx/frontier_exploration_ros2 smartnav-bot/src/frontier_exploration_ros2
+> ```
 
 ### 3. 安裝依賴
 

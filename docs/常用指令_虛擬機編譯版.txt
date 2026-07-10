@@ -14,11 +14,12 @@ sudo docker run --rm --platform linux/arm64 ros:jazzy uname -m   # 應輸出 aar
 
 V2. 取得程式碼
 ----------------------------------------------------------
-git clone --recursive https://github.com/xiange1209/welcoming_robot.git ~/arm64_ws
+git clone https://github.com/xiange1209/welcoming_robot.git ~/arm64_ws
 cd ~/arm64_ws
+git clone https://github.com/mertgulerx/frontier_exploration_ros2 smartnav-bot/src/frontier_exploration_ros2
 mkdir -p src/wheeltec_robot_urdf/meshes    # meshes 不在 git，佔位即可編譯
 cp scripts/build_arm64.sh ~/arm64_ws/
-# 之後更新：git pull && git submodule update --init --recursive
+# 之後更新：git pull
 
 V3. 全量編譯（第一次，QEMU 下約 1.5~3 小時；中斷可續跑）
 ----------------------------------------------------------
@@ -42,8 +43,9 @@ scp ~/arm64_ws/smartnav_arm64_install.tar.gz <帳號>@<RPi4-IP>:~/smartnav_ws/
 
 P1. 一次性：取得原始碼（rosdep 解執行依賴要用）＋udev
 ----------------------------------------------------------
-git clone --recursive https://github.com/xiange1209/welcoming_robot.git ~/smartnav_ws
+git clone https://github.com/xiange1209/welcoming_robot.git ~/smartnav_ws
 cd ~/smartnav_ws
+git clone https://github.com/mertgulerx/frontier_exploration_ros2 smartnav-bot/src/frontier_exploration_ros2
 sudo rosdep init; rosdep update
 rosdep install --from-paths src smartnav-bot/src --ignore-src -r -y   # 只裝依賴不編譯
 sudo apt install ros-jazzy-web-video-server ros-jazzy-rosbridge-server \

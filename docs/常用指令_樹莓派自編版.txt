@@ -12,10 +12,12 @@ source ~/smartnav_ws/install/setup.bash
 
 1. 取得程式碼（第一次）
 ----------------------------------------------------------
-git clone --recursive https://github.com/xiange1209/welcoming_robot.git ~/smartnav_ws
+git clone https://github.com/xiange1209/welcoming_robot.git ~/smartnav_ws
 cd ~/smartnav_ws
+# 自動探索建圖需另 clone（一次性）：
+git clone https://github.com/mertgulerx/frontier_exploration_ros2 smartnav-bot/src/frontier_exploration_ros2
 # 之後更新：
-git pull && git submodule update --init --recursive
+git pull
 
 2. 全量編譯（第一次，約 1~2 小時；RPi4 記憶體有限務必限制平行度）
 ----------------------------------------------------------
