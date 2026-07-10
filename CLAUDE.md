@@ -20,10 +20,11 @@
 **智慧銀行 VIP 迎賓與安全通報系統** — 以同學的 ROS 2 專案 [swient/smartnav-bot](https://github.com/swient/smartnav-bot) 為主體，整合人臉辨識（InsightFace）、語音（sherpa-onnx）、LLM 對話 Agent（LangChain + Ollama）與 Nav2 導航的雙機系統。
 
 **關鍵約束**：
-- **RPi4（8GB RAM, Ubuntu 24.04, ROS 2 Jazzy）**：跑 vision / audio / navigation / bringup；機器人本體為 **WHEELTEC 底盤**（2026-07-06 起，driver 在 `src/wheeltec/`；TurtleBot3 流程保留於 `smartnav_navigation` 供模擬）
+- **RPi4（8GB RAM, Ubuntu 24.04, ROS 2 Jazzy）**：跑 vision / audio / navigation / bringup；機器人本體為 **WHEELTEC 底盤**（2026-07-06 起，driver 在 `src/`；TurtleBot3 流程保留於 `smartnav_navigation` 供模擬）
 - **Windows 筆電（RTX 3050 4GB VRAM）**：跑 Ollama；RPi4 的 `smartnav_llm` 透過 `ollama_base_url` 連到筆電
 - 2026-07-02 專案重組：**舊的單機 Python 原型已全部刪除**（`src/ai_vision/`、`src/database/`、`src/llm_server/`、`src/scripts/`、`config/inference_config.yaml`、`setup_rpi4_quick.sh` 等皆不存在，不可再引用）
-- 2026-07-06 WHEELTEC 整合：廠商原始碼（Humble 世代，97 套件）精選 **17 套件**修正後放入 `src/wheeltec/`；原始壓縮包內容在 `wheeltec_ros2_src_20260518/`（已 gitignore，僅本地素材庫，不可直接 build——內含會撞 Jazzy 的 navigation2-humble）
+- 2026-07-06 WHEELTEC 整合：廠商原始碼（Humble 世代，97 套件）精選 **17 套件**修正後放入 `src/`；原始壓縮包內容在 `樹5_wheeltec_ros2_src_20260518/`（已 gitignore，僅本地素材庫，不可直接 build——內含會撞 Jazzy 的 navigation2-humble）
+- 2026-07-10 結構重組（swient 主導）：**自有 smartnav 套件改由子模組 `smartnav-bot/` 提供**（swient/smartnav-bot），clone 必須 `--recursive`。子模組釘在 `xiange/verified-integration` 分支（我們的已驗證整合版：雙版本 bringup＋橋接＋HMI）；swient 的 vision/brain 重設計（face_embedding＋user_auth）在他的 master，**尚未合併**——動 smartnav 程式前先確認釘點。
 
 ## 目前狀態（2026-07-02 起，異動時更新本節）
 
@@ -44,12 +45,12 @@
 ## Architecture
 
 **結構總覽**（完整樹狀圖、各套件節點/話題/參數細節 → `docs/架構參考.md`）：
-`src/` 下 8 個自有 ROS 2 套件——`smartnav_msgs`（介面定義）、`smartnav_vision`（人臉辨識）、`smartnav_audio`（語音）、`smartnav_llm`（LLM Agent＋`ollama_chat_bridge`）、`smartnav_navigation`（地圖/導航，TB3/模擬）、`smartnav_brain`／`smartnav_hmi`（空殼預留）、`smartnav_bringup`（統一啟動）；`src/wheeltec/` 下 17 個廠商套件（底盤 `turn_on_wheeltec_robot`、URDF、serial、雷達 ldlidar/lslidar、相機 astra、麥克風陣列 `wheeltec_mic_ros2`、導航參數 `wheeltec_robot_nav2`、slam 封裝、巡邏 `nav2_waypoint_cycle`、`ollama_ros_chat` 等）。
+`smartnav-bot/src/`（子模組）8 個自有 ROS 2 套件——`smartnav_msgs`（介面定義）、`smartnav_vision`（人臉辨識）、`smartnav_audio`（語音）、`smartnav_llm`（LLM Agent＋`ollama_chat_bridge`）、`smartnav_navigation`（地圖/導航，TB3/模擬）、`smartnav_brain`（空殼）、`smartnav_hmi`（平板網頁 UI）、`smartnav_bringup`（統一啟動）；`src/` 下 17 個廠商套件（底盤 `turn_on_wheeltec_robot`、URDF、serial、雷達 ldlidar/lslidar、相機 astra、麥克風陣列 `wheeltec_mic_ros2`、導航參數 `wheeltec_robot_nav2`、slam 封裝、巡邏 `nav2_waypoint_cycle`、`ollama_ros_chat` 等）。colcon 從 repo 根建置會同時掃到兩處。
 
 **雙版本可選方案**（bringup launch 參數選擇，重疊功能各保留兩版）：
 - 語音：`audio_stack:=smartnav`（sherpa-onnx 自由語句，預設）｜`wheeltec`（麥克風陣列＋本地離線命令詞，免金鑰；`voice_words` 經 topic_tools relay 轉 `/user_text`）
 - LLM：`llm_stack:=smartnav`（LangChain Agent 含導航工具，預設）｜`wheeltec`（`ollama_ros_chat` 單輪對話，經 `ollama_chat_bridge` 接 `/user_text` 與 `/speech_text`）
-- 底盤：`enable_chassis:=true` 啟動 WHEELTEC 驅動（車型改 `src/wheeltec/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`）
+- 底盤：`enable_chassis:=true` 啟動 WHEELTEC 驅動（車型改 `src/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`）
 
 ### 雙機通訊
 
@@ -85,7 +86,8 @@ qwen2.5:3b 最快（TTFT 2.2 秒/總 3.1 秒）、gemma3:4b 次之（2.3/4.7 秒
 ### 建置（RPi4）
 
 ```bash
-cd ~/smartnav-bot          # workspace 根目錄（含 src/）
+git clone --recursive https://github.com/xiange1209/welcoming_robot.git ~/smartnav_ws
+cd ~/smartnav_ws           # repo 根即 workspace 根（src/ ＋ smartnav-bot/src/）
 colcon build --symlink-install
 source install/setup.bash
 ```
@@ -130,7 +132,7 @@ Windows（Claude Code 修改程式）→ git push 或 scp 到 RPi4 → RPi4 `col
 ## 已知限制與注意事項
 
 1. **LLM 沒有銀行場景工具**：工具集全為導航導向；`system_prompt.txt` 是導航設定。人臉事件進 `/user_text` 後只會被當一般對話處理。這是後續開發重點。
-2. **frontier_exploration_ros2 需手動 clone**：`brain.launch.py` 依賴它；`git clone https://github.com/mertgulerx/frontier_exploration_ros2` 到 `src/`。
+2. **frontier_exploration_ros2 是子模組的子模組**：`git clone --recursive` 會一併帶下；已 clone 的舊工作區補 `git submodule update --init --recursive`。
 3. **gemma4 在 4GB VRAM 不可行**：實測 CPU 卸載、首次輸出 42~95 秒。即時互動用 `qwen2.5:3b` 或 `gemma3:4b`。
 4. **Windows 上用 `python` 不要用 `python3`**：後者是 Microsoft Store 空殼。
 5. **ROS 2 workspace 未經實機驗證**：改動時不要假設既有行為已通過測試；文件需誠實區分「已驗證」與「已實作待驗證」。
@@ -142,4 +144,4 @@ Windows（Claude Code 修改程式）→ git push 或 scp 到 RPi4 → RPi4 `col
 
 ## 參考檔案
 
-各套件節點/話題/服務/參數、Key Files 對照表、LLM 實測明細、指令大全 → `docs/架構參考.md`。部署步驟 → `docs/部署與重現指南.md`。驗證狀態與待辦 → `docs/驗證與實作清單.md`。STM32 韌體/串口協議/car_mode 對應/阿克曼導航差異 → `docs/底盤與韌體分析.md`。
+各套件節點/話題/服務/參數、Key Files 對照表、LLM 實測明細、指令大全 → `docs/架構參考.md`。部署步驟 → `docs/部署與重現指南.md`。驗證狀態與待辦 → `docs/驗證與實作清單.md`。STM32 韌體/串口協議/car_mode 對應/阿克曼導航差異 → `docs/底盤與韌體分析.md`。組員抄指令 → `docs/常用指令_樹莓派自編版.txt`＋`docs/常用指令_虛擬機編譯版.txt`。

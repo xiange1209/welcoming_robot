@@ -106,15 +106,15 @@ smartnav_llm Agent（LangChain + Ollama）
 
 | 套件 | 類型 | 功能 |
 | --- | --- | --- |
-| [`smartnav_msgs`](src/smartnav_msgs/) | ament_cmake | 訊息/服務/動作定義。本專案擴充：`RecognitionResult.msg`（person_uuid / person_name / gender / person_type / confidence / timestamp / bbox）、`RegisterFace.srv`（含 gender、person_type）；另有 `AudioData.msg`、`MapInfo.msg`、`WaypointInfo.msg`、地圖/地點服務與 `CreateMap` / `GlobalLocalization` / `Navigate` 動作 |
-| [`smartnav_vision`](src/smartnav_vision/) | ament_python | 人臉辨識核心。節點：`face_recognition_node`（即時辨識）、`face_registration_node`（線上註冊）、`recognition_text_bridge_node`（辨識結果轉文字）。模組：`face_engine.py`（InsightFace 封裝 + 顏色框）、`database_manager.py`、`face_utils.py` |
-| [`smartnav_audio`](src/smartnav_audio/) | ament_python | sherpa-onnx 語音管線。節點：`voice_trigger`（KWS 喚醒 + VAD）、`speech_recognizer`（ASR）、`speech_synthesizer`（TTS）、`voice_playback`（播放） |
-| [`smartnav_llm`](src/smartnav_llm/) | ament_python | LangChain + Ollama 對話式 Agent（`llm_service_node`），工具集：create_map / list_maps / switch_map / create_waypoint / list_waypoints / navigate / global_localization。含 `launch/llm.launch.py`、`config/system_prompt.txt` |
-| [`smartnav_navigation`](src/smartnav_navigation/) | ament_python | 地圖/地點/導航（2026-07-01 由原 smartnav_brain 重構拆出）。節點：`map_service_node`、`waypoint_service_node`、`navigation_action_node`。Launch：`brain.launch.py`（三節點 + AMCL + slam_toolbox + frontier_explorer + map_server）、`nav2.launch.py`（完整 Nav2 棧 + RViz）。設定：`config/burger.yaml`、`config/empty_map` |
-| [`smartnav_brain`](src/smartnav_brain/) | ament_python | 空殼套件，保留給未來 orchestrator / 多模態決策（如黑名單通報策略） |
-| [`smartnav_hmi`](src/smartnav_hmi/) | ament_python | 空殼套件，保留給未來人機介面 |
-| [`smartnav_bringup`](src/smartnav_bringup/) | ament_cmake | 統一啟動。`launch/smartnav.launch.py` 一次啟動 vision + audio + llm + navigation（＋可選 WHEELTEC 底盤與雙版本方案，見下） |
-| [`src/wheeltec/`](src/wheeltec/) | 混合（17 套件） | WHEELTEC 廠商套件精選子集（2026-07-06 整合，Jazzy 修正後）：底盤驅動、URDF、雷達/相機驅動、各車型 Nav2 參數、麥克風陣列、輕量 Ollama 對話。細節與捨棄清單 → [`docs/架構參考.md`](docs/架構參考.md) |
+| [`smartnav_msgs`](smartnav-bot/src/smartnav_msgs/) | ament_cmake | 訊息/服務/動作定義。本專案擴充：`RecognitionResult.msg`（person_uuid / person_name / gender / person_type / confidence / timestamp / bbox）、`RegisterFace.srv`（含 gender、person_type）；另有 `AudioData.msg`、`MapInfo.msg`、`WaypointInfo.msg`、地圖/地點服務與 `CreateMap` / `GlobalLocalization` / `Navigate` 動作 |
+| [`smartnav_vision`](smartnav-bot/src/smartnav_vision/) | ament_python | 人臉辨識核心。節點：`face_recognition_node`（即時辨識）、`face_registration_node`（線上註冊）、`recognition_text_bridge_node`（辨識結果轉文字）。模組：`face_engine.py`（InsightFace 封裝 + 顏色框）、`database_manager.py`、`face_utils.py` |
+| [`smartnav_audio`](smartnav-bot/src/smartnav_audio/) | ament_python | sherpa-onnx 語音管線。節點：`voice_trigger`（KWS 喚醒 + VAD）、`speech_recognizer`（ASR）、`speech_synthesizer`（TTS）、`voice_playback`（播放） |
+| [`smartnav_llm`](smartnav-bot/src/smartnav_llm/) | ament_python | LangChain + Ollama 對話式 Agent（`llm_service_node`），工具集：create_map / list_maps / switch_map / create_waypoint / list_waypoints / navigate / global_localization。含 `launch/llm.launch.py`、`config/system_prompt.txt` |
+| [`smartnav_navigation`](smartnav-bot/src/smartnav_navigation/) | ament_python | 地圖/地點/導航（2026-07-01 由原 smartnav_brain 重構拆出）。節點：`map_service_node`、`waypoint_service_node`、`navigation_action_node`。Launch：`brain.launch.py`（三節點 + AMCL + slam_toolbox + frontier_explorer + map_server）、`nav2.launch.py`（完整 Nav2 棧 + RViz）。設定：`config/burger.yaml`、`config/empty_map` |
+| [`smartnav_brain`](smartnav-bot/src/smartnav_brain/) | ament_python | 空殼套件，保留給未來 orchestrator / 多模態決策（如黑名單通報策略） |
+| [`smartnav_hmi`](smartnav-bot/src/smartnav_hmi/) | ament_python | 平板網頁 HMI（2026-07-10）：rosbridge websocket＋自含網頁，顯示辨識結果/對話/相機串流，`enable_hmi:=true` 啟用 |
+| [`smartnav_bringup`](smartnav-bot/src/smartnav_bringup/) | ament_cmake | 統一啟動。`launch/smartnav.launch.py` 一次啟動 vision + audio + llm + navigation（＋可選 WHEELTEC 底盤與雙版本方案，見下） |
+| [`src/`](src/) | 混合（17 套件） | WHEELTEC 廠商套件精選子集（2026-07-06 整合，Jazzy 修正後）：底盤驅動、URDF、雷達/相機驅動、各車型 Nav2 參數、麥克風陣列、輕量 Ollama 對話。細節與捨棄清單 → [`docs/架構參考.md`](docs/架構參考.md) |
 
 工作區以外的輔助檔案：
 
@@ -158,17 +158,12 @@ sudo apt install ros-jazzy-desktop python3-colcon-common-extensions python3-rosd
 
 ```bash
 cd ~
-git clone https://github.com/xiange1209/welcoming_robot.git smartnav_ws
+git clone --recursive https://github.com/xiange1209/welcoming_robot.git smartnav_ws
 cd smartnav_ws
 ```
 
-> ⚠️ **frontier_exploration_ros2 需另外 clone**：`brain.launch.py` 的自動探索建圖依賴
-> [mertgulerx/frontier_exploration_ros2](https://github.com/mertgulerx/frontier_exploration_ros2)。
-> 同學的 repo 以 git submodule 引入，本 repo 尚未加入 submodule，請手動：
->
-> ```bash
-> git clone https://github.com/mertgulerx/frontier_exploration_ros2 src/frontier_exploration_ros2
-> ```
+> ⚠️ **一定要加 `--recursive`**：自有 smartnav 套件由子模組 `smartnav-bot/` 提供（其內部又以子模組帶
+> frontier_exploration_ros2）。已 clone 過的工作區補：`git submodule update --init --recursive`。
 
 ### 3. 安裝依賴
 
@@ -237,7 +232,7 @@ ros2 launch smartnav_bringup smartnav.launch.py \
 | `use_sim_time` | `false` | 是否使用模擬時間（Gazebo） |
 | `enable_vision` / `enable_audio` / `enable_llm` / `enable_navigation` | `true` | 各模組開關，硬體未就緒可個別關閉 |
 | `enable_nav2` | `false` | 是否啟動完整 Nav2 棧 + RViz（需 TurtleBot3 或模擬環境） |
-| `enable_chassis` | `false` | WHEELTEC 實體底盤驅動（車型先改 `src/wheeltec/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`） |
+| `enable_chassis` | `false` | WHEELTEC 實體底盤驅動（車型先改 `src/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`） |
 | `audio_stack` | `smartnav` | 語音方案：`smartnav`（sherpa-onnx 自由語句）／`wheeltec`（麥克風陣列＋離線命令詞，免金鑰但為固定語法） |
 | `llm_stack` | `smartnav` | LLM 方案：`smartnav`（LangChain Agent 含導航工具）／`wheeltec`（ollama_ros_chat 單輪對話，經橋接節點接管線） |
 | `enable_web_video` | `false` | 瀏覽器即時看影像（apt: `ros-jazzy-web-video-server`）：開啟後瀏覽 `http://<機器人IP>:8080/stream?topic=/image_raw` |
