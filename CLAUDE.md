@@ -20,7 +20,7 @@
 **智慧銀行 VIP 迎賓與安全通報系統** — 以同學的 ROS 2 專案 [swient/smartnav-bot](https://github.com/swient/smartnav-bot) 為主體，整合人臉辨識（InsightFace）、語音（sherpa-onnx）、LLM 對話 Agent（LangChain + Ollama）與 Nav2 導航的雙機系統。
 
 **關鍵約束**：
-- **RPi4（8GB RAM, Ubuntu 24.04, ROS 2 Jazzy）**：跑 vision / audio / navigation / bringup；機器人本體為 **WHEELTEC 底盤**（2026-07-06 起，driver 在 `src/`；TurtleBot3 流程保留於 `smartnav_navigation` 供模擬）
+- **RPi4B 4GB 實機 `wheeltec-r680`（Ubuntu 24.04.4, ROS 2 Jazzy，workspace `~/smartnav_ws`，RMW=cyclonedds）**：機器人本體為 **WHEELTEC 底盤** senior_akm（driver 在 `src/`；TB3 流程保留於 `smartnav_navigation` 供模擬）。2026-07-10 使用者定調：**Pi 只跑輕量節點（底盤/感測器/HMI/橋接），重運算（vision/LLM Agent）移往筆電側**——分散式 ROS2 組態未驗證；已驗證組態仍是 Pi 跑全部節點＋筆電只供 Ollama HTTP
 - **Windows 筆電（RTX 3050 4GB VRAM）**：跑 Ollama；RPi4 的 `smartnav_llm` 透過 `ollama_base_url` 連到筆電
 - 2026-07-02 專案重組：**舊的單機 Python 原型已全部刪除**（`src/ai_vision/`、`src/database/`、`src/llm_server/`、`src/scripts/`、`config/inference_config.yaml`、`setup_rpi4_quick.sh` 等皆不存在，不可再引用）
 - 2026-07-06 WHEELTEC 整合：廠商原始碼（Humble 世代，97 套件）精選 **17 套件**修正後放入 `src/`；原始壓縮包內容在 `樹5_wheeltec_ros2_src_20260518/`（已 gitignore，僅本地素材庫，不可直接 build——內含會撞 Jazzy 的 navigation2-humble）
