@@ -5,6 +5,7 @@
 ## ⚡ 每個 session 先讀（30 秒）
 
 **制度手冊在 `.claude/handbook/`**（七份）：harness 診斷 → `01-diagnosis.md`｜派工與模型選擇 → `02-dispatch.md`｜判斷 rubric（何時升級/何時算完成/何時停下問/何時換路）→ `03-judgment.md`｜模板（搜尋/實作/重構/研究/審查/HANDOFF 交接）→ `04-templates.md`｜改手冊的規則 → `05-maintenance.md`｜交接信與未竟事項 → `06-letter.md`｜黃金任務驗收 → `07-benchmark.md`。非 trivial 任務動手前先掃 02 與 03；若存在 `.claude/handbook/HANDOFF.md`，最先讀它。
+**首次接手或不熟這個專案 → 先讀 `docs/AI專案總覽.md`**（全貌/名詞/現況/任務路由表/鐵則，為輕量模型設計的總入口）。使用者說「照 20260720 實作」→ 直接照 `docs/AI實作指南_20260720.md` 執行（自包含單日任務書；SSH 工具在 `.claude/tools/`）。
 **派工授權**：02-dispatch.md 第 1 節「指揮官不下場」是使用者的常設授權（2026-07-03 訂立）——列於該表的工作型態預設派 subagent，此指示覆寫 Agent 工具「僅使用者要求時派工」的預設限制。
 
 **環境速查卡**（每條都是實測踩過的坑，違反必炸）：
@@ -35,12 +36,11 @@
 - **RPi4 實機首次啟動**（2026-07-10，真實 RPi4B 4GB `wheeltec-r680`）：arm64 產物解壓即用，8 個 smartnav 套件可見，HMI（rosbridge :9090＋網頁 :8081 HTTP 200）與 web_video_server 實跑通過；workspace 在 Pi 的 `~/smartnav_ws`，細節見 B11 (1c)
 
 **已實作、待實機驗證**：
+- **銀行場景功能（2026-07-17，commit `1078482`）**：`smartnav_brain/bank_reception_node`（VIP 迎賓/黑名單 Telegram 通報/訪客 SQLite 記錄/冷卻防抖）＋`smartnav_llm/bank_tools.py`（帶位/通報/FAQ 三工具）＋`system_prompt_bank.txt`＋bringup `enable_brain`（預設開）；**尚未部署到 Pi**（未 push；部署包在 scratchpad bank_update.tar），實測手冊→`docs/20260720.md`
 - vision → LLM 橋接（`/user_text`）、bringup 統一啟動、audio、navigation 的實際運行皆屬此類（vision/audio 的 pip 依賴尚未裝在 Pi 上）
-- WHEELTEC 硬體鏈（2026-07-06 整合）：底盤、麥克風陣列、astra 相機、雙版本語音/LLM 切換——建置過但硬體未上電測過（2026-07-10 檢查 Pi 無任何 ttyUSB/ttyACM 裝置）
+- WHEELTEC 硬體鏈（2026-07-06 整合）：底盤、麥克風陣列、astra 相機、雙版本語音/LLM 切換——建置過但硬體未上電測過
 
-**未實作**：
-- 銀行場景 LLM 工具（帶 VIP 到貴賓室、通報行員）— 目前工具集全為導航導向
-- 多模態決策 orchestrator（`smartnav_brain` 為空殼；`smartnav_hmi` 已於 2026-07-10 實作為平板網頁 UI——rosbridge＋自含網頁，`enable_hmi:=true` 啟用，屬待實機驗證）
+**未實作**：巡邏模式整合（`nav2_waypoint_cycle` 現成待接）、活體檢測、HMI 統計頁（Phase C 加分項，見 docs/專題計畫.md 路線圖）
 
 ## Architecture
 

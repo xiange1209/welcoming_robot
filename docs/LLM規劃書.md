@@ -1,6 +1,11 @@
 # 智慧銀行 LLM 規劃書
 
-更新日期：2026-07-02
+更新日期：2026-07-17（增補實驗指向與銀行工具規劃；延遲數據仍為 2026-07-02 實測）
+
+> **2026-07-17 增補**：
+> 1. 「建議的實測欄位」中待測的**工具呼叫成功率**與 GPU/CPU 占用，已正式設計為實驗 E3／E7，方法與記錄表見 `docs/實驗設計_報告數據.md`；端到端延遲為 E6。
+> 2. **銀行場景工具組已排入路線圖 Phase B**（`bank_tools.py`：`guide_to_vip_room`／`notify_staff`／`query_bank_faq`＋銀行版 system prompt），由本 repo 側實作，見 `docs/專題計畫.md` 第五章。
+> 3. **通報機制選型**：LINE Notify 已於 2025-03 終止服務，`notify_staff` 工具的推播後端首選 **Telegram Bot API**（免費、HTTP POST 即可）；備選 Discord webhook、email。
 
 本文件整理目前 repo 內 Qwen2.5、Gemma 3、Gemma 4 的定位、實測延遲結果、現有程式碼支援狀態與後續測試建議。重要原則只有一個：區分已驗證、已配置但未驗證、以及純規劃中的內容，避免把估計值誤當成實測值。
 
