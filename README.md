@@ -7,7 +7,9 @@
 
 基於 **SmartNav**（[swient/smartnav-bot](https://github.com/swient/smartnav-bot)）與 **ROS 2 Jazzy** 的智慧銀行服務機器人專題。本專案與同學的 SmartNav 導航機器人系統協作開發：以 SmartNav 的視覺、語音、LLM、導航框架為主體，加上銀行場景的擴充——VIP / 黑名單 / 訪客三類身分辨識、性別欄位、辨識事件轉自然語言進入 LLM Agent，目標場景為銀行大廳的 VIP 迎賓、訪客引導與黑名單安全通報。
 
-硬體平台：Raspberry Pi 4（8GB）+ TurtleBot3 為感知與行動端，Windows 筆電（RTX 3050 4GB）為 LLM 運算端。
+硬體平台：**WHEELTEC 高配阿克曼實車（senior_akm）**＋Raspberry Pi 4B 4GB 為感知與行動端，Windows 筆電（RTX 3050 4GB）為 LLM 運算端，平板為 HMI 顯示端。（TurtleBot3 流程保留於 `smartnav_navigation` 供模擬。）
+
+> **2026-07-17 起銀行場景功能已實作**：VIP 迎賓劇本、黑名單 Telegram 通報、LLM 銀行工具（帶位/通報/FAQ）、平板 HMI——皆屬「已實作、待實機驗證」。當前狀態速覽 → [`CLAUDE.md`](CLAUDE.md)；下次實作日手冊 → [`docs/20260720.md`](docs/20260720.md)。
 
 ## 📋 目錄
 
@@ -111,7 +113,7 @@ smartnav_llm Agent（LangChain + Ollama）
 | [`smartnav_audio`](smartnav-bot/src/smartnav_audio/) | ament_python | sherpa-onnx 語音管線。節點：`voice_trigger`（KWS 喚醒 + VAD）、`speech_recognizer`（ASR）、`speech_synthesizer`（TTS）、`voice_playback`（播放） |
 | [`smartnav_llm`](smartnav-bot/src/smartnav_llm/) | ament_python | LangChain + Ollama 對話式 Agent（`llm_service_node`），工具集：create_map / list_maps / switch_map / create_waypoint / list_waypoints / navigate / global_localization。含 `launch/llm.launch.py`、`config/system_prompt.txt` |
 | [`smartnav_navigation`](smartnav-bot/src/smartnav_navigation/) | ament_python | 地圖/地點/導航（2026-07-01 由原 smartnav_brain 重構拆出）。節點：`map_service_node`、`waypoint_service_node`、`navigation_action_node`。Launch：`brain.launch.py`（三節點 + AMCL + slam_toolbox + frontier_explorer + map_server）、`nav2.launch.py`（完整 Nav2 棧 + RViz）。設定：`config/burger.yaml`、`config/empty_map` |
-| [`smartnav_brain`](smartnav-bot/src/smartnav_brain/) | ament_python | 空殼套件，保留給未來 orchestrator / 多模態決策（如黑名單通報策略） |
+| [`smartnav_brain`](smartnav-bot/src/smartnav_brain/) | ament_python | **銀行迎賓劇本與通報中樞（2026-07-17 實作）**：`bank_reception_node`——VIP 迎賓語音（冷卻防抖）、黑名單警告＋Telegram 推播、訪客 SQLite 記錄、訂閱 `/staff_notify_request` 統一送通報 |
 | [`smartnav_hmi`](smartnav-bot/src/smartnav_hmi/) | ament_python | 平板網頁 HMI（2026-07-10）：rosbridge websocket＋自含網頁，顯示辨識結果/對話/相機串流，`enable_hmi:=true` 啟用 |
 | [`smartnav_bringup`](smartnav-bot/src/smartnav_bringup/) | ament_cmake | 統一啟動。`launch/smartnav.launch.py` 一次啟動 vision + audio + llm + navigation（＋可選 WHEELTEC 底盤與雙版本方案，見下） |
 | [`src/`](src/) | 混合（17 套件） | WHEELTEC 廠商套件精選子集（2026-07-06 整合，Jazzy 修正後）：底盤驅動、URDF、雷達/相機驅動、各車型 Nav2 參數、麥克風陣列、輕量 Ollama 對話。細節與捨棄清單 → [`docs/架構參考.md`](docs/架構參考.md) |
@@ -403,6 +405,7 @@ ros2 run smartnav_vision face_recognition --ros-args --params-file face_recognit
 | --- | --- |
 | RPi4 即時人臉檢測 | InsightFace buffalo_sc 於 RPi4 實機達 **15+ FPS**（於舊架構驗證；ROS 2 版使用相同引擎與模型） |
 | 筆電 LLM 延遲基準 | 上方實測表格，2026-07-02，`scripts/benchmark_llm_models.py` 全數 100% 成功 |
+| **RPi4 實機首次啟動** | 2026-07-10，真實 RPi4B 4GB（`wheeltec-r680`）：arm64 交叉編譯產物解壓即用，8 套件可見，HMI（rosbridge :9090＋網頁 :8081）與 web_video_server 實跑 HTTP 200 |
 
 ### 已實作、待實機驗證
 
@@ -415,9 +418,8 @@ ros2 run smartnav_vision face_recognition --ros-args --params-file face_recognit
 
 ## ⚠️ 已知限制
 
-- **LLM 工具集全為導航導向**：目前 `smartnav_llm` 只有 create_map / navigate 等導航工具，**沒有銀行場景工具**（如「帶 VIP 到貴賓室」「通報行員」），`config/system_prompt.txt` 也是導航機器人設定。人臉事件進入 `/user_text` 後只會被當成一般對話處理，銀行場景的決策與通報動作是下一階段工作（預計落在 `smartnav_brain`）。
+- **銀行場景功能已實作、待實機驗證**（2026-07-17）：LLM 銀行工具（`bank_tools.py`：帶位/通報/FAQ，預設掛載，`enable_bank_tools:=false` 可關）＋銀行版 system prompt（`system_prompt_bank.txt`，bringup 預設採用）＋迎賓劇本與 Telegram 通報（`smartnav_brain`，`enable_brain` 預設開；通報預設 dry-run，實際推播需 `notify_backend:=telegram` 與 token/chat_id）。實測步驟見 [`docs/20260720.md`](docs/20260720.md)。
 - **frontier_exploration_ros2 未內含**：自動探索建圖需另外 clone（見[安裝與建置](#-安裝與建置)），否則 `brain.launch.py` 的 frontier_explorer 無法啟動。
-- **黑名單通報僅到「事件定位」層**：辨識結果會標示 BLACKLIST 並發布事件，但實際通報管道（LoRa / 訊息推播）尚未實作。
 - **bringup 預設模型不適合本硬體**：`model_name` 預設 `gemma4:e2b`，在 4GB VRAM 筆電上實測極慢，請覆寫為 `qwen2.5:3b`。
 - **兩條導航鏈不可混用**：WHEELTEC 鏈（底盤 EKF、SLAM、Nav2 參數）全程用 `odom_combined` frame，`smartnav_navigation`（TB3/模擬）用 `odom`。實體機建圖/導航用 wheeltec 官方 launch（它們**自帶底盤啟動**，勿與 `enable_chassis:=true` 同開）。
 - **wheeltec 語音是固定命令詞**：`audio_stack:=wheeltec` 的本地離線辨識綁定語法檔，非自由語句；自由對話請用預設 `smartnav` 方案。銀行場景詞彙需重編語法檔。

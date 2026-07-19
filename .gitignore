@@ -80,6 +80,17 @@ wheeltec_audit_full.json
 # Claude Code 本地檔案（制度手冊與個人設定）不進 GitHub——2026-07-09 使用者決定
 .claude/
 
+# 2026-07-17 使用者政策：GitHub 只留程式與正式專題文件；
+# AI 協作文件與操作教學（組員教學另外傳）本機保留、不進 git
+docs/AI*.md
+docs/20260720.md
+docs/測試記錄_*.md
+docs/專題計畫_舊版*.md
+docs/常用指令_*.txt
+docs/編譯教學_*.txt
+docs/實驗室測試日檢核表.txt
+docs/Pi4重灌重建指南.md
+
 # 簡報/文件一律不進 git（2026-07-09 使用者政策：GitHub 上不放 pdf/pptx，含廠商手冊）
 *.pdf
 *.pptx
