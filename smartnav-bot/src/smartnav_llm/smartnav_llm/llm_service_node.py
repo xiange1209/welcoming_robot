@@ -98,6 +98,17 @@ class LLMServiceNode(Node):
         )
         self.model_name = self.declare_parameter("model_name", "gemma4:e2b").get_parameter_value().string_value
         self.temperature = self.declare_parameter("temperature", 0.0).get_parameter_value().double_value
+        # 銀行場景擴充參數（2026-07-17）
+        self.wait_for_nav_services = (
+            self.declare_parameter("wait_for_nav_services", True).get_parameter_value().bool_value
+        )
+        self.system_prompt_file = (
+            self.declare_parameter("system_prompt_file", "system_prompt.txt").get_parameter_value().string_value
+        )
+        self.enable_bank_tools = self.declare_parameter("enable_bank_tools", True).get_parameter_value().bool_value
+        self.vip_room_waypoint_name = (
+            self.declare_parameter("vip_room_waypoint_name", "貴賓室").get_parameter_value().string_value
+        )
 
         # 初始化對話記憶
         self.memory = ConversationMemory()
@@ -125,6 +136,8 @@ class LLMServiceNode(Node):
         self.llm_response_pub = self.create_publisher(String, "llm_response", 10)
         self.llm_stream_pub = self.create_publisher(String, "llm_stream", 10)
         self.speech_text_pub = self.create_publisher(String, "speech_text", 10)
+        # 行員通報請求（由 smartnav_brain 的 bank_reception_node 訂閱並實際推播）
+        self.staff_notify_pub = self.create_publisher(String, "/staff_notify_request", 10)
         self.user_text_sub = self.create_subscription(
             String, "user_text", self.user_text_callback, 10, callback_group=self.cb_group
         )
@@ -154,6 +167,15 @@ class LLMServiceNode(Node):
             ("global_localization", self.global_localization_client),
             ("navigate", self.navigate_client),
         ]
+        if not self.wait_for_nav_services:
+            # 無導航環境（例如在家只測 LLM/迎賓）：檢查一輪就放行，不阻塞
+            missing = [n for n, c in services if not c.wait_for_service(timeout_sec=1.0)]
+            missing += [n for n, c in actions if not c.wait_for_server(timeout_sec=1.0)]
+            if missing:
+                self.get_logger().warn(f"⚠ 導航服務未就緒（wait_for_nav_services=false，略過等待）: {missing}")
+            else:
+                self.get_logger().info("✓ 所有基礎服務與動作已就緒")
+            return
         for service_name, client in services:
             while not client.wait_for_service(timeout_sec=2.0):
                 self.get_logger().warn(f"⌛ 等待服務 {service_name}...")
@@ -342,6 +364,13 @@ class LLMServiceNode(Node):
             "global_localization_tool": global_localization_tool,
         }
 
+        # 銀行場景工具（帶位/通報/FAQ；enable_bank_tools:=false 可退回純導航工具集）
+        if self.enable_bank_tools:
+            from smartnav_llm.bank_tools import make_bank_tools
+
+            self.tools_map.update(make_bank_tools(self))
+            self.get_logger().info("✓ 銀行場景工具已掛載（guide_to_vip_room / notify_staff / query_bank_faq）")
+
         # 初始化模型並綁定工具
         stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub)
         raw_llm = ChatOllama(
@@ -383,7 +412,7 @@ class LLMServiceNode(Node):
 
     def _run_agent_loop(self, user_input: str) -> None:
         """ReAct 自主思考迴圈"""
-        system_content_path = get_config_path("system_prompt.txt")
+        system_content_path = get_config_path(self.system_prompt_file)
         if system_content_path:
             with open(system_content_path, "r", encoding="utf-8") as f:
                 system_content = f.read()

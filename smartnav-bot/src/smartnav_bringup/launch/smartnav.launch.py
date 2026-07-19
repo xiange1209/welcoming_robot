@@ -32,6 +32,11 @@ def generate_launch_description():
     enable_hmi = LaunchConfiguration("enable_hmi")
     audio_stack = LaunchConfiguration("audio_stack")
     llm_stack = LaunchConfiguration("llm_stack")
+    enable_brain = LaunchConfiguration("enable_brain")
+    system_prompt_file = LaunchConfiguration("system_prompt_file")
+    notify_backend = LaunchConfiguration("notify_backend")
+    telegram_bot_token = LaunchConfiguration("telegram_bot_token")
+    telegram_chat_id = LaunchConfiguration("telegram_chat_id")
 
     # 雙版本選擇器的組合條件（enable 開關 + stack 選擇要同時成立）
     audio_smartnav = IfCondition(PythonExpression(["'", enable_audio, "' == 'true' and '", audio_stack, "' == 'smartnav'"]))
@@ -95,6 +100,24 @@ def generate_launch_description():
                 default_value="smartnav",
                 description="LLM 方案：smartnav（LangChain Agent，含導航工具）或 wheeltec（ollama_ros_chat 輕量單輪對話）",
             ),
+            # ── 銀行迎賓劇本（smartnav_brain）與通報設定 ─────────────────
+            DeclareLaunchArgument(
+                "enable_brain",
+                default_value="true",
+                description="是否啟動銀行迎賓劇本節點（VIP 迎賓語音／黑名單通報／訪客記錄）",
+            ),
+            DeclareLaunchArgument(
+                "system_prompt_file",
+                default_value="system_prompt_bank.txt",
+                description="LLM system prompt：銀行版 system_prompt_bank.txt 或導航版 system_prompt.txt",
+            ),
+            DeclareLaunchArgument(
+                "notify_backend",
+                default_value="none",
+                description="行員通報後端：none（dry-run 只記錄）或 telegram（需同時給 token 與 chat_id）",
+            ),
+            DeclareLaunchArgument("telegram_bot_token", default_value="", description="Telegram Bot Token"),
+            DeclareLaunchArgument("telegram_chat_id", default_value="", description="Telegram Chat ID"),
             # ── smartnav_vision ───────────────────────────────────────
             Node(
                 package="smartnav_vision",
@@ -175,14 +198,32 @@ def generate_launch_description():
                 output="screen",
                 condition=audio_any,
             ),
-            # ── LLM：smartnav 方案（LangChain Agent，含導航工具）─────────
+            # ── LLM：smartnav 方案（LangChain Agent，含導航＋銀行工具）────
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(os.path.join(smartnav_llm_share, "launch", "llm.launch.py")),
                 launch_arguments={
                     "ollama_base_url": ollama_base_url,
                     "model_name": model_name,
+                    # 導航關閉時 LLM 不阻塞等待導航服務（在家測試不卡住）
+                    "wait_for_nav_services": enable_navigation,
+                    "system_prompt_file": system_prompt_file,
                 }.items(),
                 condition=llm_smartnav,
+            ),
+            # ── 銀行迎賓劇本：VIP 迎賓／黑名單 Telegram 通報／訪客記錄 ────
+            Node(
+                package="smartnav_brain",
+                executable="bank_reception",
+                name="bank_reception_node",
+                output="screen",
+                condition=IfCondition(enable_brain),
+                parameters=[
+                    {
+                        "notify_backend": notify_backend,
+                        "telegram_bot_token": telegram_bot_token,
+                        "telegram_chat_id": telegram_chat_id,
+                    }
+                ],
             ),
             # ── LLM：wheeltec 方案（ollama_ros_chat 單輪對話＋橋接節點）──
             Node(
