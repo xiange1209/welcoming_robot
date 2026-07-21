@@ -11,6 +11,8 @@
   <depend>smartnav_msgs</depend>
   <!-- 瀏覽器↔ROS 橋接（apt: ros-jazzy-rosbridge-server） -->
   <exec_depend>rosbridge_server</exec_depend>
+  <!-- 相機畫面串流給網頁的 <img>（apt: ros-jazzy-web-video-server） -->
+  <exec_depend>web_video_server</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

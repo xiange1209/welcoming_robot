@@ -78,7 +78,17 @@
   "use strict";
   var host = location.hostname || "localhost";
   var ROSBRIDGE_URL = "ws://" + host + ":9090";
-  var VIDEO_URL = "http://" + host + ":8080/stream?topic=/image_raw";
+
+  // 影像話題可用網址參數覆寫，例如 ?video_topic=/image_raw
+  // 預設 /camera/color/image_raw：實車的 astra 相機直接發布在這裡，
+  // 不必再開 relay 轉發（Pi4 上轉發 640x480@30fps 要多花約 27MB/s 記憶體複製）。
+  // 在家接 USB webcam（usb_cam 發布 /image_raw）時，網址加 ?video_topic=/image_raw
+  var params = new URLSearchParams(location.search);
+  // 注意：話題不可用 encodeURIComponent——web_video_server 不解碼 %2F，
+  // 會把 "%2Fcamera%2F..." 當成非法話題名稱拒絕（2026-07-21 實機踩過）。
+  // ROS 話題名稱本身只允許安全字元，直接串接即可。
+  var VIDEO_TOPIC = params.get("video_topic") || "/camera/color/image_raw";
+  var VIDEO_URL = "http://" + host + ":8080/stream?topic=" + VIDEO_TOPIC;
 
   document.getElementById("cam").src = VIDEO_URL;
 

@@ -24,6 +24,7 @@ import urllib.request
 from pathlib import Path
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
 
@@ -205,11 +206,14 @@ def main(args=None):
     node = BankReceptionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # SIGINT（Ctrl-C）與 SIGTERM（launch 關閉節點）都是正常收工，不該噴 traceback
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGTERM 路徑下 context 已被 rclpy signal handler 關掉，再關一次會拋 RCLError
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
