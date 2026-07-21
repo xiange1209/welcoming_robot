@@ -1,4 +1,0 @@
-FROM qwen2.5:3b
-PARAMETER temperature 0.1
-PARAMETER num_ctx 512
-PARAMETER num_gpu 99
