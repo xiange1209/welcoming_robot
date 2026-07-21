@@ -106,6 +106,11 @@ class LLMServiceNode(Node):
             self.declare_parameter("system_prompt_file", "system_prompt.txt").get_parameter_value().string_value
         )
         self.enable_bank_tools = self.declare_parameter("enable_bank_tools", True).get_parameter_value().bool_value
+        # 地圖/導航管理工具是否暴露給 LLM。2026-07-21 實測：qwen2.5:3b 綁 10 個工具時
+        # 完全選不出正確工具（0/3），只綁 3 個銀行工具則 100% 正確——小模型的工具數量
+        # 是決定性變因（與是否串流無關）。客戶服務情境關掉這組，只留銀行三工具。
+        # 註：guide_to_vip_room_tool 內部直接呼叫 ROS 服務，不依賴這些工具被 LLM 看見。
+        self.enable_nav_tools = self.declare_parameter("enable_nav_tools", True).get_parameter_value().bool_value
         self.vip_room_waypoint_name = (
             self.declare_parameter("vip_room_waypoint_name", "貴賓室").get_parameter_value().string_value
         )
@@ -354,15 +359,21 @@ class LLMServiceNode(Node):
                 return f"執行結果: 失敗, 詳細信息: {str(e)}"
 
         # 對照表與工具集
-        self.tools_map = {
-            "create_map_tool": create_map_tool,
-            "list_maps_tool": list_maps_tool,
-            "switch_map_tool": switch_map_tool,
-            "create_waypoint_tool": create_waypoint_tool,
-            "list_waypoints_tool": list_waypoints_tool,
-            "navigate_tool": navigate_tool,
-            "global_localization_tool": global_localization_tool,
-        }
+        self.tools_map: dict = {}
+
+        # 地圖/導航管理工具（管理員維護地圖用）
+        if self.enable_nav_tools:
+            self.tools_map.update(
+                {
+                    "create_map_tool": create_map_tool,
+                    "list_maps_tool": list_maps_tool,
+                    "switch_map_tool": switch_map_tool,
+                    "create_waypoint_tool": create_waypoint_tool,
+                    "list_waypoints_tool": list_waypoints_tool,
+                    "navigate_tool": navigate_tool,
+                    "global_localization_tool": global_localization_tool,
+                }
+            )
 
         # 銀行場景工具（帶位/通報/FAQ；enable_bank_tools:=false 可退回純導航工具集）
         if self.enable_bank_tools:
@@ -370,6 +381,15 @@ class LLMServiceNode(Node):
 
             self.tools_map.update(make_bank_tools(self))
             self.get_logger().info("✓ 銀行場景工具已掛載（guide_to_vip_room / notify_staff / query_bank_faq）")
+
+        self.get_logger().info(
+            f"✓ 已綁定 {len(self.tools_map)} 個工具: {', '.join(self.tools_map.keys())}"
+        )
+        if len(self.tools_map) > 5:
+            self.get_logger().warn(
+                f"⚠ 工具數量 {len(self.tools_map)} 偏多——小模型（3B 級）在超過約 5 個工具時"
+                "會選不出正確工具。客戶服務情境建議加 enable_nav_tools:=false"
+            )
 
         # 初始化模型並綁定工具
         stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub)
