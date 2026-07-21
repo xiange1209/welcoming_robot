@@ -1,0 +1,43 @@
+# 全 repo 統一使用 LF 行尾。
+#
+# 為什麼需要這個檔案：Windows 上 git 常設 core.autocrlf=true，checkout 時會把
+# LF 換成 CRLF，導致同一份檔案在 Windows 與 Pi（Linux）上內容不一致——
+# shell 腳本會因為結尾的 \r 而報 "bad interpreter"，Python 也可能出現詭異行為。
+# .gitattributes 跟著 repo 走，會覆寫每個人的本地 core.autocrlf 設定。
+
+# 預設：讓 git 自行判斷是否為文字檔，文字檔一律以 LF 存放與檢出
+* text=auto eol=lf
+
+# ── 明確標記為二進位（絕不做行尾轉換）─────────────────
+*.so       binary
+*.so.*     binary
+*.a        binary
+*.o        binary
+*.pyc      binary
+*.wav      binary
+*.mp3      binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.pdf      binary
+*.zip      binary
+*.tar      binary
+*.gz       binary
+*.bag      binary
+*.db3      binary
+*.onnx     binary
+*.pt       binary
+*.pth      binary
+*.pgm      binary
+*.stl      binary
+*.dae      binary
+*.STL      binary
+*.DAE      binary
+
+# ── 必須是 LF（在 Linux 上執行，有 CRLF 會直接壞掉）──
+*.sh       text eol=lf
+*.bash     text eol=lf
+*.py       text eol=lf
+*.rules    text eol=lf

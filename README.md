@@ -5,473 +5,248 @@
 ![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-orange)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-green)
 
-基於 **SmartNav**（[swient/smartnav-bot](https://github.com/swient/smartnav-bot)）與 **ROS 2 Jazzy** 的智慧銀行服務機器人專題。本專案與同學的 SmartNav 導航機器人系統協作開發：以 SmartNav 的視覺、語音、LLM、導航框架為主體，加上銀行場景的擴充——VIP / 黑名單 / 訪客三類身分辨識、性別欄位、辨識事件轉自然語言進入 LLM Agent，目標場景為銀行大廳的 VIP 迎賓、訪客引導與黑名單安全通報。
+大學部畢業專題。一台 **WHEELTEC 阿克曼實車**在銀行大廳擔任迎賓機器人：
+用人臉辨識分辨來客身分（GUEST／VIP／ADMIN）、以語音與 LLM 對話、可導航帶位，
+平板即時顯示影像、身分與對話。
 
-硬體平台：**WHEELTEC 高配阿克曼實車（senior_akm）**＋Raspberry Pi 4B 4GB 為感知與行動端，Windows 筆電（RTX 3050 4GB）為 LLM 運算端，平板為 HMI 顯示端。（TurtleBot3 流程保留於 `smartnav_navigation` 供模擬。）
+本儲存庫是**硬體層**（WHEELTEC 廠商套件、建置腳本、專案文件）。
+應用層在同學 swient 的 [smartnav-bot](https://github.com/swient/smartnav-bot)，兩者疊加執行。
 
-> **2026-07-17 起銀行場景功能已實作**：VIP 迎賓劇本、黑名單 Telegram 通報、LLM 銀行工具（帶位/通報/FAQ）、平板 HMI——皆屬「已實作、待實機驗證」。當前狀態速覽 → [`CLAUDE.md`](CLAUDE.md)；下次實作日手冊 → [`docs/20260720.md`](docs/20260720.md)。
+> **首次接手請先讀 [`docs/專案總覽.md`](docs/專案總覽.md)**——全貌、事件流、名詞、現況與鐵則都在那裡。
 
 ## 📋 目錄
 
-- [主要功能](#-主要功能)
-- [系統架構](#️-系統架構)
-- [套件說明](#-套件說明)
-- [環境需求](#-環境需求)
-- [安裝與建置](#-安裝與建置)
-- [快速開始](#-快速開始)
-- [配置說明](#️-配置說明)
-- [主題與服務](#-主題與服務)
-- [LLM 模型選擇（實測）](#-llm-模型選擇實測)
-- [驗證狀態](#-驗證狀態)
-- [已知限制](#-已知限制)
-- [故障排除](#️-故障排除)
-- [文件索引](#-文件索引)
+- [專案結構](#專案結構)
+- [系統架構](#系統架構)
+- [人機介面](#人機介面fastapi)
+- [環境需求](#環境需求)
+- [快速開始](#快速開始)
+- [目前狀態](#目前狀態)
+- [實測數據](#實測數據)
+- [已知限制](#已知限制)
+- [文件索引](#文件索引)
 
-## 🎯 主要功能
+## 專案結構
 
-### 銀行場景人臉辨識（`smartnav_vision`，本專案擴充）
+```
+welcoming_robot/
+├── smartnav_ws/
+│   └── smartnav-bot/              swient/smartnav-bot：應用層 7 套件
+│       └── src/
+│           ├── smartnav_msgs/           介面定義（msg / srv / action）
+│           ├── smartnav_vision/         人臉向量擷取（InsightFace）
+│           ├── smartnav_brain/          身份驗證與使用者管理
+│           ├── smartnav_audio/          喚醒詞、ASR、TTS、播放（sherpa-onnx）
+│           ├── smartnav_llm/            LLM 對話 Agent（LangChain + Ollama）
+│           ├── smartnav_navigation/     地圖／地點／導航服務（nav2）
+│           └── smartnav_hmi/            平板網頁介面（FastAPI）
+└── wheeltec_ws/
+    └── welcoming_robot/           本儲存庫：硬體層 17 個廠商套件
+        ├── src/                         底盤、雷達、相機、麥克風陣列、nav2 參數…
+        ├── scripts/                     建置與實驗工具
+        └── docs/                        專案文件
+```
 
-- **三類身分**：`VIP` / `BLACKLIST`（黑名單）/ `VISITOR`（訪客），註冊時指定 `person_type`
-- **性別欄位**：註冊時輸入 `gender`（M / F / Other），隨辨識結果一併發布
-- **顏色框標示**（debug 影像）：🟩 綠框 = VIP、🟥 紅框 = 黑名單、🟦 藍框 = 訪客
-- **InsightFace buffalo_sc**：512D 特徵向量，餘弦相似度比對，動態註冊免重新訓練
-- **黑名單安全通報定位**：辨識到黑名單人員時發布高優先事件，供後續通報流程使用（通報動作本身尚未實作，見[已知限制](#-已知限制)）
+**兩個 workspace 分開建置、疊加載入**（先 source 硬體層，再 source 應用層）。
 
-### 辨識事件 → LLM 對話橋接（本專案擴充）
-
-- `recognition_text_bridge_node` 將 `/face_recognition/result` 轉為自然語言句子，發布到 `/user_text`，讓 LLM Agent 能「看到」誰走進銀行
-
-### 語音介面（`smartnav_audio`，sherpa-onnx）
-
-- 關鍵詞喚醒（KWS + VAD）→ 語音辨識（ASR）→ 文字進 `/user_text`
-- LLM 回覆文字 → 語音合成（TTS）→ 喇叭播放
-
-### 對話式 LLM Agent（`smartnav_llm`）
-
-- LangChain + Ollama，訂閱 `/user_text`，可呼叫 ROS 2 導航工具（建圖、切換地圖、建立/列出地點、導航、全域定位）
-- Ollama 跑在筆電上，RPi4 透過區網呼叫（`ollama_base_url`）
-
-### 地圖與導航（`smartnav_navigation`）
-
-- 地圖服務（建圖含自動探索、列出、切換）、地點服務、Nav2 到點導航動作
-
-### 統一啟動（`smartnav_bringup`）
-
-- `smartnav.launch.py` 一鍵啟動 vision + audio + llm + navigation，各模組可獨立開關
-
-## 🏗️ 系統架構
-
-### 雙機架構
+## 系統架構
 
 ```text
-┌────────────────────────────────────────────┐          ┌─────────────────────────────┐
-│  Raspberry Pi 4 (8GB)                      │          │  Windows 筆電                │
-│  Ubuntu 24.04 + ROS 2 Jazzy + TurtleBot3   │          │  RTX 3050 Laptop 4GB VRAM   │
-│                                            │          │                             │
-│  📷 相機 ─→ smartnav_vision（人臉辨識）      │          │  🤖 Ollama (:11434)          │
-│  🎤 麥克風 ─→ smartnav_audio（喚醒/ASR）     │   HTTP   │     qwen2.5:3b（建議）       │
-│  🧠 smartnav_llm（LangChain Agent）─────────┼─────────→│     gemma3:4b（次選）        │
-│  🗺️ smartnav_navigation（地圖/導航/Nav2）    │  區網    │                             │
-│  🔊 smartnav_audio（TTS/播放）              │          │  ollama_base_url:=          │
-│  🚗 TurtleBot3 底盤                         │          │  http://<筆電IP>:11434       │
-└────────────────────────────────────────────┘          └─────────────────────────────┘
+┌────────────────────────────┐   HTTP :11434   ┌────────────────────────┐
+│ Raspberry Pi 4B (8GB)      │ ───────────────→│ Windows 筆電            │
+│ Ubuntu 24.04 / ROS 2 Jazzy │                 │ RTX 3050 4GB           │
+│ 跑全部 ROS 2 節點           │←─────────────── │ Ollama (qwen2.5:3b)    │
+└──────────┬─────────────────┘    串流回覆      └────────────────────────┘
+           │ USB
+   ┌───────┴────────┬──────────────┬──────────────┐
+   │ senior_akm 底盤 │ N10 光達      │ ASTRA S 相機  │   平板瀏覽器 → :8080
+   └────────────────┴──────────────┴──────────────┘
 ```
 
-- **RPi4（感知與行動端）**：跑 vision / audio / navigation / bringup，所有人臉辨識推理在本機完成（隱私 + 低延遲）
-- **筆電（LLM 運算端）**：只跑 Ollama；RPi4 的 `smartnav_llm` 以 `ollama_base_url:=http://<筆電IP>:11434` 連線
+**Pi 跑全部節點、筆電只當 Ollama 推理伺服器**——所有人臉辨識在本機完成（隱私＋低延遲）。
 
-### 銀行場景事件流
+### 事件流
 
 ```text
-相機 /image_raw
-   │
-   ▼
-face_recognition_node ──(InsightFace 512D 比對 VIP/黑名單/訪客資料庫)
-   │
-   ▼
-/face_recognition/result (smartnav_msgs/RecognitionResult)
-   │                                  │
-   ▼                                  └─→ /face_recognition/debug_image（可選，含顏色框）
-recognition_text_bridge_node ──(轉自然語言，例如「VIP 陳先生出現在門口」)
-   │
-   ▼
-/user_text (std_msgs/String) ←──────── smartnav_audio 語音辨識結果也走同一話題
-   │
-   ▼
-smartnav_llm Agent（LangChain + Ollama）
-   │
-   ├─→ 呼叫導航工具（navigate / list_waypoints / ...）→ smartnav_navigation → Nav2 → TurtleBot3
-   └─→ /speech_text → speech_synthesizer → /audio_out → voice_playback（語音回覆）
+image_raw ─→ face_embedding_node ─→ face_embedding ─→ user_auth_node
+   │            (InsightFace 512D)      (向量，不含身分)      (比對資料庫)
+   │                                                             │
+   │                                                             ▼
+   │                                                      user_identity
+   │                                              (姓名／類型／相似度／是否認出)
+   │                                                             │
+   └─────────────────────────────────────────────────────────────┴─→ HMI 顯示
+
+麥克風 ─→ voice_trigger ─→ speech_recognizer ─→ user_text
+          (喚醒詞＋VAD)        (ASR)                  │
+                                                      ▼
+                                        llm_service_node（可呼叫導航工具）
+                                                      │
+                              llm_response / llm_stream / speech_text
+                                                      │
+                              speech_synthesizer ─→ voice_playback ─→ 喇叭
 ```
 
-## 📦 套件說明
+## 人機介面（FastAPI）
 
-| 套件 | 類型 | 功能 |
-| --- | --- | --- |
-| [`smartnav_msgs`](smartnav-bot/src/smartnav_msgs/) | ament_cmake | 訊息/服務/動作定義。本專案擴充：`RecognitionResult.msg`（person_uuid / person_name / gender / person_type / confidence / timestamp / bbox）、`RegisterFace.srv`（含 gender、person_type）；另有 `AudioData.msg`、`MapInfo.msg`、`WaypointInfo.msg`、地圖/地點服務與 `CreateMap` / `GlobalLocalization` / `Navigate` 動作 |
-| [`smartnav_vision`](smartnav-bot/src/smartnav_vision/) | ament_python | 人臉辨識核心。節點：`face_recognition_node`（即時辨識）、`face_registration_node`（線上註冊）、`recognition_text_bridge_node`（辨識結果轉文字）。模組：`face_engine.py`（InsightFace 封裝 + 顏色框）、`database_manager.py`、`face_utils.py` |
-| [`smartnav_audio`](smartnav-bot/src/smartnav_audio/) | ament_python | sherpa-onnx 語音管線。節點：`voice_trigger`（KWS 喚醒 + VAD）、`speech_recognizer`（ASR）、`speech_synthesizer`（TTS）、`voice_playback`（播放） |
-| [`smartnav_llm`](smartnav-bot/src/smartnav_llm/) | ament_python | LangChain + Ollama 對話式 Agent（`llm_service_node`），工具集：create_map / list_maps / switch_map / create_waypoint / list_waypoints / navigate / global_localization。含 `launch/llm.launch.py`、`config/system_prompt.txt` |
-| [`smartnav_navigation`](smartnav-bot/src/smartnav_navigation/) | ament_python | 地圖/地點/導航（2026-07-01 由原 smartnav_brain 重構拆出）。節點：`map_service_node`、`waypoint_service_node`、`navigation_action_node`。Launch：`brain.launch.py`（三節點 + AMCL + slam_toolbox + frontier_explorer + map_server）、`nav2.launch.py`（完整 Nav2 棧 + RViz）。設定：`config/burger.yaml`、`config/empty_map` |
-| [`smartnav_brain`](smartnav-bot/src/smartnav_brain/) | ament_python | **銀行迎賓劇本與通報中樞（2026-07-17 實作）**：`bank_reception_node`——VIP 迎賓語音（冷卻防抖）、黑名單警告＋Telegram 推播、訪客 SQLite 記錄、訂閱 `/staff_notify_request` 統一送通報 |
-| [`smartnav_hmi`](smartnav-bot/src/smartnav_hmi/) | ament_python | 平板網頁 HMI（2026-07-10）：rosbridge websocket＋自含網頁，顯示辨識結果/對話/相機串流，`enable_hmi:=true` 啟用 |
-| [`smartnav_bringup`](smartnav-bot/src/smartnav_bringup/) | ament_cmake | 統一啟動。`launch/smartnav.launch.py` 一次啟動 vision + audio + llm + navigation（＋可選 WHEELTEC 底盤與雙版本方案，見下） |
-| [`src/`](src/) | 混合（17 套件） | WHEELTEC 廠商套件精選子集（2026-07-06 整合，Jazzy 修正後）：底盤驅動、URDF、雷達/相機驅動、各車型 Nav2 參數、麥克風陣列、輕量 Ollama 對話。細節與捨棄清單 → [`docs/架構參考.md`](docs/架構參考.md) |
+平板瀏覽器開 `http://<Pi的IP>:8080`，**單一服務**提供全部功能：
 
-工作區以外的輔助檔案：
+| 端點 | 用途 |
+|---|---|
+| `GET /` | 網頁：身分橫幅、即時影像、對話流、系統狀態 |
+| `GET /video` | MJPEG 影像串流（`<img>` 直接吃，前端零函式庫） |
+| `WS /ws` | 狀態即時推播 |
+| `GET /api/state` · `/api/health` | 狀態快照與健康檢查 |
+| `POST /api/register` | 觸發人臉註冊 |
 
-| 路徑 | 用途 |
-| --- | --- |
-| `scripts/benchmark_llm_models.py` | LLM 延遲基準測試（TTFT / 總時長，串流 Ollama `/api/chat`，輸出 Markdown 表與 JSON） |
-| `scripts/download_audio_models.sh` | 下載 sherpa-onnx KWS / ASR / VAD / TTS 模型 |
-| `Modelfile_qwen` / `Modelfile_gemma3` / `Modelfile_gemma4e2b` / `Modelfile_gemma4e4b` | Ollama 銀行場景模型設定檔 |
-| `benchmark_llm_results.json` | 2026-07-02 LLM 延遲實測原始數據 |
+> **為什麼改用 FastAPI**：舊版要同時跑 rosbridge(9090)＋靜態網頁(8081)＋web_video_server(8080)
+> 三個服務，任一沒起來畫面就壞（實際踩過：launch 漏帶 web_video_server，平板永遠停在
+> 「相機畫面載入中…」）。現在收斂成一個節點、一個埠。
 
-## 🔧 環境需求
+## 環境需求
 
-### RPi4（感知端）
+| 項目 | 需求 |
+|---|---|
+| Raspberry Pi 4B（8GB） | Ubuntu 24.04.4、ROS 2 Jazzy、`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` |
+| Windows 筆電 | Ollama（`qwen2.5:3b`），需設 `OLLAMA_HOST=0.0.0.0` 才能被 Pi 連到 |
+| 車體 | WHEELTEC senior_akm 阿克曼底盤＋N10 光達＋Orbbec ASTRA S 深度相機 |
+| Python 相依 | `insightface`、`onnxruntime`、`sherpa-onnx`、`langchain`、`fastapi`、`uvicorn` |
 
-- **硬體**：Raspberry Pi 4（8GB RAM）、相機、麥克風/喇叭、TurtleBot3（導航功能需要）
-- **作業系統**：Ubuntu 24.04 LTS（Noble Numbat）
-- **ROS 2**：Jazzy Jalisco
-- **Python**：3.12+
-- **主要 Python 套件**：`insightface`、`opencv-python`、`onnxruntime`、`numpy`、`sherpa-onnx`、`langchain`、`langchain-ollama`
+## 快速開始
 
-### 筆電（LLM 端）
-
-- **GPU**：建議 4GB VRAM 以上（實測平台為 RTX 3050 Laptop 4GB）
-- **軟體**：[Ollama](https://ollama.com/)（實測版本 0.24.0）
-- 筆電只需要 Ollama，不需要安裝 ROS 2
-
-## 📥 安裝與建置
-
-### 1. RPi4：安裝 ROS 2 Jazzy
+完整步驟（相依安裝、numpy 衝突處理、各節點啟動）→ [`docs/部署與執行.md`](docs/部署與執行.md)
 
 ```bash
-# 新增 ROS 2 GPG 金鑰與套件庫
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list >/dev/null
-
-sudo apt update
-sudo apt install ros-jazzy-desktop python3-colcon-common-extensions python3-rosdep
-```
-
-### 2. 複製專案
-
-```bash
-cd ~
-git clone https://github.com/xiange1209/welcoming_robot.git smartnav_ws
-cd smartnav_ws
-```
-
-> ⚠️ **frontier_exploration_ros2 需另外 clone**（自動探索建圖用）：
->
-> ```bash
-> git clone https://github.com/mertgulerx/frontier_exploration_ros2 smartnav-bot/src/frontier_exploration_ros2
-> ```
-
-### 3. 安裝依賴
-
-```bash
+# 環境（每個新終端都要，順序不能反）
 source /opt/ros/jazzy/setup.bash
-sudo rosdep init 2>/dev/null; rosdep update
-rosdep install --from-paths src --ignore-src -r -y
+source ~/welcoming_robot/wheeltec_ws/welcoming_robot/install/setup.bash   # 硬體層
+source ~/welcoming_robot/smartnav_ws/smartnav-bot/install/setup.bash      # 應用層
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
-# Python 依賴（rosdep 未涵蓋者）
-pip install insightface onnxruntime opencv-python sherpa-onnx langchain langchain-ollama
+# 相機（只開彩色——同時開深度會超過 USB 2.0 頻寬導致彩色斷流）
+ros2 launch astra_camera astra.launch.xml \
+  enable_depth:=false enable_point_cloud:=false enable_ir:=false color_fps:=15
 
-# 下載語音模型（KWS / ASR / VAD / TTS）
-bash scripts/download_audio_models.sh
+# 人臉辨識鏈（Pi 無 CUDA，enable_gpu 必須 false）
+ros2 run smartnav_vision face_embedding --ros-args \
+  -p enable_gpu:=false -r /image_raw:=/camera/color/image_raw
+ros2 run smartnav_brain user_auth --ros-args -r /image_raw:=/camera/color/image_raw
+
+# 平板介面
+ros2 launch smartnav_hmi hmi.launch.py image_capture_topic:=/camera/color/image_raw
+
+# LLM（筆電先開好 Ollama 並開放區網）
+ros2 run smartnav_llm llm_service --ros-args \
+  -p ollama_base_url:=http://<筆電IP>:11434 -p model_name:=qwen2.5:3b
 ```
 
-### 4. 建置工作區
+### 註冊人臉
 
 ```bash
-cd ~/smartnav_ws
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-
-# 或只建置部分套件
-colcon build --packages-select smartnav_msgs smartnav_vision --symlink-install
+ros2 service call /register_face smartnav_msgs/srv/RegisterFace \
+  "{user_name: '陳佳憲', user_type: {type: 1}, description: '專題負責人', num_samples: 10}"
 ```
 
-### 5. 設定環境
+呼叫後**立刻站到相機前並持續站著**（約 20~30 秒），稍微轉頭讓樣本多樣化。
+`user_type`：0=GUEST、1=VIP、2=ADMIN。
+
+> **正式展示務必用多樣本**——實測單張照片註冊的辨識置信度距門檻僅 0.002（隨時誤判），
+> 10 樣本可拉到 0.071。
+
+### 底盤操作
+
+阿克曼車：後輪驅動、前輪只打角、**不能原地旋轉**。
 
 ```bash
-echo "source ~/smartnav_ws/install/setup.bash" >> ~/.bashrc
-source ~/.bashrc
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p repeat_rate:=20.0
+#   i 前進   , 後退   u 前進+左轉   o 前進+右轉   k 停止
+#   ★ j / l 是原地旋轉，阿克曼車做不到，按了沒反應是正確的
+#   ★ repeat_rate 必加，且送出指令後約 10 秒輪子才會動（STM32 韌體保護）
 ```
 
-### 6. 筆電：準備 Ollama 模型
-
-```powershell
-# 在 Windows 筆電上
-ollama pull qwen2.5:3b            # 實測最快，建議使用
-ollama create gemma3-bank -f Modelfile_gemma3   # 次選（可選）
-
-# 讓 Ollama 監聽區網（預設只綁 localhost）
-$env:OLLAMA_HOST = "0.0.0.0"
-ollama serve
-```
-
-## 🚀 快速開始
-
-### 方式 1：bringup 一鍵啟動（RPi4）
-
-```bash
-source ~/smartnav_ws/install/setup.bash
-
-# ollama_base_url 指向筆電的區網 IP；model_name 建議 qwen2.5:3b（見下方實測）
-ros2 launch smartnav_bringup smartnav.launch.py \
-  ollama_base_url:=http://192.168.1.xxx:11434 \
-  model_name:=qwen2.5:3b
-```
-
-常用 launch 參數（皆可用 `參數名:=值` 覆寫）：
-
-| Launch 參數 | 預設值 | 說明 |
-| --- | --- | --- |
-| `image_topic` | `/image_raw` | 相機影像話題 |
-| `enable_gpu` | `true` | 視覺推理是否使用 GPU（RPi4 上建議 `false`，走 CPU） |
-| `ollama_base_url` | `http://localhost:11434` | Ollama API 位址，請改成筆電區網 IP |
-| `model_name` | `gemma4:e2b` | smartnav_llm 使用的 Ollama 模型（實測建議改為 `qwen2.5:3b`） |
-| `use_sim_time` | `false` | 是否使用模擬時間（Gazebo） |
-| `enable_vision` / `enable_audio` / `enable_llm` / `enable_navigation` | `true` | 各模組開關，硬體未就緒可個別關閉 |
-| `enable_nav2` | `false` | 是否啟動完整 Nav2 棧 + RViz（需 TurtleBot3 或模擬環境） |
-| `enable_chassis` | `false` | WHEELTEC 實體底盤驅動（車型先改 `src/turn_on_wheeltec_robot/config/wheeltec_param.yaml` 的 `car_mode`） |
-| `audio_stack` | `smartnav` | 語音方案：`smartnav`（sherpa-onnx 自由語句）／`wheeltec`（麥克風陣列＋離線命令詞，免金鑰但為固定語法） |
-| `llm_stack` | `smartnav` | LLM 方案：`smartnav`（LangChain Agent 含導航工具）／`wheeltec`（ollama_ros_chat 單輪對話，經橋接節點接管線） |
-| `enable_web_video` | `false` | 瀏覽器即時看影像（apt: `ros-jazzy-web-video-server`）：開啟後瀏覽 `http://<機器人IP>:8080/stream?topic=/image_raw` |
-| `web_video_port` | `8080` | web_video_server 的 HTTP 埠 |
-| `enable_hmi` | `false` | 平板 HMI（apt: `ros-jazzy-rosbridge-server`）：平板瀏覽 `http://<機器人IP>:8081` 顯示辨識結果/對話/相機畫面（影像需同開 `enable_web_video`） |
-
-範例——只測「人臉辨識 → LLM」串接，不啟動語音與導航：
-
-```bash
-ros2 launch smartnav_bringup smartnav.launch.py \
-  ollama_base_url:=http://192.168.1.xxx:11434 \
-  model_name:=qwen2.5:3b \
-  enable_audio:=false enable_navigation:=false
-```
-
-### 方式 2：個別啟動模組
-
-```bash
-# 人臉辨識節點（RPi4 走 CPU）
-ros2 run smartnav_vision face_recognition --ros-args \
-  -p image_topic:=/image_raw -p enable_gpu:=false -p publish_debug_image:=true
-
-# 辨識結果轉文字橋接
-ros2 run smartnav_vision recognition_text_bridge
-
-# LLM Agent（單獨啟動）
-ros2 launch smartnav_llm llm.launch.py \
-  ollama_base_url:=http://192.168.1.xxx:11434 model_name:=qwen2.5:3b
-
-# 地圖/地點/導航服務
-ros2 launch smartnav_navigation brain.launch.py
-```
-
-### 註冊 VIP / 黑名單人臉
-
-請本人站在相機前，呼叫註冊服務（會連續擷取 `num_samples` 張臉部樣本）：
-
-```bash
-# 先啟動註冊節點（bringup 已包含）
-ros2 run smartnav_vision face_registration
-
-# 註冊 VIP
-ros2 service call /face_registration/register smartnav_msgs/srv/RegisterFace \
-  "{person_name: '陳佳憲', gender: 'M', person_type: 'VIP', num_samples: 10}"
-
-# 註冊黑名單
-ros2 service call /face_registration/register smartnav_msgs/srv/RegisterFace \
-  "{person_name: '可疑人士A', gender: 'F', person_type: 'BLACKLIST', num_samples: 10}"
-
-# 註冊後刷新辨識快取
-ros2 service call /face_recognition/refresh_cache std_srvs/srv/Empty
-```
-
-### 觀察辨識結果
-
-```bash
-# 結構化辨識結果
-ros2 topic echo /face_recognition/result
-
-# 轉成自然語言後、送進 LLM 的文字
-ros2 topic echo /user_text
-
-# 帶顏色框的除錯影像（需 publish_debug_image:=true）
-ros2 run rqt_image_view rqt_image_view /face_recognition/debug_image
-```
-
-## ⚙️ 配置說明
-
-### `face_recognition_node` 參數
-
-| 參數名稱 | 型態 | 預設值 | 說明 |
-| --- | --- | --- | --- |
-| `image_topic` | `string` | `/image_raw` | 輸入相機影像話題 |
-| `model_name` | `string` | `buffalo_sc` | InsightFace 模型名稱（支援 `buffalo_sc`、`buffalo_l`） |
-| `confidence_threshold` | `double` | `0.5` | 人臉檢測信心閾值（0.0–1.0） |
-| `enable_gpu` | `bool` | `true` | 是否啟用 GPU 加速（RPi4 請設 `false`） |
-| `recognition_threshold` | `double` | `0.6` | 人臉辨識相似度閾值（0.0–1.0） |
-| `publish_debug_image` | `bool` | `false` | 是否發布帶顏色框的除錯影像 |
-| `result_republish_interval` | `double` | `15.0` | 同一身分持續出現時，重新發布結果的最小間隔秒數（去抖動，避免 LLM 被同一人的事件洗版） |
-
-### `recognition_text_bridge_node` 參數
-
-| 參數名稱 | 型態 | 預設值 | 說明 |
-| --- | --- | --- | --- |
-| `result_topic` | `string` | `/face_recognition/result` | 訂閱的辨識結果話題 |
-| `user_text_topic` | `string` | `/user_text` | 輸出給 smartnav_llm 的文字話題 |
-
-### `llm_service_node` 參數
-
-| 參數名稱 | 型態 | 預設值 | 說明 |
-| --- | --- | --- | --- |
-| `ollama_base_url` | `string` | `http://localhost:11434` | Ollama API 位址（雙機架構請改筆電 IP） |
-| `model_name` | `string` | `gemma4:e2b` | Ollama 模型（實測建議 `qwen2.5:3b`） |
-| `temperature` | `double` | `0.0` | 取樣溫度 |
-
-### 使用 YAML 參數檔
-
-```yaml
-face_recognition_node:
-  ros__parameters:
-    image_topic: /image_raw
-    model_name: buffalo_sc
-    enable_gpu: false
-    recognition_threshold: 0.6
-    publish_debug_image: true
-```
-
-```bash
-ros2 run smartnav_vision face_recognition --ros-args --params-file face_recognition_config.yaml
-```
-
-## 📡 主題與服務
-
-### 主要話題
-
-| 話題名稱 | 訊息型態 | 發布者 → 訂閱者 | 說明 |
-| --- | --- | --- | --- |
-| `/image_raw` | `sensor_msgs/Image` | 相機驅動 → face_recognition / face_registration | 相機影像串流 |
-| `/face_recognition/result` | `smartnav_msgs/RecognitionResult` | face_recognition → recognition_text_bridge | 辨識結果（uuid / 姓名 / 性別 / 身分類型 / 信心度 / bbox） |
-| `/face_recognition/debug_image` | `sensor_msgs/Image` | face_recognition → rqt 等 | 帶顏色框除錯影像（🟩VIP 🟥黑名單 🟦訪客，可選） |
-| `/user_text` | `std_msgs/String` | recognition_text_bridge、speech_recognizer → llm_service | 進入 LLM Agent 的統一文字入口 |
-| `/llm_response` / `/llm_stream` | `std_msgs/String` | llm_service → | LLM 完整回覆 / 串流片段 |
-| `/speech_text` | `std_msgs/String` | llm_service → speech_synthesizer | 要合成語音的文字 |
-| `/audio_in` | `smartnav_msgs/AudioData` | voice_trigger → speech_recognizer | 喚醒後的語音片段 |
-| `/audio_out` | `smartnav_msgs/AudioData` | speech_synthesizer → voice_playback | 合成的語音資料 |
-| `/voice_triggered` | `std_msgs/Bool` | voice_trigger → | 喚醒觸發訊號 |
-| `/playback_status` | `std_msgs/Bool` | voice_playback → speech_recognizer | 播放狀態（避免自己聽自己） |
-
-### 服務與動作
-
-| 名稱 | 型態 | 提供者 | 說明 |
-| --- | --- | --- | --- |
-| `/face_registration/register` | `smartnav_msgs/srv/RegisterFace` | face_registration | 註冊人臉（姓名 / 性別 / VIP 或 BLACKLIST / 樣本數） |
-| `/face_recognition/refresh_cache` | `std_srvs/srv/Empty` | face_recognition | 重新載入資料庫並刷新特徵向量快取 |
-| `list_maps` / `switch_map` | `smartnav_msgs/srv/*` | map_service | 列出 / 切換地圖 |
-| `create_waypoint` / `list_waypoints` / `get_waypoint` | `smartnav_msgs/srv/*` | waypoint_service | 地點管理 |
-| `create_map`（action） | `smartnav_msgs/action/CreateMap` | map_service | 建圖（含 frontier 自動探索） |
-| `global_localization`（action） | `smartnav_msgs/action/GlobalLocalization` | waypoint_service | 全域定位 |
-| `navigate`（action） | `smartnav_msgs/action/Navigate` | navigation_action | 導航到指定地點 |
-
-## 🤖 LLM 模型選擇（實測）
-
-**測試方法**：`scripts/benchmark_llm_models.py`，Windows 筆電 RTX 3050 Laptop 4GB VRAM、Ollama 0.24.0；每模型 1 次暖機 + 5 次正式，串流 `/api/chat`，銀行場景 system prompt，`temperature 0.1`、`num_ctx 512`。測試日期 **2026-07-02**，原始明細見 [`benchmark_llm_results.json`](benchmark_llm_results.json)。
-
-| 模型（Ollama tag） | 基底模型 | 首次輸出平均 (ms) | 總生成平均 (ms) | 最快 (ms) | 最慢 (ms) | 成功率 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| **qwen2.5:3b** | qwen2.5:3b | **2218** | **3076** | 3017 | 3196 | 100% |
-| gemma3-bank | gemma3:4b | 2303 | 4700 | 4583 | 4755 | 100% |
-| gemma4e2b-bank | gemma4:e2b | 42235 | 47909 | 44838 | 50206 | 100% |
-| gemma4e4b-bank | gemma4:e4b | 95066 | 107123 | 100231 | 123839 | 100% |
-
-**關鍵解讀**：
-
-- gemma4 系列模型檔（e2b 7.2GB / e4b 9.6GB）**遠超 4GB VRAM**，Ollama 將大部分權重卸載到 CPU，導致比可全載入 VRAM 的模型慢 **20~40 倍**，完全不適合即時互動。
-- gemma3:4b（約 4GB）與 qwen2.5:3b（約 1.9GB）能塞進 VRAM；在此硬體上 **qwen2.5:3b 最快**（總生成約 3 秒），gemma3:4b 次之（約 4.7 秒）。
-- **結論**：本專題雙機架構建議 `model_name:=qwen2.5:3b`。注意 `smartnav_llm` 的預設值仍是 `gemma4:e2b`（沿用上游 SmartNav 預設），在本硬體上務必以 launch 參數覆寫。
-
-## ✅ 驗證狀態
-
-本節誠實區分「已實機驗證」與「僅完成程式碼、尚未實機驗證」的部分。
-
-### 已驗證
-
-| 項目 | 驗證方式與結果 |
-| --- | --- |
-| RPi4 即時人臉檢測 | InsightFace buffalo_sc 於 RPi4 實機達 **15+ FPS**（於舊架構驗證；ROS 2 版使用相同引擎與模型） |
-| 筆電 LLM 延遲基準 | 上方實測表格，2026-07-02，`scripts/benchmark_llm_models.py` 全數 100% 成功 |
-| **RPi4 實機首次啟動** | 2026-07-10，真實 RPi4B 4GB（`wheeltec-r680`）：arm64 交叉編譯產物解壓即用，8 套件可見，HMI（rosbridge :9090＋網頁 :8081）與 web_video_server 實跑 HTTP 200 |
-
-### 已實作、待實機驗證
-
-- **建置已驗證、實機運行未驗證**（2026-07-09 起）：全 workspace `colcon build` 已在 x86-64 Jazzy VM（24/24）與 arm64 QEMU 容器（25/25，含 wheeltec_mic_ros2）通過，arm64 產物可直接部署 RPi4（見部署指南路線 D）。以下**運行面**仍待實機：
-  - vision → recognition_text_bridge → LLM 的完整事件流
-  - `smartnav_audio` 語音管線（喚醒 / ASR / TTS / 播放）在 RPi4 上的效能
-  - `smartnav_navigation` + Nav2 + TurtleBot3 實機導航
-  - RPi4 跨區網呼叫筆電 Ollama 的實際延遲與穩定性
-  - **WHEELTEC 硬體鏈**：底盤驅動、`audio_stack` / `llm_stack` 兩條 wheeltec 鏈、astra 相機實機接入——步驟見 [`docs/驗證與實作清單.md`](docs/驗證與實作清單.md) B11
-
-## ⚠️ 已知限制
-
-- **銀行場景功能已實作、待實機驗證**（2026-07-17）：LLM 銀行工具（`bank_tools.py`：帶位/通報/FAQ，預設掛載，`enable_bank_tools:=false` 可關）＋銀行版 system prompt（`system_prompt_bank.txt`，bringup 預設採用）＋迎賓劇本與 Telegram 通報（`smartnav_brain`，`enable_brain` 預設開；通報預設 dry-run，實際推播需 `notify_backend:=telegram` 與 token/chat_id）。實測步驟見 [`docs/20260720.md`](docs/20260720.md)。
-- **frontier_exploration_ros2 未內含**：自動探索建圖需另外 clone（見[安裝與建置](#-安裝與建置)），否則 `brain.launch.py` 的 frontier_explorer 無法啟動。
-- **bringup 預設模型不適合本硬體**：`model_name` 預設 `gemma4:e2b`，在 4GB VRAM 筆電上實測極慢，請覆寫為 `qwen2.5:3b`。
-- **兩條導航鏈不可混用**：WHEELTEC 鏈（底盤 EKF、SLAM、Nav2 參數）全程用 `odom_combined` frame，`smartnav_navigation`（TB3/模擬）用 `odom`。實體機建圖/導航用 wheeltec 官方 launch（它們**自帶底盤啟動**，勿與 `enable_chassis:=true` 同開）。
-- **wheeltec 語音是固定命令詞**：`audio_stack:=wheeltec` 的本地離線辨識綁定語法檔，非自由語句；自由對話請用預設 `smartnav` 方案。銀行場景詞彙需重編語法檔。
-- **額外依賴 rosdep 蓋不到**：`llm_stack:=wheeltec` 需 `pip install openai`；astra 相機需 `apt install libuvc-dev libgoogle-glog-dev`（見部署指南）。
-
-## 🛠️ 故障排除
-
-### 問題：LLM 沒有回應 / 逾時（Ollama 連線）
-
-1. 確認筆電 Ollama 有監聽區網：設定 `OLLAMA_HOST=0.0.0.0` 後重啟 `ollama serve`
-2. 從 RPi4 測試連線：`curl http://<筆電IP>:11434/api/tags`，應回傳模型清單
-3. 檢查 Windows 防火牆是否放行 11434 連接埠（TCP 輸入規則）
-4. 確認 launch 參數 `ollama_base_url` 是筆電**區網 IP**，不是 `localhost`
-5. 若回應極慢（數十秒），檢查模型是否超出 VRAM：`ollama ps` 查看 CPU/GPU 分配比例，改用 `qwen2.5:3b`
-
-### 問題：人臉辨識效能低下
-
-1. RPi4 上請確認 `enable_gpu:=false`（RPi4 無 CUDA，強開 GPU provider 會失敗或退回 CPU）
-2. 調整 `confidence_threshold` 與 `recognition_threshold`
-3. 確保光照充足、影像清晰；檢查相機話題 `ros2 topic hz /image_raw`
-
-### 問題：辨識錯誤率高（認錯人 / 認不出）
-
-1. 增加註冊樣本數（`num_samples`，建議 10 以上，含不同角度）
-2. 調整 `recognition_threshold`（調高減少誤認、調低減少漏認）
-3. 註冊或刪除人員後記得呼叫 `/face_recognition/refresh_cache`
-4. 換用更大的模型 `model_name:=buffalo_l`（RPi4 上 FPS 會下降，需權衡）
-
-### 問題：找不到依賴套件 / 建置失敗
-
-```bash
-rosdep install --from-paths src --ignore-src -r -y
-pip install insightface opencv-python onnxruntime sherpa-onnx langchain langchain-ollama
-```
-
-- 若 `brain.launch.py` 找不到 frontier_explorer：確認已 clone `frontier_exploration_ros2` 到 `src/` 並重新 `colcon build`
-
-### 問題：語音節點啟動失敗
-
-1. 確認已執行 `bash scripts/download_audio_models.sh` 下載 KWS / ASR / VAD / TTS 模型
-2. 檢查麥克風/喇叭裝置：`arecord -l`、`aplay -l`，必要時以 `device` 參數指定
-
-## 📚 文件索引
-
-- [`docs/專題計畫.md`](docs/專題計畫.md)：專題企畫、里程碑與下一步
-- [`docs/架構參考.md`](docs/架構參考.md)：各套件節點/話題/參數細節、指令大全、Key Files 對照、LLM 實測明細
-- [`docs/LLM規劃書.md`](docs/LLM規劃書.md)：LLM 模型選擇與效能分析
-- [`docs/部署與重現指南.md`](docs/部署與重現指南.md)：組員最快速的部署與 smoke test 流程
-- [`docs/驗證與實作清單.md`](docs/驗證與實作清單.md)：待驗證項目與實作清單
-- 上游專案：[swient/smartnav-bot](https://github.com/swient/smartnav-bot)
-- [ROS 2 Jazzy 官方文檔](https://docs.ros.org/en/jazzy/) / [Nav2](https://navigation.ros.org/) / [InsightFace](https://github.com/deepinsight/insightface) / [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) / [Ollama](https://ollama.com/)
+## 目前狀態
+
+| 分類 | 內容 |
+|---|---|
+| **已驗證**（實機、有輸出證據） | 底盤（含遙控）、N10 光達 10.06 Hz、ASTRA S 相機 29.6 Hz、SLAM 建圖存檔、人臉辨識端到端（10 樣本註冊 65 次零誤判） |
+| **已實作待驗證** | FastAPI HMI、`user_identity` 發布——**尚未在 Pi 上建置或執行過** |
+| **未實作** | 銀行場景劇本（迎賓詞／通報／帶位／FAQ）、Telegram 通報、麥克風陣列語音、導航帶位端到端、巡邏模式 |
+
+逐項與驗收步驟 → [`docs/驗證清單.md`](docs/驗證清單.md)
+
+> ⚠️ 已驗證項目是在 **2026-07-21 重整前**的程式碼上取得的。硬體結論（光達型號、
+> USB 頻寬、底盤行為、資源瓶頸）仍然成立；軟體行為需在新結構上重新驗證。
+
+## 實測數據
+
+### 感測器與資源
+
+| 項目 | 結果 |
+|---|---|
+| N10 光達 | 10.06 Hz、std dev 0.0013s、360°（±π）、約 450 點 |
+| ASTRA S 彩色（只開彩色） | **29.6 Hz**；同時開深度時彩色會完全斷流（USB 2.0 頻寬不足） |
+| 關閉深度串流的效益 | 彩色 20.8→29.6 Hz、astra CPU 175%→71%、load average 19.4→4.45 |
+| 人臉辨識（10 樣本註冊） | 65 次 100% 正確、置信度 0.671~0.875、平均 0.751、標準差 0.057 |
+| 人臉辨識（單張照片註冊） | 0.602~0.723，距門檻僅 0.002，**有誤判** |
+| Pi4 資源（全節點運行） | load average 19.4（4 核心超載 4.8 倍），記憶體僅 40% → **瓶頸在 CPU** |
+
+### LLM 模型延遲（筆電 RTX 3050 4GB，2026-07-02）
+
+方法：`scripts/benchmark_llm_models.py`，每模型 1 次暖機＋5 次正式，串流 `/api/chat`，
+`temperature 0.1`、`num_ctx 512`。
+
+| 模型 | 首次輸出平均 (ms) | 總生成平均 (ms) | 成功率 |
+|---|---:|---:|---:|
+| **qwen2.5:3b** | **2218** | **3076** | 100% |
+| gemma3:4b | 2303 | 4700 | 100% |
+| gemma4:e2b | 42235 | 47909 | 100% |
+| gemma4:e4b | 95066 | 107123 | 100% |
+
+gemma4 系列模型檔（7.2GB／9.6GB）遠超 4GB VRAM，被卸載到 CPU 而慢 20~40 倍，
+**不適合即時互動**。結論：用 `qwen2.5:3b`。
+
+### LLM 工具呼叫（qwen2.5:3b，2×2 因子實驗）
+
+| | 3 個工具 | 10 個工具 |
+|---|:---:|:---:|
+| 無串流回呼 | ✓ | ✗ |
+| 有串流回呼 | ✓ | ✗ |
+
+**決定性變因是工具數量，與是否串流無關。** 小模型綁超過約 5 個工具就選不出正確工具。
+
+## 已知限制
+
+1. **numpy 版本衝突**：`insightface`／`onnxruntime` 會裝進 numpy 2.x，而 apt 的 `cv_bridge`
+   是對 numpy 1.x 編譯的 C 擴充，衝突時節點一收到影像就 segfault。
+   解法見 [`docs/部署與執行.md`](docs/部署與執行.md) 第二節。
+   **驗證相容性必須跑到真正的 C 執行路徑，只 `import` 成功沒有意義。**
+2. **USB 2.0 頻寬**：ASTRA S 同時開深度＋彩色會超過頻寬導致彩色斷流；只開彩色反而更快。
+3. **同時跑兩個 `astra_camera_node` 會搶 USB**，啟動前確認節點數為 1。
+4. **slam_toolbox 在 Jazzy 是 lifecycle 節點**，廠商 Humble 世代 launch 不會自動 activate，
+   症狀是 `/map` 話題不存在。需手動 `ros2 lifecycle set /slam_toolbox configure/activate`。
+5. **`--symlink-install` 後不可改名或搬移 workspace**，否則 install 內連結全懸空
+   （`ls` 看得到但 `test -f` 失敗）。
+6. **兩條導航鏈不可混用**：WHEELTEC 鏈全程用 `odom_combined` frame（EKF 輸出），
+   `smartnav_navigation`（模擬）用 `odom`。
+7. **`frontier_exploration_ros2` 未內含**：`brain.launch.py` 需要它，須另外 clone。
+8. **銀行場景劇本尚未移植**——重整前有（VIP 迎賓詞、黑名單通報、帶位、FAQ），
+   新結構下需重新實作，這是 12 月發表前的第一優先。
+
+## 文件索引
+
+| 文件 | 內容 |
+|---|---|
+| [`docs/專案總覽.md`](docs/專案總覽.md) | 入口：全貌、事件流、名詞、現況、鐵則 |
+| [`docs/架構參考.md`](docs/架構參考.md) | 套件、節點、話題、服務、參數速查 |
+| [`docs/部署與執行.md`](docs/部署與執行.md) | 建置、相依、啟動、常見問題 |
+| [`docs/驗證清單.md`](docs/驗證清單.md) | 已驗證／待驗證／未實作逐項與驗收步驟 |
+
+外部參考：[swient/smartnav-bot](https://github.com/swient/smartnav-bot)（應用層上游）·
+[ROS 2 Jazzy](https://docs.ros.org/en/jazzy/) · [Nav2](https://navigation.ros.org/) ·
+[InsightFace](https://github.com/deepinsight/insightface) ·
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) · [Ollama](https://ollama.com/)
 
 ## 授權
 
 本專案採用 [MIT License](LICENSE)。開發規範見 [`.clinerules`](.clinerules)。
+廠商套件（`src/` 下的 WHEELTEC 程式碼）依其原始授權條款。
