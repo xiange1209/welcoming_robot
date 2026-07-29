@@ -576,8 +576,15 @@ class HmiServerNode(Node):
         self.declare_parameter(
             "admin_username", "admin", ParameterDescriptor(description="管理者帳號")
         )
+        # 預設留空，密碼不寫死在原始碼裡 —— 這個 repo 是公開的，寫死等於公開密碼。
+        # 取得順序：launch 參數 > 環境變數 SMARTNAV_ADMIN_PASSWORD > 隨機生成。
+        # 三者都沒有時會隨機生成一組並印在啟動 log，所以不會有「登不進去」的情況。
         self.declare_parameter(
-            "admin_password", "***REMOVED-CREDENTIAL***", ParameterDescriptor(description="管理者密碼")
+            "admin_password",
+            "",
+            ParameterDescriptor(
+                description="管理者密碼（留空則讀環境變數 SMARTNAV_ADMIN_PASSWORD，仍為空則隨機生成並印在啟動 log）"
+            ),
         )
         self.declare_parameter(
             "admin_session_hours", 12.0, ParameterDescriptor(description="管理者登入有效時數")
@@ -650,7 +657,7 @@ class HmiServerNode(Node):
         self.host = self.get_parameter("host").get_parameter_value().string_value
         self.port = self.get_parameter("port").get_parameter_value().integer_value
         self.admin_username = self.get_parameter("admin_username").get_parameter_value().string_value
-        self.admin_password = self.get_parameter("admin_password").get_parameter_value().string_value
+        self.admin_password = self._resolve_admin_password()
         self.admin_session_sec = (
             self.get_parameter("admin_session_hours").get_parameter_value().double_value * 3600.0
         )
@@ -1583,6 +1590,40 @@ class HmiServerNode(Node):
     def _revoke_token(self, token: str) -> None:
         with self._token_lock:
             self._tokens.pop(token, None)
+
+    def _resolve_admin_password(self) -> str:
+        """決定管理者密碼，順序：launch 參數 > 環境變數 > 隨機生成
+
+        密碼不寫死在原始碼裡：這個 repo 是公開的，寫死等於公開密碼，
+        而且大家很容易拿平常在用的密碼當預設值（這正是先前的情況——
+        預設值跟 Pi 的 SSH 密碼是同一組）。
+
+        三個來源都沒有時**不會拒絕啟動**，而是隨機生成一組印在 log 上。
+        車子在現場沒網路、沒鍵盤時，「起不來」比「密碼要去 log 裡看」麻煩得多。
+        """
+        pw = self.get_parameter("admin_password").get_parameter_value().string_value
+        if pw:
+            return pw
+
+        pw = os.environ.get("SMARTNAV_ADMIN_PASSWORD", "")
+        if pw:
+            self.get_logger().info("管理者密碼來自環境變數 SMARTNAV_ADMIN_PASSWORD")
+            return pw
+
+        # token_urlsafe 會產生 URL 安全字元，不會有需要跳脫的符號，平板上好輸入
+        pw = secrets.token_urlsafe(6)
+        self.get_logger().warn(
+            "\n"
+            "════════════════════════════════════════════\n"
+            " 未指定管理者密碼，已隨機生成一組：\n"
+            f"     帳號 {self.admin_username}    密碼 {pw}\n"
+            "\n"
+            " 這組密碼每次重啟都會變。要固定的話擇一：\n"
+            "   ros2 launch ... admin_password:=你的密碼\n"
+            "   export SMARTNAV_ADMIN_PASSWORD=你的密碼\n"
+            "════════════════════════════════════════════"
+        )
+        return pw
 
     def _check_credentials(self, username: str, password: str) -> bool:
         # compare_digest 避免用字串比較洩漏長度/前綴資訊

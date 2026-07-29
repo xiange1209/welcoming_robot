@@ -18,3 +18,7 @@ logs/
 .vscode/
 .idea/
 *.swp
+
+# 本機密碼設定 —— 絕對不可進版控
+local_env.sh
+.env.local
