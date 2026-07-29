@@ -1,0 +1,6 @@
+# 列出所有已註冊使用者
+
+---
+UserInfo[] users
+bool success
+string message

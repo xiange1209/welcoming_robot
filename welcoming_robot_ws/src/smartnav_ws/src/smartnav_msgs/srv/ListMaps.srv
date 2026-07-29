@@ -1,0 +1,6 @@
+# 列出地圖服務
+
+---
+MapInfo[] maps_info             # 地圖資訊列表
+bool success                    # 是否成功
+string message                  # 訊息 (成功或錯誤描述)

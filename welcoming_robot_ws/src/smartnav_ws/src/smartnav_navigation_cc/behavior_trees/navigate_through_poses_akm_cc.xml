@@ -1,0 +1,64 @@
+<!--
+  navigate_through_poses_akm_cc.xml
+  以 Nav2 預設的 navigate_through_poses_w_replanning_and_recovery.xml 為基礎，
+  和 navigate_to_pose_akm_cc.xml 做同樣的阿克曼調整：恢復行為拿掉 <Spin>。
+
+  這一支不能省略。bt_navigator 在 activate 時會把 navigate_to_pose 與
+  navigate_through_poses 兩棵樹都載入並檢查其中每個 action server 是否存在。
+  只覆寫 default_nav_to_pose_bt_xml 的話，through_poses 仍會用預設樹，
+  裡面的 <Spin> 找不到 server 就會拋例外：
+
+      [bt_navigator] Exception when loading BT: Action server spin not available
+      [lifecycle_manager] Failed to change state for node: bt_navigator
+      [lifecycle_manager] Failed to bring up all requested nodes. Aborting bringup.
+
+  也就是說「只要 behavior_plugins 拿掉 spin，兩棵樹就都要換掉」。
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="10" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="0.333">
+          <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
+            <ReactiveSequence>
+              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+              <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            </ReactiveSequence>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated/>
+          <RoundRobin name="RecoveryActions">
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <BackUp backup_dist="0.40" backup_speed="0.08" error_code_id="{backup_error_code}"/>
+            <DriveOnHeading dist_to_travel="0.25" speed="0.10" error_code_id="{drive_error_code}"/>
+            <BackUp backup_dist="0.25" backup_speed="0.08" error_code_id="{backup_error_code}"/>
+            <Wait wait_duration="3.0"/>
+          </RoundRobin>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

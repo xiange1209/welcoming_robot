@@ -1,0 +1,1632 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>SmartNav 智慧銀行迎賓系統</title>
+<!--
+  零外部函式庫：影像用 <img> 吃 MJPEG，地圖用 <canvas> 疊圖，狀態用原生 WebSocket。
+  所有 ROS 服務都經由同一個埠的 /api/* 呼叫，前端不需要 rosbridge。
+-->
+<style>
+  :root {
+    --bg: #0f1216;
+    --panel: #171c23;
+    --panel-2: #1f2630;
+    --line: #2b3441;
+    --text: #e6ecf3;
+    --muted: #8fa0b4;
+    --accent: #4da3ff;
+    --gold: #f0b429;
+    --green: #35c27a;
+    --red: #ff5c5c;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
+    height: 100vh;
+    /* 手機網址列會伸縮，100vh 會比實際可視區高，內容因此被切掉 */
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── 頂部身分橫幅 ─────────────────────────────── */
+  #banner {
+    padding: 10px 18px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    transition: background .3s;
+  }
+  #banner.vip   { background: linear-gradient(90deg, #4a3708, #1f1a0a); }
+  #banner.admin { background: linear-gradient(90deg, #0b3358, #101b26); }
+
+  #who { font-size: 22px; font-weight: 700; }
+  #who .tag {
+    font-size: 13px; padding: 2px 9px; border-radius: 99px;
+    margin-left: 8px; vertical-align: middle;
+    background: var(--panel-2); color: var(--muted);
+  }
+  #banner.vip   #who .tag { background: var(--gold); color: #2a1e00; }
+  #banner.admin #who .tag { background: var(--accent); color: #04121f; }
+  #sub { color: var(--muted); font-size: 13px; }
+  #stats { margin-left: auto; display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--red); }
+  .dot.on { background: var(--green); }
+
+  /* ── 分頁 ─────────────────────────────────────── */
+  #tabs { display: flex; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #tabs button {
+    flex: 1; padding: 12px; background: none; border: none; cursor: pointer;
+    color: var(--muted); font-size: 15px; border-bottom: 3px solid transparent;
+    font-family: inherit;
+  }
+  #tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  .page { display: none; flex: 1; min-height: 0; overflow: hidden; padding: 14px; gap: 14px; }
+  .page.active { display: flex; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px; display: flex; flex-direction: column; min-height: 0;
+  }
+
+  /* 卡片內的控制列一律不可被壓縮。
+     它們是 column flex 的子項，預設 flex-shrink:1；內容一多就會被壓扁，
+     而 .seg 有 overflow:hidden，壓扁等於按鈕消失、再也點不到。 */
+  .card > .row, .card > .seg, .card > p, #paneLive, #panePhoto { flex: none; }
+  .card h3 { margin: 0 0 10px; font-size: 14px; color: var(--muted); font-weight: 600; }
+
+  /* ── 通用控制項 ───────────────────────────────── */
+  button.btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 9px 13px; cursor: pointer; font-size: 14px;
+    font-family: inherit; white-space: nowrap;
+  }
+  button.btn:hover  { border-color: var(--accent); }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+  button.btn.danger  { background: #3a1a1a; border-color: #5c2b2b; color: #ffb3b3; }
+  button.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* ── 遙控方向鍵 ───────────────────────────────── */
+  /* 手機操作：按鍵要夠大（48px 是可觸控目標的下限，這裡給到 68px），
+     touch-action:none 是必要的 —— 否則長按會被瀏覽器判成捲動或選取，
+     手指還按著卻不再送指令，車子就會被看門狗停掉。 */
+  button.tbtn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; font-size: 26px; font-family: inherit;
+    height: 68px; cursor: pointer; touch-action: none; user-select: none;
+    -webkit-user-select: none; -webkit-tap-highlight-color: transparent;
+  }
+  button.tbtn:active, button.tbtn.held {
+    background: var(--accent); color: #04121f; border-color: var(--accent);
+  }
+  button.tbtn.stop { background: #3a1a1a; border-color: #5c2b2b; color: #ffb3b3; }
+
+  input, select, textarea {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 9px 11px; font-size: 14px; font-family: inherit;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .spacer { margin-left: auto; }
+
+  /* ── 對話 ─────────────────────────────────────── */
+  #chat { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 88%; padding: 9px 13px; border-radius: 12px; line-height: 1.5; font-size: 15px; }
+  .msg.user  { align-self: flex-end;   background: #1d354f; }
+  .msg.robot { align-self: flex-start; background: var(--panel-2); }
+  .msg.ghost { opacity: .55; font-style: italic; }
+
+  /* LLM 回覆下方的耗時數據 */
+  .msgstats {
+    align-self: flex-start; margin: -4px 0 2px 4px;
+    font-size: 11px; color: var(--muted);
+    display: flex; gap: 10px; flex-wrap: wrap;
+  }
+  .msgstats b { color: var(--text); font-weight: 600; }
+
+  /* ── 現場影像 ─────────────────────────────────── */
+  /* 外框自己吃掉卡片剩下的空間，影像用 contain 置中。
+     不寫死長寬比，換相機（4:3 / 16:9）或轉向都不會凸出圓角邊框。 */
+  .videobox {
+    flex: 1; min-height: 0; position: relative; overflow: hidden;
+    background: #000; border: 1px solid var(--line); border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .videobox img { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+  /* 註冊頁的預覽比迎賓頁小，其餘空間留給表單 */
+  .regpreview { flex: 1 1 180px; min-height: 150px; margin-bottom: 10px; }
+
+  /* 註冊時的人臉對位框，偵測到人臉就轉綠色實線 */
+  #faceguide {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 42%; aspect-ratio: 3 / 4; max-height: 76%;
+    border: 2px dashed rgba(255, 255, 255, .5); border-radius: 50%;
+    pointer-events: none; transition: border-color .2s;
+  }
+  #faceguide.ok { border-color: var(--green); border-style: solid; }
+
+  #facestatus {
+    position: absolute; left: 8px; bottom: 8px; pointer-events: none;
+    background: rgba(0, 0, 0, .62); border-radius: 6px; padding: 4px 9px;
+    font-size: 12px; color: var(--muted);
+  }
+  #facestatus.ok { color: #7fe0ad; }
+
+  /* ── 地圖 ─────────────────────────────────────── */
+  #mapwrap { flex: 1; position: relative; min-height: 220px; background: #0a0d11; border-radius: 8px; }
+  #mapcanvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  #maphint {
+    position: absolute; left: 10px; bottom: 10px; font-size: 12px; color: var(--muted);
+    background: rgba(0,0,0,.55); padding: 5px 9px; border-radius: 6px; pointer-events: none;
+  }
+
+  .list { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 6px; min-height: 60px; }
+  .item {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 11px; display: flex; align-items: center; gap: 9px; font-size: 14px;
+  }
+  .item .name { font-weight: 600; }
+  .meta { color: var(--muted); font-size: 12px; }
+
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--line); color: var(--muted); }
+  .badge.VIP   { background: var(--gold);   color: #2a1e00; }
+  .badge.ADMIN { background: var(--accent); color: #04121f; }
+  .badge.run   { background: #12324d; color: #7fc5ff; }
+  .badge.ok    { background: #123d29; color: #7fe0ad; }
+  .badge.bad   { background: #3d1414; color: #ff9d9d; }
+
+  /* ── 提示訊息 ─────────────────────────────────── */
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    background: #222c38; border: 1px solid var(--line); border-radius: 9px;
+    padding: 11px 18px; font-size: 14px; opacity: 0; pointer-events: none;
+    transition: opacity .25s; max-width: 80vw; z-index: 50;
+  }
+  #toast.show { opacity: 1; }
+  #toast.bad { border-color: #6b2b2b; background: #3a1c1c; }
+
+  /* ── 管理者登入 ───────────────────────────────── */
+  #adminbtn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+    font-family: inherit; white-space: nowrap;
+  }
+  #adminbtn.on { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+
+  /* 未登入時管理分頁整個不顯示，避免訪客誤按 */
+  #tabs button[data-admin]{ display: none; }
+  body.admin #tabs button[data-admin]{ display: block; }
+
+  #loginmask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.66); z-index: 60;
+    display: none; align-items: center; justify-content: center; padding: 20px;
+  }
+  #loginmask.show { display: flex; }
+  #loginbox {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 22px; width: 100%; max-width: 340px;
+    /* 手機叫出鍵盤後可視區會變很矮，讓對話框自己能捲 */
+    max-height: 90dvh; overflow-y: auto;
+  }
+  #loginbox h3 { margin: 0 0 4px; font-size: 17px; }
+  #loginbox .meta { display: block; margin-bottom: 14px; }
+  #loginbox input { width: 100%; margin-bottom: 10px; }
+  #loginerr { color: var(--red); font-size: 13px; min-height: 18px; }
+
+  /* ── 照片註冊 ─────────────────────────────────── */
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .seg button {
+    flex: 1; padding: 7px 10px; background: var(--panel-2); color: var(--muted);
+    border: none; cursor: pointer; font-size: 13px; font-family: inherit;
+  }
+  .seg button.on { background: var(--accent); color: #04121f; font-weight: 600; }
+
+  #shots {
+    display: flex; gap: 6px; overflow-x: auto; padding: 4px 0; min-height: 62px;
+    align-items: center;
+  }
+  #shots .shot { position: relative; flex: none; }
+  #shots img {
+    width: 54px; height: 54px; object-fit: cover; border-radius: 6px;
+    border: 1px solid var(--line); display: block;
+  }
+  #shots .rm {
+    position: absolute; top: -5px; right: -5px; width: 18px; height: 18px;
+    border-radius: 50%; border: none; background: var(--red); color: #fff;
+    font-size: 12px; line-height: 18px; padding: 0; cursor: pointer;
+  }
+
+  /* ── 手機 / 直向平板 ─────────────────────────────
+     桌機的版型是「整頁不捲、各區塊內部捲」，螢幕一小就行不通：
+     卡片高度被壓到不夠，內部元素全被擠扁而點不到。
+     這裡改成頁面整體捲動、卡片高度依內容決定。
+
+     用 display:block 而不是改 flex 值，是因為卡片的 flex 比例寫在
+     行內 style 上（flex:1.4 等），行內樣式蓋不掉；改成 block 之後
+     那些值自然失效，不必動用 !important。 */
+  @media (max-width: 900px) {
+    .page.active {
+      display: block; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    }
+    .page > .card { margin-bottom: 14px; }
+    .page > .card:last-child { margin-bottom: 0; }
+
+    /* 卡片不再有固定高度，原本靠 flex:1 撐開的區塊要給明確高度，
+       否則會塌成 0 */
+    /* flex:1 / flex-basis 在自動高度的卡片裡會塌掉，改用明確高度 */
+    .videobox, .regpreview { flex: none; height: 56vw; max-height: 300px; min-height: 160px; }
+    #mapwrap  { height: 58vh; min-height: 240px; }
+    #chat     { height: 46vh; min-height: 180px; }
+    .list     { max-height: 46vh; }
+
+    /* 登入後有 5 個分頁，窄螢幕塞不下就橫向捲 */
+    #tabs { overflow-x: auto; }
+    #tabs button { flex: none; padding: 12px 15px; font-size: 14px; }
+
+    /* 橫幅的狀態列換行，不要把管理者按鈕擠出畫面 */
+    #banner { flex-wrap: wrap; gap: 10px; }
+    #stats { margin-left: 0; width: 100%; flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+<div id="banner">
+  <div>
+    <div id="who">等待辨識…<span class="tag" id="tag">—</span></div>
+    <div id="sub">系統啟動中</div>
+  </div>
+  <div id="stats">
+    <span><span class="dot" id="wsdot"></span> 連線</span>
+    <span id="fps">相機 —</span>
+    <span id="volt">電壓 —</span>
+    <span id="mapname">地圖 —</span>
+    <button id="adminbtn">管理者登入</button>
+  </div>
+</div>
+
+<div id="tabs">
+  <button class="active" data-page="p-greet">迎賓</button>
+  <button data-page="p-map" data-admin>地圖與導航</button>
+  <button data-page="p-teleop" data-admin>遙控建圖</button>
+  <button data-page="p-users" data-admin>使用者管理</button>
+  <button data-page="p-sys">系統</button>
+  <button data-page="p-voice">語音測試</button>
+</div>
+
+<!-- ── 管理者登入 ─────────────────────────────────── -->
+<div id="loginmask">
+  <div id="loginbox">
+    <h3>管理者登入</h3>
+    <span class="meta">登入後才會出現「地圖與導航」與「使用者管理」</span>
+    <input id="loginuser" placeholder="帳號" autocomplete="username">
+    <input id="loginpass" type="password" placeholder="密碼" autocomplete="current-password">
+    <div id="loginerr"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn primary" id="logindo" style="flex:1">登入</button>
+      <button class="btn" id="logincancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 迎賓 ───────────────────────────────────────── -->
+<div class="page active" id="p-greet">
+  <div class="card" style="flex:1.1">
+    <h3>現場影像</h3>
+    <!-- src 由 updateStreams() 依當前分頁掛上／卸下，切走就中斷串流 -->
+    <div class="videobox"><img id="video" alt="現場影像"></div>
+  </div>
+  <div class="card" style="flex:1">
+    <h3>對話</h3>
+    <div id="chat"></div>
+    <div class="row" style="margin-top:10px">
+      <input id="sayinput" placeholder="輸入要對機器人說的話…" style="flex:1" autocomplete="off">
+      <button class="btn primary" id="saybtn">送出</button>
+      <button class="btn danger" id="clearchatbtn">清除對話</button>
+    </div>
+    <div class="meta" id="llmmodel" style="margin-top:8px">模型 —</div>
+  </div>
+</div>
+
+<!-- ── 地圖 ───────────────────────────────────────── -->
+<!-- 遙控建圖：手機直接操作，左邊即時地圖、右邊方向鍵 -->
+<div class="page" id="p-teleop">
+  <div class="card" style="flex:1.4">
+    <h3>即時地圖</h3>
+    <div id="tmapwrap" style="position:relative; flex:1; min-height:240px; background:#111; border-radius:8px; overflow:hidden">
+      <canvas id="tmapcanvas" style="width:100%; height:100%; display:block"></canvas>
+      <div id="tmaphint" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#888">等待地圖…</div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="tmapname" placeholder="地圖名稱" style="flex:1">
+      <button class="btn primary" id="tstartmap">開始建圖</button>
+      <button class="btn" id="tfinishmap">完成存檔</button>
+    </div>
+  </div>
+
+  <div class="card" style="flex:1">
+    <h3>遙控</h3>
+    <div id="tstatus" class="meta" style="margin-bottom:8px">未連線</div>
+
+    <!-- 方向鍵：按住送指令、放開就停。手機用 touch 事件。 -->
+    <div id="tpad" style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; max-width:320px; margin:0 auto; touch-action:none; user-select:none">
+      <div></div>
+      <button class="tbtn" data-lin="1"  data-ang="0">▲</button>
+      <div></div>
+      <button class="tbtn" data-lin="0"  data-ang="1">◀</button>
+      <button class="tbtn stop" id="tstop">■</button>
+      <button class="tbtn" data-lin="0"  data-ang="-1">▶</button>
+      <div></div>
+      <button class="tbtn" data-lin="-1" data-ang="0">▼</button>
+      <div></div>
+    </div>
+
+    <div class="row" style="margin-top:14px; align-items:center">
+      <span class="meta" style="width:60px">速度</span>
+      <input type="range" id="tspeed" min="20" max="100" value="60" style="flex:1">
+      <span class="meta" id="tspeedval" style="width:52px; text-align:right">0.11</span>
+    </div>
+
+    <div class="row" style="margin-top:14px; align-items:center">
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer">
+        <input type="checkbox" id="trearmask">
+        <span>遮蔽車尾雷達（我站在車後）</span>
+      </label>
+    </div>
+    <div class="meta" style="margin-top:6px; line-height:1.5; color:#ffb3b3">
+      注意：雷達驅動只在<b>啟動時</b>讀這個設定，勾選後<b>本次不會生效</b>
+      （已實測確認）。要真的遮蔽必須重啟感測器。<br>
+      在那之前，請盡量走在車子<b>側邊或前方</b>，不要待在正後方。
+    </div>
+
+    <div class="meta" style="margin-top:14px; line-height:1.5">
+      放開按鈕即停。若連線中斷（走出 WiFi、鎖螢幕、切換 App），
+      車子會在 0.6 秒內自動停止。
+    </div>
+  </div>
+</div>
+
+<div class="page" id="p-map">
+  <div class="card" style="flex:1.5">
+    <h3>地圖（點一下選位置，按住拖曳可設定朝向）</h3>
+    <div class="row" style="margin-bottom:10px">
+      <select id="mapmode">
+        <option value="view">檢視模式</option>
+        <option value="waypoint">建立地點</option>
+        <option value="navigate">導航到此</option>
+      </select>
+      <span id="picked" class="meta">尚未選點</span>
+      <button class="btn spacer" id="maprefresh">重新整理</button>
+    </div>
+    <div id="mapwrap">
+      <canvas id="mapcanvas"></canvas>
+      <div id="maphint">等待地圖…</div>
+    </div>
+  </div>
+
+  <div class="card" style="flex:1">
+    <h3>地點</h3>
+    <div class="list" id="wplist"></div>
+
+    <h3 style="margin-top:12px">地圖管理</h3>
+    <div class="row">
+      <select id="mapselect" style="flex:1"></select>
+      <button class="btn" id="switchmap">切換</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="newmapname" placeholder="新地圖名稱" style="flex:1">
+      <button class="btn" id="createmap">開始建圖</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" id="localize">全域定位</button>
+    </div>
+
+    <h3 style="margin-top:12px">進行中的作業</h3>
+    <div class="list" id="joblist" style="max-height:160px; flex:none"></div>
+  </div>
+</div>
+
+<!-- ── 使用者 ─────────────────────────────────────── -->
+<div class="page" id="p-users">
+  <div class="card" style="flex:1.4">
+    <h3>已註冊使用者</h3>
+    <div class="list" id="userlist"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="userrefresh">重新整理</button>
+    </div>
+  </div>
+  <div class="card" style="flex:1">
+    <h3>註冊新使用者</h3>
+    <div class="videobox regpreview">
+      <img id="video2" alt="註冊預覽">
+      <div id="faceguide"></div>
+      <div id="facestatus">等待影像…</div>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <input id="regname" placeholder="姓名" style="flex:1">
+      <select id="regtype">
+        <option value="0">訪客 GUEST</option>
+        <option value="1">貴賓 VIP</option>
+        <option value="2">管理員 ADMIN</option>
+      </select>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <input id="regdesc" placeholder="備註（例如：分行經理）" style="flex:1">
+    </div>
+
+    <div class="seg" style="margin-bottom:8px">
+      <button id="modelive" class="on">即時採樣</button>
+      <button id="modephoto">照片註冊</button>
+    </div>
+
+    <!-- 即時採樣 -->
+    <div id="paneLive">
+      <div class="row" style="margin-bottom:8px">
+        <span class="meta">採樣張數</span>
+        <input id="regsamples" type="number" value="10" min="1" max="30" style="width:82px">
+        <button class="btn primary spacer" id="regbtn">開始註冊</button>
+      </div>
+      <p class="meta" style="line-height:1.7">
+        按下後<b>立刻站到相機前並持續站著</b>，稍微轉頭讓樣本多樣化。上方會即時顯示已採集張數。<br>
+        採樣有 <b>20 秒</b>上限，時間內沒收滿會自動取消並移除該筆使用者，需要重新註冊。
+      </p>
+    </div>
+
+    <!-- 照片註冊 -->
+    <div id="panePhoto" style="display:none">
+      <div class="row" style="margin-bottom:6px">
+        <button class="btn" id="pickfiles">選擇照片</button>
+        <button class="btn" id="snapshot">從畫面拍照</button>
+        <span class="meta spacer" id="shotcount">尚未選擇</span>
+      </div>
+      <input id="fileinput" type="file" accept="image/*" multiple style="display:none">
+      <div id="shots"></div>
+      <button class="btn primary" id="regphotobtn" style="width:100%; margin-top:6px">用這些照片註冊</button>
+      <p class="meta" style="line-height:1.7">
+        適合替不在現場的人建檔。每張照片會各自抽一次人臉特徵，<b>沒偵測到人臉的會被略過</b>。<br>
+        實測：單張的置信度距門檻只有 0.002，10 張則有 0.071 的安全邊際（約 35 倍）。
+        <b>正式展示請放 10 張以上不同角度的照片。</b>
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ── 系統 ───────────────────────────────────────── -->
+<div class="page" id="p-sys">
+  <div class="card" style="flex:1">
+    <h3 id="pihead">Pi 4（本機）</h3>
+    <div class="list" id="pilist"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="healthrefresh">重新整理</button>
+    </div>
+  </div>
+  <div class="card" style="flex:1">
+    <h3>邊緣裝置（筆電）</h3>
+    <div class="list" id="edgelist"></div>
+    <p class="meta" style="line-height:1.7; margin-top:10px">
+      節點歸屬是比對本機行程判定的：在這台 Pi 找得到對應行程就歸左欄，
+      其餘視為在另一台機器上。判定不準的節點可用
+      <code>pi_nodes</code> / <code>edge_nodes</code> 參數釘死。<br>
+      顯示「未就緒」代表對應節點沒啟動，不是網頁壞掉——地圖與導航需要
+      <code>map_service_node</code>、<code>waypoint_service_node</code> 與 nav2；
+      使用者管理需要 <code>user_auth_node</code>，照片註冊另外需要
+      <code>face_embedding_node</code>。
+    </p>
+  </div>
+</div>
+
+<!-- ── 語音測試 ───────────────────────────────────── -->
+<div class="page" id="p-voice">
+  <div class="card" style="flex:1">
+    <h3>語音測試（跳過 LLM 直接播報）</h3>
+    <div class="row">
+      <input id="speakinput" style="flex:1" value="歡迎光臨，我是智慧銀行迎賓機器人">
+      <button class="btn" id="speakbtn">播報</button>
+    </div>
+    <p class="meta" style="line-height:1.8; margin-top:14px">
+      這裡送出的文字會直接進 TTS 播報，不經過 LLM，用來單獨確認語音鏈路是否正常。<br>
+      若要測整條對話流程（語音辨識 → LLM → 播報），請用「迎賓」頁下方的對話框。
+    </p>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+// ── 小工具 ─────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "show" + (bad ? " bad" : "");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => (t.className = ""), 2800);
+}
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+// ── 管理者登入 ─────────────────────────────────────
+// 權杖放 sessionStorage：重新整理還在，關掉分頁就失效，適合共用平板。
+let adminToken = sessionStorage.getItem("hmiToken") || "";
+
+function setAdmin(on) {
+  document.body.classList.toggle("admin", on);
+  $("adminbtn").textContent = on ? "登出" : "管理者登入";
+  $("adminbtn").classList.toggle("on", on);
+  if (!on) {
+    adminToken = "";
+    sessionStorage.removeItem("hmiToken");
+    // 站在管理分頁時被登出，要把人帶回公開頁，否則會停在一個空白畫面
+    const active = document.querySelector("#tabs button.active");
+    if (active && active.hasAttribute("data-admin")) selectTab(document.querySelector("#tabs button"));
+  }
+}
+
+async function api(path, options) {
+  try {
+    const headers = {"Content-Type": "application/json"};
+    if (adminToken) headers["Authorization"] = "Bearer " + adminToken;
+    const res = await fetch(path, Object.assign({headers}, options));
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      // 權杖過期或被撤銷：收起管理分頁，別讓畫面停在會一直失敗的地方
+      if (adminToken) toast("管理者登入已失效，請重新登入", true);
+      setAdmin(false);
+      return {success: false, message: "需要管理者登入"};
+    }
+    // 後端一律用 success 欄位表達成敗，HTTP 狀態碼只用來分類錯誤來源
+    if (!res.ok && data.message) toast(data.message, true);
+    return data;
+  } catch (e) {
+    toast("無法連線到機器人：" + e.message, true);
+    return {success: false, message: String(e)};
+  }
+}
+
+const post = (p, body) => api(p, {method: "POST", body: JSON.stringify(body || {})});
+const put  = (p, body) => api(p, {method: "PUT",  body: JSON.stringify(body || {})});
+const del  = (p)       => api(p, {method: "DELETE"});
+
+// ── 分頁 ───────────────────────────────────────────
+// MJPEG 是一條開著不關的連線，隱藏的 <img> 照樣會一直收。
+// 只讓目前看得到的那一路連著，切走就把 src 拿掉中斷它。
+const STREAMS = {"p-greet": "video", "p-users": "video2"};
+
+function updateStreams(activePage) {
+  for (const [page, imgId] of Object.entries(STREAMS)) {
+    const img = $(imgId);
+    if (page === activePage) {
+      // 帶 timestamp 避免瀏覽器把中斷過的串流當成快取重用
+      if (!img.getAttribute("src")) img.src = "/video?t=" + Date.now();
+    } else if (img.getAttribute("src")) {
+      img.removeAttribute("src");
+    }
+  }
+}
+
+// 地圖分頁的「有人在看」心跳。
+// 後端的位姿來源（amcl_pose／TF 監聽）與地圖 PNG 渲染都很貴，而且只有這個
+// 分頁看得到，所以做成按需開啟：在地圖分頁時每 5 秒打一次，切走就停，
+// 後端十幾秒後自動把訂閱收掉。不打這個心跳地圖就不會更新。
+let mapWatchTimer = null;
+
+function setMapWatch(on) {
+  if (on && mapWatchTimer === null) {
+    const ping = () => fetch("/api/map/watch", {method: "POST"}).catch(() => {});
+    ping();                                   // 立刻通知一次，不要等第一個間隔
+    mapWatchTimer = setInterval(ping, 5000);
+  } else if (!on && mapWatchTimer !== null) {
+    clearInterval(mapWatchTimer);
+    mapWatchTimer = null;
+  }
+}
+
+function selectTab(btn) {
+  document.querySelectorAll("#tabs button").forEach((b) => b.classList.remove("active"));
+  document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
+  btn.classList.add("active");
+  $(btn.dataset.page).classList.add("active");
+  updateStreams(btn.dataset.page);
+  // 遙控頁也要地圖，所以兩個分頁都要開心跳
+  const wantsMap = btn.dataset.page === "p-map" || btn.dataset.page === "p-teleop";
+  setMapWatch(wantsMap);
+  if (btn.dataset.page === "p-map")   { refreshMaps(); refreshWaypoints(); drawMap(); }
+  if (btn.dataset.page === "p-users") refreshUsers();
+  if (btn.dataset.page === "p-sys")   refreshHealth();
+  // 離開遙控頁一定要停車：使用者可能按著方向鍵就切走了
+  if (btn.dataset.page !== "p-teleop") teleopStop();
+  else drawTeleopMap();
+}
+
+// 平板螢幕關掉或切到別的 App 時瀏覽器不會觸發 selectTab，心跳會一直打下去。
+// 分頁隱藏就停，回來再續——這是「沒人在看就不要算」最直接的一種情況。
+document.addEventListener("visibilitychange", () => {
+  const onMap = (document.querySelector("#tabs button.active") || {}).dataset;
+  const page = onMap && onMap.page;
+  setMapWatch(!document.hidden && (page === "p-map" || page === "p-teleop"));
+  // 螢幕關掉／切到別的 App 一定要停車。
+  // 後端看門狗本來就會在 0.6 秒內停，這裡只是讓它更即時。
+  if (document.hidden) teleopStop();
+});
+
+/* ══════════════════════════════════════════════════════════
+   遙控建圖
+   ══════════════════════════════════════════════════════════
+   設計原則：**車子的移動由「持續收到指令」維持，而不是由狀態維持。**
+
+   前端每 200 ms 送一次目前的方向；放開按鍵就不再送。後端看門狗超過
+   0.6 秒沒收到就自動歸零。這樣「連線中斷」和「使用者放開手」對車子
+   來說是同一件事 —— 都會停。
+
+   如果反過來做成「按下送 start、放開送 stop」，那則 stop 只要沒送達
+   （手機遙控很常見），車子就會一直跑下去。 */
+let teleopVec = {lin: 0, ang: 0};
+let teleopTimer = null;
+let teleopSpeed = 0.60;          // 0~1，對應到後端上限
+
+function teleopSend() {
+  const lin = teleopVec.lin * teleopSpeed * 0.18;   // 後端上限 0.18 m/s
+  const ang = teleopVec.ang * teleopSpeed * 0.45;   // 後端上限 0.45 rad/s
+  fetch("/api/teleop", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({linear: lin, angular: ang}),
+  }).catch(() => {
+    // 送不出去就直接停止本地心跳；車子那端看門狗也會停
+    teleopHalt();
+    setText("tstatus", "連線中斷，已停車");
+  });
+}
+
+function teleopStart(lin, ang) {
+  teleopVec = {lin: lin, ang: ang};
+  if (teleopTimer === null) {
+    teleopSend();                                  // 立刻送一次，不要等第一個間隔
+    teleopTimer = setInterval(teleopSend, 200);
+  }
+  setText("tstatus", `移動中　前後 ${lin>0?"前進":lin<0?"後退":"—"}　轉向 ${ang>0?"左":ang<0?"右":"—"}`);
+}
+
+function teleopHalt() {
+  if (teleopTimer !== null) { clearInterval(teleopTimer); teleopTimer = null; }
+  teleopVec = {lin: 0, ang: 0};
+  document.querySelectorAll(".tbtn").forEach((b) => b.classList.remove("held"));
+}
+
+function teleopStop() {
+  const wasMoving = teleopTimer !== null;
+  teleopHalt();
+  if (wasMoving) {
+    fetch("/api/teleop/stop", {method: "POST"}).catch(() => {});
+    setText("tstatus", "已停止");
+  }
+}
+
+function setText(id, s) { const el = $(id); if (el) el.textContent = s; }
+
+// 方向鍵綁定。pointer 事件同時涵蓋滑鼠與觸控，不用分開處理。
+document.querySelectorAll("#tpad .tbtn").forEach((btn) => {
+  if (btn.id === "tstop") { btn.onclick = teleopStop; return; }
+  const lin = parseFloat(btn.dataset.lin) || 0;
+  const ang = parseFloat(btn.dataset.ang) || 0;
+  const down = (e) => {
+    e.preventDefault();
+    btn.classList.add("held");
+    // 手指按著時把後續事件都導到這個按鈕，滑出邊界也不會漏掉 pointerup
+    if (btn.setPointerCapture && e.pointerId !== undefined) {
+      try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    teleopStart(lin, ang);
+  };
+  btn.addEventListener("pointerdown", down);
+  ["pointerup", "pointercancel", "pointerleave"].forEach((ev) =>
+    btn.addEventListener(ev, (e) => { e.preventDefault(); teleopStop(); })
+  );
+});
+
+// 鍵盤操作（筆電上比較好用）
+const keyMap = {ArrowUp:[1,0], ArrowDown:[-1,0], ArrowLeft:[0,1], ArrowRight:[0,-1],
+                w:[1,0], s:[-1,0], a:[0,1], d:[0,-1]};
+document.addEventListener("keydown", (e) => {
+  if ($("p-teleop") && !$("p-teleop").classList.contains("active")) return;
+  if (e.repeat) return;                            // 按住時瀏覽器會連發，心跳已經在跑了
+  const v = keyMap[e.key];
+  if (!v) return;
+  e.preventDefault();
+  teleopStart(v[0], v[1]);
+});
+document.addEventListener("keyup", (e) => { if (keyMap[e.key]) teleopStop(); });
+
+// 速度滑桿
+const tspeed = $("tspeed");
+if (tspeed) {
+  const upd = () => {
+    teleopSpeed = parseInt(tspeed.value, 10) / 100;
+    setText("tspeedval", (teleopSpeed * 0.18).toFixed(2));
+  };
+  tspeed.addEventListener("input", upd);
+  upd();
+}
+
+// 車尾雷達遮罩
+const trearmask = $("trearmask");
+if (trearmask) {
+  trearmask.addEventListener("change", async () => {
+    const r = await post("/api/teleop/rearmask", {enabled: trearmask.checked, half_angle_deg: 35});
+    setText("tstatus", (r && r.message) || "設定失敗");
+    if (r && r.success === false) trearmask.checked = !trearmask.checked;
+  });
+}
+
+// 建圖控制
+if ($("tstartmap")) {
+  $("tstartmap").onclick = async () => {
+    const name = ($("tmapname").value || "").trim() || ("map_" + Date.now());
+    const r = await post("/api/maps/create", {map_name: name});
+    setText("tstatus", (r && r.message) || "已送出建圖要求");
+  };
+}
+if ($("tfinishmap")) {
+  $("tfinishmap").onclick = async () => {
+    teleopStop();
+    const r = await post("/api/maps/finish", {});
+    setText("tstatus", (r && r.message) || "已送出存檔要求");
+  };
+}
+
+/* 遙控頁的地圖：沿用主地圖已經抓好的 mapImage，只是畫到另一張 canvas。
+   不另外抓圖是刻意的 —— Pi4 的 CPU 很緊，多一路輪詢就多一份成本。 */
+function drawTeleopMap() {
+  const cv = $("tmapcanvas");
+  if (!cv || !$("p-teleop").classList.contains("active")) return;
+  const hint = $("tmaphint");
+  if (!mapImage) { if (hint) hint.style.display = "flex"; return; }
+  if (hint) hint.style.display = "none";
+
+  const wrap = $("tmapwrap");
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if (!W || !H) return;
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#111"; ctx.fillRect(0, 0, W, H);
+
+  const s = Math.min(W / mapImage.width, H / mapImage.height);
+  const dw = mapImage.width * s, dh = mapImage.height * s;
+  const ox = (W - dw) / 2, oy = (H - dh) / 2;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mapImage, ox, oy, dw, dh);
+
+  // 機器人位置（沿用主地圖的 robotPose 與 mapMeta）
+  if (typeof robotPose !== "undefined" && robotPose && mapMeta) {
+    const px = ox + ((robotPose.x - mapMeta.origin_x) / mapMeta.resolution) * s;
+    const py = oy + dh - ((robotPose.y - mapMeta.origin_y) / mapMeta.resolution) * s;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(-robotPose.yaw);
+    ctx.fillStyle = "#2ee6a8";
+    ctx.beginPath();
+    ctx.moveTo(12, 0); ctx.lineTo(-7, 7); ctx.lineTo(-7, -7);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+window.addEventListener("resize", drawTeleopMap);
+
+document.querySelectorAll("#tabs button").forEach((btn) => {
+  btn.onclick = () => selectTab(btn);
+});
+
+// ── 狀態推播 ───────────────────────────────────────
+let lastMapVersion = -1;
+let mapMeta = null;
+let robotPose = null;
+let waypoints = [];
+let mapsCache = [];
+let wsDelay = 500;
+let lastIdentity = {};
+
+// 「現在有沒有人臉」的判斷依據。
+// user_auth_node 只在偵測到人臉時才發布 UserIdentity，沒人時不發任何訊息，
+// 所以狀態會一直留著上一個人的資料——不能用 user_name 有沒有值來判斷
+// （未認出時它是字串 "Unknown"，永遠非空）。只能看時戳夠不夠新。
+// 3.5 秒必須大於 user_auth_node 的 identity_publish_interval（預設 2.0 秒），
+// 否則同一個人被節流不發布的空檔會被誤判成人走了。
+const FACE_FRESH_SEC = 3.5;
+let identityAgeAtRecv = Infinity;   // 收到快照當下，identity 已經多舊（秒）
+let identityRecvAt = 0;             // 收到快照的本地時間
+
+function faceAge() {
+  if (!isFinite(identityAgeAtRecv)) return Infinity;
+  // 只用本地經過時間外推，避免兩邊時鐘差造成誤判
+  return identityAgeAtRecv + (Date.now() - identityRecvAt) / 1000;
+}
+const facePresent = () => faceAge() < FACE_FRESH_SEC;
+// 註冊狀態來自後端廣播，不是本地變數——否則只有按下按鈕的那台裝置看得到進度。
+// 伺服器時鐘與瀏覽器時鐘不一定同步，所以收到時換算成本地時間軸再倒數。
+let reg = null;         // {status, user_name, message, num_samples}
+let regLocalEnd = 0;    // 採樣預計結束時間（本地 performance 時間軸）
+let regFinishedSeen = null;
+let regSynced = false;  // 收過第一份快照沒？用來分辨「剛連上」與「真的剛完成」
+
+function applyRegistration(r) {
+  const prev = reg;
+  reg = r;
+
+  if (r && r.status === "running") {
+    // deadline/started_at 都是伺服器時鐘，取兩者差值才不受時鐘偏移影響。
+    // 照片註冊沒有時限（做完就回），這兩個欄位會是 undefined，此時不倒數。
+    if (!prev || prev.status !== "running") {
+      regLocalEnd = (r.deadline && r.started_at)
+        ? Date.now() + Math.max(0, r.deadline - r.started_at) * 1000
+        : 0;
+    }
+    // 採樣期間張數會一直跳，左邊清單跟著更新才看得到 num_samples 累積
+    if (prev && prev.status === "running" && prev.collected !== r.collected) refreshUsers();
+  } else {
+    regLocalEnd = 0;
+  }
+
+  // 註冊剛結束：所有裝置都跳提示並刷新名單，不只發起的那一台。
+  // 但剛連上時收到的可能是上一輪留下的結果，那份要吞掉不要重跳。
+  if (r && r.status !== "running" && r.finished_at && regFinishedSeen !== r.finished_at) {
+    const stale = !regSynced;
+    regFinishedSeen = r.finished_at;
+    if (!stale) {
+      toast(r.message, r.status !== "succeeded");
+      refreshUsers();
+    }
+  }
+  regSynced = true;
+
+  // 註冊期間所有裝置都鎖住按鈕，避免兩台同時按
+  $("regbtn").disabled = !!(r && r.status === "running");
+  updateFaceStatus();
+}
+
+// 註冊頁的對位提示。identity.user_name 有值就代表這一幀有抓到人臉
+// （認得出來是誰是另一回事），拿來判斷「有沒有正對鏡頭」剛好夠用。
+function updateFaceStatus() {
+  const el = $("facestatus"), guide = $("faceguide");
+
+  if (reg && reg.status === "running") {
+    // 文字（含 n/N 張）統一由 user_auth_node 產生，前端只補上倒數，
+    // 免得即時採樣與照片註冊兩種流程各寫一份措辭。
+    const left = regLocalEnd ? Math.max(0, Math.ceil((regLocalEnd - Date.now()) / 1000)) : 0;
+    el.textContent = (reg.message || "註冊進行中…") + (left > 0 ? `　剩 ${left} 秒` : "");
+    el.classList.add("ok");
+    guide.classList.add("ok");
+    return;
+  }
+
+  const seen = facePresent();
+  el.textContent = seen
+    ? (lastIdentity.recognized
+        ? `偵測到人臉：${lastIdentity.user_name}`
+        : "偵測到人臉（未在資料庫中）——可以開始註冊")
+    : "未偵測到人臉——請正對鏡頭，臉部對準虛線框";
+  el.classList.toggle("ok", seen);
+  guide.classList.toggle("ok", seen);
+}
+// 倒數要自己跑，不能只靠 WebSocket 推播（沒人在畫面前時狀態不會變、也就不會重畫）
+setInterval(updateFaceStatus, 500);
+
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { wsDelay = 500; $("wsdot").classList.add("on"); };
+  ws.onclose = () => {
+    $("wsdot").classList.remove("on");
+    // 指數退避重連，避免機器人重開機期間前端狂打
+    wsDelay = Math.min(8000, wsDelay * 1.7);
+    setTimeout(connectWS, wsDelay);
+  };
+  ws.onmessage = (ev) => render(JSON.parse(ev.data));
+}
+
+function render(s) {
+  // 身分橫幅
+  const id = s.identity || {};
+  $("banner").className = id.recognized ? (id.user_type || "").toLowerCase() : "";
+  $("who").firstChild.nodeValue = id.recognized ? id.user_name : (id.user_name ? "訪客" : "等待辨識…");
+  $("tag").textContent = id.recognized ? id.user_type : "—";
+  $("sub").textContent = id.recognized
+    ? `${id.description || "已認證"}　相似度 ${id.similarity}`
+    : (id.user_name ? `未在資料庫中（相似度 ${id.similarity}）` : "尚未偵測到人臉");
+
+  lastIdentity = id;
+  // updated_at 為 0 代表從沒收過辨識結果，維持 Infinity 讓它判定為「沒人」
+  identityAgeAtRecv = (id.updated_at && s.now) ? Math.max(0, s.now - id.updated_at) : Infinity;
+  identityRecvAt = Date.now();
+
+  applyRegistration(s.registration || null);
+
+  // 系統列
+  const sys = s.system || {};
+  $("fps").textContent  = "相機 " + (sys.camera_fps ? sys.camera_fps + " fps" : "—");
+  $("volt").textContent = "電壓 " + (sys.voltage != null ? sys.voltage + " V" : "—");
+  const m = mapsCache.find((x) => x.map_id === sys.map_id);
+  $("mapname").textContent = "地圖 " + (m ? m.map_name : (sys.map_id || "—"));
+  // 空字串代表 llm_service_node 還沒啟動（模型名稱是 latched 話題，一啟動就會收到）
+  $("llmmodel").textContent = "模型 " + (sys.llm_model || "— 未連線");
+
+  renderChat(s);
+
+  mapMeta = s.map_meta;
+  robotPose = s.robot_pose;
+  if (mapMeta && mapMeta.version !== lastMapVersion) {
+    lastMapVersion = mapMeta.version;
+    loadMapImage(mapMeta.version);   // 圖載完會自己重畫
+  } else {
+    drawMap();
+  }
+
+  renderJobs(s.jobs || []);
+}
+
+// 後端只在對話真的變過時才帶 messages 欄位（LLM 串流期間省下大量序列化），
+// 沒帶就沿用上一次收到的那份。
+let cachedMessages = [];
+
+/** 把後端量到的耗時整理成一行標籤 */
+function statsLine(st) {
+  const parts = [];
+  if (st.total != null)    parts.push(`總耗時 <b>${st.total}s</b>`);
+  if (st.think != null)    parts.push(`首字延遲 <b>${st.think}s</b>`);
+  if (st.generate != null) parts.push(`產生 <b>${st.generate}s</b>`);
+  if (st.cps != null)      parts.push(`<b>${st.cps}</b> 字/秒`);
+  if (st.chars != null)    parts.push(`${st.chars} 字`);
+  return parts.join("");
+}
+
+function renderChat(s) {
+  const box = $("chat");
+  if (Array.isArray(s.messages)) cachedMessages = s.messages;
+  const items = cachedMessages.slice();
+  // 串流中的暫時訊息。後端會把 token 累積起來，所以這裡是逐字長出來的完整段落
+  if (s.llm_streaming) items.push({role: "robot", text: s.llm_streaming, ghost: true});
+  if (s.partial_text)  items.push({role: "user",  text: s.partial_text,  ghost: true});
+
+  // 內容雜湊比對——不比對的話每次推播都重建 DOM，畫面會閃、也會一直捲到底
+  const hash = items.map((i) => i.role + i.text).join("|");
+  if (box._hash === hash) return;
+  box._hash = hash;
+
+  box.innerHTML = "";
+  for (const it of items) {
+    const div = document.createElement("div");
+    div.className = "msg " + it.role + (it.ghost ? " ghost" : "");
+    div.textContent = it.text;
+    box.appendChild(div);
+
+    const line = it.stats ? statsLine(it.stats) : "";
+    if (line) {
+      const meta = document.createElement("div");
+      meta.className = "msgstats";
+      meta.innerHTML = line;   // 只有數字與固定標籤，沒有使用者輸入
+      box.appendChild(meta);
+    }
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderJobs(jobs) {
+  const box = $("joblist");
+  const active = jobs.slice().reverse();
+  const hash = active.map((j) => j.job_id + j.status + j.message).join("|");
+  if (box._hash === hash) return;
+  box._hash = hash;
+
+  box.innerHTML = "";
+  if (!active.length) {
+    box.innerHTML = '<div class="meta">目前沒有作業。</div>';
+    return;
+  }
+  for (const j of active) {
+    const running = j.status === "running" || j.status === "pending" || j.status === "cancelling";
+    const div = document.createElement("div");
+    div.className = "item";
+    div.innerHTML =
+      `<span class="badge ${running ? "run" : j.status === "succeeded" ? "ok" : "bad"}">${escapeHtml(j.status)}</span>` +
+      `<span><span class="name">${escapeHtml(j.label)}</span><br>` +
+      `<span class="meta">${escapeHtml(j.message || "")}</span></span>`;
+    if (running) {
+      const btn = document.createElement("button");
+      btn.className = "btn danger spacer";
+      btn.textContent = "取消";
+      btn.onclick = () => del("/api/jobs/" + j.job_id).then((r) => toast(r.message, !r.success));
+      div.appendChild(btn);
+    }
+    box.appendChild(div);
+  }
+}
+
+// ── 對話送出 ───────────────────────────────────────
+function sendSay() {
+  const inp = $("sayinput");
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = "";
+  post("/api/say", {text}).then((r) => { if (!r.success) toast(r.message, true); });
+}
+$("saybtn").onclick = sendSay;
+$("sayinput").onkeydown = (e) => { if (e.key === "Enter") sendSay(); };
+
+$("clearchatbtn").onclick = () => {
+  if (!confirm("確定要清除目前所有對話嗎？機器人的對話記憶也會一併清空。")) return;
+  post("/api/chat/clear").then((r) => {
+    if (!r.success) { toast(r.message, true); return; }
+    // 不等推播先自己清一次，按下去就有反應
+    cachedMessages = [];
+    $("chat")._hash = null;
+    $("chat").innerHTML = "";
+    toast(r.message);
+  });
+};
+
+$("speakbtn").onclick = () => {
+  const text = $("speakinput").value.trim();
+  if (text) post("/api/speak", {text}).then((r) => toast(r.message, !r.success));
+};
+
+// ── 地圖 ───────────────────────────────────────────
+const canvas = $("mapcanvas");
+const ctx = canvas.getContext("2d");
+let mapImage = null;
+let picked = null;      // {x, y, yaw} 世界座標
+let dragStart = null;   // 拖曳決定朝向用
+
+function loadMapImage(version) {
+  const img = new Image();
+  img.onload = () => { mapImage = img; drawMap(); };
+  img.src = "/api/map.png?v=" + version;
+}
+
+/** 把畫布依 devicePixelRatio 調到實際像素，回傳 CSS 尺寸 */
+function fitCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width  = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {w, h};
+}
+
+/** 目前地圖圖片在畫布上的縮放與位移（等比置中） */
+function mapTransform(view) {
+  const scale = Math.min(view.w / mapImage.width, view.h / mapImage.height);
+  return {
+    scale,
+    offX: (view.w - mapImage.width  * scale) / 2,
+    offY: (view.h - mapImage.height * scale) / 2,
+  };
+}
+
+// 世界座標 ↔ 圖片像素。
+// 地圖 PNG 在後端已上下翻轉（ROS 柵格 row 0 在下、影像 row 0 在上），所以 y 要再翻一次。
+// 註：假設地圖 origin 的 yaw 為 0——map_saver 產出的地圖一律如此。
+function worldToPixel(wx, wy) {
+  return {
+    px: (wx - mapMeta.origin_x) / mapMeta.resolution,
+    py: mapMeta.height - (wy - mapMeta.origin_y) / mapMeta.resolution,
+  };
+}
+function pixelToWorld(px, py) {
+  return {
+    x: mapMeta.origin_x + px * mapMeta.resolution,
+    y: mapMeta.origin_y + (mapMeta.height - py) * mapMeta.resolution,
+  };
+}
+function worldToCanvas(t, wx, wy) {
+  const p = worldToPixel(wx, wy);
+  return {x: t.offX + p.px * t.scale, y: t.offY + p.py * t.scale};
+}
+
+function drawMap() {
+  const view = fitCanvas();
+  ctx.clearRect(0, 0, view.w, view.h);
+
+  if (!mapImage || !mapMeta) {
+    $("maphint").textContent = "等待地圖…（需啟動 SLAM 建圖，或切換到已存在的地圖）";
+    return;
+  }
+  const t = mapTransform(view);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mapImage, t.offX, t.offY, mapImage.width * t.scale, mapImage.height * t.scale);
+
+  // 地點標記
+  ctx.font = "12px sans-serif";
+  for (const w of waypoints) {
+    const c = worldToCanvas(t, w.x, w.y);
+    ctx.fillStyle = "#4da3ff";
+    ctx.beginPath(); ctx.arc(c.x, c.y, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#e6ecf3";
+    ctx.fillText(w.waypoint_name, c.x + 9, c.y + 4);
+  }
+
+  // 已選的點（含朝向）
+  if (picked) {
+    const c = worldToCanvas(t, picked.x, picked.y);
+    drawArrow(c.x, c.y, picked.yaw, "#f0b429", 20);
+  }
+
+  // 機器人
+  if (robotPose) {
+    const c = worldToCanvas(t, robotPose.x, robotPose.y);
+    drawArrow(c.x, c.y, robotPose.yaw, "#35c27a", 16);
+  }
+
+  const meters = (mapMeta.width * mapMeta.resolution).toFixed(1);
+  $("maphint").textContent =
+    `${mapMeta.width}×${mapMeta.height} @ ${mapMeta.resolution} m/px（約 ${meters} m 寬）　` +
+    (robotPose ? `機器人 (${robotPose.x.toFixed(2)}, ${robotPose.y.toFixed(2)})` : "機器人位置未知");
+}
+
+/** 畫一個代表位置與朝向的箭頭。畫布 y 軸向下，所以角度取負 */
+function drawArrow(x, y, yaw, color, size) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(-yaw);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(size, 0);
+  ctx.lineTo(-size * 0.6, size * 0.55);
+  ctx.lineTo(-size * 0.25, 0);
+  ctx.lineTo(-size * 0.6, -size * 0.55);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/** 指標事件座標 → 世界座標（超出地圖範圍回 null） */
+function eventToWorld(ev) {
+  if (!mapImage || !mapMeta) return null;
+  const view = fitCanvas();
+  const t = mapTransform(view);
+  const rect = canvas.getBoundingClientRect();
+  const px = (ev.clientX - rect.left - t.offX) / t.scale;
+  const py = (ev.clientY - rect.top  - t.offY) / t.scale;
+  if (px < 0 || py < 0 || px > mapImage.width || py > mapImage.height) return null;
+  return pixelToWorld(px, py);
+}
+
+canvas.addEventListener("pointerdown", (ev) => {
+  if ($("mapmode").value === "view") return;
+  const w = eventToWorld(ev);
+  if (!w) return;
+  dragStart = w;
+  picked = {x: w.x, y: w.y, yaw: 0};
+  canvas.setPointerCapture(ev.pointerId);
+  drawMap();
+});
+
+canvas.addEventListener("pointermove", (ev) => {
+  if (!dragStart) return;
+  const w = eventToWorld(ev);
+  if (!w) return;
+  const dx = w.x - dragStart.x, dy = w.y - dragStart.y;
+  // 拖超過 10 公分才視為在指定朝向，否則手指微抖會亂轉
+  if (Math.hypot(dx, dy) > 0.1) picked.yaw = Math.atan2(dy, dx);
+  drawMap();
+});
+
+canvas.addEventListener("pointerup", () => {
+  if (!dragStart) return;
+  dragStart = null;
+
+  const deg = (picked.yaw * 180 / Math.PI).toFixed(0);
+  $("picked").textContent = `已選 (${picked.x.toFixed(2)}, ${picked.y.toFixed(2)}) 朝向 ${deg}°`;
+
+  const mode = $("mapmode").value;
+  if (mode === "waypoint") {
+    const name = prompt("這個地點叫什麼名字？（例如：理財專區）");
+    if (!name || !name.trim()) return;
+    post("/api/waypoints", {
+      waypoint_name: name.trim(), use_given_pose: true,
+      x: picked.x, y: picked.y, yaw: picked.yaw,
+    }).then((r) => { toast(r.message, !r.success); if (r.success) refreshWaypoints(); });
+  } else if (mode === "navigate") {
+    if (!confirm(`確定導航到 (${picked.x.toFixed(2)}, ${picked.y.toFixed(2)})？`)) return;
+    post("/api/navigate", {x: picked.x, y: picked.y, yaw: picked.yaw, target_name: "指定位置"})
+      .then((r) => toast(r.message, !r.success));
+  }
+});
+
+window.addEventListener("resize", drawMap);
+$("maprefresh").onclick = () => { refreshWaypoints(); if (mapMeta) loadMapImage(mapMeta.version); };
+
+// ── 地點與地圖清單 ─────────────────────────────────
+async function refreshWaypoints() {
+  const r = await api("/api/waypoints");
+  waypoints = r.waypoints || [];
+
+  const box = $("wplist");
+  box.innerHTML = "";
+  if (!waypoints.length) {
+    box.innerHTML = '<div class="meta">尚無地點。切到「建立地點」模式後在地圖上點一下即可新增。</div>';
+  }
+  for (const w of waypoints) {
+    const div = document.createElement("div");
+    div.className = "item";
+    div.innerHTML = `<span><span class="name">${escapeHtml(w.waypoint_name)}</span><br>` +
+                    `<span class="meta">(${w.x.toFixed(2)}, ${w.y.toFixed(2)})</span></span>`;
+    const btn = document.createElement("button");
+    btn.className = "btn primary spacer";
+    btn.textContent = "導航";
+    btn.onclick = () =>
+      post("/api/navigate", {waypoint_id: w.waypoint_id, target_name: w.waypoint_name})
+        .then((res) => toast(res.message, !res.success));
+
+    // 刪除要跟「導航」隔開來看：這兩顆並排、誤觸的代價差很多，
+    // 所以刪除走 confirm 並把座標一起寫進提示，讓人確認刪的是不是同名的另一個點。
+    const rm = document.createElement("button");
+    rm.className = "btn danger";
+    rm.textContent = "刪除";
+    rm.onclick = () => {
+      if (!confirm(`確定刪除地點「${w.waypoint_name}」(${w.x.toFixed(2)}, ${w.y.toFixed(2)})？\n刪除後無法復原。`)) return;
+      del("/api/waypoints/" + encodeURIComponent(w.waypoint_id)).then((res) => {
+        toast(res.message, !res.success);
+        if (res.success) refreshWaypoints();   // 重新拉一次，順便把地圖上的標記清掉
+      });
+    };
+
+    div.appendChild(btn);
+    div.appendChild(rm);
+    box.appendChild(div);
+  }
+  drawMap();
+}
+
+async function refreshMaps() {
+  const r = await api("/api/maps");
+  mapsCache = r.maps || [];
+  const sel = $("mapselect");
+  sel.innerHTML = "";
+  for (const m of mapsCache) {
+    const opt = document.createElement("option");
+    opt.value = m.map_id;
+    opt.textContent = m.map_name;
+    sel.appendChild(opt);
+  }
+}
+
+$("switchmap").onclick = () => {
+  const map_id = $("mapselect").value;
+  if (!map_id) return toast("沒有可切換的地圖", true);
+  post("/api/maps/switch", {map_id}).then((r) => {
+    toast(r.message, !r.success);
+    if (r.success) refreshWaypoints();
+  });
+};
+
+$("createmap").onclick = () => {
+  const map_name = $("newmapname").value.trim();
+  if (!map_name) return toast("請先輸入地圖名稱", true);
+  post("/api/maps/create", {map_name}).then((r) => {
+    toast(r.message, !r.success);
+    if (r.success) $("newmapname").value = "";
+  });
+};
+
+$("localize").onclick = () => post("/api/localize").then((r) => toast(r.message, !r.success));
+
+// ── 使用者管理 ─────────────────────────────────────
+async function refreshUsers() {
+  const r = await api("/api/users");
+  const box = $("userlist");
+  box.innerHTML = "";
+
+  const users = r.users || [];
+  if (!users.length) {
+    box.innerHTML = '<div class="meta">尚無註冊使用者。</div>';
+    return;
+  }
+  for (const u of users) {
+    const div = document.createElement("div");
+    div.className = "item";
+    div.innerHTML =
+      `<span class="badge ${u.user_type_name}">${u.user_type_name}</span>` +
+      `<span><span class="name">${escapeHtml(u.user_name)}</span><br>` +
+      `<span class="meta">${escapeHtml(u.description || "無備註")}　${u.num_samples} 個樣本</span></span>`;
+
+    const edit = document.createElement("button");
+    edit.className = "btn spacer";
+    edit.textContent = "編輯";
+    edit.onclick = () => editUser(u);
+
+    const rm = document.createElement("button");
+    rm.className = "btn danger";
+    rm.textContent = "刪除";
+    rm.onclick = () => {
+      if (!confirm(`確定刪除「${u.user_name}」？連同 ${u.num_samples} 個人臉樣本一起移除，無法復原。`)) return;
+      del("/api/users/" + u.user_uuid).then((res) => { toast(res.message, !res.success); refreshUsers(); });
+    };
+
+    div.appendChild(edit);
+    div.appendChild(rm);
+    box.appendChild(div);
+  }
+}
+
+function editUser(u) {
+  const name = prompt("姓名", u.user_name);
+  if (name === null) return;
+  const type = prompt("類型：0=訪客 GUEST，1=貴賓 VIP，2=管理員 ADMIN", String(u.user_type));
+  if (type === null) return;
+  const desc = prompt("備註", u.description || "");
+  if (desc === null) return;
+  put("/api/users/" + u.user_uuid, {
+    user_name: name.trim(),
+    user_type: parseInt(type, 10) || 0,
+    description: desc,
+  }).then((r) => { toast(r.message, !r.success); refreshUsers(); });
+}
+
+$("userrefresh").onclick = refreshUsers;
+
+$("regbtn").onclick = () => {
+  const user_name = $("regname").value.trim();
+  if (!user_name) return toast("請輸入姓名", true);
+  post("/api/users/register", {
+    user_name,
+    user_type: parseInt($("regtype").value, 10),
+    description: $("regdesc").value,
+    num_samples: parseInt($("regsamples").value, 10) || 10,
+  }).then((r) => {
+    toast(r.message, !r.success);
+    if (r.success) {
+      $("regname").value = "";
+      $("regdesc").value = "";
+      // 進度、完成提示與名單刷新都由 applyRegistration() 依後端廣播處理，
+      // 這裡不再自己算時間——否則只有這台裝置看得到。
+    }
+  });
+};
+
+// ── 登入互動 ───────────────────────────────────────
+function openLogin() {
+  $("loginerr").textContent = "";
+  $("loginpass").value = "";
+  $("loginmask").classList.add("show");
+  $("loginuser").focus();
+}
+
+$("adminbtn").onclick = () => {
+  if (document.body.classList.contains("admin")) {
+    post("/api/logout").then(() => { setAdmin(false); toast("已登出"); });
+  } else {
+    openLogin();
+  }
+};
+
+$("logincancel").onclick = () => $("loginmask").classList.remove("show");
+$("loginmask").onclick = (e) => { if (e.target === $("loginmask")) $("loginmask").classList.remove("show"); };
+
+async function doLogin() {
+  const username = $("loginuser").value.trim();
+  const password = $("loginpass").value;
+  if (!username || !password) return ($("loginerr").textContent = "請輸入帳號與密碼");
+
+  $("logindo").disabled = true;
+  // 這支不能走 api()——尚未登入時 401 會被當成權杖失效
+  let data = {};
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({username, password}),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    data = {success: false, message: "無法連線：" + e.message};
+  }
+  $("logindo").disabled = false;
+
+  if (!data.success) return ($("loginerr").textContent = data.message || "登入失敗");
+  adminToken = data.token;
+  sessionStorage.setItem("hmiToken", adminToken);
+  setAdmin(true);
+  $("loginmask").classList.remove("show");
+  toast("管理者登入成功");
+  refreshMaps();
+}
+
+$("logindo").onclick = doLogin;
+$("loginpass").onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
+$("loginuser").onkeydown = (e) => { if (e.key === "Enter") $("loginpass").focus(); };
+
+// ── 照片註冊 ───────────────────────────────────────
+let shots = [];   // data URL 陣列，來源可以是選檔或從畫面拍照
+
+function renderShots() {
+  const box = $("shots");
+  box.innerHTML = "";
+  $("shotcount").textContent = shots.length ? `已選 ${shots.length} 張` : "尚未選擇";
+  shots.forEach((src, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "shot";
+    const img = document.createElement("img");
+    img.src = src;
+    const rm = document.createElement("button");
+    rm.className = "rm";
+    rm.textContent = "×";
+    rm.title = "移除";
+    rm.onclick = () => { shots.splice(i, 1); renderShots(); };
+    wrap.appendChild(img);
+    wrap.appendChild(rm);
+    box.appendChild(wrap);
+  });
+}
+
+function setRegMode(photo) {
+  $("modelive").classList.toggle("on", !photo);
+  $("modephoto").classList.toggle("on", photo);
+  $("paneLive").style.display = photo ? "none" : "";
+  $("panePhoto").style.display = photo ? "" : "none";
+}
+$("modelive").onclick = () => setRegMode(false);
+$("modephoto").onclick = () => setRegMode(true);
+
+$("pickfiles").onclick = () => $("fileinput").click();
+$("fileinput").onchange = () => {
+  const files = Array.from($("fileinput").files || []);
+  files.forEach((f) => {
+    const reader = new FileReader();
+    reader.onload = () => { shots.push(reader.result); renderShots(); };
+    reader.readAsDataURL(f);
+  });
+  $("fileinput").value = "";   // 同一個檔案可以再選一次
+};
+
+$("snapshot").onclick = async () => {
+  try {
+    const res = await fetch("/api/frame.jpg?t=" + Date.now());
+    if (!res.ok) return toast("目前沒有相機影像", true);
+    const blob = await res.blob();
+    const reader = new FileReader();
+    reader.onload = () => { shots.push(reader.result); renderShots(); toast("已擷取 1 張"); };
+    reader.readAsDataURL(blob);
+  } catch (e) {
+    toast("擷取失敗：" + e.message, true);
+  }
+};
+
+$("regphotobtn").onclick = async () => {
+  const user_name = $("regname").value.trim();
+  if (!user_name) return toast("請輸入姓名", true);
+  if (!shots.length) return toast("請先選擇或擷取照片", true);
+
+  const btn = $("regphotobtn");
+  btn.disabled = true;
+  btn.textContent = `分析 ${shots.length} 張照片中…`;
+  const r = await post("/api/users/register-photo", {
+    user_name,
+    user_type: parseInt($("regtype").value, 10),
+    description: $("regdesc").value,
+    photos: shots,
+  });
+  btn.disabled = false;
+  btn.textContent = "用這些照片註冊";
+
+  toast(r.message || "註冊結束", !r.success);
+  if (r.success) {
+    $("regname").value = "";
+    $("regdesc").value = "";
+    shots = [];
+    renderShots();
+    refreshUsers();
+  }
+};
+
+// ── 系統健康 ───────────────────────────────────────
+function healthRow(box, label, ok, note) {
+  const div = document.createElement("div");
+  div.className = "item";
+  div.innerHTML =
+    `<span class="badge ${ok ? "ok" : "bad"}">${ok ? "就緒" : "未就緒"}</span>` +
+    `<span class="name">${escapeHtml(label)}</span>` +
+    (note ? `<span class="meta spacer">${escapeHtml(note)}</span>` : "");
+  box.appendChild(div);
+}
+
+function healthHeading(box, text) {
+  const h = document.createElement("div");
+  h.className = "meta";
+  h.style.cssText = "margin:8px 2px 2px; font-weight:600;";
+  h.textContent = text;
+  box.appendChild(h);
+}
+
+/** 依 group 分段輸出節點列。回傳 [正常數, 總數] */
+function renderNodeGroups(box, nodes) {
+  let group = null;
+  for (const n of nodes) {
+    if (n.group !== group) {
+      group = n.group;
+      const rows = nodes.filter((x) => x.group === group);
+      const ok = rows.filter((x) => x.ok).length;
+      healthHeading(box, `${group}（${ok}/${rows.length}）`);
+    }
+    healthRow(box, n.name, n.ok, n.state);
+  }
+  return [nodes.filter((x) => x.ok).length, nodes.length];
+}
+
+async function refreshHealth() {
+  const h = await api("/api/health");
+  const pi = $("pilist"), edge = $("edgelist");
+  pi.innerHTML = "";
+  edge.innerHTML = "";
+
+  // 「節點存在」不代表能用——lifecycle 節點停在 inactive／unconfigured 時
+  // 節點照樣在圖上，但功能是壞的，所以顯示的是 lifecycle 狀態。
+  const nodes = h.nodes || [];
+  $("pihead").textContent = `Pi 4（本機${h.host ? "：" + h.host : ""}）`;
+
+  renderNodeGroups(pi, nodes.filter((n) => n.device === "pi"));
+
+  // HMI 自身的能力也算在本機這欄——這個網頁就是這台 Pi 提供的
+  healthHeading(pi, "HMI 介面自身");
+  healthRow(pi, "相機影像", h.camera);
+  healthRow(pi, "地圖資料", h.map);
+  for (const [k, v] of Object.entries(h.services || {})) healthRow(pi, "服務 " + k, v);
+  for (const [k, v] of Object.entries(h.actions  || {})) healthRow(pi, "動作 " + k, v);
+
+  const edgeNodes = nodes.filter((n) => n.device === "edge");
+  if (edgeNodes.length) renderNodeGroups(edge, edgeNodes);
+  else healthHeading(edge, "目前沒有偵測到其他機器上的節點");
+
+  // 沒在跑的節點談不上在哪台機器，另外列，不塞進任一欄誤導
+  const down = nodes.filter((n) => n.device === "down");
+  if (down.length) {
+    healthHeading(edge, `尚未啟動（${down.length}，無法判定裝置）`);
+    for (const n of down) healthRow(edge, n.name, false, n.group);
+  }
+
+  const unknown = nodes.filter((n) => n.device === "unknown");
+  if (unknown.length) {
+    healthHeading(edge, `內部節點（${unknown.length}，由其他節點建立）`);
+    for (const n of unknown) healthRow(edge, n.name, n.ok, n.state);
+  }
+}
+$("healthrefresh").onclick = refreshHealth;
+
+// ── 啟動 ───────────────────────────────────────────
+updateStreams("p-greet");   // 預設分頁是迎賓
+updateFaceStatus();
+renderShots();
+connectWS();
+
+// 地圖與地點清單都是管理端點，未登入時打了只會拿到 401，所以要先確認權杖。
+(async () => {
+  if (!adminToken) return setAdmin(false);
+  let ok = false;
+  try {
+    const res = await fetch("/api/session", {headers: {"Authorization": "Bearer " + adminToken}});
+    ok = (await res.json().catch(() => ({}))).admin === true;
+  } catch (e) { ok = false; }
+  setAdmin(ok);
+  if (ok) { refreshMaps(); refreshWaypoints(); }
+})();
+</script>
+</body>
+</html>

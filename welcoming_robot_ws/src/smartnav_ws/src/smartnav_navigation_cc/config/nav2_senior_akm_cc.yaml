@@ -1,0 +1,684 @@
+# =============================================================================
+# Nav2 參數 - wheeltec senior_akm (奧克曼常規型) / ROS 2 Jazzy / Raspberry Pi 4
+# =============================================================================
+# 車身 footprint：採用原廠 param_senior_akm.yaml 的定義 (2026-07-29)
+#   footprint = [-0.09, 0.40] x [±0.185]
+#   **base_footprint 位在後輪軸心**，不是車身中央 ——
+#   所以車尾只有 0.09 m，車頭卻伸出 0.40 m。總長 0.49 m、寬 0.37 m。
+#   padding    = 0.02
+#   inscribed  = 0.185 + 0.02 = 0.205 m
+#   circumscribed = sqrt(0.40² + 0.185²) + 0.02 = 0.461 m
+#
+#   曾經誤用「車身中央」的假設寫成 [-0.22, 0.24]，等於讓 costmap 以為車頭
+#   只到 0.24 m —— 實際車頭有 16 公分是「隱形」的，規劃器覺得過得去、
+#   車子卻會撞上，這很可能是實測撞到雜物的原因之一。
+#
+#   註：inflation_radius (0.22) 小於 circumscribed (0.461) 是刻意的，
+#   原廠自己也是 0.1~0.25。走廊淨寬只有 0.99 m，膨脹半徑若真的放到 0.46
+#   會把整條走廊封死。實際碰撞由 MPPI 的 consider_footprint (真實車形檢查)
+#   與 collision_monitor 的 PolygonStop 把關，不靠膨脹層硬擋。
+#
+# 座標系：map -> odom_combined -> base_footprint
+#   odom_combined 由 turn_on_wheeltec_robot 的 robot_localization ekf_node 發布。
+#   map -> odom_combined 在「同一時間只會有一個發布者」：
+#     建圖模式 = slam_toolbox，導航模式 = amcl。
+#     兩者的生命週期由 map_service_cc 節點獨佔管理，nav2 的 lifecycle_manager
+#     絕對不可以再去管 amcl / map_server / slam_toolbox。
+# =============================================================================
+
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: "base_footprint"
+    odom_frame_id: "odom_combined"
+    global_frame_id: "map"
+    scan_topic: scan
+    map_topic: map
+
+    # 阿克曼底盤沒有專用的運動模型，Nav2 只提供 Differential / Omni。
+    # Differential 是正確選擇：它描述的是「里程計雜訊」而不是底盤的運動學限制。
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    alpha1: 0.2 # 旋轉估計中來自旋轉的雜訊
+    alpha2: 0.2 # 旋轉估計中來自平移的雜訊
+    alpha3: 0.2 # 平移估計中來自平移的雜訊
+    alpha4: 0.2 # 平移估計中來自旋轉的雜訊
+    alpha5: 0.2
+
+    laser_model_type: "likelihood_field"
+    # 似然場的最大考慮距離。調小 = 匹配更銳利、對角度誤差更敏感，
+    # 正是走廊環境需要的 (2.0 太寬鬆，偏個十幾度分數也差不多)。
+    laser_likelihood_max_dist: 1.2
+    laser_max_range: 12.0 # 鐳射實際量程，設 -1 會讓似然場計算包含無效點
+    laser_min_range: -1.0
+    # === 60 -> 240 (2026-07-28) ===
+    # 這台雷達每圈 450 點，max_beams 60 等於只用了 13% 的資料、每 6 度才取一個點。
+    # 在長直走廊裡兩側是平行牆，角度資訊本來就只藏在少數特徵上，
+    # 取樣這麼稀疏根本分不出車頭偏了十幾度 —— 實測導航後 yaw 誤差 13.9 度，
+    # 車子因此偏離走廊中線 12 公分。
+    #
+    # 佐證：拿同一幀雷射去暴力比對地圖，正確位姿的吻合度是 99.8%、
+    # 錯誤位姿只有 28% —— 資料本身足以定位，是 AMCL 沒把它用上。
+    # 240 點 (每 1.5 度) 讓角度估計有足夠的判別力。
+    # 代價是 CPU，但相機在導航時已經關掉 (camera_manager_cc)，撥得出來。
+    max_beams: 240
+    z_hit: 0.5
+    z_max: 0.05
+    z_rand: 0.5
+    z_short: 0.05
+    # 測量雜訊的標準差。調小讓權重分布更尖銳，粒子之間的優劣更容易分開；
+    # 配合上面加密的 max_beams，才拉得動被 IMU 零偏帶偏的粒子雲。
+    sigma_hit: 0.1
+    lambda_short: 0.1
+    do_beamskip: false
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+
+    min_particles: 500
+    max_particles: 2000
+    pf_err: 0.05
+    pf_z: 0.99
+    resample_interval: 1
+    # === 自我恢復機制 (2026-07-28 啟用) ===
+    # 原本沿用舊設定的 0.0 = 完全關閉。在這台車上這是不能接受的：
+    #
+    # 底盤 IMU 有 +4.54 度/分鐘 的陀螺儀零偏 (靜止實測 z 軸角速度 0.00132 rad/s)，
+    # odom 的 yaw 會持續漂。車子靜置一段時間後 AMCL 的粒子雲整團被帶到錯誤角度，
+    # 而 alpha 為 0 時沒有任何隨機粒子注入，粒子全部困在錯誤位置，
+    # 光靠 request_nomotion_update 重新加權救不回來 —— 實測位姿偏 38 度，
+    # 雷射與地圖吻合度只有 28%，導航目標被算到牆裡去。
+    #
+    # 這兩個值是 Nav2 文件的建議值：長短期權重平均一旦背離就注入隨機粒子，
+    # 讓濾波器有機會跳出錯誤的局部解。
+    recovery_alpha_slow: 0.001
+    recovery_alpha_fast: 0.1
+    save_pose_rate: 0.5
+
+    # 阿克曼車不能原地轉，update_min_a 設太大會讓濾波器長時間不更新，
+    # 導致 /amcl_pose 遲遲不發布 -> navigation_action_cc 誤判「定位不準」。
+    #
+    # 又因為 IMU 零偏會讓 odom 持續漂 (見上方 recovery_alpha 的說明)，
+    # 門檻越大、兩次觀測更新之間累積的角度誤差就越大。
+    # 0.10 m / 0.10 rad (5.7 度) 是在「夠頻繁修正」與「Pi 4 CPU 負擔」之間的折衷。
+    update_min_d: 0.10
+    update_min_a: 0.10
+
+    tf_broadcast: true
+    transform_tolerance: 1.0
+
+    # 初始位姿由 map_service_cc 在 configure 之前用參數服務寫入
+    # (建完圖時直接沿用 SLAM 的最後位姿，切換地圖時歸零)。
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    first_map_only: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    # 實際地圖由 map_service_cc 透過 /map_server/load_map 指定。
+    # 這裡故意留空字串：yaml_filename 指向不存在的檔案時 on_configure 會直接失敗，
+    # 留空則可以 configure 成功後再載入。
+    yaml_filename: ""
+
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+    # 存檔時 map_server 已退到 unconfigured，map_saver 要等 slam_toolbox 補一張 /map。
+    # Pi 4 滿載時 5 秒不夠；map_service_cc 端等 25 秒，這裡必須留在它之內。
+    save_map_timeout: 15.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: true
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: odom_combined
+    transform_tolerance: 1.0
+    # 以下兩個的單位都是「毫秒」，Nav2 的預設值是給桌機等級的機器用的。
+    #
+    # bt_loop_duration 10 ms = 行為樹每秒 tick 100 次。Pi 4 上這是純粹的浪費，
+    # 20 ms (50 Hz) 對 10 Hz 的控制迴圈來說反應仍然綽綽有餘。
+    bt_loop_duration: 20
+    #
+    # default_server_timeout 是「送出 action 目標後等對方確認」的上限。
+    # 預設 20 ms —— 這是實測導航一直失敗的真正原因：
+    #     Timed out while waiting for action server to acknowledge
+    #         goal request for compute_path_to_pose
+    #     [navigate_to_pose] [ActionServer] Aborting handle.  (從開始到放棄只有 54 ms)
+    # 規劃本身明明是好的 (單獨呼叫 compute_path_to_pose 可以正常回傳路徑)，
+    # 純粹是 planner_server 在忙、20 ms 內來不及回 ack 就被判定失敗。
+    # 放到 1000 ms：正常情況本來就在幾 ms 內回應，這個值只在系統忙碌時才用得到。
+    default_server_timeout: 1000
+    wait_for_service_timeout: 1000
+    always_reload_bt_xml: false
+    goal_blackboard_id: goal
+    goals_blackboard_id: goals
+    path_blackboard_id: path
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+    # 行為樹由 launch 檔以絕對路徑覆寫成本包的阿克曼版本 (拿掉 Spin)。
+    error_code_names:
+      - compute_path_error_code
+      - follow_path_error_code
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 10.0
+    costmap_update_timeout: 0.5
+    odom_topic: odom_combined
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    use_realtime_priority: false
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # 阿克曼車在窄處要來回切換前進/後退才轉得過來，0.25 m / 15 s 太嚴格會誤判卡住。
+      required_movement_radius: 0.25
+      movement_time_allowance: 20.0
+
+    general_goal_checker:
+      stateful: true
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      # 阿克曼車無法原地修正朝向，yaw 容差必須放寬，否則會在終點附近無限來回。
+      yaw_goal_tolerance: 0.5
+
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      # Pi 4 只有 4 核，還要同時跑 slam_toolbox / frontier_explorer / HMI。
+      # 20 x 400 在 0.35 m/s 下軌跡長度 2 秒，足夠室內使用。
+      time_steps: 20
+      model_dt: 0.1
+      batch_size: 400
+      iteration_count: 1
+
+      # 0.35 -> 0.25 (2026-07-28)：窄走廊 + 需要來回修正掉頭的環境，
+      # 慢一點讓 MPPI 有更多時間評估、也讓碰撞監控有餘裕反應。
+      # 迎賓機器人本來就不需要快。
+      vx_max: 0.25
+      # 倒車速度刻意比前進慢一半。
+      # 深度相機固定在車頭，**車尾只有雷達**，而雷達裝在 0.11 m 高，
+      # 地上的雜物它掃不到 —— 倒車等於半盲。而阿克曼車偏偏又很依賴倒車
+      # (脫困、三點調頭都要)。慢速讓萬一撞到時衝擊小，也給卡住偵測反應時間。
+      vx_min: -0.12
+      vy_max: 0.0
+      wz_max: 1.0
+      vx_std: 0.2
+      vy_std: 0.0
+      wz_std: 0.4
+      ax_max: 1.0
+      ax_min: -1.0
+      ay_max: 0.0
+      ay_min: 0.0
+      az_max: 1.5
+
+      prune_distance: 1.5
+      # 路徑有前進/倒車轉折點 (cusp) 時，逐段跟隨而不是硬切過去
+      # 路徑有前進/倒車轉折點 (cusp) 時，逐段跟隨而不是硬切過去。
+      # 容差放寬 (0.2/0.4 -> 0.25/0.6)：規劃器現在會產生更多段切換，
+      # 每個轉折點都要求高精度會讓車子在原地磨很久才肯進到下一段。
+      enforce_path_inversion: true
+      inversion_xy_tolerance: 0.25
+      inversion_yaw_tolerance: 0.6
+      transform_tolerance: 0.5
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "Ackermann"
+      visualize: false
+      regenerate_noises: false
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        # 底盤物理極限，來自原廠 param_senior_akm.yaml，不要改小
+        min_turning_r: 0.80
+      critics:
+        [
+          "ConstraintCritic",
+          "CostCritic",
+          "GoalCritic",
+          "GoalAngleCritic",
+          "PathAlignCritic",
+          "PathFollowCritic",
+          "PathAngleCritic",
+        ]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 15.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        near_collision_cost: 253
+        # 300 -> 500：探索參數放激進後，控制器要更強烈地避開接近碰撞的軌跡。
+        # 這是「激進但不撞」的關鍵：放寬的是「要不要去」，不是「怎麼過去」。
+        critical_cost: 500.0
+        # true = 用真實 footprint 做碰撞檢查。false 時 MPPI 只看軌跡中心點，
+        # 車身角落壓到牆時中心點仍是合法 cost，於是車子貼著牆走 -> 規劃器回
+        # "Start occupied"。代價是 CPU；trajectory_point_step 拉到 3 補回來。
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 0.5
+        trajectory_point_step: 3
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 25.0
+        max_path_occupancy_ratio: 0.07
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: true
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 25.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        # mode 2 = 允許倒車朝向，阿克曼車必須用這個
+        mode: 2
+    enable_stamped_cmd_vel: false
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom_combined
+      robot_base_frame: base_footprint
+      transform_tolerance: 1.0
+      rolling_window: true
+      # 4 -> 5 m：車尾沒有相機，倒車時完全靠這個視窗裡「先前記下的」障礙。
+      # 視窗越大、記得越久，倒車越安全。代價是 costmap 更新成本略增。
+      width: 5
+      height: 5
+      resolution: 0.05
+      # 採用原廠 param_senior_akm.yaml 的定義 (2026-07-29 改回)。
+      # base_footprint 位在**後輪軸心**，不是車身中央 ——
+      # 所以車尾只有 0.09 m，車頭卻伸出 0.40 m。
+      #
+      # 先前誤用「車身中央」的假設寫成 [-0.22, 0.24]，等於讓 costmap 以為
+      # 車頭只到 0.24 m，**實際車頭有 16 公分是「隱形」的**。
+      # 那正是規劃器覺得過得去、車子卻撞上去的原因之一。
+      footprint: "[ [-0.09, -0.185], [-0.09, 0.185], [0.40, 0.185], [0.40, -0.185] ]"
+      footprint_padding: 0.02
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        # 兩個來源：雷達看遠、深度相機補雷達看不到的低矮障礙。
+        # 雷達裝在 0.11 m 高，地上的雜物 / 電線 / 椅腳橫桿它完全掃不到 ——
+        # 實測車子就是這樣撞上去卡住的，當時 costmap 一片空白。
+        # 相機裝在 0.09 m 高、朝前，正好看得到前方地面。
+        observation_sources: scan camera_cloud
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+        camera_cloud:
+          # 不是驅動原生的 /camera/depth/points ——
+          # 那個是 30 Hz 全解析度，光生成就吃掉 34% CPU。
+          # 這是 depth_obstacle_cc 降頻降採樣後的版本（5 Hz、1/16 像素）。
+          topic: /camera/obstacle_points
+          data_type: "PointCloud2"
+          marking: true
+          # clearing 用雷達做就好。深度相機視野窄 (約 60 度)，
+          # 讓它做 raytrace 清除會把視野外的真實障礙誤清掉。
+          #
+          # 不清除還有一個關鍵好處：**車子前進時相機看到的地面障礙會留在
+          # local_costmap 裡**，等一下倒車經過同一個位置時仍然避得開 ——
+          # 這是彌補「車尾沒有相機」的主要手段。
+          # local_costmap 是 4x4 m 的 rolling window，移出範圍才會消失，
+          # 涵蓋範圍對倒車脫困來說綽綽有餘。
+          clearing: false
+          # 高度過濾：地板本身不能算障礙，太高的東西也不影響通行。
+          # 0.03 m 以下視為地面雜訊，0.40 m 以上超過車身高度不必理會。
+          min_obstacle_height: 0.03
+          max_obstacle_height: 0.40
+          # 深度相機近距離量測不可靠，遠距離誤差大且用不到
+          obstacle_min_range: 0.15
+          obstacle_max_range: 2.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # 0.30 -> 0.22 (2026-07-28 二次調整)
+        #
+        # 車身內接半徑是 0.205 m (半寬 0.185 + padding 0.02)。膨脹半徑只要
+        # 略大於它就能提供「靠近障礙就加分」的梯度，不需要更大。
+        #
+        # 為什麼非降不可：走廊淨寬只有 0.99 m。膨脹 0.30 m 時兩側各吃掉 0.30，
+        # 中間只剩約 0.4 m 的低成本帶。frontier explorer 挑出來的目標幾乎
+        # 一定落在膨脹區裡，而規劃器用 footprint 做碰撞檢查會一律拒絕 ——
+        # 實測就是 explorer 不斷送出 (7.14, 1.04)、planner 連續數十次回
+        # "no valid path found"，車子只能一路倒退。
+        #
+        # 壓到 0.22 讓可行帶回到約 0.55 m，兩邊標準才對得起來。
+        # 安全性不靠膨脹層硬擋，而是靠 collision_monitor 的 PolygonStop
+        # 與 MPPI 的 consider_footprint 真實碰撞檢查。
+        #
+        # 舊註記 (0.35 -> 0.30，cost_scaling 2.0 -> 3.5)：
+        # 實測環境的地圖有雜訊 (SLAM 在走廊裡難免留下零星假點)，
+        # 膨脹半徑大 + 衰減慢的組合會讓那些雜點把整條通道糊成高成本區，
+        # 規劃器就算找得到路，MPPI 也不敢走 -> 看起來像卡死。
+        # 調快衰減等於「只有真的很貼近障礙才算貴」，把中間的可行帶讓出來。
+        # 安全性由 collision_monitor 的 PolygonStop 與 MPPI 的
+        # consider_footprint 真實碰撞檢查把關，不是靠膨脹層硬擋。
+        inflation_radius: 0.22
+        cost_scaling_factor: 3.5
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      transform_tolerance: 1.0
+      # activate 時要等 map -> base_footprint。這條 TF 由 map_service_cc 決定模式後
+      # 才會出現 (slam_toolbox 或 amcl)，預設 60 秒在 Pi 4 上不一定夠。
+      initial_transform_timeout: 300.0
+      # 採用原廠 param_senior_akm.yaml 的定義 (2026-07-29 改回)。
+      # base_footprint 位在**後輪軸心**，不是車身中央 ——
+      # 所以車尾只有 0.09 m，車頭卻伸出 0.40 m。
+      #
+      # 先前誤用「車身中央」的假設寫成 [-0.22, 0.24]，等於讓 costmap 以為
+      # 車頭只到 0.24 m，**實際車頭有 16 公分是「隱形」的**。
+      # 那正是規劃器覺得過得去、車子卻撞上去的原因之一。
+      footprint: "[ [-0.09, -0.185], [-0.09, 0.185], [0.40, 0.185], [0.40, -0.185] ]"
+      footprint_padding: 0.02
+      resolution: 0.05
+      # 未探索區域維持 unknown，配合規劃器的 allow_unknown 才能往未知區推進。
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+        transform_tolerance: 1.0
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 10.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # 與 local_costmap 一致：地圖雜訊 + 大膨脹 + 慢衰減會把通道糊死
+        inflation_radius: 0.22
+        cost_scaling_factor: 3.5
+      always_send_full_costmap: true
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 1.0
+    costmap_update_timeout: 2.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      tolerance: 0.5
+      # Pi 4 上 Hybrid-A* 是整條鏈最貴的一環。0.05 m 網格搜尋一次會超過 4 秒，
+      # 降採樣到 0.1 m (格數 1/4) + 角度分箱減半，搜尋量約降到 1/8。
+      downsample_costmap: true
+      downsampling_factor: 2
+      # 探索時目標就在未知區邊界，必須允許穿越 unknown
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # 阿克曼車可倒車，用 Reeds-Shepp 而不是 Dubins
+      motion_model_for_search: "REEDS_SHEPP"
+      minimum_turning_radius: 0.80
+      angle_quantization_bins: 32
+      analytic_expansion_ratio: 3.5
+      # 3.0 -> 2.0：解析展開段越長，規劃器越傾向用一條大弧線一次到位，
+      # 在小房間裡那種路徑通常不可行。縮短它讓規劃器改用多段短路徑組合，
+      # 也就是「前進一點、倒車一點」的調整方式。
+      analytic_expansion_max_length: 2.0
+      # 允許在原始運動基元之間插值，路徑更貼合窄空間的可行區
+      allow_primitive_interpolation: true
+      analytic_expansion_max_cost: 200.0
+      analytic_expansion_max_cost_override: false
+      # === 2.0 -> 1.3 -> 1.05 (2026-07-28) ===
+      # 再降一階：使用者要求「可以連續前進後退或轉彎來調整姿態，達到脫困或回頭」。
+      # 1.05 幾乎等於「倒車和前進一樣便宜」，Reeds-Shepp 就會大方地產生
+      # 三點調頭那種多段切換的路徑 —— 這是阿克曼車在小房間裡唯一的迴轉方式。
+      # 完全設 1.0 不好：那樣連空曠處都可能無謂地倒車。
+      # 舊註記 (2.0 -> 1.3)：
+      # 倒車的代價倍率。2.0 代表「倒車一公尺 = 前進兩公尺」，規劃器因此會
+      # 寧可繞遠路也不肯用倒車。但這台車在 0.99 m 寬的走廊裡最小轉彎直徑是
+      # 1.6 m，掉頭本來就只能靠「前進一點、倒車一點」反覆修正 (Reeds-Shepp
+      # 的 cusp)，代價設太高等於直接把唯一可行的解排除掉，規劃器就回
+      # no valid path。1.3 保留「能不倒車就不倒車」的偏好，但窄處願意切換。
+      reverse_penalty: 1.05
+      # 方向切換不額外罰。窄空間掉頭必須來回切好幾次，罰了就掉不了頭。
+      change_penalty: 0.0
+      non_straight_penalty: 1.20
+      # 2.0 -> 1.4：這是「盡量走在通道中央」的傾向強度。
+      # 地圖有雜訊時，高成本區到處都是，權重太大會讓 Hybrid-A* 找不到
+      # 它認為夠便宜的路而回 no valid path。調低讓它願意接受次佳但可行的路線。
+      cost_penalty: 1.4
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: true
+      downsample_obstacle_heuristic: true
+      use_quadratic_cost_penalty: false
+      debug_visualizations: false
+      smooth_path: true
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    # 沒有 spin / assisted_teleop：阿克曼車無法原地旋轉，Spin 一定逾時失敗
+    # (舊 log 裡的 "Exceeded time allowance before reaching the Spin goal")，
+    # 白白吃掉恢復行為的重試次數。行為樹改用 BackUp + Wait + 清 costmap。
+    behavior_plugins: ["backup", "drive_on_heading", "wait"]
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    local_frame: odom_combined
+    global_frame: map
+    robot_base_frame: base_footprint
+    transform_tolerance: 1.0
+    simulate_ahead_time: 2.0
+    enable_stamped_cmd_vel: false
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 20
+    stop_on_failure: false
+    action_server_result_timeout: 900.0
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: true
+      waypoint_pause_duration: 200
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: true
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.25, 0.0, 1.0]
+    min_velocity: [-0.25, 0.0, -1.0]
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+    max_accel: [1.0, 0.0, 1.5]
+    max_decel: [-1.0, 0.0, -1.5]
+    odom_topic: "odom_combined"
+    odom_duration: 0.1
+    use_realtime_priority: false
+    enable_stamped_cmd_vel: false
+
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: "base_footprint"
+    odom_frame_id: "odom_combined"
+    # 吃 steering_trim_cc 補償過的指令，而不是直接吃 velocity_smoother 的輸出。
+    # 鏈路：velocity_smoother -> steering_trim_cc -> collision_monitor -> 底盤
+    # 補償刻意放在碰撞檢查「之前」，補償量設錯也不會繞過安全層。
+    cmd_vel_in_topic: "cmd_vel_trimmed"
+    cmd_vel_out_topic: "cmd_vel"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 1.0
+    source_timeout: 2.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    enable_stamped_cmd_vel: false
+    use_realtime_priority: false
+    polygons: ["PolygonStop", "PolygonSlow", "FootprintApproach"]
+    PolygonStop:
+      type: "polygon"
+      # === 2026-07-29 重畫：原本是照「錯的」車身尺寸畫的 ===
+      #
+      # 舊值 [[0.29,0.23],[0.29,-0.23],[-0.27,-0.23],[-0.27,0.23]] 是依據
+      # 舊註解裡的「車身 [-0.22, 0.24] x [±0.185]」畫的 —— 那個尺寸假設
+      # base_footprint 在車身中央。但原廠規格是 [-0.09, 0.40]（見
+      # wheeltec-akm-footprint 記憶），**base_footprint 在後輪軸心**。
+      # footprint 改成原廠值時，這裡沒有跟著改，於是：
+      #
+      #     車頭  安全區 +0.29 vs 實際車身 +0.40  -> 鼻子有 11 cm 露在保護外(危險)
+      #     車尾  安全區 -0.27 vs 實際車身 -0.09  -> 往後多伸 18 cm(倒車過度敏感)
+      #
+      # 後果實測：車子在房間門口左側貼牆後，這個「多伸 18 cm」的框讓
+      # collision_monitor 持續回報 `Robot to stop due to PolygonStop polygon`，
+      # **所有方向的指令都被歸零**（固定框不分方向），車子完全無法倒車脫困，
+      # BackUp 動作跑滿 40 秒時間額度卻移動 0.00 m。
+      #
+      # 新值 = 原廠車身外擴 5 cm。車頭終於被保護到，車尾不再過度外伸。
+      points: "[[0.45, 0.235], [0.45, -0.235], [-0.14, -0.235], [-0.14, 0.235]]"
+      action_type: "stop"
+      min_points: 4
+      visualize: true
+      polygon_pub_topic: "polygon_stop"
+      # === 停用 (2026-07-29)：在窄走廊裡這個機制物理上行不通 ===
+      #
+      # 這是一個**固定在車體上、不分方向**的方框：框內出現任何雷射點就把
+      # 所有速度指令歸零，不管車子是想往障礙物開過去還是想離開它。
+      #
+      # 幾何上算一次就知道為什麼不可行：
+      #     走廊淨寬 1.0 m、車寬 0.37 m -> 置中時每邊餘裕只有 0.315 m
+      #     這個框的半寬是 0.235 m     -> 車子只要偏離中線 0.08 m 就觸發
+      # 實測就是這樣：車子貼近左牆後 collision_monitor 持續回報
+      # `Robot to stop due to PolygonStop polygon`，倒車指令也一起被歸零，
+      # BackUp 動作跑滿 40 秒時間額度卻移動 0.00 m，完全無法自救。
+      #
+      # 改用下面的 FootprintApproach 取代：它沿著**指令速度方向**投影 footprint
+      # 做碰撞預測（time_before_collision 1.5 秒），所以
+      #   - 往障礙物開 -> 會擋（該有的保護還在）
+      #   - 往空曠方向倒車脫困 -> 放行（這正是原本被鎖死的動作）
+      #
+      # 要在開闊環境重新啟用就把這行改回 true。
+      enabled: false
+    PolygonSlow:
+      type: "polygon"
+      # 同樣重畫對齊原廠車身：車頭前方留 0.35 m、車尾後方 0.16 m。
+      # 舊值 [0.60, -0.42] 是對著舊車身尺寸的，車頭方向反而留太少。
+      points: "[[0.75, 0.32], [0.75, -0.32], [-0.25, -0.32], [-0.25, 0.32]]"
+      action_type: "slowdown"
+      min_points: 4
+      slowdown_ratio: 0.5
+      visualize: true
+      polygon_pub_topic: "polygon_slowdown"
+      enabled: true
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: "/local_costmap/published_footprint"
+      time_before_collision: 1.5
+      simulation_time_step: 0.05
+      min_points: 6
+      visualize: false
+      enabled: true
+    # 停車判斷同樣要兩個來源。只看雷達的話，低於 0.11 m 的障礙
+    # 進到 PolygonStop 框內也不會觸發停車。
+    observation_sources: ["scan", "depth_cloud"]
+    scan:
+      source_timeout: 2.0
+      type: "scan"
+      topic: "/scan"
+      enabled: true
+    depth_cloud:
+      source_timeout: 3.0   # depth_obstacle_cc 是 5 Hz，逾時要放寬
+      type: "pointcloud"
+      topic: "/camera/obstacle_points"
+      # 只取地面以上、車身高度以內的點
+      min_height: 0.03
+      max_height: 0.40
+      enabled: true

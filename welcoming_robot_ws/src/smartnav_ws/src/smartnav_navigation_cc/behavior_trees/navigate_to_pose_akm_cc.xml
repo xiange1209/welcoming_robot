@@ -1,0 +1,62 @@
+<!--
+  navigate_to_pose_akm_cc.xml
+  以 Nav2 預設的 navigate_to_pose_w_replanning_and_recovery.xml 為基礎，
+  針對 wheeltec senior_akm 阿克曼底盤做兩處修改：
+
+  1. 恢復行為拿掉 <Spin>。
+     阿克曼車不能原地旋轉，Spin 一定會走到逾時才失敗
+     (舊 log: "Exceeded time allowance before reaching the Spin goal - Exiting Spin")，
+     不但沒有恢復效果，還會白白吃掉 RoundRobin 的一輪與 6 次重試額度。
+     改成「清 costmap -> 倒車 -> 等待」的循環，倒車是這種底盤真正能做的脫困動作。
+
+  2. BackUp 距離從 0.30 加大到 0.40、速度降到 0.10。
+     車身 0.46 m，倒 0.30 m 常常還留在原本的窄縫裡；
+     慢速倒車也比較不會在後方無感測器的情況下撞到東西。
+
+  注意：backup_dist 為正值代表往後退的距離 (Nav2 內部自行轉成負向速度)。
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="10" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated/>
+          <RoundRobin name="RecoveryActions">
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <BackUp backup_dist="0.40" backup_speed="0.08" error_code_id="{backup_code_id}"/>
+            <DriveOnHeading dist_to_travel="0.25" speed="0.10" error_code_id="{drive_error_code}"/>
+            <BackUp backup_dist="0.25" backup_speed="0.08" error_code_id="{backup_code_id}"/>
+            <Wait wait_duration="3.0"/>
+          </RoundRobin>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

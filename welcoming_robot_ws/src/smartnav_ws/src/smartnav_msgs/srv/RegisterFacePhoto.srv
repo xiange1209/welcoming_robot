@@ -1,0 +1,15 @@
+# 用現成照片註冊人臉
+#
+# 與 RegisterFace 的差別：這支是同步的。照片當下就有，抽完特徵、寫完樣本才回應，
+# 不需要使用者站在鏡頭前等 20 秒採樣。適合替不在現場的人建檔。
+
+string user_name                         # 人員名稱
+UserType user_type                       # 人員類型 (GUEST, VIP, ADMIN)
+string description                       # 人員描述
+sensor_msgs/CompressedImage[] photos     # 一張以上，每張成功抽出特徵就算一個樣本
+---
+bool success                             # 是否至少採用了一張
+string message                           # 訊息
+string user_uuid                         # 建立（或沿用）的使用者 UUID
+int32 accepted                           # 成功採用的張數
+int32 rejected                           # 沒偵測到人臉而略過的張數

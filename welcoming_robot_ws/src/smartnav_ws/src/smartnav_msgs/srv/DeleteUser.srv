@@ -1,0 +1,6 @@
+# 刪除使用者（連同其所有人臉樣本）
+
+string user_uuid
+---
+bool success
+string message

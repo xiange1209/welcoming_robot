@@ -1,0 +1,10 @@
+# 在 Windows 上編輯、在 Pi (Linux) 上執行 —— 行尾一律用 LF。
+# 沒有這行的話 shell 腳本會帶著 CRLF 傳到 Pi，執行時噴
+# "bad interpreter: /usr/bin/env bash^M"。
+* text=auto eol=lf
+
+# 地圖是二進位，不可以做行尾轉換（會整張圖壞掉）
+*.pgm binary
+*.png binary
+*.jpg binary
+*.tar.gz binary

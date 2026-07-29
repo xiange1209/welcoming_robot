@@ -1,0 +1,132 @@
+# =============================================================================
+# slam_toolbox 建圖參數 - senior_akm / Raspberry Pi 4
+# =============================================================================
+# 用 async_slam_toolbox_node：sync 版本會在掃描處理上阻塞，Pi 4 四核同時跑
+# nav2 + MPPI 時容易讓 map -> odom_combined 的更新延遲到超過 transform_tolerance。
+#
+# use_lifecycle_manager: false
+#   這個參數只控制「要不要跟外部 lifecycle_manager 建立 bond」。
+#   slam_toolbox 本身就是 LifecycleNode，用一般 Node 方式啟動時會停在 unconfigured，
+#   不會自己 activate。本包刻意讓它停在 unconfigured，由 map_service_cc 在進入
+#   建圖模式時才 configure + activate，離開建圖模式時 deactivate + cleanup。
+#   設成 true 會要求 bond，反而讓沒有 lifecycle_manager 管它的情況下轉換失敗。
+# =============================================================================
+
+slam_toolbox:
+  ros__parameters:
+    use_sim_time: false
+    use_lifecycle_manager: false
+
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    odom_frame: odom_combined
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan
+    mode: mapping
+
+    debug_logging: false
+    throttle_scans: 1
+    # === 不要調低這個值。0.02 (50 Hz) 是唯一實測穩定的設定。===
+    #
+    # 2026-07-29 我為了省 CPU 調低它，兩次都弄壞導航：
+    #
+    #   0.1  (10 Hz) -> controller_server: "Lookup would require extrapolation
+    #                   into the future. Requested time X but latest is X-0.144"
+    #                -> "Unable to transform goal pose into costmap frame"
+    #   0.05 (20 Hz) -> 同樣的錯誤，差距 37 ms。探索的每一個目標都在 1 秒內
+    #                   ABORTED (error_code=102)，車子從頭到尾沒動過。
+    #
+    # 原因：控制器每個週期都用「現在」的時間戳查 map->odom_combined，
+    # 發布間隔加上抖動就會讓「現在」比最新一筆 TF 還新，
+    # 而 transform_tolerance 對「未來」方向的外插沒有幫助。
+    #
+    # 省下來的量也不值得：只讓兩個 Python 節點各降約 5 個百分點，
+    # 代價是整個導航不能動。要省 /tf 成本請往「訂閱端」下手
+    # （例如 HMI 那樣改成需要時才訂閱），不要動發布頻率。
+    transform_publish_period: 0.02
+    # 探索用的 frontier 偵測吃 /map，太慢會讓 explorer 一直對著舊地圖挑目標；
+    # 太快在 Pi 4 上會跟 MPPI 搶 CPU。3 秒是折衷。
+    map_update_interval: 3.0
+    resolution: 0.05
+    # 12.0 -> 5.0 (2026-07-29)
+    #
+    # 在 0.99 m 寬的走廊裡，只有約 5 度的錐形看得到遠處（其餘射線 1 公尺內
+    # 就打到側牆），而那些遠距離回波幾乎都是**掠射角**打在側牆上 ——
+    # 角度誤差在遠處會被線性放大成很大的橫向誤差。
+    #
+    # 實測後果：車子從 x=0 開到 x=+5，回頭觀測 x=-3 的位置（距離 5~8 m），
+    # 地圖上那段走廊呈扇形張開：
+    #     x = 0 ~ +6 m（車子實際開過）  牆間距 1.00~1.10 m   正確
+    #     x = -3 ~ 0 m（只從遠處看過）  牆間距 1.30~1.45 m   錯
+    # 多出來的寬度全在左側，形成一個**不存在的開口**，
+    # explorer 把它當成大片 frontier (size=24) 而掉頭回去，
+    # 反而不往前走去真正的房間入口。
+    #
+    # 5 m 內的回波入射角合理、誤差可控。代價是遠處要靠車子開近才會被建圖，
+    # 但這對「開進去看」的探索流程本來就是正確的行為。
+    max_laser_range: 5.0
+    minimum_time_interval: 0.5
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    use_scan_matching: true
+    use_scan_barycenter: true
+    # 阿克曼車是連續轉向，位移門檻不要太大，否則轉彎時關鍵幀太稀疏
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    # 走廊來回：回程要能跟去程 loop close。3.0 m 在近 20 m 的走廊裡太短，
+    # 累積的漂移一旦超過它就再也接不回去。
+    loop_search_maximum_distance: 8.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # === 長直走廊調校 (2026-07-28) ===
+    # 症狀：在 0.99 m 寬、近 20 m 長的走廊來回走一趟，存出來的地圖中間出現
+    # 假障礙物，global_costmap 車子腳下 cost=88~100，但同一時間 local_costmap
+    # (純即時雷射) 是 0 -> 規劃器一律回 "Start occupied"，整條走廊無法導航。
+    #
+    # 根因：走廊沿前進方向沒有特徵，scan matching 的 correlation 在長軸上是平的
+    # (往前往後移一點，掃描吻合度幾乎一樣)，於是位姿會沿走廊滑動。去程和回程
+    # 各滑到不同位置，兩側牆就被畫成雙重牆，中間夾出假的障礙物。
+    #
+    # 對策：限制滑動幅度 + 更信任里程計。
+    #   correlation_search_space_dimension 0.5 -> 0.3
+    #     scan matching 的搜尋視窗。走廊裡視窗越大、可以滑得越遠。
+    #     縮小等於直接限制單次匹配的最大位移。
+    correlation_search_space_dimension: 0.3
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    #   loop_search_space_dimension 8.0 -> 10.0，並放寬 loop 距離 (見下方)
+    #   來回走同一條走廊時，回程要能跟去程 loop close 才會把誤差拉回來。
+    loop_search_space_dimension: 10.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    #   distance_variance_penalty 0.5 -> 1.5
+    #     這是「偏離里程計預測」的懲罰。阿克曼底盤直線行進時輪速里程計相當準，
+    #     而走廊裡的 scan matching 反而不可靠，所以要更信任 odom、
+    #     讓 scan matching 只做小幅修正，不要亂拉。
+    distance_variance_penalty: 1.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true

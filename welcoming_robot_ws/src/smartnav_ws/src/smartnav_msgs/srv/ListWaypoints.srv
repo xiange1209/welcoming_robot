@@ -1,0 +1,7 @@
+# 列出地點服務
+
+string map_id                   # 地圖 ID (可選)
+---
+WaypointInfo[] waypoints_info    # 地點資訊列表
+bool success                    # 是否成功
+string message                  # 訊息 (成功或錯誤描述)

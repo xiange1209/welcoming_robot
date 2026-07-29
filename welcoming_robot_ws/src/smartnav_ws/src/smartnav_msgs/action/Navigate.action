@@ -1,0 +1,14 @@
+# 導航動作
+#
+# waypoint_id 有值 → 查詢地點資料庫後導航過去（原本的行為）。
+# use_target_pose = true → 忽略 waypoint_id，直接導航到 target_pose
+# （HMI 讓使用者點地圖任意位置導航時用）。
+
+string waypoint_id
+bool use_target_pose            # true 時直接導航到 target_pose
+geometry_msgs/Pose target_pose  # 目標座標（map frame）
+string target_name              # 目標顯示名稱（僅供語音播報，可留空）
+---
+bool success                    # 是否成功
+string message                  # 訊息
+---

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CycloneDDS 調校 - Raspberry Pi 4 / ROS 2 Jazzy / welcoming_robot_ws
+
+  1. ParticipantIndex=none
+     預設的 ParticipantIndex 會在 domain 內配置有限的索引，節點一多
+     (nav2 + slam + brain 約 20+ 個節點) 就會出現
+     "Failed to find a free participant index for domain 0"，nav2 節點大量崩潰。
+     none = 走 wide 模式，不再受索引數量限制。
+
+  2. SocketReceiveBufferSize min=10MB
+     單張 640x480 影像約 900KB，遠大於核心預設的 208KB 接收緩衝，
+     分片一遺失整幀就重組失敗 -> 訂閱端完全收不到資料。
+     (搭配 /etc/sysctl.d/60-ros2-dds.conf 的 net.core.rmem_max=32MB)
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetermine="true" priority="default" multicast="default" />
+      </Interfaces>
+      <AllowMulticast>default</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+
+    <Discovery>
+      <!-- 關鍵：避免 "Failed to find a free participant index for domain 0" -->
+      <ParticipantIndex>none</ParticipantIndex>
+      <!-- 殘留的 participant 較快被回收，減少 ghost node -->
+      <LeaseDuration>10s</LeaseDuration>
+    </Discovery>
+
+    <Internal>
+      <SocketReceiveBufferSize min="10MB" />
+      <Watermarks>
+        <WhcHigh>2MB</WhcHigh>
+      </Watermarks>
+    </Internal>
+
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

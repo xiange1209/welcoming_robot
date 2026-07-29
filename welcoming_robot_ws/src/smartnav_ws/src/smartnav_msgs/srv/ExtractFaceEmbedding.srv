@@ -1,0 +1,11 @@
+# 從單張影像抽取人臉特徵向量
+#
+# 由 face_embedding_node 提供——InsightFace 模型已經載在那個行程裡，
+# 其他節點走這個服務就不必各自再載一份（Pi 上記憶體很吃緊）。
+
+sensor_msgs/CompressedImage image        # 待分析的影像
+---
+bool success                             # 是否成功抽出特徵
+string message                           # 失敗原因（例如沒偵測到人臉）
+float32[4] bbox                          # 人臉邊界框 [x1, y1, x2, y2]
+float32[] embedding                      # L2 歸一化後的特徵向量

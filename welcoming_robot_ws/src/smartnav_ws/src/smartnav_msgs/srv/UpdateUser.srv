@@ -1,0 +1,10 @@
+# 修改使用者資料（不動人臉樣本）
+# user_name 留空表示不改名；其餘欄位一律套用
+
+string user_uuid
+string user_name
+UserType user_type
+string description
+---
+bool success
+string message

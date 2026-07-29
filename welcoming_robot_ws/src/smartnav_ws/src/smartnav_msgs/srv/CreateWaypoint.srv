@@ -1,0 +1,14 @@
+# 建立地點服務
+#
+# 預設行為（use_given_pose = false）：在機器人「當前位置」建立地點。
+# HMI 讓使用者直接點地圖建點時，把 use_given_pose 設為 true 並填入 pose
+# （map frame 座標）。新欄位放在最後且預設值等同舊行為，既有呼叫端不需修改。
+
+string waypoint_name            # 地點名稱
+string map_id                   # 地圖 ID
+bool use_given_pose             # true 時採用下方 pose，false 時採用機器人當前位置
+geometry_msgs/Pose pose         # 指定的地點座標（map frame）
+---
+WaypointInfo waypoint_info
+bool success                    # 是否成功
+string message                  # 訊息 (成功或錯誤描述)

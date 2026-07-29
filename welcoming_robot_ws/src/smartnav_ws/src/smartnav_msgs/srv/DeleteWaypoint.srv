@@ -1,0 +1,9 @@
+# 刪除地點服務
+#
+# 只用 waypoint_id 指定，不用名稱：名稱只在「同一張地圖內」唯一，
+# 用名稱刪會在多地圖情境下刪錯。id 由 create_waypoint 產生，全域唯一。
+
+string waypoint_id              # 要刪除的地點 ID
+---
+bool success                    # 是否成功
+string message                  # 訊息 (成功或錯誤描述)

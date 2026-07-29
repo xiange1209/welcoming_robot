@@ -1,0 +1,9 @@
+# 人臉註冊服務
+
+string user_name                # 人員名稱
+UserType user_type              # 人員類型 (GUEST, VIP, ADMIN)
+string description              # 人員描述
+int32 num_samples               # 採集的臉部影像數量
+---
+bool success                    # 是否成功
+string message                  # 訊息 (成功或錯誤描述)
