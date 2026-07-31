@@ -815,17 +815,29 @@ class HmiServerNode(Node):
         # 雷達節點在 /x10 命名空間底下，不是頂層的 /lslidar_driver_node。
         # 做成參數而不是寫死，換雷達或改命名空間時不用改程式。
         self.declare_parameter("lidar_node_name", "/x10/lslidar_driver_node")
-        self.teleop_pub = self.create_publisher(
-            Twist, self.get_parameter("teleop_cmd_topic").value, 10
+        # 控制指令用 BEST_EFFORT + depth 1：這是「只有最新值有意義」的串流資料，
+        # 不是不能掉的事件。預設的 RELIABLE + depth 10 會在訂閱端稍慢時把最多
+        # 10 則過期指令排隊重送，車子就照著幾百毫秒前的方向繼續開。
+        teleop_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
         )
+        self.teleop_pub = self.create_publisher(
+            Twist, self.get_parameter("teleop_cmd_topic").value, teleop_qos
+        )
+        # 中繼節點不在時的直通路徑，理由見 _publish_teleop
+        self.teleop_direct_pub = self.create_publisher(Twist, "cmd_vel", teleop_qos)
+        self._teleop_fallback_warned = False
         self._teleop_watchdog_sec = float(self.get_parameter("teleop_watchdog_sec").value)
         self._teleop_last_cmd = 0.0      # 最後一次收到遙控指令的時間 (monotonic)
         self._teleop_active = False      # 是否還需要送停止命令
         self._teleop_linear = 0.0
         self._teleop_angular = 0.0
         self._teleop_lock = threading.Lock()
-        # 10 Hz：只負責「補送指令」與「逾時歸零」，不是主要的指令來源
-        self.create_timer(0.1, self._teleop_tick, callback_group=cb)
+        # 20 Hz：這才是底盤的指令來源。HTTP 只負責更新設定值，
+        # 網路抖動因此不會傳導成底盤的 1.0 秒逾時停車。
+        self.create_timer(0.05, self._teleop_tick, callback_group=cb)
 
         # ── 服務／動作客戶端 ───────────────────────────────
         self.service_clients: Dict[str, Any] = {
@@ -1769,6 +1781,41 @@ class HmiServerNode(Node):
     TELEOP_MAX_LINEAR = 0.18
     TELEOP_MAX_ANGULAR = 0.45
 
+    def _publish_teleop(self, lin: float, ang: float) -> None:
+        """把速度指令送到底盤，必要時自動繞過不存在的中繼節點
+
+        teleop_cmd_topic 預設是 cmd_vel_trimmed，指令會經過 collision_monitor
+        才到底盤，遙控時一樣有防撞保護。但這只在完整導航堆疊有起來時成立：
+
+            mapping_manual_cc.launch.py  只起 slam_toolbox
+            sensors_cc.launch.py         只起底盤與雷達
+            nav_bringup_cc 剛啟動的頭幾分鐘  collision_monitor 還在 unconfigured
+
+        這三種情況下 cmd_vel_trimmed **沒有任何訂閱者**，指令發出去就消失，
+        HTTP 卻照樣回成功 —— 從操作者的角度就是「按了完全沒反應」。
+
+        所以發布前先看有沒有人在聽；沒有就直接發 cmd_vel（底盤自己訂的話題）。
+        這是刻意的降級而不是預設值改動：有防撞層時仍然走防撞層。
+        """
+        msg = Twist()
+        msg.linear.x = lin
+        msg.angular.z = ang
+        self.teleop_pub.publish(msg)
+
+        if self.teleop_pub.topic_name.lstrip("/") == "cmd_vel":
+            return
+        if self.count_subscribers(self.teleop_pub.topic_name) > 0:
+            self._teleop_fallback_warned = False
+            return
+
+        if not self._teleop_fallback_warned:
+            self._teleop_fallback_warned = True
+            self.get_logger().warn(
+                f"{self.teleop_pub.topic_name} 沒有訂閱者（collision_monitor 未啟動？），"
+                f"遙控指令改直接發 cmd_vel —— 此時沒有防撞保護，請放慢速度"
+            )
+        self.teleop_direct_pub.publish(msg)
+
     def apply_teleop(self, linear: float, angular: float) -> None:
         """套用一次遙控指令並重置看門狗"""
         try:
@@ -1786,18 +1833,22 @@ class HmiServerNode(Node):
             self._teleop_linear = lin
             self._teleop_angular = ang
             self._teleop_last_cmd = time.monotonic()
-            self._teleop_active = True
+            # 收到零速就直接收工，不要讓看門狗在 0.6 秒後再多噴一次逾時警告
+            self._teleop_active = lin != 0.0 or ang != 0.0
 
-        msg = Twist()
-        msg.linear.x = lin
-        msg.angular.z = ang
-        self.teleop_pub.publish(msg)
+        self._publish_teleop(lin, ang)
 
     def _teleop_tick(self) -> None:
-        """看門狗：太久沒收到新指令就把車子停住。
+        """維持指令流 ＋ 看門狗
 
-        這是手機遙控的安全核心。連線中斷、鎖螢幕、切 App、瀏覽器分頁被回收，
-        都會讓指令停止送達卻沒有任何「停止」訊息 —— 只靠「收到停止才停」
+        **補送指令**：底盤韌體有 1.0 秒指令逾時，沒收到新指令就自己停。
+        如果發布頻率等於 HTTP 到達頻率（前端標稱 5 Hz），那麼 WiFi 抖動、
+        TCP 重傳、Pi4 CPU 排隊只要讓連續幾則請求慢下來，底盤就會看到
+        超過 1 秒的空窗 → 停車 → 下一則到達又起步，表現就是一頓一頓。
+        所以這裡以固定頻率重送目前的設定值，讓網路抖動不會傳導到底盤。
+
+        **看門狗**：連線中斷、鎖螢幕、切 App、瀏覽器分頁被回收，都會讓
+        指令停止送達卻沒有任何「停止」訊息 —— 只靠「收到停止才停」
         會讓車子在失聯後繼續跑。
         """
         with self._teleop_lock:
@@ -1805,15 +1856,23 @@ class HmiServerNode(Node):
                 return
             idle = time.monotonic() - self._teleop_last_cmd
             if idle < self._teleop_watchdog_sec:
-                return
-            self._teleop_active = False
-            self._teleop_linear = 0.0
-            self._teleop_angular = 0.0
+                # 還在有效期內：重送目前的設定值，維持指令流不中斷
+                lin, ang = self._teleop_linear, self._teleop_angular
+                timed_out = False
+            else:
+                self._teleop_active = False
+                self._teleop_linear = 0.0
+                self._teleop_angular = 0.0
+                lin = ang = 0.0
+                timed_out = True
+
+        if not timed_out:
+            self._publish_teleop(lin, ang)
+            return
 
         # 連送三次零速：DDS 掉一則封包不能變成「車子繼續跑」
-        stop = Twist()
         for _ in range(3):
-            self.teleop_pub.publish(stop)
+            self._publish_teleop(0.0, 0.0)
         self.get_logger().warn(f"遙控逾時 {idle:.1f} 秒未收到指令，已停車")
 
     def set_lidar_rear_mask(self, enabled: bool, half_angle_deg: float) -> tuple:

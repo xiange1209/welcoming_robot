@@ -361,17 +361,24 @@
     <h3>遙控</h3>
     <div id="tstatus" class="meta" style="margin-bottom:8px">未連線</div>
 
-    <!-- 方向鍵：按住送指令、放開就停。手機用 touch 事件。 -->
+    <!-- 方向鍵：按住送指令、放開就停。pointer 事件同時涵蓋滑鼠與觸控。
+         九宮格排法對照 teleop_twist_keyboard 的 u/i/o j/k/l m/,/.：
+         四個角是「前進＋轉向」的複合鍵，這是阿克曼車真正能執行的動作。
+         純轉向的 ◀ ▶ 要搭配 ▲ 或 ▼ 一起按才有效（可以多指同時按）。 -->
     <div id="tpad" style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; max-width:320px; margin:0 auto; touch-action:none; user-select:none">
-      <div></div>
+      <button class="tbtn" data-lin="1"  data-ang="1">◤</button>
       <button class="tbtn" data-lin="1"  data-ang="0">▲</button>
-      <div></div>
+      <button class="tbtn" data-lin="1"  data-ang="-1">◥</button>
       <button class="tbtn" data-lin="0"  data-ang="1">◀</button>
       <button class="tbtn stop" id="tstop">■</button>
       <button class="tbtn" data-lin="0"  data-ang="-1">▶</button>
-      <div></div>
+      <button class="tbtn" data-lin="-1" data-ang="1">◣</button>
       <button class="tbtn" data-lin="-1" data-ang="0">▼</button>
-      <div></div>
+      <button class="tbtn" data-lin="-1" data-ang="-1">◢</button>
+    </div>
+    <div class="meta" style="margin-top:8px; line-height:1.5">
+      這是<b>阿克曼轉向</b>車，和汽車一樣<b>無法原地旋轉</b>——只按 ◀ ▶ 車子不會動。
+      請用四個角的複合鍵，或按住 ▲ 再加按 ◀ ▶。最小轉彎半徑 0.8 m（掉頭需要 1.6 m 寬）。
     </div>
 
     <div class="row" style="margin-top:14px; align-items:center">
@@ -679,82 +686,150 @@ document.addEventListener("visibilitychange", () => {
 
    如果反過來做成「按下送 start、放開送 stop」，那則 stop 只要沒送達
    （手機遙控很常見），車子就會一直跑下去。 */
-let teleopVec = {lin: 0, ang: 0};
 let teleopTimer = null;
 let teleopSpeed = 0.60;          // 0~1，對應到後端上限
+let teleopInFlight = false;      // 背壓：上一則還沒回來就不要再送
+
+/* 目前按著的所有輸入來源。key 是 pointerId 或鍵名，value 是 {lin, ang}。
+   用集合而不是單一向量，是因為「按著▲再加按◀」在阿克曼車上是最常用的動作
+   ——單一向量會被後按的那顆整個覆寫掉，變成 lin=0 的純轉向（車子不會動），
+   而且先放開其中一顆就會整台停下。 */
+const teleopHeld = new Map();
+
+function teleopVector() {
+  let lin = 0, ang = 0;
+  for (const v of teleopHeld.values()) { lin += v.lin; ang += v.ang; }
+  // 多顆同向鍵一起按不應該疊成兩倍速
+  return {lin: Math.max(-1, Math.min(1, lin)), ang: Math.max(-1, Math.min(1, ang))};
+}
 
 function teleopSend() {
-  const lin = teleopVec.lin * teleopSpeed * 0.18;   // 後端上限 0.18 m/s
-  const ang = teleopVec.ang * teleopSpeed * 0.45;   // 後端上限 0.45 rad/s
+  // in-flight 保護：Pi4 忙起來時一則 POST 可能超過 200 ms，沒有這道閘門
+  // 請求會在瀏覽器連線池裡無上限堆積，延遲隨時間單調增長，放手後那些
+  // 排隊中的舊指令還會繼續餵飽底盤的 1 秒逾時 —— 車子不會停。
+  if (teleopInFlight) return;
+  const v = teleopVector();
+  const lin = v.lin * teleopSpeed * 0.18;          // 後端上限 0.18 m/s
+  const ang = v.ang * teleopSpeed * 0.45;          // 後端上限 0.45 rad/s
+  teleopInFlight = true;
+  const headers = {"Content-Type": "application/json"};
+  // 遙控端點掛了 admin_only，沒帶權杖一律回 401。
+  // 而 fetch 只有在網路層失敗才 reject，401 對它來說是「成功完成」——
+  // 少了這個標頭，指令會被靜默丟棄且畫面上不會有任何錯誤。
+  if (adminToken) headers["Authorization"] = "Bearer " + adminToken;
   fetch("/api/teleop", {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: headers,
     body: JSON.stringify({linear: lin, angular: ang}),
+  }).then((res) => {
+    if (!res.ok) {
+      teleopHalt();
+      setText("tstatus", res.status === 401
+        ? "遙控需要管理者登入（權杖已失效，請重新登入）"
+        : "指令被拒絕：HTTP " + res.status);
+    }
   }).catch(() => {
     // 送不出去就直接停止本地心跳；車子那端看門狗也會停
     teleopHalt();
     setText("tstatus", "連線中斷，已停車");
-  });
+  }).finally(() => { teleopInFlight = false; });
 }
 
-function teleopStart(lin, ang) {
-  teleopVec = {lin: lin, ang: ang};
+function teleopRefresh() {
+  if (teleopHeld.size === 0) { teleopStop(); return; }
   if (teleopTimer === null) {
     teleopSend();                                  // 立刻送一次，不要等第一個間隔
-    teleopTimer = setInterval(teleopSend, 200);
+    teleopTimer = setInterval(teleopSend, 100);    // 後端 20 Hz 補送，這裡只要跟得上手指
+  } else {
+    teleopSend();                                  // 方向變了就立刻反映，不要等下一個間隔
   }
-  setText("tstatus", `移動中　前後 ${lin>0?"前進":lin<0?"後退":"—"}　轉向 ${ang>0?"左":ang<0?"右":"—"}`);
+  const v = teleopVector();
+  setText("tstatus",
+    `移動中　前後 ${v.lin>0?"前進":v.lin<0?"後退":"—"}　轉向 ${v.ang>0?"左":v.ang<0?"右":"—"}`
+    + (v.lin === 0 && v.ang !== 0 ? "　⚠ 阿克曼車無法原地轉，請同時按前進或後退" : ""));
 }
 
 function teleopHalt() {
   if (teleopTimer !== null) { clearInterval(teleopTimer); teleopTimer = null; }
-  teleopVec = {lin: 0, ang: 0};
+  teleopHeld.clear();
   document.querySelectorAll(".tbtn").forEach((b) => b.classList.remove("held"));
 }
 
 function teleopStop() {
-  const wasMoving = teleopTimer !== null;
+  const wasMoving = teleopTimer !== null || teleopHeld.size > 0;
   teleopHalt();
-  if (wasMoving) {
-    fetch("/api/teleop/stop", {method: "POST"}).catch(() => {});
-    setText("tstatus", "已停止");
-  }
+  // keepalive：頁面正在關閉或被隱藏時，一般的 fetch 會被瀏覽器直接取消，
+  // 停車指令就送不出去。這個旗標讓請求脫離頁面生命週期繼續送完。
+  // 即使它仍失敗，後端 0.6 秒看門狗還是會停車 —— 這是第二道保險不是唯一一道。
+  const headers = {};
+  if (adminToken) headers["Authorization"] = "Bearer " + adminToken;
+  fetch("/api/teleop/stop", {method: "POST", headers: headers, keepalive: true}).catch(() => {});
+  if (wasMoving) setText("tstatus", "已停止");
 }
 
 function setText(id, s) { const el = $(id); if (el) el.textContent = s; }
 
 // 方向鍵綁定。pointer 事件同時涵蓋滑鼠與觸控，不用分開處理。
 document.querySelectorAll("#tpad .tbtn").forEach((btn) => {
-  if (btn.id === "tstop") { btn.onclick = teleopStop; return; }
+  if (btn.id === "tstop") {
+    // 急停綁 pointerdown 而不是 click：click 要等 pointerup 才觸發，
+    // 而且在觸控裝置上還有 ~300 ms 的延遲。急停不能等。
+    btn.addEventListener("pointerdown", (e) => { e.preventDefault(); teleopStop(); });
+    return;
+  }
   const lin = parseFloat(btn.dataset.lin) || 0;
   const ang = parseFloat(btn.dataset.ang) || 0;
-  const down = (e) => {
+  btn.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     btn.classList.add("held");
     // 手指按著時把後續事件都導到這個按鈕，滑出邊界也不會漏掉 pointerup
     if (btn.setPointerCapture && e.pointerId !== undefined) {
       try { btn.setPointerCapture(e.pointerId); } catch (_) {}
     }
-    teleopStart(lin, ang);
-  };
-  btn.addEventListener("pointerdown", down);
+    teleopHeld.set("p" + e.pointerId, {lin: lin, ang: ang});
+    teleopRefresh();
+  });
+  // 只移除這一根手指，其他還按著的照常生效
   ["pointerup", "pointercancel", "pointerleave"].forEach((ev) =>
-    btn.addEventListener(ev, (e) => { e.preventDefault(); teleopStop(); })
+    btn.addEventListener(ev, (e) => {
+      e.preventDefault();
+      btn.classList.remove("held");
+      teleopHeld.delete("p" + e.pointerId);
+      teleopRefresh();
+    })
   );
 });
 
-// 鍵盤操作（筆電上比較好用）
+// 鍵盤操作（筆電上比較好用）。四個角是複合動作，對應方向鍵無法表達的組合。
 const keyMap = {ArrowUp:[1,0], ArrowDown:[-1,0], ArrowLeft:[0,1], ArrowRight:[0,-1],
-                w:[1,0], s:[-1,0], a:[0,1], d:[0,-1]};
+                w:[1,0], s:[-1,0], a:[0,1], d:[0,-1],
+                W:[1,0], S:[-1,0], A:[0,1], D:[0,-1]};
 document.addEventListener("keydown", (e) => {
   if ($("p-teleop") && !$("p-teleop").classList.contains("active")) return;
-  if (e.repeat) return;                            // 按住時瀏覽器會連發，心跳已經在跑了
+  // 焦點在輸入框時不可以攔截：同一頁就有「地圖名稱」欄位，
+  // 不擋的話打 "warehouse" 的每個 w/a/s/d 都會開走車子，而且 preventDefault
+  // 會讓字元根本打不進去，看起來像輸入框壞掉。
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;   // Ctrl+S 想存檔不該變成倒車
+  if (e.repeat) return;                             // 按住時瀏覽器會連發，心跳已經在跑了
   const v = keyMap[e.key];
   if (!v) return;
   e.preventDefault();
-  teleopStart(v[0], v[1]);
+  teleopHeld.set("k" + e.key.toLowerCase(), {lin: v[0], ang: v[1]});
+  teleopRefresh();
 });
-document.addEventListener("keyup", (e) => { if (keyMap[e.key]) teleopStop(); });
+document.addEventListener("keyup", (e) => {
+  if (!keyMap[e.key]) return;
+  teleopHeld.delete("k" + e.key.toLowerCase());
+  teleopRefresh();
+});
+
+/* 視窗失焦一定要停車。
+   alt-tab、點到別的視窗、跳出系統對話框都**不會**觸發 visibilitychange，
+   但會讓 keyup 整個遺失 —— 鍵還「按著」，計時器繼續送，車子就暴衝出去。
+   這是鍵盤遙控最容易出事的一種情況。 */
+window.addEventListener("blur", () => { if (teleopHeld.size > 0 || teleopTimer !== null) teleopStop(); });
 
 // 速度滑桿
 const tspeed = $("tspeed");
