@@ -64,7 +64,7 @@ import threading
 
 import rclpy
 from nav_msgs.msg import Odometry
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
@@ -293,7 +293,17 @@ class ImuBiasCorrectorCcNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = ImuBiasCorrectorCcNode()
-    executor = MultiThreadedExecutor()
+    # 這個節點只有三個回呼（IMU、odom、重新校準服務），全都是純運算、
+    # 不呼叫其他服務、不等待結果——沒有任何理由需要多執行緒。
+    #
+    # 之前用 MultiThreadedExecutor 實測吃掉 14.2% CPU，而它處理的量其實
+    # 只有 20 Hz IMU + 20 Hz odom。rclpy 的多執行緒 executor 每則訊息都要
+    # 重建 wait set 並做一次執行緒交接，在 Pi4 上這個固定成本遠大於回呼本身。
+    #
+    # 注意：其他 _cc 節點（map_service、waypoint_service、navigation_action…）
+    # 的回呼裡有服務呼叫會阻塞，那些**必須**保留 MultiThreadedExecutor，
+    # 否則會自我死鎖。不要把這個改動套用過去。
+    executor = SingleThreadedExecutor()
     executor.add_node(node)
     try:
         executor.spin()

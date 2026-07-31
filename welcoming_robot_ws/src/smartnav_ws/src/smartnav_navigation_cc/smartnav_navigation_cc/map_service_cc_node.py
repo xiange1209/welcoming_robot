@@ -72,7 +72,7 @@ from tf2_ros import Buffer, TransformListener
 from frontier_exploration_ros2.srv import ControlExploration
 from smartnav_msgs.action import CreateMap
 from smartnav_msgs.msg import MapInfo
-from smartnav_msgs.srv import ListMaps, SwitchMap
+from smartnav_msgs.srv import DeleteMap, ListMaps, SwitchMap
 
 from smartnav_navigation_cc.lifecycle_helper_cc import (
     ACTIVE,
@@ -226,6 +226,10 @@ class MapServiceCcNode(Node):
         # ------------------------------------------------------------------
         self.create_service(ListMaps, "list_maps", self._list_maps_callback, callback_group=self.server_cb_group)
         self.create_service(SwitchMap, "switch_map", self._switch_map_callback, callback_group=self.server_cb_group)
+        self.create_service(
+            DeleteMap, "delete_map", self._delete_map_callback,
+            callback_group=self.server_cb_group,
+        )
         self.create_service(Trigger, "finish_map", self._finish_map_callback, callback_group=self.client_cb_group)
         self.create_service(
             Trigger, "ensure_localization", self._ensure_localization_callback, callback_group=self.server_cb_group
@@ -686,6 +690,22 @@ class MapServiceCcNode(Node):
             self.get_logger().warning("建立地圖被拒絕: 未提供地圖名稱")
             return GoalResponse.REJECT
 
+        # 已經有建圖作業在跑就拒絕。
+        #
+        # 下面那段名稱檢查只看**已存檔**的地圖（maps_db），擋不住
+        # 「同一個名字連按兩次」——第二次按的時候第一張還沒存檔，
+        # 名字自然不在 db 裡。2026-07-31 實測：同時跑起三個 create_map 目標，
+        # 三個都在等 /finish_map，按下結束時會同時搶存檔與模式切換。
+        #
+        # 建圖作業本質上是獨佔的（獨佔 slam_toolbox、獨佔模式），
+        # 所以這裡用 _exploration_active 直接擋掉第二個。
+        if self._exploration_active:
+            self.get_logger().warning(
+                f"建立地圖被拒絕: 已經有建圖作業在進行中"
+                f"（要重新開始請先按「結束並儲存」或取消目前的作業）"
+            )
+            return GoalResponse.REJECT
+
         with self._db_lock:
             for meta in self.maps_db.values():
                 if meta["name"] == goal_request.map_name:
@@ -812,8 +832,20 @@ class MapServiceCcNode(Node):
             return True
 
         if not self.control_exploration_client.wait_for_service(timeout_sec=15.0):
-            self.get_logger().error("/control_exploration 服務不存在")
-            return False
+            # 服務不在 = frontier_explorer 節點根本沒啟動。
+            # 這種情況下硬失敗是最糟的選擇：使用者按了「開始建圖」，
+            # 15 秒後才失敗、而且錯誤只進 log 不上畫面，於是他以為建圖已經
+            # 開始、走完一整趟才發現存不了（2026-07-31 實測發生過）。
+            #
+            # 節點不在就是不可能自動探索，退回遙控建圖是唯一合理的行為。
+            # 講清楚原因就好，不要把整個建圖作業斃掉。
+            self.get_logger().warning(
+                "/control_exploration 服務不存在（frontier_explorer 沒啟動），"
+                "自動探索無法使用 —— 已改為遙控建圖模式，"
+                "請用遙控把環境走一遍，完成後按「結束並儲存」"
+            )
+            self.use_exploration = False
+            return True
 
         req = ControlExploration.Request()
         req.action = ControlExploration.Request.ACTION_START
@@ -1144,6 +1176,83 @@ class MapServiceCcNode(Node):
             response.success = False
             response.message = "系統出現異常，查詢地圖列表失敗"
             self.get_logger().error(f"查詢地圖列表錯誤: {exc}")
+        return response
+
+    def _delete_map_callback(self, request, response):
+        """刪除一張地圖（資料庫紀錄 + 磁碟上的 .yaml/.pgm）
+
+        建圖失敗或建壞的地圖以前只能手動改 json 再刪檔案，很容易改壞。
+
+        兩條硬性拒絕（不是提醒，是直接不做）：
+
+        1. **create_map 工作階段進行中不可刪任何地圖**。
+           中途動資料庫會讓 create_map 結束存檔時的目標對不上。
+
+           注意這裡看的是 `_exploration_active`（有沒有 create_map 在跑），
+           **不是** `mode == MODE_MAPPING`。一開始寫成後者，結果是
+           「導航堆疊只要跑在建圖模式就不准刪任何地圖」——
+           但手動建圖時本來就一直處於建圖模式，那正是操作者最想
+           清掉先前建壞的圖的時候。兩者是不同的事：
+           「模式」是 slam 有沒有 active，「工作階段」才是有沒有在寫某張圖。
+
+        2. **不可刪除目前正在使用的地圖**。
+           map_server 已經把它載入記憶體，刪掉磁碟檔案不會讓它消失，
+           但下一次切換或重啟就會變成「資料庫說有、檔案卻不見」的破碎狀態，
+           而 _pick_startup_map 會挑到一個載不起來的 map_id。
+           要刪的話請先切換到別張地圖。
+        """
+        try:
+            if not request.map_id:
+                response.success = False
+                response.message = "必須提供 map_id"
+                return response
+
+            if self._exploration_active:
+                response.success = False
+                response.message = "建圖工作階段進行中，無法刪除地圖；請先完成存檔或取消建圖"
+                self.get_logger().warn(f"拒絕在 create_map 進行中刪除地圖 {request.map_id}")
+                return response
+
+            if request.map_id == self.current_map_id:
+                response.success = False
+                response.message = "不能刪除目前使用中的地圖，請先切換到其他地圖"
+                return response
+
+            with self._db_lock:
+                meta = self.maps_db.get(request.map_id)
+                if meta is None:
+                    response.success = False
+                    response.message = f"地圖 {request.map_id} 不存在"
+                    return response
+                map_name = meta.get("name", request.map_id)
+                self.maps_db.pop(request.map_id, None)
+                self._save_maps_db()
+
+            # 檔案刪不掉不算失敗：資料庫紀錄已經移除，地圖不會再被選到。
+            # 殘留檔案只是佔空間，比「資料庫還在但檔案沒了」安全得多，
+            # 所以順序刻意是「先移除紀錄、再刪檔案」。
+            removed, failed = [], []
+            for suffix in (".yaml", ".pgm", ".png"):
+                path = self.map_data_dir / f"{request.map_id}{suffix}"
+                try:
+                    if path.exists():
+                        path.unlink()
+                        removed.append(path.name)
+                except OSError as exc:
+                    failed.append(f"{path.name}({exc.strerror})")
+
+            msg = f"已刪除地圖「{map_name}」"
+            if removed:
+                msg += f"，移除檔案 {len(removed)} 個"
+            if failed:
+                msg += f"；但有檔案刪不掉：{', '.join(failed)}"
+            self.get_logger().warn(f"{msg} (id={request.map_id})")
+            response.success = True
+            response.message = msg
+        except Exception as exc:  # noqa: BLE001
+            response.success = False
+            response.message = "系統出現異常，刪除地圖失敗"
+            self.get_logger().error(f"刪除地圖錯誤: {exc}")
         return response
 
     def _switch_map_callback(self, request, response):

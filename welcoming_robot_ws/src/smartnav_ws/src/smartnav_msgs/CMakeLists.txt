@@ -27,6 +27,7 @@ set(msg_files
 # Generate service files
 set(srv_files
   "srv/CreateWaypoint.srv"
+  "srv/DeleteMap.srv"
   "srv/DeleteUser.srv"
   "srv/DeleteWaypoint.srv"
   "srv/ExtractFaceEmbedding.srv"

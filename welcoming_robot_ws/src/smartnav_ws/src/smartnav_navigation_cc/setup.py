@@ -36,6 +36,8 @@ setup(
             "imu_bias_corrector_cc = smartnav_navigation_cc.imu_bias_corrector_cc_node:main",
             "stuck_detector_cc = smartnav_navigation_cc.stuck_detector_cc_node:main",
             "depth_obstacle_cc = smartnav_navigation_cc.depth_obstacle_cc_node:main",
+            "teleop_keyboard_cc = smartnav_navigation_cc.teleop_keyboard_cc_node:main",
+            "scan_filter_cc = smartnav_navigation_cc.scan_filter_cc_node:main",
         ],
     },
 )

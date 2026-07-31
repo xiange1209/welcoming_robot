@@ -27,7 +27,12 @@ slam_toolbox:
     odom_frame: odom_combined
     map_frame: map
     base_frame: base_footprint
-    scan_topic: /scan
+    # /scan_slam = scan_filter_cc 遮掉車尾扇區之後的掃描。
+    # 建圖時操作者跟在車後走，直接吃 /scan 會把人建進地圖，
+    # 而且那團會動的「牆」會把局部匹配拖到錯誤的迴路閉合
+    # （2026-07-31 實測 map->odom 一步跳 14~22 公尺）。
+    # costmap / collision_monitor 仍然吃原始 /scan —— 避障必須看得到人。
+    scan_topic: /scan_slam
     mode: mapping
 
     debug_logging: false
@@ -86,14 +91,41 @@ slam_toolbox:
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
-    # 走廊來回：回程要能跟去程 loop close。3.0 m 在近 20 m 的走廊裡太短，
-    # 累積的漂移一旦超過它就再也接不回去。
-    loop_search_maximum_distance: 8.0
+    # === 迴路閉合門檻 (2026-07-31 全面收緊) ===
+    #
+    # 之前 loop_search_maximum_distance 是 8.0（註解說「20 m 走廊需要」），
+    # 但實際建圖的空間只有約 7.7 x 5.2 m —— 搜尋半徑比整個環境還大，
+    # 等於允許 SLAM 拿當下的掃描去跟地圖上**任何一處**比對。
+    # 走廊的重複幾何（兩側平行牆）一旦湊巧對上，位姿就被整個拉走：
+    # 實測 map->odom 單步跳 14.3 / 16.1 / 22.3 公尺，比地圖還大。
+    #
+    # === 2026-07-31 第二版：第一版收過頭了 ===
+    #
+    # 第一版把「去哪裡找」和「多挑剔」兩件事同時收緊：
+    #     搜尋半徑 8.0 -> 3.0、response 0.35/0.45 -> 0.55/0.65、chain 10 -> 15
+    # 結果是**一次迴路閉合都沒觸發**：22 公尺的亂跳確實消失了
+    # （全程最大修正 0.198 m），但去程與回程從此變成兩段互不相干的軌跡，
+    # 疊不起來 -> 存出來的地圖有「鬼牆」畫在實際是空地的位置 ->
+    # 那面牆離車子只有 5 cm、在 inscribed_radius (0.205) 之內 ->
+    # global_costmap 把車子那一格標成 253 -> 規劃器每次都回 "Start occupied"，
+    # 四個導航目標全部失敗。
+    #
+    # 這兩件事要分開處理，只收其中一件：
+    #
+    #   「去哪裡找」保持收緊 —— 這才是擋掉 22 公尺亂跳的關鍵。
+    #     搜尋半徑限制在 3 m 之後，物理上就不可能跳到十幾公尺外。
+    #
+    #   「多挑剔」放回接近預設 —— 搜尋範圍既然已經限制住了，
+    #     就不需要再靠高門檻把關。走廊的正確閉合本來分數就不會太高
+    #     （特徵少、部分遮蔽），0.65 等於連對的也一起拒絕。
+    #
+    # 0.50/0.40 比原廠預設 (0.45/0.35) 略嚴一點，當作安全邊際。
+    loop_search_maximum_distance: 3.0
     do_loop_closing: true
     loop_match_minimum_chain_size: 10
     loop_match_maximum_variance_coarse: 3.0
-    loop_match_minimum_response_coarse: 0.35
-    loop_match_minimum_response_fine: 0.45
+    loop_match_minimum_response_coarse: 0.40
+    loop_match_minimum_response_fine: 0.50
 
     # === 長直走廊調校 (2026-07-28) ===
     # 症狀：在 0.99 m 寬、近 20 m 長的走廊來回走一趟，存出來的地圖中間出現
@@ -112,9 +144,12 @@ slam_toolbox:
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1
 
-    #   loop_search_space_dimension 8.0 -> 10.0，並放寬 loop 距離 (見下方)
-    #   來回走同一條走廊時，回程要能跟去程 loop close 才會把誤差拉回來。
-    loop_search_space_dimension: 10.0
+    #   loop_search_space_dimension 10.0 -> 5.0 (2026-07-31)
+    #   這是迴路閉合的比對視窗，跟上面的 loop_search_maximum_distance 一起收緊。
+    #   10.0 比整個環境 (8.2x4.5 m) 還大，是位姿被拉飛十幾公尺的共犯。
+    #   第一版設 4.0 偏保守；搜尋半徑 3 m 的候選需要略大的視窗才比得準，
+    #   5.0 給匹配一點餘裕，同時仍遠小於原本的 10.0。
+    loop_search_space_dimension: 5.0
     loop_search_space_resolution: 0.05
     loop_search_space_smear_deviation: 0.03
 

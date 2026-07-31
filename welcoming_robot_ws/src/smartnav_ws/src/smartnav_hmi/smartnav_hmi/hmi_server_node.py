@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -48,6 +49,7 @@ from tf2_ros import Buffer, TransformListener
 from smartnav_msgs.msg import RegistrationProgress, UserIdentity, UserType
 from smartnav_msgs.srv import (
     CreateWaypoint,
+    DeleteMap,
     DeleteUser,
     ListMaps,
     ListUsers,
@@ -815,12 +817,31 @@ class HmiServerNode(Node):
         # 雷達節點在 /x10 命名空間底下，不是頂層的 /lslidar_driver_node。
         # 做成參數而不是寫死，換雷達或改命名空間時不用改程式。
         self.declare_parameter("lidar_node_name", "/x10/lslidar_driver_node")
-        # 控制指令用 BEST_EFFORT + depth 1：這是「只有最新值有意義」的串流資料，
-        # 不是不能掉的事件。預設的 RELIABLE + depth 10 會在訂閱端稍慢時把最多
-        # 10 則過期指令排隊重送，車子就照著幾百毫秒前的方向繼續開。
+        # 控制指令用 RELIABLE + depth 1。
+        #
+        # depth=1 + KEEP_LAST 才是解決「指令過期」的關鍵：訂閱端稍慢時只留
+        # 最新一則，不會像預設的 depth=10 那樣排隊重送幾百毫秒前的方向。
+        #
+        # ★ reliability 一定要 RELIABLE，不能圖方便用 BEST_EFFORT ★
+        # 2026-07-31 實測：底盤 `wheeltec_robot` 訂閱 /cmd_vel 用的是 RELIABLE，
+        # collision_monitor 訂閱 /cmd_vel_trimmed 也是。DDS 的相容規則是
+        # 「發布端的保證不得低於訂閱端的要求」，所以 BEST_EFFORT 發布端對上
+        # RELIABLE 訂閱端 **完全建立不了連線**，訊息一則都不會送達：
+        #
+        #     [WARN] New subscription discovered on topic 'cmd_vel',
+        #            requesting incompatible QoS. No messages will be sent to it.
+        #
+        # 這就是「HMI 按了車子不動」的真因，跟速度、頻率、看門狗都無關。
+        # 反方向是相容的（RELIABLE 發布端可以餵 BEST_EFFORT 訂閱端），
+        # 所以發布端選 RELIABLE 對兩種訂閱者都通。
+        #
+        # 當初的 T1 驗證會過關是因為測試節點自己用 BEST_EFFORT 訂閱，
+        # 只證明了「訊息有發出去」，沒證明「底盤收得到」。
+        # 以後測資料流要訂在**真正的消費端**上，或直接比對 topic info -v 的
+        # Reliability 欄位。
         teleop_qos = QoSProfile(
             depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
         self.teleop_pub = self.create_publisher(
@@ -835,9 +856,27 @@ class HmiServerNode(Node):
         self._teleop_linear = 0.0
         self._teleop_angular = 0.0
         self._teleop_lock = threading.Lock()
-        # 20 Hz：這才是底盤的指令來源。HTTP 只負責更新設定值，
+        self._teleop_tick_count = 0
+        self._teleop_tick_t0 = time.monotonic()
+        self._teleop_loop_count = 0
+        self._teleop_loop_t0 = time.monotonic()
+        # 20 Hz 補送：這才是底盤的指令來源。HTTP 只負責更新設定值，
         # 網路抖動因此不會傳導成底盤的 1.0 秒逾時停車。
-        self.create_timer(0.05, self._teleop_tick, callback_group=cb)
+        #
+        # **用獨立執行緒而不是 ROS timer。** 原本寫成
+        #     self.create_timer(0.05, self._teleop_tick, callback_group=cb)
+        # 但實測完全沒有作用：加了計數器之後，持續遙控 12 秒（20 Hz 應有 240 次）
+        # 一次補送都沒發生，而同一個函式裡的看門狗分支卻會觸發 ——
+        # 代表 timer 的實際間隔遠大於 0.6 秒，每次被執行到時都已經逾時了。
+        # 這個節點的 SingleThreadedExecutor 要同時處理 HTTP 進來的服務呼叫、
+        # 訂閱與動作回呼，0.05 秒的 timer 根本排不上。
+        #
+        # 遙控是安全相關的即時路徑，不能讓它跟一般回呼搶執行器。
+        # 獨立執行緒不受執行器排程影響，而 rclpy 的 publish 本身可以跨執行緒呼叫。
+        self._teleop_thread = threading.Thread(
+            target=self._teleop_loop, name="teleop_resend", daemon=True
+        )
+        self._teleop_thread.start()
 
         # ── 服務／動作客戶端 ───────────────────────────────
         self.service_clients: Dict[str, Any] = {
@@ -850,6 +889,10 @@ class HmiServerNode(Node):
             "update_user": self.create_client(UpdateUser, "update_user", callback_group=cb),
             "list_maps": self.create_client(ListMaps, "list_maps", callback_group=cb),
             "switch_map": self.create_client(SwitchMap, "switch_map", callback_group=cb),
+            # 刪掉建壞的地圖。安全檢查在 map_service_cc 那端做（建圖中、使用中都拒絕）
+            "delete_map": self.create_client(DeleteMap, "delete_map", callback_group=cb),
+            # 建圖頁面要顯示「現在是建圖還是定位」
+            "get_nav_mode": self.create_client(Trigger, "/get_nav_mode", callback_group=cb),
             # 遙控建圖用：沒有 /exploration_complete 事件，要由操作者手動結束
             "finish_map": self.create_client(Trigger, "/finish_map", callback_group=cb),
             "create_waypoint": self.create_client(CreateWaypoint, "create_waypoint", callback_group=cb),
@@ -1838,6 +1881,41 @@ class HmiServerNode(Node):
 
         self._publish_teleop(lin, ang)
 
+    def _teleop_loop(self) -> None:
+        """20 Hz 補送迴圈（獨立執行緒）
+
+        用 monotonic 推算下一次的絕對時間點而不是固定 sleep(0.05)，
+        這樣單次處理慢一點也不會讓整體頻率一路往下掉。
+        """
+        period = 0.05
+        next_at = time.monotonic()
+        while rclpy.ok():
+            next_at += period
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                # 落後太多就重新對時，不要補一堆遲到的指令
+                next_at = time.monotonic()
+            try:
+                self._teleop_tick()
+            except Exception as exc:  # noqa: BLE001
+                # 這條執行緒掛掉等於看門狗失效，車子可能停不下來 —— 絕不能讓它死
+                self.get_logger().error(f"遙控補送迴圈異常：{exc}")
+
+            # 量的是**迴圈本身**的頻率，不是「有補送」的次數：
+            # 看門狗一觸發就把 _teleop_active 設回 False，之後的 tick 會提早 return，
+            # 只計補送次數會把「執行緒沒在跑」和「沒東西要送」混為一談。
+            self._teleop_loop_count += 1
+            if self._teleop_loop_count % 200 == 0:
+                span = time.monotonic() - self._teleop_loop_t0
+                if span > 0:
+                    self.get_logger().info(
+                        f"遙控迴圈 {200.0 / span:.1f} Hz（目標 20），"
+                        f"其中實際補送 {self._teleop_tick_count} 次"
+                    )
+                self._teleop_loop_t0 = time.monotonic()
+
     def _teleop_tick(self) -> None:
         """維持指令流 ＋ 看門狗
 
@@ -1868,12 +1946,305 @@ class HmiServerNode(Node):
 
         if not timed_out:
             self._publish_teleop(lin, ang)
+            self._teleop_tick_count += 1
+            # 每 100 次補送（20 Hz 下約 5 秒）報一次實際速率。
+            # 這不是除錯殘留：補送頻率掉下來就代表執行器被塞住，
+            # 而症狀會是「車子一頓一頓」，從外面很難判斷是網路還是排程。
+            if self._teleop_tick_count % 100 == 0:
+                now_s = time.monotonic()
+                span = now_s - self._teleop_tick_t0
+                if span > 0:
+                    self.get_logger().info(
+                        f"遙控補送 {self._teleop_tick_count} 次，實際 {100.0 / span:.1f} Hz（目標 20）"
+                    )
+                self._teleop_tick_t0 = now_s
             return
 
         # 連送三次零速：DDS 掉一則封包不能變成「車子繼續跑」
         for _ in range(3):
             self._publish_teleop(0.0, 0.0)
         self.get_logger().warn(f"遙控逾時 {idle:.1f} 秒未收到指令，已停車")
+
+    # ------------------------------------------------------------------
+    # 系統節點開關
+    # ------------------------------------------------------------------
+    # 只允許這張表裡的項目，而且對應的是**既有的啟動腳本**而不是任意指令。
+    # 這是刻意的：HMI 是有網頁介面的服務，如果讓它執行前端傳來的字串，
+    # 等於把 shell 開放給任何拿到管理者權杖的人。
+    #
+    # detect  用來判斷是否在跑（比對行程指令列，不是 pgrep -f 以免誤殺）
+    # start   啟動腳本；stop 停止腳本（沒有停止腳本的用 detect 找 PID 送 TERM）
+    SYSTEM_UNITS = {
+        "sensors": {
+            "label": "底盤 + 雷達 + IMU",
+            "detect": ["lslidar_driver_node", "wheeltec_robot_node"],
+            "start": ["/home/user/maprun/run_sensors_cc.sh"],
+            "stop": ["/home/user/maprun/kill_sensors_cc.sh"],
+            # 啟動後要靜止校準 IMU，時間較長
+            "start_hint": "啟動後約 20 秒完成 IMU 零偏校準，期間車子必須靜止",
+        },
+        "camera": {
+            "label": "深度相機（避障點雲）",
+            "detect": ["astra_camera_node", "depth_obstacle_cc"],
+            "start": ["/home/user/maprun/run_camera_obstacle_cc.sh", "false", "160", "120", "5.0", "2"],
+            "stop": ["/home/user/maprun/kill_camera_cc.sh"],
+            "start_hint": "160x120 深度 + 降頻點雲，約佔 30% CPU",
+        },
+        # 導航堆疊只有一個單元，但有三種啟動方式。
+        #
+        # 一開始寫成 nav_mapping / nav_explore / nav_localization 三個獨立單元，
+        # 結果是災難：三者共用同一批行程（map_service_cc、planner_server、amcl…），
+        # 只靠比對行程名稱根本分不出來，於是啟動建圖模式之後
+        # 「定位＋導航」也顯示執行中、「建圖＋探索」顯示部分 —— UI 在騙人。
+        #
+        # 真正的模式是 map_service_cc 的內部狀態，要問 /get_nav_mode 才知道，
+        # 所以改成「一個單元 + 三個啟動選項」，模式由 /api/maps/status 另外顯示。
+        "nav": {
+            "label": "導航堆疊",
+            "detect": ["map_service_cc"],
+            "stop": ["/home/user/maprun/stop_nav_cc.sh"],
+            "start_hint": "啟動約需 60 秒。模式請看建圖頁的狀態列",
+            "variants": {
+                "mapping": {
+                    "label": "建圖（遙控）",
+                    "cmd": ["/home/user/maprun/run_nav_cc.sh", "mapping", "false"],
+                },
+                "explore": {
+                    "label": "建圖 + 自動探索",
+                    "cmd": ["/home/user/maprun/run_nav_cc.sh", "mapping", "true"],
+                    "warn": "車子會自己跑動",
+                },
+                "localization": {
+                    "label": "定位 + 導航",
+                    "cmd": ["/home/user/maprun/run_nav_cc.sh", "localization"],
+                },
+            },
+        },
+        # ── 迎賓流程的功能模組 ──────────────────────────
+        # 流程：待機（人臉辨識）-> 認出貴賓 -> LLM 對話 -> 觸發導航 -> 到達 -> 恢復辨識
+        #
+        # 這些都是 `ros2 run` 起的單一節點，沒有 launch 檔，
+        # 所以統一透過 run_node_cc.sh（負責補上 ROS 與 DDS 環境）。
+        #
+        # requires 欄位是**前置條件檢查**：與其讓操作者按了沒反應、
+        # 還要自己去翻 log，不如在按鈕旁邊直接說明缺什麼。
+        "face": {
+            "label": "人臉辨識",
+            "detect": ["face_embedding"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_vision", "face_embedding"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_vision", "face_embedding"],
+            "start_hint": "迎賓流程的觸發點。需要深度相機的彩色影像",
+            "requires": {"module": "insightface"},
+        },
+        "user_auth": {
+            "label": "使用者認證 / 決策",
+            "detect": ["user_auth"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_brain", "user_auth"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_brain", "user_auth"],
+            "start_hint": "辨識到人之後決定要不要迎賓、走哪個流程",
+        },
+        "llm": {
+            "label": "LLM 對話",
+            "detect": ["llm_service"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_llm", "llm_service"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_llm", "llm_service"],
+            "start_hint": "連遠端 Ollama（預設 192.168.11.101:11434），不是跑在這台 Pi 上",
+        },
+        "voice_trigger": {
+            "label": "語音喚醒",
+            "detect": ["voice_trigger"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "voice_trigger"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "voice_trigger"],
+            "requires": {"module": "sounddevice"},
+        },
+        "speech_recognizer": {
+            "label": "語音辨識",
+            "detect": ["speech_recognizer"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "speech_recognizer"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "speech_recognizer"],
+            "requires": {"module": "sounddevice"},
+        },
+        "speech_synthesizer": {
+            "label": "語音合成",
+            "detect": ["speech_synthesizer"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "speech_synthesizer"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "speech_synthesizer"],
+        },
+        "voice_playback": {
+            "label": "語音播放",
+            "detect": ["voice_playback"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "voice_playback"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "voice_playback"],
+            "requires": {"module": "sounddevice"},
+        },
+    }
+
+    @staticmethod
+    def _proc_cmdlines() -> list:
+        """讀出所有行程的指令列
+
+        用 /proc 而不是 pgrep：pgrep -f 會匹配到「指令列裡含有該關鍵字的
+        呼叫端自己」，在這個專案已經造成過三次自殺（exit 144）。
+        """
+        out = []
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/cmdline", "rb") as fp:
+                    cmd = fp.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                if cmd.strip():
+                    out.append((int(entry.name), cmd))
+            except (OSError, ValueError):
+                continue
+        return out
+
+    # Python 模組是否存在的結果會被快取：狀態頁每幾秒就打一次，
+    # 而模組裝沒裝在一次執行期間不會變。
+    _requires_cache: Dict[str, str] = {}
+
+    def _check_requires(self, requires: Optional[dict]) -> str:
+        """回傳「缺什麼」的說明，都齊全就回空字串"""
+        if not requires:
+            return ""
+        module = requires.get("module")
+        if not module:
+            return ""
+        cached = self._requires_cache.get(module)
+        if cached is None:
+            try:
+                import importlib.util
+
+                cached = "" if importlib.util.find_spec(module) else f"缺少 Python 模組 {module}"
+            except (ImportError, ValueError):
+                cached = f"缺少 Python 模組 {module}"
+            self._requires_cache[module] = cached
+        return cached
+
+    def system_status(self) -> list:
+        """回報每個單元是否在跑"""
+        procs = self._proc_cmdlines()
+        mypid = os.getpid()
+        units = []
+        for key, spec in self.SYSTEM_UNITS.items():
+            found = []
+            for needle in spec["detect"]:
+                for pid, cmd in procs:
+                    # 排除自己，也排除 shell 包裝（bash -c "..." 會含有關鍵字）
+                    if pid == mypid or cmd.lstrip().startswith("/bin/bash"):
+                        continue
+                    if needle in cmd:
+                        found.append(needle)
+                        break
+            units.append(
+                {
+                    "key": key,
+                    "label": spec["label"],
+                    "running": len(found) == len(spec["detect"]),
+                    "partial": 0 < len(found) < len(spec["detect"]),
+                    "hint": spec.get("start_hint", ""),
+                    # 缺什麼就先講，不要讓操作者按了沒反應才去翻 log
+                    "blocked": self._check_requires(spec.get("requires")),
+                    # 有 variants 的單元由前端畫成多顆啟動按鈕
+                    "variants": [
+                        {"key": vk, "label": v["label"], "warn": v.get("warn", "")}
+                        for vk, v in spec.get("variants", {}).items()
+                    ],
+                }
+            )
+        return units
+
+    def system_control(self, unit: str, action: str) -> tuple:
+        """啟動或停止一個單元
+
+        action 是 "stop"，或 "start"（單一啟動方式）／"start:<variant>"（多選一）。
+        """
+        spec = self.SYSTEM_UNITS.get(unit)
+        if spec is None:
+            return False, f"未知的單元：{unit}"
+
+        variant_key = None
+        if action.startswith("start:"):
+            action, variant_key = "start", action.split(":", 1)[1]
+        if action not in ("start", "stop"):
+            return False, f"未知的動作：{action}"
+
+        if action == "start" and spec.get("variants"):
+            if variant_key is None:
+                return False, f"{spec['label']} 需要指定啟動方式"
+            variant = spec["variants"].get(variant_key)
+            if variant is None:
+                return False, f"未知的啟動方式：{variant_key}"
+            cmd = variant["cmd"]
+        else:
+            cmd = spec.get(action)
+        if not cmd:
+            return False, f"{spec['label']} 不支援 {action}"
+
+        # 重複啟動的防呆。
+        #
+        # 導航堆疊要 60 秒才會有可見的變化，操作者按了沒反應很自然會再按一次，
+        # 於是同時跑起兩套 Nav2 —— 兩個 controller_server、兩個 planner_server、
+        # 兩個 slam_toolbox 搶同一個 /map 與 map->odom TF，比沒啟動還糟，
+        # 而且外顯症狀（地圖亂跳、目標一直 abort）看起來完全不像是「按了兩次」。
+        # 2026-07-31 實測發生過一次，兩套疊跑了四分鐘。
+        if action == "start":
+            for u in self.system_status():
+                if u["key"] != unit:
+                    continue
+                if u["running"]:
+                    return False, f"{spec['label']} 已經在執行中，不需要再啟動一次"
+                if u["partial"]:
+                    return False, (
+                        f"{spec['label']} 正在啟動或只起來一半，"
+                        "請先按停止再重新啟動，不要重複按啟動"
+                    )
+                break
+
+        try:
+            if action == "start":
+                # setsid + 完全脫離：HMI 服務重啟時不能把這些節點一起帶走
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                what = spec["label"]
+                if variant_key:
+                    what += f" — {spec['variants'][variant_key]['label']}"
+                hint = spec.get("start_hint", "")
+                return True, f"已啟動 {what}" + (f"（{hint}）" if hint else "")
+            # stop 要等它跑完才知道結果
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL
+            )
+            tail = (res.stdout or res.stderr or "").strip().splitlines()
+            return True, f"已停止 {spec['label']}" + (f"：{tail[-1]}" if tail else "")
+        except subprocess.TimeoutExpired:
+            return False, f"{action} {spec['label']} 逾時"
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"system_control({unit},{action}) 失敗: {exc}")
+            return False, f"執行失敗：{exc}"
+
+    def _query_nav_mode(self) -> str:
+        """問 map_service_cc 目前是建圖還是定位模式"""
+        client = self.service_clients.get("get_nav_mode")
+        if client is None or not client.wait_for_service(timeout_sec=1.0):
+            return "unknown"
+        try:
+            res = self._await_future(client.call_async(Trigger.Request()), timeout=5.0)
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        if not res:
+            return "unknown"
+        # /get_nav_mode 把模式字串放在 message 裡
+        msg = (res.message or "").strip()
+        for token in ("mapping", "localization", "unknown"):
+            if token in msg:
+                return token
+        return msg or "unknown"
 
     def set_lidar_rear_mask(self, enabled: bool, half_angle_deg: float) -> tuple:
         """開關雷達後方扇形遮罩
@@ -2162,6 +2533,84 @@ class HmiServerNode(Node):
                 {"success": ok, "message": (res.message if res else "無回應")},
                 status_code=200 if ok else 500,
             )
+
+        @app.delete("/api/maps/{map_id}", dependencies=admin_only)
+        async def api_delete_map(map_id: str) -> JSONResponse:
+            """刪除地圖（建壞的、建到一半失敗的都可以刪）
+
+            安全檢查刻意放在 map_service_cc 那端而不是這裡：
+            它才知道現在是不是在建圖、目前載入的是哪張。
+            HMI 這層只負責轉發與呈現結果。
+            """
+            client = self.service_clients.get("delete_map")
+            if client is None or not client.wait_for_service(timeout_sec=3.0):
+                return JSONResponse(
+                    {"success": False, "message": "delete_map 服務不存在（導航堆疊沒啟動？）"},
+                    status_code=503,
+                )
+            req = DeleteMap.Request()
+            req.map_id = map_id
+            try:
+                res = self._await_future(client.call_async(req), timeout=15.0)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({"success": False, "message": f"刪除失敗：{exc}"}, status_code=500)
+            ok = bool(res and res.success)
+            return JSONResponse(
+                {"success": ok, "message": (res.message if res else "無回應")},
+                status_code=200 if ok else 409,
+            )
+
+        @app.get("/api/maps/status", dependencies=admin_only)
+        async def api_map_status() -> JSONResponse:
+            """建圖頁面用的綜合狀態
+
+            把「操作者想知道的事」湊成一包，前端只要打這一支就好：
+            現在是建圖還是定位、載入哪張圖、圖多大、建了多少格、有沒有建圖作業在跑。
+            """
+            meta = self.state.map_meta_copy()
+            mode = self._query_nav_mode()
+            jobs = self.state.jobs_copy()
+            # 欄位名是 "action" 不是 "kind"（jobs_copy() 產出的結構）。
+            # 之前寫成 kind，篩選永遠回 None：畫面上「建圖作業」一直顯示
+            # 「尚未開始」，使用者連按三次都失敗卻毫不知情，走完才發現存不了。
+            mapping_job = next(
+                (j for j in jobs if j.get("action") == "create_map" and j.get("status") == "running"),
+                None,
+            )
+            # 沒有進行中的作業時，把最近一次失敗帶出去，讓畫面能講出原因，
+            # 而不是只顯示「尚未開始」——失敗和沒開始是兩件完全不同的事。
+            last_failed = None
+            if mapping_job is None:
+                fails = [j for j in jobs
+                         if j.get("action") == "create_map" and j.get("status") == "failed"]
+                if fails:
+                    last_failed = max(fails, key=lambda j: j.get("started_at") or 0)
+            known = None
+            if meta and meta.get("known_cells") is not None:
+                known = meta.get("known_cells")
+            return JSONResponse(
+                {
+                    "mode": mode,                       # mapping / localization / unknown
+                    "current_map": (self.state.snapshot().get("system") or {}).get("map_id"),
+                    "mapping_job": mapping_job,         # None 表示沒有建圖作業在跑
+                    "last_failed_job": last_failed,     # 最近一次失敗，讓畫面講得出原因
+                    "map_meta": meta,                   # 寬高、解析度、原點
+                    "known_cells": known,
+                }
+            )
+
+        # ── 系統節點開關 ─────────────────────────────────
+
+        @app.get("/api/system/status", dependencies=admin_only)
+        async def api_system_status() -> JSONResponse:
+            return JSONResponse({"units": self.system_status()})
+
+        @app.post("/api/system/{unit}/{action:path}", dependencies=admin_only)
+        async def api_system_control(unit: str, action: str) -> JSONResponse:
+            # action 可能是 "start"、"stop"，或 "start:mapping" 這種帶啟動方式的形式。
+            # 用 {action:path} 而不是 {action}，冒號才不會被路由切掉。
+            ok, msg = self.system_control(unit, action)
+            return JSONResponse({"success": ok, "message": msg}, status_code=200 if ok else 400)
 
         @app.get("/api/waypoints", dependencies=admin_only)
         async def api_waypoints() -> JSONResponse:

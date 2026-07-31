@@ -280,6 +280,9 @@
     #banner { flex-wrap: wrap; gap: 10px; }
     #stats { margin-left: 0; width: 100%; flex-wrap: wrap; }
   }
+/* 系統開關頁「啟動中」的呼吸燈：導航堆疊要 60 秒，
+   要讓人一眼看出「有在動，只是還沒好」 */
+@keyframes syspulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
 </style>
 </head>
 <body>
@@ -302,6 +305,7 @@
   <button class="active" data-page="p-greet">迎賓</button>
   <button data-page="p-map" data-admin>地圖與導航</button>
   <button data-page="p-teleop" data-admin>遙控建圖</button>
+  <button data-page="p-system" data-admin>系統開關</button>
   <button data-page="p-users" data-admin>使用者管理</button>
   <button data-page="p-sys">系統</button>
   <button data-page="p-voice">語音測試</button>
@@ -342,6 +346,22 @@
 </div>
 
 <!-- ── 地圖 ───────────────────────────────────────── -->
+<!-- 系統開關：不用進終端機打 ros2 run -->
+<div class="page" id="p-system">
+  <div class="card" style="flex:1">
+    <h3>節點開關</h3>
+    <div class="meta" style="margin-bottom:10px; line-height:1.6">
+      綠燈＝執行中。啟動需要時間（導航堆疊約 60 秒），按下後請等狀態變綠再操作下一項。<br>
+      一般順序：<b>底盤 → 導航堆疊</b>；要相機避障就在中間加開相機。
+    </div>
+    <div id="syslist" class="list" style="flex:none"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="sysrefresh">重新整理狀態</button>
+      <span id="sysmsg" class="meta spacer"></span>
+    </div>
+  </div>
+</div>
+
 <!-- 遙控建圖：手機直接操作，左邊即時地圖、右邊方向鍵 -->
 <div class="page" id="p-teleop">
   <div class="card" style="flex:1.4">
@@ -350,11 +370,20 @@
       <canvas id="tmapcanvas" style="width:100%; height:100%; display:block"></canvas>
       <div id="tmaphint" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#888">等待地圖…</div>
     </div>
+    <!-- 目前狀態：操作者最需要知道的四件事 -->
+    <div id="tmapstatus" style="margin-top:8px; padding:9px 11px; background:var(--panel-2);
+         border:1px solid var(--line); border-radius:7px; font-size:13px; line-height:1.7">
+      <span class="meta">狀態載入中…</span>
+    </div>
+
     <div class="row" style="margin-top:8px">
       <input id="tmapname" placeholder="地圖名稱" style="flex:1">
       <button class="btn primary" id="tstartmap">開始建圖</button>
       <button class="btn" id="tfinishmap">完成存檔</button>
     </div>
+
+    <h3 style="margin-top:12px">已存地圖</h3>
+    <div class="list" id="tmaplist" style="max-height:190px"></div>
   </div>
 
   <div class="card" style="flex:1">
@@ -661,7 +690,10 @@ function selectTab(btn) {
   if (btn.dataset.page === "p-sys")   refreshHealth();
   // 離開遙控頁一定要停車：使用者可能按著方向鍵就切走了
   if (btn.dataset.page !== "p-teleop") teleopStop();
-  else drawTeleopMap();
+  else { drawTeleopMap(); refreshMapStatus(); refreshMapList(); }
+  const onSystem = btn.dataset.page === "p-system";
+  setSystemWatch(onSystem);
+  if (onSystem) refreshSystem();
 }
 
 // 平板螢幕關掉或切到別的 App 時瀏覽器不會觸發 selectTab，心跳會一直打下去。
@@ -670,6 +702,8 @@ document.addEventListener("visibilitychange", () => {
   const onMap = (document.querySelector("#tabs button.active") || {}).dataset;
   const page = onMap && onMap.page;
   setMapWatch(!document.hidden && (page === "p-map" || page === "p-teleop"));
+  setSystemWatch(!document.hidden && page === "p-system");
+  if (!document.hidden && page === "p-system") refreshSystem();
   // 螢幕關掉／切到別的 App 一定要停車。
   // 後端看門狗本來就會在 0.6 秒內停，這裡只是讓它更即時。
   if (document.hidden) teleopStop();
@@ -858,13 +892,16 @@ if ($("tstartmap")) {
     const name = ($("tmapname").value || "").trim() || ("map_" + Date.now());
     const r = await post("/api/maps/create", {map_name: name});
     setText("tstatus", (r && r.message) || "已送出建圖要求");
+    // 建圖模式切換要幾秒，隔一下再刷才看得到「建圖中」
+    setTimeout(refreshMapStatus, 4000);
   };
 }
 if ($("tfinishmap")) {
   $("tfinishmap").onclick = async () => {
-    teleopStop();
+    teleopStop();                                  // 存檔前先確保車子停著
     const r = await post("/api/maps/finish", {});
     setText("tstatus", (r && r.message) || "已送出存檔要求");
+    setTimeout(() => { refreshMapStatus(); refreshMapList(); }, 5000);
   };
 }
 
@@ -905,6 +942,204 @@ function drawTeleopMap() {
   }
 }
 window.addEventListener("resize", drawTeleopMap);
+
+/* ── 建圖頁：狀態列 + 地圖清單（含刪除）─────────────────── */
+const MODE_LABEL = {mapping: "建圖中", localization: "定位／導航", unknown: "未知（導航堆疊沒啟動？）"};
+
+async function refreshMapStatus() {
+  const el = $("tmapstatus");
+  if (!el) return;
+  const r = await api("/api/maps/status");
+  if (!r) { el.innerHTML = '<span class="meta">讀取狀態失敗</span>'; return; }
+
+  const mode = MODE_LABEL[r.mode] || r.mode || "未知";
+  const modeColor = r.mode === "mapping" ? "#2ee6a8" : r.mode === "localization" ? "#7fc7ff" : "#888";
+  const m = r.map_meta;
+  const size = m ? `${m.width}×${m.height} 格 @${m.resolution}m（${(m.width*m.resolution).toFixed(1)}×${(m.height*m.resolution).toFixed(1)} 公尺）` : "尚未收到地圖";
+  const job = r.mapping_job;
+
+  el.innerHTML =
+    `<div>模式：<b style="color:${modeColor}">${mode}</b></div>` +
+    `<div>目前地圖：<b>${r.current_map || "（無）"}</b></div>` +
+    `<div>尺寸：${size}</div>` +
+    // 「沒有在跑」和「跑了但失敗」是完全不同的兩件事。
+    // 只顯示前者的話，使用者按了開始建圖、後端 15 秒後失敗，
+    // 畫面卻還是那句「沒有建圖作業在跑」——他會以為是自己還沒按。
+    (job
+      ? `<div style="color:#2ee6a8">● 建圖作業進行中：${job.label || ""}</div>`
+      : r.last_failed_job
+        ? `<div style="color:#ffb3b3">✗ 上次建圖失敗：${r.last_failed_job.message || ""}` +
+          `<div class="meta">按「開始建圖」重試前請先看這則訊息</div></div>`
+        : `<div class="meta">沒有建圖作業在跑 —— 要建圖請先按「開始建圖」</div>`);
+}
+
+async function refreshMapList() {
+  const box = $("tmaplist");
+  if (!box) return;
+  const r = await api("/api/maps");
+  const maps = (r && r.maps) || [];
+  if (!maps.length) { box.innerHTML = '<div class="meta">尚無地圖</div>'; return; }
+  box.innerHTML = "";
+  maps.forEach((mp) => {
+    const row = document.createElement("div");
+    row.className = "item";
+    row.style.cssText = "display:flex; align-items:center; gap:8px";
+    const name = document.createElement("span");
+    name.style.flex = "1";
+    name.textContent = mp.map_name || mp.map_id;
+    const idtag = document.createElement("span");
+    idtag.className = "meta";
+    idtag.textContent = mp.map_id;
+    const sw = document.createElement("button");
+    sw.className = "btn"; sw.textContent = "切換";
+    sw.onclick = async () => {
+      const rr = await post("/api/maps/switch", {map_id: mp.map_id});
+      setText("tstatus", (rr && rr.message) || "切換失敗");
+      refreshMapStatus();
+    };
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn danger"; delBtn.textContent = "刪除";
+    delBtn.onclick = async () => {
+      // 帶上名稱與 ID：同名地圖很常見，只顯示名稱會刪錯
+      if (!confirm(`確定刪除地圖「${mp.map_name || ""}」？\nID: ${mp.map_id}\n此動作無法復原。`)) return;
+      const rr = await del(`/api/maps/${encodeURIComponent(mp.map_id)}`);
+      setText("tstatus", (rr && rr.message) || "刪除失敗");
+      refreshMapList(); refreshMapStatus();
+    };
+    row.append(name, idtag, sw, delBtn);
+    box.appendChild(row);
+  });
+}
+
+
+/* ── 系統開關 ───────────────────────────────────────── */
+// 十個開關擠成一列很難找，照迎賓流程的順序分三組
+const SYS_GROUPS = [
+  {title: "移動與感測", keys: ["sensors", "camera", "nav"]},
+  {title: "迎賓互動", keys: ["face", "user_auth", "llm"]},
+  {title: "語音", keys: ["voice_trigger", "speech_recognizer", "speech_synthesizer", "voice_playback"]},
+];
+
+// 「剛按下去、還沒看到結果」的單元。導航堆疊要 60 秒才會全部起來，
+// 沒有這個回饋操作者只會看到一顆沒反應的按鈕，然後再按一次
+// —— 2026-07-31 就這樣同時跑起兩套 Nav2。
+const sysPending = {};
+const SYS_PENDING_TIMEOUT_MS = 90000;
+
+let sysTimer = null;
+function setSystemWatch(on) {
+  if (sysTimer) { clearInterval(sysTimer); sysTimer = null; }
+  // 只在系統開關頁而且分頁沒被隱藏時輪詢：Pi4 的 CPU 不該花在沒人看的畫面上
+  if (on) sysTimer = setInterval(refreshSystem, 2000);
+}
+
+async function refreshSystem() {
+  const box = $("syslist");
+  if (!box) return;
+  const r = await api("/api/system/status");
+  const all = (r && r.units) || [];
+  box.innerHTML = "";
+
+  // 等待中的單元：狀態已經變成期望值就結束等待，超時也結束（免得永遠轉圈）
+  Object.keys(sysPending).forEach((k) => {
+    const p = sysPending[k];
+    const u = all.find((x) => x.key === k);
+    const done = u && (p.action === "stop" ? !u.running && !u.partial : u.running);
+    if (done || Date.now() - p.since > SYS_PENDING_TIMEOUT_MS) delete sysPending[k];
+  });
+
+  // 依分組排序；不在任何分組裡的（之後新增的）排最後，不會消失
+  const seen = new Set();
+  const units = [];
+  SYS_GROUPS.forEach((g) => {
+    const inGroup = g.keys.map((k) => all.find((u) => u.key === k)).filter(Boolean);
+    if (!inGroup.length) return;
+    units.push({_header: g.title});
+    inGroup.forEach((u) => { units.push(u); seen.add(u.key); });
+  });
+  all.filter((u) => !seen.has(u.key)).forEach((u) => units.push(u));
+
+  units.forEach((u) => {
+    if (u._header) {
+      const h = document.createElement("div");
+      h.className = "meta";
+      h.style.cssText = "margin:10px 0 2px; padding-top:8px; border-top:1px solid var(--line); font-weight:600";
+      h.textContent = u._header;
+      box.appendChild(h);
+      return;
+    }
+    const row = document.createElement("div");
+    row.className = "item";
+    row.style.cssText = "display:flex; align-items:center; gap:10px; padding:9px 4px";
+
+    const pending = sysPending[u.key];
+    const waited = pending ? Math.round((Date.now() - pending.since) / 1000) : 0;
+
+    const dot = document.createElement("span");
+    const color = pending ? "#66b3ff" : u.running ? "#2ee6a8" : u.partial ? "#ffcc66" : "#555";
+    dot.style.cssText =
+      `width:11px; height:11px; border-radius:50%; background:${color}; flex:none` +
+      (pending ? "; animation:syspulse 1s ease-in-out infinite" : "");
+
+    const txt = document.createElement("div");
+    txt.style.flex = "1";
+    txt.innerHTML = `<div>${u.label}</div>` +
+      (u.hint ? `<div class="meta" style="font-size:12px">${u.hint}</div>` : "") +
+      (pending
+        ? `<div class="meta" style="color:#66b3ff; font-size:12px">` +
+          `${pending.action === "stop" ? "停止" : "啟動"}中… 已等 ${waited} 秒` +
+          `${pending.action !== "stop" ? "（導航堆疊約需 60 秒，請不要重複按）" : ""}</div>`
+        : "") +
+      (u.partial && !pending ? `<div class="meta" style="color:#ffcc66; font-size:12px">部分節點在跑，狀態不完整</div>` : "") +
+      // 前置條件不足時直接講清楚，不要讓人按了沒反應才去翻 log
+      (u.blocked ? `<div class="meta" style="color:#ffb3b3; font-size:12px">⚠ ${u.blocked} —— 啟動會失敗</div>` : "");
+
+    // 動作區：執行中只給「停止」；停止時給啟動按鈕
+    // （導航堆疊有三種啟動方式，所以是多顆）
+    const acts = document.createElement("div");
+    acts.style.cssText = "display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end";
+
+    const fire = async (action, label, btn) => {
+      btn.disabled = true;
+      setText("sysmsg", `${label} 執行中…`);
+      const rr = await post(`/api/system/${u.key}/${action}`);
+      setText("sysmsg", (rr && rr.message) || "操作失敗");
+      // 只有真的送出去才進「等待中」；被防呆擋下來（已在執行中）就不要等
+      if (rr && rr.success) sysPending[u.key] = {since: Date.now(), action};
+      refreshSystem();
+    };
+
+    // 執行中或半死狀態都給「停止」：卡在一半時最需要的就是能把它收乾淨
+    if (u.running || u.partial) {
+      const b = document.createElement("button");
+      b.className = "btn danger"; b.textContent = "停止";
+      b.onclick = () => fire("stop", `停止 ${u.label}`, b);
+      acts.appendChild(b);
+    } else if (u.variants && u.variants.length) {
+      u.variants.forEach((v) => {
+        const b = document.createElement("button");
+        b.className = "btn primary"; b.textContent = v.label;
+        b.onclick = () => {
+          // 會讓車子自己跑的選項要先確認，避免誤觸
+          if (v.warn && !confirm(`${v.label}：${v.warn}。確定要啟動嗎？`)) return;
+          fire(`start:${v.key}`, `啟動 ${v.label}`, b);
+        };
+        acts.appendChild(b);
+      });
+    } else {
+      const b = document.createElement("button");
+      b.className = "btn primary"; b.textContent = "啟動";
+      b.onclick = () => fire("start", `啟動 ${u.label}`, b);
+      acts.appendChild(b);
+    }
+    // 等待期間整列的按鈕都鎖住——這是「按了沒反應就再按一次」的根本解法
+    if (pending) acts.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+
+    row.append(dot, txt, acts);
+    box.appendChild(row);
+  });
+}
+if ($("sysrefresh")) $("sysrefresh").onclick = refreshSystem;
 
 document.querySelectorAll("#tabs button").forEach((btn) => {
   btn.onclick = () => selectTab(btn);
@@ -1170,7 +1405,11 @@ let dragStart = null;   // 拖曳決定朝向用
 
 function loadMapImage(version) {
   const img = new Image();
-  img.onload = () => { mapImage = img; drawMap(); };
+  // 兩張畫布都要重畫。只呼叫 drawMap() 的話，遙控建圖頁的地圖
+  // 只會在「切進該頁的那一瞬間」畫一次；那時候 mapImage 通常還沒載完，
+  // 於是永遠停在「尚無地圖」的提示上——建圖過程中一格都不會更新。
+  // （2026-07-31 實測：後端 /api/map.png 一直是好的，純粹是前端沒重畫。）
+  img.onload = () => { mapImage = img; drawMap(); drawTeleopMap(); };
   img.src = "/api/map.png?v=" + version;
 }
 

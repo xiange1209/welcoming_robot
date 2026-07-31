@@ -59,10 +59,24 @@ def generate_launch_description():
         condition=IfCondition(with_camera),
     )
 
+    # 四個輪子的 TF。實測整條 TF 樹只有這五條邊會動：
+    #   odom_combined -> base_footprint   (EKF，必要)
+    #   base_link -> {lb,lf,rb,rf}_wheel_link   (這裡，只有 RViz 顯示車輪模型會用到)
+    #
+    # 導航與 SLAM 完全不查 *_wheel_link，但每秒 40 則 TF 會被系統裡
+    # 每一個 TransformListener（Nav2 約 6 個 + 我們 3 個 Python 服務節點）
+    # 反序列化並存進緩衝區。實測 joint_state_publisher 4.3% CPU / 73 MB，
+    # robot_state_publisher 2.0% CPU，兩者合計約 6% —— 在 Pi4 上不算小。
+    #
+    # 關掉 joint_state_publisher 一個就夠：沒有 /joint_states，
+    # robot_state_publisher 就不會再發任何動態 TF，自己變成閒置。
+    # 想在 RViz 看車輪模型時再 publish_wheel_tf:=true 打開。
+    publish_wheel_tf = LaunchConfiguration("publish_wheel_tf")
     joint_state_publisher = Node(
         package="joint_state_publisher",
         executable="joint_state_publisher",
         name="joint_state_publisher",
+        condition=IfCondition(publish_wheel_tf),
     )
 
     imu_corrector = Node(
@@ -112,6 +126,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("with_camera", default_value="false"),
             DeclareLaunchArgument("imu_output_topic", default_value="/imu/data_unbiased"),
+            DeclareLaunchArgument("publish_wheel_tf", default_value="false"),
             LogInfo(
                 msg=(
                     "\n===== 感測器啟動 (含 IMU 零偏補償) =====\n"

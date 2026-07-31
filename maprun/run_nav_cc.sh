@@ -28,7 +28,23 @@ START_MODE="${1:-auto}"
 # 第二個參數：自動探索開關。false = 建圖時不自動跑，改用遙控走完再 /finish_map
 USE_EXPLORATION="${2:-true}"
 
+# launch 那邊其實有**兩個**參數，而且只設一個會產生矛盾的組合：
+#
+#   use_exploration        要不要「啟動」frontier_explorer 節點
+#   auto_start_exploration create_map 時要不要「立刻自動探索」
+#                          （這個才是餵給 map_service_cc 的那一個）
+#
+# 只給 use_exploration:=false 的話，explorer 節點不會啟動，
+# 但 map_service_cc 仍然以為要自動探索，於是去呼叫根本不存在的
+# /control_exploration，等 15 秒後 create_map 失敗
+# —— 而且錯誤只進 log，畫面上什麼都看不到。
+# 2026-07-31 實測：使用者連按三次「開始建圖」全部失敗還以為成功了。
+#
+# 這兩個要一起設。想要「explorer 在線但待命、由 /start_exploration 手動觸發」
+# 的話，請直接呼叫 ros2 launch 並分別指定，不要走這支腳本。
 exec ros2 launch smartnav_navigation_cc nav_bringup_cc.launch.py \
   use_sim_time:=false use_rviz:=false \
-  start_mode:="$START_MODE" use_exploration:="$USE_EXPLORATION" \
+  start_mode:="$START_MODE" \
+  use_exploration:="$USE_EXPLORATION" \
+  auto_start_exploration:="$USE_EXPLORATION" \
   > "$LOGDIR/nav_cc.log" 2>&1

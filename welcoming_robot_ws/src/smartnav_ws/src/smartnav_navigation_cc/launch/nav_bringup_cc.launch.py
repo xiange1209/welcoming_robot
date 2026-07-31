@@ -264,6 +264,18 @@ def generate_launch_description():
             arguments=common_ros_args,
             remappings=tf_remap,
         ),
+        # slam_toolbox 吃的是 /scan_slam（車尾扇區已遮蔽），不是原始 /scan。
+        # 建圖時操作者跟在車後走，人被掃進去會拖垮局部匹配、誘發錯誤的
+        # 迴路閉合（實測 map->odom 單步跳 14~22 m）。costmap / collision_monitor
+        # 仍然吃原始 /scan —— 避障必須看得到人。詳見 scan_filter_cc_node.py。
+        Node(
+            package=PKG,
+            executable="scan_filter_cc",
+            name="scan_filter_cc_node",
+            output="screen",
+            parameters=[{"use_sim_time": use_sim_time}],
+            arguments=common_ros_args,
+        ),
         Node(
             package="slam_toolbox",
             executable="async_slam_toolbox_node",
@@ -306,6 +318,25 @@ def generate_launch_description():
         Node(
             package=PKG,
             executable="map_service_cc",
+            # 降低排程優先度（nice 10）。
+            #
+            # 這幾個是 Python 服務節點，工作是「有人呼叫才做事」，
+            # 但它們的 TransformListener 要在 rclpy 裡逐則處理 60 Hz 的 /tf，
+            # 實測各吃掉約 30% CPU。Pi4 滿載時這會把真正即時的東西擠掉：
+            #     odom_combined -> base_footprint 出現 333 ms 空窗
+            #     -> controller 每個目標都噴 extrapolation into the future
+            #     -> 所有導航目標 abort，車子完全不動
+            #
+            # 用正的 nice 值（不需要 root）把它們往後排，
+            # 讓 EKF / slam_toolbox / controller_server 優先拿到 CPU。
+            # 這不是減少總工作量，是決定「誰先做」——
+            # 服務呼叫晚幾十毫秒沒差，控制迴路晚 300 毫秒就壞掉。
+            # ★ prefix 必須是**單一字串**，不能給 list ★
+            # 給 ["nice","-n","10"] 的話 launch_ros 會把它黏成一個 token
+            # 'nice-n10'，然後 FileNotFoundError，節點根本起不來
+            # （2026-07-31 踩過：三個服務節點全部沒啟動，
+            #   症狀是 HMI 的開始建圖／結束儲存按了完全沒反應）。
+            prefix="nice -n 10",
             name="map_service_cc_node",
             output="screen",
             parameters=[
@@ -320,6 +351,25 @@ def generate_launch_description():
         Node(
             package=PKG,
             executable="waypoint_service_cc",
+            # 降低排程優先度（nice 10）。
+            #
+            # 這幾個是 Python 服務節點，工作是「有人呼叫才做事」，
+            # 但它們的 TransformListener 要在 rclpy 裡逐則處理 60 Hz 的 /tf，
+            # 實測各吃掉約 30% CPU。Pi4 滿載時這會把真正即時的東西擠掉：
+            #     odom_combined -> base_footprint 出現 333 ms 空窗
+            #     -> controller 每個目標都噴 extrapolation into the future
+            #     -> 所有導航目標 abort，車子完全不動
+            #
+            # 用正的 nice 值（不需要 root）把它們往後排，
+            # 讓 EKF / slam_toolbox / controller_server 優先拿到 CPU。
+            # 這不是減少總工作量，是決定「誰先做」——
+            # 服務呼叫晚幾十毫秒沒差，控制迴路晚 300 毫秒就壞掉。
+            # ★ prefix 必須是**單一字串**，不能給 list ★
+            # 給 ["nice","-n","10"] 的話 launch_ros 會把它黏成一個 token
+            # 'nice-n10'，然後 FileNotFoundError，節點根本起不來
+            # （2026-07-31 踩過：三個服務節點全部沒啟動，
+            #   症狀是 HMI 的開始建圖／結束儲存按了完全沒反應）。
+            prefix="nice -n 10",
             name="waypoint_service_cc_node",
             output="screen",
             parameters=[{"use_sim_time": use_sim_time}],
@@ -327,6 +377,25 @@ def generate_launch_description():
         Node(
             package=PKG,
             executable="navigation_action_cc",
+            # 降低排程優先度（nice 10）。
+            #
+            # 這幾個是 Python 服務節點，工作是「有人呼叫才做事」，
+            # 但它們的 TransformListener 要在 rclpy 裡逐則處理 60 Hz 的 /tf，
+            # 實測各吃掉約 30% CPU。Pi4 滿載時這會把真正即時的東西擠掉：
+            #     odom_combined -> base_footprint 出現 333 ms 空窗
+            #     -> controller 每個目標都噴 extrapolation into the future
+            #     -> 所有導航目標 abort，車子完全不動
+            #
+            # 用正的 nice 值（不需要 root）把它們往後排，
+            # 讓 EKF / slam_toolbox / controller_server 優先拿到 CPU。
+            # 這不是減少總工作量，是決定「誰先做」——
+            # 服務呼叫晚幾十毫秒沒差，控制迴路晚 300 毫秒就壞掉。
+            # ★ prefix 必須是**單一字串**，不能給 list ★
+            # 給 ["nice","-n","10"] 的話 launch_ros 會把它黏成一個 token
+            # 'nice-n10'，然後 FileNotFoundError，節點根本起不來
+            # （2026-07-31 踩過：三個服務節點全部沒啟動，
+            #   症狀是 HMI 的開始建圖／結束儲存按了完全沒反應）。
+            prefix="nice -n 10",
             name="navigation_action_cc_node",
             output="screen",
             parameters=[{"use_sim_time": use_sim_time}],

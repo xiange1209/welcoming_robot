@@ -1,0 +1,7 @@
+image: partial_map_02.pgm
+mode: trinary
+resolution: 0.050
+origin: [-11.584, -3.404, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

@@ -1,0 +1,13 @@
+# 刪除地圖服務
+#
+# 建圖失敗或建壞的地圖會一直留在資料庫裡，之前只能手動改 json 再刪檔案。
+#
+# 安全限制（由 map_service_cc 執行，不是建議而是硬性拒絕）：
+#   - 建圖進行中不可刪任何地圖
+#   - 不可刪除目前正在使用的地圖（要先切到別張）
+# 這兩條的理由見 map_service_cc_node.py 的 _delete_map_callback。
+
+string map_id                   # 要刪除的地圖 ID
+---
+bool success                    # 是否成功
+string message                  # 訊息 (成功或錯誤描述)

@@ -650,7 +650,17 @@ collision_monitor:
       type: "polygon"
       # 同樣重畫對齊原廠車身：車頭前方留 0.35 m、車尾後方 0.16 m。
       # 舊值 [0.60, -0.42] 是對著舊車身尺寸的，車頭方向反而留太少。
-      points: "[[0.75, 0.32], [0.75, -0.32], [-0.25, -0.32], [-0.25, 0.32]]"
+      #
+      # === 2026-07-31 收窄側向：0.32 -> 0.22 ===
+      # 半寬 0.32 m 在 0.99 m 的走廊裡幾乎永遠觸發：
+      #     走廊半寬 0.495 m - 多邊形半寬 0.32 m = 車子偏離中線 0.175 m 就中招
+      # 實測 log 出現連續 11 秒的 `Robot to slowdown for 50 percents`，
+      # 而阿克曼底盤在窄走廊裡本來就會左右修正，偏離 0.175 m 是常態。
+      #
+      # 收到 0.22（車身半寬 0.185 + 3.5 cm 餘裕）之後，只有真的快擦到側邊
+      # 才會減速。**前後方向刻意不動** —— 減速區的用途是「前方有東西要慢下來」，
+      # 側向的牆在走廊裡是常態，不該一直觸發。
+      points: "[[0.75, 0.22], [0.75, -0.22], [-0.25, -0.22], [-0.25, 0.22]]"
       action_type: "slowdown"
       min_points: 4
       slowdown_ratio: 0.5
@@ -681,4 +691,17 @@ collision_monitor:
       # 只取地面以上、車身高度以內的點
       min_height: 0.03
       max_height: 0.40
-      enabled: true
+      # === 停用 (2026-07-31)：相機不開時它會把整台車鎖死 ===
+      #
+      # collision_monitor 對「來源逾時」的處置是**停住機器人**：
+      #     Robot to stop due to invalid source. Either due to data not
+      #     published yet, or to lack of new data received within the sensor timeout
+      # 相機常態是關的（CPU 不夠，分階段開），/camera/obstacle_points 沒有
+      # 資料 -> depth_cloud 永遠 invalid -> 所有導航速度指令被歸零。
+      # 這不是安全保護，是「感測器沒開就不准動」。
+      #
+      # 雷射仍然在（scan 來源 enabled: true），緊急停止的保護還在。
+      # 相機點雲繼續餵 costmap 的 obstacle 層做規劃避障，那邊資料斷了
+      # 只是不加新障礙，不會鎖車。
+      # 之後 camera_manager_cc 若能在開相機時動態把這裡切回 true 再啟用。
+      enabled: false
