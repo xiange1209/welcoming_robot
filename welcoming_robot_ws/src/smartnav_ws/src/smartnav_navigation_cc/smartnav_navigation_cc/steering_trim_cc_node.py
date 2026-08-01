@@ -76,10 +76,48 @@ class SteeringTrimCcNode(Node):
         self.declare_parameter("measure_speed", 0.15)
         self.declare_parameter("measure_duration_sec", 4.0)
 
+        # ── 轉向平滑（2026-08-01 加）──────────────────────────────
+        #
+        # 症狀：導航中方向舵持續抽動、不停地回正又打回去。
+        #
+        # 成因不是這個節點，是上游 MPPI：它每個週期從 400 條取樣軌跡做
+        # softmax 加權，`wz_std: 0.4` 的取樣噪聲讓輸出的 angular.z 本來就在
+        # 小幅震盪；而 velocity_smoother 的 deadband_velocity 是 [0,0,0]，
+        # 等於把每一個微小變化原封不動送到舵機。舵機以 10~20 Hz 抽動，
+        # 既磨損機構也吃電流。
+        #
+        # 這裡做三件事（都可以個別關掉）：
+        #   1. 一階低通 —— 主要手段。震盪頻率(5~10 Hz)遠高於真正的轉向動作
+        #      (1~3 秒完成)，低通能大幅衰減前者而幾乎不影響後者。
+        #   2. 遲滯死區 —— 變化小於死區就維持原輸出，殺掉殘餘的微抖。
+        #   3. 停車不強制回正 —— 車子停下時把輪子扳回中間是純粹多餘的動作。
+        #      阿克曼車靜止時前輪角度不影響任何事，下次起步再轉即可。
+        #
+        # ⚠ 低通會在轉向迴路裡引入延遲，而 MPPI 的模型並不知道這個延遲。
+        #   time_constant 0.15 秒 @ 0.25 m/s 約等於 3.7 公分的行程落後。
+        #   調大更平順但可能讓 MPPI 過衝，**必須實機驗證**。設 0 可完全停用。
+        self.declare_parameter("steer_filter_tau", 0.15)
+        self.declare_parameter("steer_deadband_rad_s", 0.02)
+        self.declare_parameter("hold_steer_on_stop", True)
+        # 抖動量測：每隔這麼久印一次「每秒轉向反轉次數」，用來驗證有沒有改善
+        self.declare_parameter("chatter_report_sec", 0.0)   # 0 = 不印
+
         self.trim = float(self.get_parameter("trim_rad_per_m").value)
         self.max_trim = float(self.get_parameter("max_trim_rad_s").value)
+        self.steer_tau = float(self.get_parameter("steer_filter_tau").value)
+        self.steer_deadband = float(self.get_parameter("steer_deadband_rad_s").value)
+        self.hold_on_stop = bool(self.get_parameter("hold_steer_on_stop").value)
+        self.chatter_report = float(self.get_parameter("chatter_report_sec").value)
         in_topic = self.get_parameter("input_topic").value
         out_topic = self.get_parameter("output_topic").value
+
+        self._steer_out = 0.0        # 濾波後的轉向輸出（狀態）
+        self._steer_last_t = time.monotonic()
+        # 抖動統計：反轉次數 = 轉向指令變號的次數，直接反映舵機來回動的次數
+        self._chatter_reversals = 0
+        self._chatter_samples = 0
+        self._chatter_prev_delta = 0.0
+        self._chatter_t0 = time.monotonic()
 
         self.pub = self.create_publisher(Twist, out_topic, 10)
         self.create_subscription(Twist, in_topic, self._cmd_cb, 10)
@@ -99,17 +137,65 @@ class SteeringTrimCcNode(Node):
     def _odom_cb(self, msg: Odometry) -> None:
         self._odom = msg
 
+    def _smooth_steer(self, target: float, moving: bool) -> float:
+        """低通 + 遲滯死區 + 停車不回正。回傳實際要送出的角速度"""
+        now = time.monotonic()
+        dt = now - self._steer_last_t
+        self._steer_last_t = now
+        # dt 異常（第一次呼叫、或節點被卡住很久）時不要讓濾波器一次跳到底
+        dt = min(0.5, max(1e-3, dt))
+
+        # 車子沒在動就維持目前輪角。回正是多餘動作，阿克曼車靜止時輪角不影響任何事。
+        if not moving and self.hold_on_stop:
+            return self._steer_out
+
+        # 遲滯：變化太小就不動舵機
+        if abs(target - self._steer_out) < self.steer_deadband:
+            return self._steer_out
+
+        if self.steer_tau <= 0.0:
+            self._steer_out = target          # 停用濾波
+        else:
+            alpha = dt / (self.steer_tau + dt)
+            self._steer_out += alpha * (target - self._steer_out)
+        return self._steer_out
+
+    def _tally_chatter(self, delta: float) -> None:
+        """統計轉向指令的反轉次數，用來量化抖動有沒有改善"""
+        if self.chatter_report <= 0.0:
+            return
+        self._chatter_samples += 1
+        if delta * self._chatter_prev_delta < 0.0:     # 變號 = 舵機掉頭
+            self._chatter_reversals += 1
+        if abs(delta) > 1e-6:
+            self._chatter_prev_delta = delta
+
+        elapsed = time.monotonic() - self._chatter_t0
+        if elapsed >= self.chatter_report:
+            self.get_logger().info(
+                f"轉向抖動：{self._chatter_reversals / elapsed:.1f} 次反轉/秒"
+                f"（{self._chatter_samples} 筆指令 / {elapsed:.0f} 秒）"
+            )
+            self._chatter_reversals = 0
+            self._chatter_samples = 0
+            self._chatter_t0 = time.monotonic()
+
     def _cmd_cb(self, msg: Twist) -> None:
         out = Twist()
         out.linear.x = msg.linear.x
         out.linear.y = msg.linear.y
-        out.angular.z = msg.angular.z
 
+        target = msg.angular.z
         # 修正量與線速度成正比。靜止時不補 —— 阿克曼車原地打方向盤沒有意義。
-        if abs(msg.linear.x) > 1e-3:
+        moving = abs(msg.linear.x) > 1e-3
+        if moving:
             corr = self.trim * msg.linear.x
             corr = max(-self.max_trim, min(self.max_trim, corr))
-            out.angular.z += corr
+            target += corr
+
+        prev = self._steer_out
+        out.angular.z = self._smooth_steer(target, moving)
+        self._tally_chatter(out.angular.z - prev)
 
         self.pub.publish(out)
 
