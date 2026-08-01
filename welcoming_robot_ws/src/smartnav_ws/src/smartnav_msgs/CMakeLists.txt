@@ -38,6 +38,7 @@ set(srv_files
   "srv/ListTaughtPaths.srv"
   "srv/ListUsers.srv"
   "srv/ListWaypoints.srv"
+  "srv/PlanTaughtPath.srv"
   "srv/RecordPath.srv"
   "srv/RegisterFace.srv"
   "srv/RegisterFacePhoto.srv"

@@ -69,7 +69,8 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose, PoseStamped, Twist
 from nav_msgs.msg import Path
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from nav2_msgs.action import ComputePathToPose
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
@@ -81,7 +82,12 @@ from tf2_ros import Buffer, TransformListener
 
 from smartnav_msgs.action import FollowTaughtPath
 from smartnav_msgs.msg import TaughtPathInfo
-from smartnav_msgs.srv import DeleteTaughtPath, ListTaughtPaths, RecordPath
+from smartnav_msgs.srv import (
+    DeleteTaughtPath,
+    ListTaughtPaths,
+    PlanTaughtPath,
+    RecordPath,
+)
 
 
 def yaw_from_quat(q) -> float:
@@ -228,6 +234,14 @@ class PathTeachNode(Node):
                             callback_group=cb)
         self.create_service(DeleteTaughtPath, "delete_taught_path", self._delete_cb,
                             callback_group=cb)
+        self.create_service(PlanTaughtPath, "plan_taught_path", self._plan_cb,
+                            callback_group=cb)
+
+        # 地圖點選模式借用 nav2 的規劃器。規劃器（SmacPlannerHybrid + REEDS_SHEPP）
+        # 本來就會產生符合最小轉彎半徑、含折返點的阿克曼可行路徑 —— 出問題的是
+        # MPPI 控制器，不是規劃器。所以「用 nav2 規劃、用純追蹤執行」。
+        self._planner_client = ActionClient(
+            self, ComputePathToPose, "compute_path_to_pose", callback_group=cb)
 
         self._action = ActionServer(
             self, FollowTaughtPath, "follow_taught_path",
@@ -806,6 +820,185 @@ class PathTeachNode(Node):
         fb.state = state
         fb.message = message
         goal_handle.publish_feedback(fb)
+
+
+
+    # ==================================================================
+    # 地圖點選 -> 用 nav2 規劃器產生教導路徑
+    # ==================================================================
+    def _plan_cb(self, req, resp):
+        """把使用者在地圖上點的一串位置，規劃成一條可存檔的教導路徑
+
+        不自己做曲線內插：SmacPlannerHybrid + REEDS_SHEPP 本來就會產生
+        符合最小轉彎半徑、含折返點的阿克曼可行路徑。規劃器本身沒問題，
+        出問題的是 MPPI 控制器 —— 所以「用 nav2 規劃、用純追蹤執行」
+        是最省事也最可靠的組合。
+        """
+        if self._following or self._recording:
+            resp.success = False
+            resp.message = "錄製或重播進行中，請先結束"
+            return resp
+
+        targets = list(req.waypoints)
+        if not targets:
+            resp.success = False
+            resp.message = "沒有給任何位置"
+            return resp
+
+        # 起點
+        if req.start_from_robot:
+            pose = self._robot_pose()
+            if pose is None:
+                resp.success = False
+                resp.message = "取不到車子目前位置，無法從車子開始規劃"
+                return resp
+            start = self._make_pose(pose[0], pose[1], pose[2])
+        else:
+            if len(targets) < 2:
+                resp.success = False
+                resp.message = "不從車子開始的話至少要兩個點"
+                return resp
+            start = targets.pop(0)
+
+        if not self._planner_client.wait_for_server(timeout_sec=5.0):
+            resp.success = False
+            resp.message = "等不到 /compute_path_to_pose 動作伺服器，nav2 有啟動嗎？"
+            return resp
+
+        all_pts: List[PathPoint] = []
+        cur = start
+        for leg, tgt in enumerate(targets, 1):
+            seg = self._plan_leg(cur, tgt)
+            if seg is None:
+                resp.success = False
+                resp.message = f"第 {leg} 段規劃失敗（{len(targets)} 段中）。目標可能落在障礙物或膨脹區裡"
+                return resp
+            # 相鄰段的接點會重複，去掉後面那段的第一個點
+            all_pts.extend(seg[1:] if all_pts else seg)
+            cur = tgt
+
+        if len(all_pts) < 2:
+            resp.success = False
+            resp.message = "規劃結果太短"
+            return resp
+
+        self._annotate_directions(all_pts)
+
+        name = (req.name or "").strip() or f"planned_{len(self._paths) + 1}"
+        pid = "path_" + uuid.uuid4().hex[:12]
+        length = self._path_length(all_pts)
+        cusps = self._count_cusps(all_pts)
+        meta = {
+            "name": name,
+            "map_id": self.current_map,
+            "source": "plan",
+            "created_at": self._now_iso(),
+            "length_m": length,
+            "num_cusps": cusps,
+        }
+        with self._db_lock:
+            self._paths[pid] = {"meta": meta, "points": all_pts}
+            ok = self._save_db()
+        if not ok:
+            with self._db_lock:
+                self._paths.pop(pid, None)
+            resp.success = False
+            resp.message = "寫入資料庫失敗"
+            return resp
+
+        self._publish_path_viz(all_pts)
+        self.get_logger().info(
+            f"規劃路徑已存檔「{name}」：{len(all_pts)} 點、{length:.2f} m、{cusps} 個折返點"
+        )
+        resp.success = True
+        resp.message = (f"已存檔「{name}」：{len(all_pts)} 點、{length:.2f} 公尺、"
+                        f"{cusps} 個折返點")
+        resp.path_id = pid
+        resp.num_points = len(all_pts)
+        resp.length_m = length
+        resp.num_cusps = cusps
+        return resp
+
+    def _make_pose(self, x: float, y: float, yaw: float) -> Pose:
+        pose = Pose()
+        pose.position.x = x
+        pose.position.y = y
+        qx, qy, qz, qw = quat_from_yaw(yaw)
+        pose.orientation.x = qx
+        pose.orientation.y = qy
+        pose.orientation.z = qz
+        pose.orientation.w = qw
+        return pose
+
+    def _plan_leg(self, start: Pose, goal: Pose) -> Optional[List[PathPoint]]:
+        """呼叫 nav2 規劃一段，回傳路徑點；失敗回 None
+
+        用同步等待而不是 callback：這是服務回呼，本來就允許阻塞，
+        而且節點用的是 MultiThreadedExecutor，不會卡住其他回呼。
+        """
+        req = ComputePathToPose.Goal()
+        req.use_start = True
+        req.start = self._stamped(start)
+        req.goal = self._stamped(goal)
+
+        send_future = self._planner_client.send_goal_async(req)
+        if not self._spin_until(send_future, 10.0):
+            self.get_logger().error("送出規劃請求逾時")
+            return None
+        handle = send_future.result()
+        if handle is None or not handle.accepted:
+            self.get_logger().error("規劃請求被拒絕")
+            return None
+
+        result_future = handle.get_result_async()
+        if not self._spin_until(result_future, 20.0):
+            self.get_logger().error("等待規劃結果逾時")
+            return None
+        wrapped = result_future.result()
+        if wrapped is None or wrapped.status != GoalStatus.STATUS_SUCCEEDED:
+            return None
+
+        poses = wrapped.result.path.poses
+        if len(poses) < 2:
+            return None
+        return [PathPoint(ps.pose.position.x, ps.pose.position.y,
+                          yaw_from_quat(ps.pose.orientation), 1) for ps in poses]
+
+    def _stamped(self, pose: Pose) -> PoseStamped:
+        ps = PoseStamped()
+        ps.header.frame_id = self.map_frame
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose = pose
+        return ps
+
+    @staticmethod
+    def _spin_until(future, timeout: float) -> bool:
+        """等 future 完成。不呼叫 spin_until_future_complete —— 這裡已經在
+        執行器的回呼裡，再要求執行器 spin 會遞迴進去死鎖。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if future.done():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _annotate_directions(self, pts: List[PathPoint]) -> None:
+        """規劃器回傳的路徑沒有標行進方向，這裡從幾何反推
+
+        Reeds-Shepp 會產生含折返的路徑：某一點的位移向量與該點朝向反向，
+        就代表那一段是倒車。判定用位移在朝向上的投影，接近 0 時沿用前一點
+        （避免原地小幅修正被誤判成折返）。
+        """
+        for i in range(len(pts) - 1):
+            dx = pts[i + 1].x - pts[i].x
+            dy = pts[i + 1].y - pts[i].y
+            forward = dx * math.cos(pts[i].yaw) + dy * math.sin(pts[i].yaw)
+            if abs(forward) > 1e-3:
+                pts[i].direction = 1 if forward > 0 else -1
+            elif i > 0:
+                pts[i].direction = pts[i - 1].direction
+        if len(pts) >= 2:
+            pts[-1].direction = pts[-2].direction
 
 
 def main(args=None):

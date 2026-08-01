@@ -314,6 +314,29 @@ def generate_launch_description():
         parameters=[{"use_sim_time": use_sim_time}],
     )
 
+    # 教導-重現路徑。錄下人開過的位姿序列，之後用純追蹤重播。
+    #
+    # 與 nav2 並存而不是取代：nav2 負責「導航到任意點」，教導路徑負責
+    # 「固定路線走得穩」。兩者不會同時送指令 —— 重播時是這個節點在發，
+    # nav2 的 controller_server 沒有 goal 就不會發。
+    #
+    # 發到 cmd_vel_smoothed 而不是 cmd_vel：這樣仍會經過
+    # steering_trim_cc（轉向零位補償）與 collision_monitor（防撞），
+    # 跟 nav2 走同一條安全鏈。
+    path_teach = Node(
+        package=PKG,
+        executable="path_teach_cc",
+        name="path_teach_cc_node",
+        output="screen",
+        parameters=[{
+            "use_sim_time": use_sim_time,
+            "cmd_topic": "cmd_vel_smoothed",
+            # 建圖用的雷達已經被 scan_filter_cc 遮掉車尾，但避障要看得到人，
+            # 所以這裡訂原始的 /scan 而不是 /scan_slam
+            "scan_topic": "scan",
+        }],
+    )
+
     smartnav_nodes = [
         Node(
             package=PKG,
@@ -420,5 +443,5 @@ def generate_launch_description():
 
     return LaunchDescription(
         declare_args + nav2_nodes + map_source_nodes + smartnav_nodes
-        + [steering_trim, stuck_detector, explorer_node, rviz]
+        + [steering_trim, stuck_detector, path_teach, explorer_node, rviz]
     )

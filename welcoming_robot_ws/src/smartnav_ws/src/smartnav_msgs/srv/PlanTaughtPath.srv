@@ -1,0 +1,20 @@
+# 從地圖上點選的一串位置，規劃成一條教導路徑
+#
+# 不自己寫曲線內插，而是逐段呼叫 nav2 的 /compute_path_to_pose：
+# SmacPlannerHybrid + REEDS_SHEPP 本來就會產生符合最小轉彎半徑、
+# 含折返點的阿克曼可行路徑。規劃器沒有問題，出問題的是 MPPI 控制器，
+# 所以「用 nav2 規劃、用純追蹤執行」是最省事也最可靠的組合。
+#
+# waypoints 至少要兩個點（起點與終點）。若 start_from_robot = true，
+# 則第一段從車子目前位置規劃到 waypoints[0]。
+
+string name                     # 存檔名稱
+bool start_from_robot true      # 從車子目前位置開始
+geometry_msgs/Pose[] waypoints  # 依序經過的位置（map frame）
+---
+bool success
+string message
+string path_id
+uint32 num_points
+float32 length_m
+uint32 num_cusps                # 折返點數（阿克曼多段掉頭會有）
