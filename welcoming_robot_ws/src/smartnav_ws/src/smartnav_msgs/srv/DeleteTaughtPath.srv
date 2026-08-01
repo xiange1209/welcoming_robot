@@ -1,0 +1,8 @@
+# 刪除教導路徑
+#
+# 硬性限制（由 path_teach_cc 執行）：正在重播中的路徑不可刪除。
+
+string path_id
+---
+bool success
+string message

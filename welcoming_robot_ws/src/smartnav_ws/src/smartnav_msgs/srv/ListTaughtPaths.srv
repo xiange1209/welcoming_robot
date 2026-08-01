@@ -1,0 +1,10 @@
+# 列出教導路徑
+#
+# 只回目前地圖的路徑（路徑座標是地圖座標系，換地圖就沒有意義）。
+# 要看全部就把 current_map_only 設 false。
+
+bool current_map_only true
+---
+bool success
+string message
+smartnav_msgs/TaughtPathInfo[] paths

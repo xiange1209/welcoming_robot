@@ -20,6 +20,7 @@ set(msg_files
   "msg/RegistrationProgress.msg"
   "msg/UserIdentity.msg"
   "msg/UserInfo.msg"
+  "msg/TaughtPathInfo.msg"
   "msg/UserType.msg"
   "msg/WaypointInfo.msg"
 )
@@ -28,13 +29,16 @@ set(msg_files
 set(srv_files
   "srv/CreateWaypoint.srv"
   "srv/DeleteMap.srv"
+  "srv/DeleteTaughtPath.srv"
   "srv/DeleteUser.srv"
   "srv/DeleteWaypoint.srv"
   "srv/ExtractFaceEmbedding.srv"
   "srv/GetWaypoint.srv"
   "srv/ListMaps.srv"
+  "srv/ListTaughtPaths.srv"
   "srv/ListUsers.srv"
   "srv/ListWaypoints.srv"
+  "srv/RecordPath.srv"
   "srv/RegisterFace.srv"
   "srv/RegisterFacePhoto.srv"
   "srv/SwitchMap.srv"
@@ -44,6 +48,7 @@ set(srv_files
 # Generate action files
 set(action_files
   "action/CreateMap.action"
+  "action/FollowTaughtPath.action"
   "action/GlobalLocalization.action"
   "action/Navigate.action"
 )

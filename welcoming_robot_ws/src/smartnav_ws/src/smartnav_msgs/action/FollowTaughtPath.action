@@ -1,0 +1,24 @@
+# 重播教導路徑
+#
+# 用純追蹤（pure pursuit）沿著錄好的位姿序列走，不經過 nav2 的規劃器與
+# MPPI 控制器。路徑是人開過的，所以物理上保證可行 —— 這正是它比自動規劃
+# 可靠的原因。
+#
+# reverse = true 時倒著走完整條路徑（原路折返回起點）。折返點會跟著翻轉，
+# 錄製時往前的段落重播時就往後開。
+
+string path_id
+bool reverse                    # 反向走完整條路徑
+float32 speed_scale             # 0 或負值 = 用預設速度；否則乘上預設速度
+---
+bool success
+string message
+float32 final_error_m           # 停止位置與路徑終點的距離
+float32 final_yaw_error_deg     # 停止朝向與路徑終點朝向的差
+---
+uint32 point_index              # 目前追到第幾個路徑點
+uint32 total_points
+float32 progress                # 0.0 ~ 1.0
+float32 cross_track_error_m     # 目前偏離路徑多遠（橫向）
+string state                    # following / avoiding / waiting / blocked
+string message

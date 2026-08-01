@@ -1,0 +1,18 @@
+# 教導路徑的錄製控制
+#
+# 流程：START -> （使用者用鍵盤或 HMI 把車開一遍）-> STOP 存檔
+# 錄製期間節點只是被動記錄 map -> base_footprint 的位姿，
+# 不會送出任何速度指令，所以跟遙控完全不衝突。
+
+uint8 START = 0                 # 開始錄製
+uint8 STOP = 1                  # 結束並存檔（name 必填）
+uint8 CANCEL = 2                # 放棄，不存檔
+
+uint8 action
+string name                     # STOP 時的路徑名稱
+---
+bool success
+string message
+string path_id                  # STOP 成功時回傳新路徑的 ID
+uint32 num_points               # 錄到幾個點
+float32 length_m                # 總長度
