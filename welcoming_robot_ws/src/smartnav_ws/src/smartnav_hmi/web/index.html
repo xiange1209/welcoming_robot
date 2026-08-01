@@ -198,6 +198,29 @@
   #toast.show { opacity: 1; }
   #toast.bad { border-color: #6b2b2b; background: #3a1c1c; }
 
+  /* ── 全域緊急停止 ─────────────────────────────────
+     96x96 遠大於觸控最小建議的 44x44：需要它的時候操作者正盯著車子
+     而不是螢幕，要能不用看就按到。固定右下角，不隨分頁切換消失。
+     touch-action:manipulation 關掉雙擊縮放的 300ms 延遲。 */
+  #estop {
+    display: none;
+    position: fixed; right: 18px; bottom: 18px;
+    width: 96px; height: 96px; border-radius: 50%;
+    background: #b3261e; color: #fff;
+    border: 4px solid #ff8a80;
+    font-size: 17px; font-weight: 700; line-height: 1.25;
+    font-family: inherit; cursor: pointer; z-index: 60;
+    box-shadow: 0 4px 14px rgba(0,0,0,.5);
+    touch-action: manipulation; user-select: none;
+  }
+  body.admin #estop { display: block; }
+  #estop:active { background: #7f1d1a; transform: scale(.94); }
+  /* 送出中：變暗並擋住重複點擊，但不改變大小以免手指跟丟 */
+  #estop.busy { opacity: .55; pointer-events: none; }
+  /* 剛停過：閃一下讓操作者確認「真的按到了」 */
+  @keyframes estopFlash { 0%,100% { border-color:#ff8a80 } 50% { border-color:#fff } }
+  #estop.done { animation: estopFlash .4s ease-in-out 2; }
+
   /* ── 管理者登入 ───────────────────────────────── */
   #adminbtn {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
@@ -581,6 +604,12 @@
 
 <div id="toast"></div>
 
+<!-- 全域緊急停止。
+     刻意做成固定在右下角、不隨分頁切換消失、且尺寸遠大於一般按鈕：
+     需要它的時候操作者正盯著車子而不是螢幕，必須不用看就按得到。
+     只有管理者登入後才出現（未登入本來就不能讓車子動）。 -->
+<button id="estop" title="立即停止所有動作">緊急<br>停止</button>
+
 <script>
 "use strict";
 
@@ -629,8 +658,28 @@ async function api(path, options) {
       setAdmin(false);
       return {success: false, message: "需要管理者登入"};
     }
-    // 後端一律用 success 欄位表達成敗，HTTP 狀態碼只用來分類錯誤來源
-    if (!res.ok && data.message) toast(data.message, true);
+    // 後端一律用 success 欄位表達成敗，HTTP 狀態碼只用來分類錯誤來源。
+    //
+    // === 2026-08-01：補上「沒有 message 欄位」的分支 ===
+    // 原本是 `if (!res.ok && data.message)`，只在後端有好好回 message 時才提示。
+    // 但 FastAPI 自己產生的錯誤不長那樣：
+    //     422 驗證失敗 -> {"detail": [{...}]}      沒有 message
+    //     500 未捕捉例外 -> {"detail": "..."} 或空  沒有 message
+    // 這些情況下畫面完全沒有任何反應，使用者只會覺得「按了沒事發生」——
+    // 這是全站最大的靜默失敗來源。
+    if (!res.ok) {
+      let m = data.message;
+      if (!m && data.detail) {
+        // FastAPI 的 detail 可能是字串，也可能是驗證錯誤的陣列
+        m = typeof data.detail === "string" ? data.detail
+          : (Array.isArray(data.detail) && data.detail[0] && data.detail[0].msg)
+            ? "資料格式錯誤：" + data.detail[0].msg
+            : "資料格式錯誤";
+      }
+      toast(m || `機器人回報錯誤（HTTP ${res.status}）`, true);
+      if (!data.message) data.message = m || `HTTP ${res.status}`;
+      if (data.success === undefined) data.success = false;
+    }
     return data;
   } catch (e) {
     toast("無法連線到機器人：" + e.message, true);
@@ -802,6 +851,42 @@ function teleopStop() {
 }
 
 function setText(id, s) { const el = $(id); if (el) el.textContent = s; }
+
+/* ── 全域緊急停止 ─────────────────────────────────────
+   綁 pointerdown 不是 click：click 要等 pointerup 才觸發，觸控裝置上
+   還可能有延遲。急停不能等。
+
+   刻意**不做二次確認** —— 誤按緊急停止的代價只是車子停下來，
+   而確認對話框會在真正需要停車的那幾秒鐘要人多做一個動作。
+   對危險操作要確認、對安全操作不要，這條的方向是後者。 */
+const estopBtn = $("estop");
+if (estopBtn) {
+  estopBtn.addEventListener("pointerdown", async (e) => {
+    e.preventDefault();
+    // 先停本地遙控心跳，不要等網路來回
+    teleopHalt();
+    estopBtn.classList.add("busy");
+    estopBtn.classList.remove("done");
+    const r = await post("/api/estop", {});
+    estopBtn.classList.remove("busy");
+    if (r && r.success) {
+      estopBtn.classList.add("done");
+      setTimeout(() => estopBtn.classList.remove("done"), 1000);
+      toast(r.message || "已緊急停止");
+      setText("tstatus", "已緊急停止");
+      // 作業清單由 WebSocket 推播驅動（renderJobs），取消後會自己更新
+    }
+    // 失敗時 api() 已經 toast 過了，這裡不重複
+  });
+  // 鍵盤：空白鍵當急停（筆電操作時最直覺）
+  document.addEventListener("keydown", (ev) => {
+    if (ev.code !== "Space" || !document.body.classList.contains("admin")) return;
+    const t = ev.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    ev.preventDefault();
+    estopBtn.dispatchEvent(new PointerEvent("pointerdown"));
+  });
+}
 
 // 方向鍵綁定。pointer 事件同時涵蓋滑鼠與觸控，不用分開處理。
 document.querySelectorAll("#tpad .tbtn").forEach((btn) => {

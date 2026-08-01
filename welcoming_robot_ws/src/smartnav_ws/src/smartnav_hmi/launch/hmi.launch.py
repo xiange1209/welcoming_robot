@@ -25,7 +25,12 @@ ARGS = [
     ("user_identity_topic", "user_identity", str, "身份辨識結果話題（由 user_auth_node 發布）"),
     ("map_topic", "map", str, "佔據柵格地圖話題（slam_toolbox 或 map_server 發布）"),
     ("map_frame", "map", str, "地圖座標系名稱"),
-    ("robot_frame", "base_link", str, "機器人本體座標系。WHEELTEC 鏈可能要設 base_footprint"),
+    # base_footprint 而不是 base_link（2026-08-01 改）：
+    # 這台車的整條鏈路——EKF 輸出、costmap 的 robot_base_frame、
+    # path_teach_cc、waypoint_service_cc——全部用 base_footprint。
+    # 預設留 base_link 的話，忘了帶參數就會查不到 TF，地圖上的車子圖示
+    # 與位姿全部靜默失效，而畫面上看不出哪裡錯了。
+    ("robot_frame", "base_footprint", str, "機器人本體座標系。這台車全鏈路用 base_footprint"),
     ("enable_map", "true", bool, "是否啟用地圖功能。純迎賓展示設 false 可省下 Pi 的 CPU"),
     ("map_render_interval", "2.0", float, "地圖最快多久重繪一次（秒）"),
     ("pose_update_rate", "2.0", float, "查詢機器人 TF 位姿的頻率（Hz）"),

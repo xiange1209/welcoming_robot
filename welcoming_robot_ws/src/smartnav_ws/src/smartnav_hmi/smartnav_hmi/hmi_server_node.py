@@ -2717,6 +2717,45 @@ class HmiServerNode(Node):
             self.apply_teleop(0.0, 0.0)
             return JSONResponse({"success": True, "message": "已停止"})
 
+        @app.post("/api/estop", dependencies=admin_only)
+        async def api_estop() -> JSONResponse:
+            """全域緊急停止：**一個動作停下所有會讓車子移動的來源**
+
+            先前唯一的停止鍵在遙控頁，而且只停遙控——導航中或重播教導路徑
+            時按它完全沒用，操作者得先切到地圖分頁、找到作業清單、按取消，
+            而那期間車子還在開。展示時評審站在旁邊，這個延遲不能接受。
+
+            這裡一次處理三個來源，而且**順序有意義**：
+              1. 先送零速（最快讓輪子停下，不必等任何服務回應）
+              2. 再取消所有進行中的作業（導航、建圖、教導路徑重播）
+              3. 最後回報哪些被取消了
+
+            即使取消服務沒回應，第 1 步的零速加上遙控看門狗（0.6 秒）
+            也會讓車停住——安全動作不可以依賴任何一個會失敗的呼叫。
+            """
+            self.apply_teleop(0.0, 0.0)
+
+            cancelled, failed = [], []
+            for job in self.state.jobs_copy():
+                if job.get("status") in ("running", "pending"):
+                    jid = job.get("job_id", "")
+                    (cancelled if self.cancel_job(jid) else failed).append(
+                        job.get("label") or jid
+                    )
+
+            self.get_logger().warn(
+                f"緊急停止：已送零速，取消 {len(cancelled)} 個作業"
+                + (f"，{len(failed)} 個取消失敗" if failed else "")
+            )
+            if cancelled:
+                msg = "已緊急停止，並取消：" + "、".join(cancelled)
+            else:
+                msg = "已緊急停止（當時沒有進行中的作業）"
+            if failed:
+                msg += f"　⚠ 這些取消失敗：{'、'.join(failed)}"
+            return JSONResponse({"success": True, "message": msg,
+                                 "cancelled": cancelled, "failed": failed})
+
         @app.post("/api/teleop/rearmask", dependencies=admin_only)
         async def api_teleop_rearmask(req: RearMaskRequest) -> JSONResponse:
             """開關雷達後方扇形遮罩。
