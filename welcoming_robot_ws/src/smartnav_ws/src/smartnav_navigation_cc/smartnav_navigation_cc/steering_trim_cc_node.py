@@ -97,7 +97,12 @@ class SteeringTrimCcNode(Node):
         #   time_constant 0.15 秒 @ 0.25 m/s 約等於 3.7 公分的行程落後。
         #   調大更平順但可能讓 MPPI 過衝，**必須實機驗證**。設 0 可完全停用。
         self.declare_parameter("steer_filter_tau", 0.15)
-        self.declare_parameter("steer_deadband_rad_s", 0.02)
+        # 0.02 -> 0.005（2026-08-01 二次修正）。
+        # 死區是**遲滯**：它容許的穩態誤差上限就等於死區本身。0.02 rad/s
+        # 在 0.15 m/s 下相當於 0.133 rad/m = 7.6 度/m，比 steering_trim
+        # 要修的 4.12 度/m 還大 —— 抑制抖動的工具不該比病症更嚴重。
+        # 主要手段是低通（steer_filter_tau），死區只用來殺掉量化級的雜訊。
+        self.declare_parameter("steer_deadband_rad_s", 0.005)
         self.declare_parameter("hold_steer_on_stop", True)
         # 抖動量測：每隔這麼久印一次「每秒轉向反轉次數」，用來驗證有沒有改善
         self.declare_parameter("chatter_report_sec", 0.0)   # 0 = 不印
@@ -181,21 +186,54 @@ class SteeringTrimCcNode(Node):
             self._chatter_t0 = time.monotonic()
 
     def _cmd_cb(self, msg: Twist) -> None:
+        """先平滑上游指令，**再**加補償 —— 順序很重要
+
+        === 2026-08-01 修：原本順序反了，補償量被死區整個吃掉 ===
+
+        原本是「先加 trim -> 再過死區/低通」：
+
+            target = msg.angular.z + trim * linear.x
+            out.angular.z = self._smooth_steer(target, moving)
+
+        直走廊裡 MPPI 輸出穩定接近 0 時，target 與上一次輸出的差就只有
+        trim 那一點點，而 trim 在各速度產生的量是：
+
+            0.05 m/s -> 0.0036    0.10 -> 0.0072
+            0.15 m/s -> 0.0108    0.25 -> 0.0180
+
+        **全部小於 0.02 的死區**，於是 _smooth_steer 每次都 return 舊值，
+        補償量 100% 被丟棄，車子照 4.12 度/m 往左漂 —— 為了治舵機抖動
+        加的東西，反而製造了比原病症更大的誤差源。
+
+        正解是分清楚兩者的性質：
+          - MPPI 的 angular.z 含高頻抖動 -> 該被低通與死區抑制
+          - trim 是常態 DC 偏置        -> 不該受抖動抑制邏輯管轄
+        所以平滑只作用在上游指令上，trim 在平滑之後才加。
+        """
         out = Twist()
         out.linear.x = msg.linear.x
         out.linear.y = msg.linear.y
 
-        target = msg.angular.z
-        # 修正量與線速度成正比。靜止時不補 —— 阿克曼車原地打方向盤沒有意義。
         moving = abs(msg.linear.x) > 1e-3
+        prev = self._steer_out
+
+        # 只平滑上游指令
+        smoothed = self._smooth_steer(msg.angular.z, moving)
+
+        # 補償量與線速度成正比。
+        # 機械零位偏移本身是固定的轉向角，但 /cmd_vel 的介面是**角速度**
+        # （韌體 usartx.c:394 的 Vz_to_Akm_Angle 才把角速度換成轉向角），
+        # 所以在指令層要抵銷它，補償量必須是 -v*tan(delta_off)/L，正比於 v。
+        #   delta_off = atan(0.0719 * 0.322) = 0.02315 rad = 1.33 度
+        #   反查 trim = -tan(0.02315)/0.322 = -0.0719  <-> 參數 -0.072，吻合
+        # 靜止時不補 —— 阿克曼車原地打方向盤沒有意義。
+        corr = 0.0
         if moving:
             corr = self.trim * msg.linear.x
             corr = max(-self.max_trim, min(self.max_trim, corr))
-            target += corr
 
-        prev = self._steer_out
-        out.angular.z = self._smooth_steer(target, moving)
-        self._tally_chatter(out.angular.z - prev)
+        out.angular.z = smoothed + corr
+        self._tally_chatter(smoothed - prev)
 
         self.pub.publish(out)
 
