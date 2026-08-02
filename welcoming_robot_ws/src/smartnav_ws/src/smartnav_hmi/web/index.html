@@ -407,6 +407,44 @@
 
     <h3 style="margin-top:12px">已存地圖</h3>
     <div class="list" id="tmaplist" style="max-height:190px"></div>
+
+    <!-- ── 教導路徑 ─────────────────────────────────────
+         放在遙控頁而不是地圖頁：錄製時使用者就是在這裡開車，
+         「按開始 → 開一遍 → 按結束」要在同一個畫面完成，
+         中途切分頁會讓人以為錄製中斷了。 -->
+    <h3 style="margin-top:16px">教導路徑</h3>
+    <div class="meta" style="line-height:1.6; margin-bottom:8px">
+      錄下你開過的路線，之後可以原樣重播。<b>路徑是你親手開過的，所以一定開得過去</b>——
+      比自動規劃可靠，展示時建議用這個。
+    </div>
+
+    <div id="trecidle">
+      <div class="row">
+        <button class="btn primary" id="tprecstart">● 開始錄製路徑</button>
+      </div>
+    </div>
+
+    <div id="trecactive" style="display:none">
+      <div class="card" style="background:#3a2a1c; border-color:#8a5a2b; padding:10px">
+        <div style="font-weight:700; color:#ffcc80">● 錄製中</div>
+        <div class="meta" id="trecinfo" style="margin-top:4px">請用上面的方向鍵把車開一遍</div>
+        <div class="row" style="margin-top:8px">
+          <input id="tpathname" placeholder="路徑名稱（例：大廳到接待點）" style="flex:1">
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn primary" id="tprecstop">■ 結束並存檔</button>
+          <button class="btn" id="tpreccancel">放棄</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px; align-items:center">
+      <span class="meta" style="width:60px">重播速度</span>
+      <input type="range" id="tpspeed" min="30" max="100" value="100" style="flex:1">
+      <span class="meta" id="tpspeedval" style="width:44px; text-align:right">100%</span>
+    </div>
+
+    <div class="list" id="tpathlist" style="max-height:220px; margin-top:8px"></div>
   </div>
 
   <div class="card" style="flex:1">
@@ -739,7 +777,7 @@ function selectTab(btn) {
   if (btn.dataset.page === "p-sys")   refreshHealth();
   // 離開遙控頁一定要停車：使用者可能按著方向鍵就切走了
   if (btn.dataset.page !== "p-teleop") teleopStop();
-  else { drawTeleopMap(); refreshMapStatus(); refreshMapList(); }
+  else { drawTeleopMap(); refreshMapStatus(); refreshMapList(); refreshPaths(); }
   const onSystem = btn.dataset.page === "p-system";
   setSystemWatch(onSystem);
   if (onSystem) refreshSystem();
@@ -988,6 +1026,144 @@ if ($("tfinishmap")) {
     setText("tstatus", (r && r.message) || "已送出存檔要求");
     setTimeout(() => { refreshMapStatus(); refreshMapList(); }, 5000);
   };
+}
+
+
+/* ══════════════════════════════════════════════════════════
+   教導-重現路徑
+   ══════════════════════════════════════════════════════════
+   錄下人開過的位姿序列，之後用純追蹤重播。
+   路徑是人開過的所以物理上保證可行 —— 展示時比自動規劃可靠。 */
+let taughtPaths = [];
+let recording = false;
+let recSince = 0;
+let recTimer = null;
+let pathSpeed = 1.0;
+
+function setRecordingUI(on) {
+  recording = on;
+  const idle = $("trecidle"), act = $("trecactive");
+  if (idle) idle.style.display = on ? "none" : "block";
+  if (act) act.style.display = on ? "block" : "none";
+  if (recTimer) { clearInterval(recTimer); recTimer = null; }
+  if (on) {
+    recSince = Date.now();
+    // 計時器是錄製中唯一的「還活著」訊號。沒有它，使用者無從判斷
+    // 錄製是真的在跑、還是後端早就掛了。
+    recTimer = setInterval(() => {
+      const s = Math.floor((Date.now() - recSince) / 1000);
+      setText("trecinfo", `已錄製 ${Math.floor(s / 60)} 分 ${s % 60} 秒　請把車開一遍`);
+    }, 1000);
+  }
+}
+
+async function refreshPaths() {
+  const box = $("tpathlist");
+  if (!box) return;
+  const r = await api("/api/paths");
+  taughtPaths = (r && r.paths) || [];
+  box.innerHTML = "";
+
+  if (!r || r.success === false) {
+    // 失敗時要說「壞了」而不是留一個空清單假裝「沒有資料」
+    box.innerHTML = `<div class="meta" style="color:#ff9e9e">讀取失敗：${escapeHtml((r && r.message) || "無回應")}</div>`;
+    return;
+  }
+  if (!taughtPaths.length) {
+    box.innerHTML = '<div class="meta">尚無教導路徑。按上面的「開始錄製路徑」，把車開一遍就會存下來。</div>';
+    return;
+  }
+
+  for (const p of taughtPaths) {
+    const div = document.createElement("div");
+    div.className = "item";
+    const src = p.source === "plan" ? "地圖規劃" : "開車錄製";
+    const cusp = p.num_cusps > 0 ? `　折返 ${p.num_cusps} 次` : "";
+    div.innerHTML = `<span><span class="name">${escapeHtml(p.name)}</span><br>` +
+                    `<span class="meta">${p.length_m} 公尺　${p.num_points} 點${cusp}　${src}</span></span>`;
+
+    const go = document.createElement("button");
+    go.className = "btn primary spacer";
+    go.textContent = "重播";
+    go.onclick = () => followPath(p, false);
+
+    // 反向重播 = 原路折返回起點。展示時「送客人過去再自己回來」就靠這個，
+    // 而且不需要掉頭（阿克曼車在 0.99 m 走廊掉不了頭）。
+    const back = document.createElement("button");
+    back.className = "btn";
+    back.textContent = "反向";
+    back.title = "原路折返回起點（不需要掉頭）";
+    back.onclick = () => followPath(p, true);
+
+    const rm = document.createElement("button");
+    rm.className = "btn danger";
+    rm.textContent = "刪除";
+    rm.onclick = () => {
+      if (!confirm(`確定刪除路徑「${p.name}」（${p.length_m} 公尺）？\n刪除後無法復原。`)) return;
+      del("/api/paths/" + encodeURIComponent(p.path_id)).then((res) => {
+        toast(res.message, !res.success);
+        if (res.success) refreshPaths();
+      });
+    };
+
+    div.appendChild(go); div.appendChild(back); div.appendChild(rm);
+    box.appendChild(div);
+  }
+}
+
+async function followPath(p, reverse) {
+  const word = reverse ? "反向重播" : "重播";
+  if (!confirm(`${word}「${p.name}」？\n\n車子會立刻開始移動（${p.length_m} 公尺）。\n右下角的「緊急停止」隨時可以中止。`)) return;
+  const r = await post("/api/paths/follow", {
+    path_id: p.path_id, name: p.name, reverse: reverse,
+    speed_scale: pathSpeed,
+  });
+  toast(r.message, !r.success);
+}
+
+if ($("tprecstart")) {
+  $("tprecstart").onclick = async () => {
+    const r = await post("/api/paths/record", {action: "start"});
+    toast(r.message, !r.success);
+    if (r.success) setRecordingUI(true);
+  };
+}
+
+if ($("tprecstop")) {
+  $("tprecstop").onclick = async () => {
+    const name = ($("tpathname").value || "").trim();
+    if (!name) { toast("請先輸入路徑名稱", true); return; }
+    // 存檔前先停車：錄製中車子可能還在動，最後幾個點會是雜訊
+    teleopStop();
+    const r = await post("/api/paths/record", {action: "stop", name: name});
+    toast(r.message, !r.success);
+    if (r.success) {
+      setRecordingUI(false);
+      $("tpathname").value = "";
+      refreshPaths();
+    }
+    // 失敗時**不要**關掉錄製介面 —— 錄了十分鐘因為名稱重複而失敗，
+    // 關掉等於把資料丟掉。留著讓使用者改名再存一次。
+  };
+}
+
+if ($("tpreccancel")) {
+  $("tpreccancel").onclick = async () => {
+    if (!confirm("放棄這次錄製？已錄的內容會被丟棄。")) return;
+    const r = await post("/api/paths/record", {action: "cancel"});
+    toast(r.message, !r.success);
+    setRecordingUI(false);
+  };
+}
+
+const tpspeed = $("tpspeed");
+if (tpspeed) {
+  const upd = () => {
+    pathSpeed = parseInt(tpspeed.value, 10) / 100;
+    setText("tpspeedval", Math.round(pathSpeed * 100) + "%");
+  };
+  tpspeed.addEventListener("input", upd);
+  upd();
 }
 
 /* 遙控頁的地圖：沿用主地圖已經抓好的 mapImage，只是畫到另一張 canvas。

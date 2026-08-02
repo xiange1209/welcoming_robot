@@ -70,6 +70,18 @@ try:
 except ImportError:  # pragma: no cover - 取決於 smartnav_msgs 有沒有重建
     DeleteWaypoint = None
 
+# 教導-重現路徑（2026-08-01 新增），同樣容許還沒重建。
+# 這五個是一組的：缺任何一個就把整組視為不可用，避免出現
+# 「列表看得到但按了重播沒反應」這種更難查的半殘狀態。
+try:
+    from smartnav_msgs.srv import DeleteTaughtPath, ListTaughtPaths, PlanTaughtPath, RecordPath
+    from smartnav_msgs.action import FollowTaughtPath
+    TAUGHT_PATH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    DeleteTaughtPath = ListTaughtPaths = PlanTaughtPath = RecordPath = None
+    FollowTaughtPath = None
+    TAUGHT_PATH_AVAILABLE = False
+
 USER_TYPE_NAMES = {UserType.GUEST: "GUEST", UserType.VIP: "VIP", UserType.ADMIN: "ADMIN"}
 
 # 健康頁的「預期節點」清單。列在這裡的節點沒啟動時會顯示成「未啟動」，
@@ -554,6 +566,30 @@ class NavigateRequest(BaseModel):
     target_name: str = ""
 
 
+class RecordPathRequest(BaseModel):
+    """POST /api/paths/record —— 教導路徑的錄製控制"""
+
+    action: str = "start"          # start / stop / cancel
+    name: str = ""                 # stop 時必填
+
+
+class FollowPathRequest(BaseModel):
+    """POST /api/paths/follow —— 重播教導路徑"""
+
+    path_id: str = ""
+    name: str = ""                 # 只用於作業標籤的顯示
+    reverse: bool = False          # 反向走完整條路徑（原路折返回起點）
+    speed_scale: float = 0.0       # 0 或負值 = 用節點的預設速度
+
+
+class PlanPathRequest(BaseModel):
+    """POST /api/paths/plan —— 把地圖上點選的位置規劃成教導路徑"""
+
+    name: str = ""
+    start_from_robot: bool = True
+    points: List[Dict[str, float]] = []    # [{"x":.., "y":.., "yaw":..}, ...]
+
+
 class HmiServerNode(Node):
     """HMI 伺服器節點"""
 
@@ -904,6 +940,20 @@ class HmiServerNode(Node):
             self.service_clients["delete_waypoint"] = self.create_client(
                 DeleteWaypoint, "delete_waypoint", callback_group=cb
             )
+        # 教導-重現路徑。整組一起加或一起不加，理由見檔案上方的 import。
+        if TAUGHT_PATH_AVAILABLE:
+            self.service_clients["record_path"] = self.create_client(
+                RecordPath, "record_path", callback_group=cb
+            )
+            self.service_clients["list_taught_paths"] = self.create_client(
+                ListTaughtPaths, "list_taught_paths", callback_group=cb
+            )
+            self.service_clients["delete_taught_path"] = self.create_client(
+                DeleteTaughtPath, "delete_taught_path", callback_group=cb
+            )
+            self.service_clients["plan_taught_path"] = self.create_client(
+                PlanTaughtPath, "plan_taught_path", callback_group=cb
+            )
         self.action_clients: Dict[str, ActionClient] = {
             "create_map": ActionClient(self, CreateMap, "create_map", callback_group=cb),
             "navigate": ActionClient(self, Navigate, "navigate", callback_group=cb),
@@ -911,6 +961,10 @@ class HmiServerNode(Node):
                 self, GlobalLocalization, "global_localization", callback_group=cb
             ),
         }
+        if TAUGHT_PATH_AVAILABLE:
+            self.action_clients["follow_taught_path"] = ActionClient(
+                self, FollowTaughtPath, "follow_taught_path", callback_group=cb
+            )
 
         # ── 位姿來源（畫機器人在地圖上的位置）───────────────
         #
@@ -2766,6 +2820,154 @@ class HmiServerNode(Node):
             """
             ok, msg = self.set_lidar_rear_mask(req.enabled, req.half_angle_deg)
             return JSONResponse({"success": ok, "message": msg}, status_code=200 if ok else 500)
+
+
+        # ── 教導-重現路徑 ──────────────────────────────────
+        #
+        # 這台車最可靠的移動方式：錄下人開過的位姿，之後用純追蹤重播。
+        # 路徑是人開過的所以物理上保證可行，繞開了自動規劃在窄走廊的
+        # 各種麻煩（MPPI 視野不足、容差疊加、K-turn 做不出來）。
+
+        def _taught_unavailable() -> JSONResponse:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "message": "教導路徑需要重建 smartnav_msgs（colcon build --packages-select "
+                               "smartnav_msgs smartnav_navigation_cc）後重啟所有節點",
+                },
+                status_code=501,
+            )
+
+        @app.get("/api/paths", dependencies=admin_only)
+        async def api_list_paths() -> JSONResponse:
+            if not TAUGHT_PATH_AVAILABLE:
+                return _taught_unavailable()
+            req = ListTaughtPaths.Request()
+            req.current_map_only = True
+            resp = await asyncio.to_thread(self._call_service, "list_taught_paths", req)
+            if resp is None:
+                return JSONResponse(
+                    {"success": False, "message": "教導路徑節點沒有回應（path_teach_cc 有啟動嗎？）",
+                     "paths": []},
+                    status_code=503,
+                )
+            return JSONResponse({
+                "success": bool(resp.success),
+                "message": resp.message,
+                "paths": [
+                    {
+                        "path_id": p.path_id, "name": p.name, "map_id": p.map_id,
+                        "num_points": int(p.num_points), "length_m": round(float(p.length_m), 2),
+                        "num_cusps": int(p.num_cusps), "source": p.source,
+                        "created_at": p.created_at,
+                    }
+                    for p in resp.paths
+                ],
+            })
+
+        @app.post("/api/paths/record", dependencies=admin_only)
+        async def api_record_path(req: RecordPathRequest) -> JSONResponse:
+            """錄製控制：start / stop / cancel
+
+            錄製期間節點只是被動記錄位姿，不送任何速度指令，所以跟遙控
+            完全不衝突——使用者照常用方向鍵或鍵盤把車開一遍。
+            """
+            if not TAUGHT_PATH_AVAILABLE:
+                return _taught_unavailable()
+            actions = {
+                "start": RecordPath.Request.START,
+                "stop": RecordPath.Request.STOP,
+                "cancel": RecordPath.Request.CANCEL,
+            }
+            if req.action not in actions:
+                return JSONResponse(
+                    {"success": False, "message": f"未知的動作 {req.action}"}, status_code=400
+                )
+            if req.action == "stop" and not (req.name or "").strip():
+                return JSONResponse(
+                    {"success": False, "message": "請先輸入路徑名稱再結束錄製"}, status_code=400
+                )
+            r = RecordPath.Request()
+            r.action = actions[req.action]
+            r.name = (req.name or "").strip()
+            resp = await asyncio.to_thread(self._call_service, "record_path", r)
+            if resp is None:
+                return JSONResponse(
+                    {"success": False, "message": "教導路徑節點沒有回應（path_teach_cc 有啟動嗎？）"},
+                    status_code=503,
+                )
+            out = {"success": bool(resp.success), "message": resp.message}
+            if req.action == "stop" and resp.success:
+                out.update({"path_id": resp.path_id, "num_points": int(resp.num_points),
+                            "length_m": round(float(resp.length_m), 2)})
+            return JSONResponse(out, status_code=200 if resp.success else 400)
+
+        @app.delete("/api/paths/{path_id}", dependencies=admin_only)
+        async def api_delete_path(path_id: str) -> JSONResponse:
+            if not TAUGHT_PATH_AVAILABLE:
+                return _taught_unavailable()
+            r = DeleteTaughtPath.Request()
+            r.path_id = path_id
+            resp = await asyncio.to_thread(self._call_service, "delete_taught_path", r)
+            if resp is None:
+                return JSONResponse(
+                    {"success": False, "message": "教導路徑節點沒有回應"}, status_code=503
+                )
+            return JSONResponse({"success": bool(resp.success), "message": resp.message},
+                                status_code=200 if resp.success else 400)
+
+        @app.post("/api/paths/follow", dependencies=admin_only)
+        async def api_follow_path(req: FollowPathRequest) -> JSONResponse:
+            """重播教導路徑。與導航一樣走作業機制，進度在作業清單裡看。"""
+            if not TAUGHT_PATH_AVAILABLE:
+                return _taught_unavailable()
+            goal = FollowTaughtPath.Goal()
+            goal.path_id = req.path_id
+            goal.reverse = bool(req.reverse)
+            goal.speed_scale = float(req.speed_scale or 0.0)
+            label = ("反向重播「%s」" if req.reverse else "重播「%s」") % (req.name or req.path_id)
+            job_id = self._start_action("follow_taught_path", goal, label)
+            return JSONResponse({"success": True, "message": label + "：已送出", "job_id": job_id})
+
+        @app.post("/api/paths/plan", dependencies=admin_only)
+        async def api_plan_path(req: PlanPathRequest) -> JSONResponse:
+            """把地圖上點選的一串位置規劃成教導路徑
+
+            逐段呼叫 nav2 的 /compute_path_to_pose。刻意不自己做曲線內插——
+            SmacPlannerHybrid + REEDS_SHEPP 本來就會產生符合最小轉彎半徑、
+            含折返點的阿克曼可行路徑。規劃器沒問題，出問題的是 MPPI 控制器。
+            """
+            if not TAUGHT_PATH_AVAILABLE:
+                return _taught_unavailable()
+            if not (req.name or "").strip():
+                return JSONResponse({"success": False, "message": "請先輸入路徑名稱"},
+                                    status_code=400)
+            if not req.points:
+                return JSONResponse({"success": False, "message": "請先在地圖上點選至少一個位置"},
+                                    status_code=400)
+            r = PlanTaughtPath.Request()
+            r.name = req.name.strip()
+            r.start_from_robot = bool(req.start_from_robot)
+            for pt in req.points:
+                pose = Pose()
+                pose.position.x = float(pt.get("x", 0.0))
+                pose.position.y = float(pt.get("y", 0.0))
+                yaw = float(pt.get("yaw", 0.0))
+                pose.orientation.z = math.sin(yaw * 0.5)
+                pose.orientation.w = math.cos(yaw * 0.5)
+                r.waypoints.append(pose)
+            # 規劃要逐段呼叫 nav2，段數多時會慢，逾時放寬
+            resp = await asyncio.to_thread(self._call_service, "plan_taught_path", r, 60.0)
+            if resp is None:
+                return JSONResponse(
+                    {"success": False, "message": "規劃逾時或節點沒有回應"}, status_code=503
+                )
+            out = {"success": bool(resp.success), "message": resp.message}
+            if resp.success:
+                out.update({"path_id": resp.path_id, "num_points": int(resp.num_points),
+                            "length_m": round(float(resp.length_m), 2),
+                            "num_cusps": int(resp.num_cusps)})
+            return JSONResponse(out, status_code=200 if resp.success else 400)
 
         # ── 作業（長時間動作）─────────────────────────────
 
