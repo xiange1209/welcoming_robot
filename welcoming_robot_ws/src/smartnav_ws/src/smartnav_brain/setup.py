@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "user_auth = smartnav_brain.user_auth_node:main",
+            "bank_reception = smartnav_brain.bank_reception_node:main",
         ],
     },
 )

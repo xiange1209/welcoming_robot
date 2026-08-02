@@ -132,6 +132,16 @@ class LLMServiceNode(Node):
             CreateWaypoint, "create_waypoint", callback_group=self.cb_group
         )
         self.list_waypoints_client = self.create_client(ListWaypoints, "list_waypoints", callback_group=self.cb_group)
+
+        # ── 銀行場景（2026-08-01 復原）────────────────────────
+        self.enable_bank_tools = self.declare_parameter(
+            "enable_bank_tools", True).get_parameter_value().bool_value
+        # 帶位目標的地點名稱。做成參數而不是寫死：地圖上的地點名是使用者
+        # 自己取的，寫死「貴賓室」會在他取名「VIP室」時直接失敗。
+        self.vip_room_waypoint_name = self.declare_parameter(
+            "vip_room_waypoint_name", "貴賓室").get_parameter_value().string_value
+        # 通報只發話題，實際送出由 bank_reception_node 負責（通報中樞）
+        self.staff_notify_pub = self.create_publisher(String, "staff_notify_request", 10)
         self.global_localization_client = ActionClient(
             self, GlobalLocalization, "global_localization", callback_group=self.cb_group
         )
@@ -456,6 +466,22 @@ class LLMServiceNode(Node):
                     "query_datetime_tool": query_datetime_tool,
                 }
             )
+
+        # ── 銀行場景工具（2026-08-01 從 git 歷史復原）────────────
+        #
+        # 帶位／通報／FAQ 三個工具。做成可關閉的（enable_bank_tools）是因為
+        # 工具數量直接影響小模型的工具選擇準確率——qwen2.5:3b 在工具太多時
+        # 會挑錯。純導航測試時關掉，銀行展示時開啟。
+        #
+        # 通報工具只發 ROS topic 不直接打 Telegram：實際送出集中在
+        # bank_reception_node（通報中樞），這樣「通報」永遠只有一個出口，
+        # 也讓 brain 沒啟動時工具仍可執行（會回報提示而不是拋例外）。
+        if self.enable_bank_tools:
+            try:
+                from smartnav_llm.bank_tools import make_bank_tools
+                self.tools_map.update(make_bank_tools(self))
+            except ImportError as exc:
+                self.get_logger().warning(f"✗ 銀行工具載入失敗（略過）: {exc}")
 
         self.get_logger().info(f"✓ 已載入 {len(self.tools_map)} 個工具: {', '.join(self.tools_map)}")
 

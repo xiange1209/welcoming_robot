@@ -18,11 +18,18 @@ from smartnav_brain.brain_utils import get_default_logger
 
 
 class UserType(IntEnum):
-    """使用者類型枚舉"""
+    """使用者類型枚舉
+
+    BLACKLIST 是 2026-08-01 補上的 —— 專題的後半段是「安全通報」，
+    但先前的資料模型裡沒有黑名單這個概念，等於通報永遠沒有觸發條件。
+    數值接在 ADMIN 之後而不是插在中間：改動既有值會讓已註冊的
+    使用者型別全部錯位（SQLite 裡存的是名稱字串，但 msg 用的是 uint8）。
+    """
 
     GUEST = 0
     VIP = 1
     ADMIN = 2
+    BLACKLIST = 3
 
 
 class UserManager:
