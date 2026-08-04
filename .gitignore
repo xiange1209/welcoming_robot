@@ -22,3 +22,44 @@ logs/
 # 本機密碼設定 —— 絕對不可進版控
 local_env.sh
 .env.local
+
+# ── 憑證與金鑰 ────────────────────────────────────────
+.env
+*.pem
+*.key
+*.crt
+*.p12
+id_rsa*
+
+# ── 個資：人臉特徵與訪客記錄 ★ 這一段最重要 ──────────
+#
+# .smartnav/ 是機器人 runtime 目錄 ~/.smartnav 的快照。同一棵樹底下，
+# 程式還會寫入 face_database/（512 維人臉向量 .npy ＋ 人臉照片）
+# 與 visit_log.db（含姓名與 VIP/BLACKLIST 分類的訪客記錄）。
+#
+# 人臉特徵在台灣《個人資料保護法》屬**特種個資**，一旦進了公開 repo
+# 就無法真正收回（git rm 只改變當前狀態，歷史裡永遠拿得到）。
+#
+# 現在還沒外洩，只是因為實機還沒跑過人臉註冊。
+# 跑過一次之後再 `git add .smartnav`，特種個資就直接上公開 repo 了。
+# ★ 同步 .smartnav 時請用具名路徑 add，不要整個目錄加。
+.smartnav/face_database/
+.smartnav/visit_log.db
+*.db
+*.sqlite
+*.sqlite3
+user_registry.json
+*.npy
+*.pkl
+
+# ── 測試影像：可能拍到人或室內環境 ────────────────────
+test_frames/
+*.jpg
+*.jpeg
+*.png
+# 若之後 HMI 需要靜態圖片，用 ! 開例外，不要整條拿掉
+
+# ── 打包檔（泛用）──────────────────────────────────
+*.tar.gz
+*.tgz
+*.zip

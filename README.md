@@ -1,0 +1,121 @@
+# 具人臉辨識與語音對話功能之迎賓機器人 — 實機開發主線
+
+![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)
+![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-orange)
+![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%204B%208GB-red)
+![循跡精度](https://img.shields.io/badge/循跡精度-3.42%20cm-brightgreen)
+
+大學部畢業專題。WHEELTEC 阿克曼實車 ＋ 人臉辨識 ＋ 語音對話 ＋ 自主導航。
+
+> **這是 `車子` 分支——目前實際在實車上運行的完整系統。**
+> 專案總覽、硬體層說明與完整實測數據在 [`master` 分支](../../tree/master)。
+> 兩個分支的 git 歷史互相獨立，是同一專案的兩個層次。
+
+---
+
+## 這個分支有什麼
+
+```
+.
+├── welcoming_robot_ws/          完整 ROS 2 workspace
+│   └── src/smartnav_ws/src/
+│       ├── smartnav_msgs/           介面定義（msg / srv / action）
+│       ├── smartnav_vision/         人臉向量擷取（InsightFace 512D）
+│       ├── smartnav_brain/          身份驗證、使用者管理、銀行迎賓劇本
+│       ├── smartnav_audio/          喚醒詞、ASR、TTS（sherpa-onnx）
+│       ├── smartnav_llm/            LLM 對話 Agent（LangChain + Ollama）
+│       ├── smartnav_navigation_cc/  ★ 導航重寫版：SLAM、AMCL、教導-重現路徑
+│       ├── smartnav_navigation/     舊版（模擬用，frame 不同不可混用）
+│       ├── smartnav_hmi/            平板網頁介面（FastAPI）
+│       └── smartnav_bringup/        統一啟動
+├── maprun/                      建圖／導航／節點管理的操作腳本
+├── .smartnav/                   地圖、地點、教導路徑資料
+└── *.md                         交接與分析文件（見下）
+```
+
+## 文件導覽（照這個順序讀）
+
+| 文件 | 給誰 | 內容 |
+|---|---|---|
+| **[`docs/AGENT交接指南.md`](docs/AGENT交接指南.md)** | 在 Pi 上工作的 AI agent | **單一入口**：部署、當前優先序、實驗步驟、禁止事項 |
+| [`docs/HANDOFF_20260803.md`](docs/HANDOFF_20260803.md) | 接手的人 | 最近一次實機日的完整結果與未解問題 |
+| [`docs/廠商原始碼分析_阿克曼控制鏈.md`](docs/廠商原始碼分析_阿克曼控制鏈.md) | 要改控制的人 | 從 STM32 韌體逆向出的事實，每條附 `檔案:行號` |
+| [`docs/本機開發與驗收.md`](docs/本機開發與驗收.md) | 開發者 | T1~T5 硬體驗收清單 |
+
+## 最近進度（2026-08-03 實機日）
+
+| 成果 | 數據 |
+|---|---|
+| **教導-重現循跡精度** | 624 筆取樣，平均偏離 **3.42 cm**、最大 8.60 cm |
+| 地點停止誤差 | 0.17 m（容差 0.25 m） |
+| AMCL 掃描過濾 | 地圖吻合度 71% → **90%** |
+| 實機抓出並修復的缺陷 | 10 個（靜態檢查全都看不出來） |
+
+**未解**：門口窄轉角（走廊淨寬 0.967 m）自動脫困未成功。
+現行對策是錄製教導路徑時由人在轉角示範三點轉向——
+細節與注意事項見 [`docs/AGENT交接指南.md`](docs/AGENT交接指南.md) §0。
+
+## 核心設計：教導-重現路徑（Teach & Repeat）
+
+阿克曼車不能原地旋轉，最小迴轉半徑 0.750 m，而測試走廊淨寬僅 0.99 m。
+MPPI 控制器的預測視野只有 `30 × 0.1 × 0.25 = 0.75 m`，
+而完成 90° 轉彎需要 `(π/2) × 0.80 = 1.26 m`——**看得到的距離只有所需的 60%**，
+評分時分不出好壞，規劃不出可行軌跡。
+
+解法不是把控制器調得更聰明，而是**換方法**：錄下人開過的位姿序列，
+重播時用純追蹤跟隨。
+
+```bash
+# 錄製
+ros2 service call /path_teach_cc/record smartnav_msgs/srv/RecordPath \
+  "{action: 0, name: '大廳到貴賓室'}"      # 0=START，開始遙控車子
+ros2 service call /path_teach_cc/record smartnav_msgs/srv/RecordPath \
+  "{action: 1}"                            # 1=STOP，存檔
+
+# 重播
+ros2 action send_goal /path_teach_cc/follow smartnav_msgs/action/FollowTaughtPath \
+  "{path_id: 'path_xxxx', speed: 0.15, reverse: false}"
+```
+
+**搜尋 vs 示範**：MPPI 是「讓機器在所有可能軌跡裡搜出一條」，
+教導-重現是「人走一次給它看」。當環境約束緊到讓可行解幾乎不存在時，
+搜尋的成本會爆炸，而示範的成本不變。
+
+## 快速開始
+
+```bash
+git clone -b 車子 https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws_repo
+cd ~/welcoming_robot_ws_repo/welcoming_robot_ws
+colcon build --symlink-install     # ★ 一律從 workspace 頂層建置
+source install/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+```
+
+```bash
+# 建圖
+./maprun/run_nav_cc.sh mapping true
+
+# 定位＋導航（★ 兩個參數都要給，只給第一個會誤啟探索模式）
+./maprun/run_nav_cc.sh localization false
+```
+
+## 開發時必須知道的四件事
+
+1. **改任何 `.msg`/`.srv`/`.action` 都要全 workspace 重建並重啟所有節點。**
+   type hash 會變，只重建部分套件的症狀是「節點都在跑、topic list 看得到，
+   但訂閱端一則訊息都收不到」，而且**不會有任何錯誤訊息**。
+
+2. **不要用 `pkill -f`。** 字串比對誤判過八次，最嚴重一次殺掉 IMU 補償節點
+   導致兩次建圖全毀，而健檢只查 `/scan` 與 `/odom` 所以完全沒發現。
+   用 `maprun/kill_node_cc.sh`。
+
+3. **低電壓 20 V 只切馬達不切舵機**（韌體行為）。症狀是「方向舵會轉但車不走」——
+   先量電池，不要查 ROS。
+
+4. **開機後 1.0~2.0 秒車子會自己前進 0.02 m/s**，那是廠商自檢，不是故障。
+   2.5 秒後才吃 ROS 指令。不要放在桌上開機。
+
+## 授權
+
+MIT（見 [`master` 分支的 LICENSE](../../blob/master/LICENSE)）。
+`src/` 下的 WHEELTEC 廠商程式碼依其原始授權條款。

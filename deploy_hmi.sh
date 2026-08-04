@@ -2,14 +2,14 @@
 # 把 HMI 的兩個改動檔傳到 Pi，並在傳送前先做備份。
 #
 # 用法（在 Windows 的 Git Bash 執行）：
-#     ./deploy_hmi.sh <PiIP>
-#     ./deploy_hmi.sh <PiIP> user
+#     ./deploy_hmi.sh 192.168.1.100
+#     ./deploy_hmi.sh 192.168.1.100 user
 #
 # 只傳兩個檔案，不碰 smartnav_navigation_cc、不碰任何 launch/config。
 
 set -eo pipefail
 
-PI_IP="${1:?請給 Pi 的 IP，例如 ./deploy_hmi.sh <PiIP>}"
+PI_IP="${1:?請給 Pi 的 IP，例如 ./deploy_hmi.sh 192.168.1.100}"
 PI_USER="${2:-user}"
 WS="~/welcoming_robot_ws/src/smartnav_ws/src/smartnav_hmi"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
