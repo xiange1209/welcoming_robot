@@ -32,7 +32,19 @@ amcl:
     base_frame_id: "base_footprint"
     odom_frame_id: "odom_combined"
     global_frame_id: "map"
-    scan_topic: scan
+    # === 2026-08-03 改用過濾後的掃描 ===
+    # scan_filter_cc 會把車尾 140~220 度遮掉再發到 /scan_slam。
+    #
+    # 原本 AMCL 吃原始 /scan。操作者跟在車後遙控時（教導路徑錄製、手動建圖
+    # 都是這樣），人是一個橫跨約 123 度、距離 0.5~0.76 m 的巨大未知障礙，
+    # 那些光束全部對不上地圖 -> 粒子權重被扭曲。
+    # 走廊本來就有沿長軸的定位歧義（平行牆在任何位置都吻合），兩者疊加
+    # 就會整團跳掉：實測教導路徑錄製時 AMCL 瞬移 3.85 公尺，
+    # 整條路徑前後半段落在不同座標系而報廢。
+    #
+    # 代價是少掉車尾 80 度的光束。在走廊裡那個扇區看到的是同樣的兩面平行牆，
+    # 本來就提供不了沿軸資訊，所以損失很小；換來的是對「人跟在後面」免疫。
+    scan_topic: scan_slam
     map_topic: map
 
     # 阿克曼底盤沒有專用的運動模型，Nav2 只提供 Differential / Omni。

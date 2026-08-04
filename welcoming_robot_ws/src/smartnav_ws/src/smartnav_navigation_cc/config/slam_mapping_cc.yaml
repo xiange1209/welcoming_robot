@@ -122,10 +122,19 @@ slam_toolbox:
     # 0.50/0.40 比原廠預設 (0.45/0.35) 略嚴一點，當作安全邊際。
     loop_search_maximum_distance: 3.0
     do_loop_closing: true
-    loop_match_minimum_chain_size: 10
+    # 10 -> 14：要求更長的連續節點鏈才算一次閉合。
+    # 重複性高的走廊裡，短鏈很容易在錯的地方湊出高分；
+    # 鏈越長越難被巧合滿足，這是比單純提高分數門檻更針對「重複結構」的手段。
+    loop_match_minimum_chain_size: 14
     loop_match_maximum_variance_coarse: 3.0
-    loop_match_minimum_response_coarse: 0.40
-    loop_match_minimum_response_fine: 0.50
+    loop_match_minimum_response_coarse: 0.450
+    # 0.50 -> 0.58（2026-08-03 晚，第三次調整）
+    # 走廊沿長軸的歧義讓錯誤閉合很容易達到 0.50。實測一次 1.74 m 的
+    # **純平移**修正（旋轉 0 度）把牆推成一條斜線，已知格數同時掉了 269 個
+    # —— 那是整張圖被重新最佳化推歪的結果。
+    # 這次環境包含大廳（特徵比純走廊多），正確的閉合本來就該拿到更高分，
+    # 所以提高門檻擋掉錯誤閉合的同時，不太會誤殺正確的。
+    loop_match_minimum_response_fine: 0.580
 
     # === 長直走廊調校 (2026-07-28) ===
     # 症狀：在 0.99 m 寬、近 20 m 長的走廊來回走一趟，存出來的地圖中間出現

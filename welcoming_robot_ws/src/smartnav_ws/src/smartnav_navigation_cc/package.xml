@@ -4,7 +4,7 @@
   <name>smartnav_navigation_cc</name>
   <version>0.1.0</version>
   <description>SmartNav 導航功能包 (_cc 重寫版) - wheeltec senior_akm 阿克曼底盤的建圖與導航</description>
-  <maintainer email="104887107+xiange1209@users.noreply.github.com">user</maintainer>
+  <maintainer email="104887107+xiange1209@users.noreply.github.com">xiange1209</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
