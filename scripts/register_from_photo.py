@@ -7,7 +7,7 @@
   ・用同一張照片重複實驗，讓 E1／E2 的比對條件可重現
 
 用法：
-    python3 scripts/register_from_photo.py --name 使用者 --gender M --type VIP photo.jpg
+    python3 scripts/register_from_photo.py --name 測試人員 --gender M --type VIP photo.jpg
     python3 scripts/register_from_photo.py --name 王小明 --type BLACKLIST a.jpg b.jpg c.jpg
 
 多張照片會全部存成同一個人的樣本（辨識時取平均，樣本越多越穩）。
