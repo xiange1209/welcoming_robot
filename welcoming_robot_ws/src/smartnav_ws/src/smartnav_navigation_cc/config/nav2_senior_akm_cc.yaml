@@ -487,11 +487,45 @@ global_costmap:
         enabled: true
         observation_sources: scan
         scan:
-          topic: /scan
+          # === 2026-08-05：改吃過濾後的掃描（根治全域成本地圖污染）===
+          #
+          # 8/04 實測：沿車子實際開過的路徑取樣 global_costmap，
+          #   清空前 13 個取樣點中 11 個 = 254（致命）→ 走廊全段不可通行
+          #   清空後 13 個中只剩 2 個
+          # 車子明明開得過去、成本地圖說過不去 —— 是地圖錯了。
+          #
+          # 污染源：這一行原本是 /scan（未過濾）。操作者跟車遙控時站在
+          # 車後 0.5~0.76 m、橫跨約 123 度，那些光束全部被標成 254。
+          # ★ 而且操作者**走在車子剛開過的那條線上**，所以標記正好落在
+          # 走廊中線 —— 就是之後規劃器要用的地方。
+          #
+          # AMCL 早在 8/03 就改吃 /scan_slam（見本檔 :47），但那次修正
+          # **沒有推廣到成本地圖**。同一個感測器、同一個污染源、兩個消費者，
+          # 只修了一個。
+          #
+          # 全域圖為什麼特別嚴重：它不是 rolling_window（本段沒有這個鍵
+          # → nav2 預設 false），標記沒有任何時間衰減，唯一的移除手段是
+          # 雷射光線實際穿過那一格。而操作者持續遮蔽車尾扇區，人**後面**
+          # 那些剛標下去的格子永遠在雷射陰影裡，拿不到清除射線。
+          # local_costmap 是 5x5 rolling，標記移出視窗就沒了，所以同樣吃
+          # /scan 卻不會現形 —— 這個不對稱正好對上症狀。
+          #
+          # ★ 不要把 global 改成 rolling_window: true：那會讓靜態地圖只剩
+          #   車周圍一小塊，長距離規劃直接壞掉。
+          # ★ 不要給這個來源加 inf_is_valid: true：被遮的光束是 inf，
+          #   設 true 會讓它們變成 range_max，反而在車後清出一個 80 度、
+          #   10 m 深的扇形，把真實障礙從全域圖抹掉。
+          topic: /scan_slam
+          # scan_filter_cc 是普通 Python 節點（非 lifecycle、無 respawn）。
+          # 它掛掉時全域 obstacle 層會**靜默**停止更新，加這行至少會警告。
+          expected_update_rate: 1.0
           max_obstacle_height: 2.0
           clearing: true
           marking: true
           data_type: "LaserScan"
+          # raytrace(10.0) > obstacle(3.0)：能清除的距離大於能標記的距離，
+          # 關係是對的。（8/04 的交接曾懷疑這兩個「不匹配」造成清除跟不上，
+          # 查證後不成立 —— 記在這裡免得下次又去動它。）
           raytrace_max_range: 10.0
           raytrace_min_range: 0.0
           obstacle_max_range: 3.0
@@ -499,6 +533,47 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # 與 local_costmap 一致：地圖雜訊 + 大膨脹 + 慢衰減會把通道糊死
+        #
+        # ⚠ 2026-08-05 分析：目前這組數值等於「沒有梯度」，下一步該調它。
+        #
+        # footprint 半寬 0.185 + footprint_padding 0.02 -> inscribed = 0.205 m。
+        # nav2 的 253（致命障礙膨脹）帶固定在 inscribed，**與 inflation_radius
+        # 無關**；inflation_radius 只決定 253 之外那條衰減尾巴有多長。
+        # 現在 0.22 - 0.205 = **衰減帶只有 1.5 公分**，代價從 252 掉到 239
+        # （252·exp(-3.5·0.015)）之後直接斷崖歸零。
+        #
+        # 後果：成本地圖對規劃器與控制器而言是二值的（沒事 / 死定了）。
+        #   - SmacPlanner 的 cost_penalty: 1.4 幾乎沒有東西可以作用，
+        #     沒有「走中間」的傾向
+        #   - MPPI 的 CostCritic near_collision_cost: 253 只吃 253/254，
+        #     收到的是二值訊號 —— ★ 這正是 8/04 記的「MPPI 取樣軌跡代價
+        #     全部一樣高、收斂到零速度而中止」。那不是 MPPI 的毛病。
+        #
+        # ★ 順帶更正一個舊判斷：把 inflation_radius 從 0.30 降到 0.22
+        #   **並沒有把可通行帶變寬**。可通行帶是 0.967 - 2×0.205 = 0.557 m，
+        #   兩個設定下完全一樣 —— 那次改動只是把梯度刪掉了。
+        #
+        # 建議值（等 /scan_slam 那項先驗過再改，一次只動一項）：
+        #     inflation_radius:   0.22 -> 0.35
+        #     cost_scaling_factor: 3.5 -> 4.0
+        # 驗算 cost = 252·exp(-4.0·(d - 0.205))：
+        #     d=0.205 -> 252  (內接，硬牆，與現在完全相同)
+        #     d=0.25  -> 210
+        #     d=0.30  -> 172
+        #     d=0.35  -> 141
+        #     d>0.35  -> 0
+        # 0.967 m 走廊裡車心可用區間是離牆 0.205~0.762 m，中線在 0.4835
+        # -> 代價 0；靠牆側有一條實質斜坡。
+        #
+        # ⚠ 與 analytic_expansion_max_cost: 200.0 耦合：離牆 < 約 0.26 m
+        #   的格子會超過 200，貼牆的 Reeds-Shepp 解析展開會被拒。中線走法
+        #   不受影響，但**門口 0.967 m 轉角本來就是最難的地方**，若出現
+        #   「規劃變慢 / no valid path」就把 analytic_expansion_max_cost 放到 260。
+        # ⚠ CPU：cell_inflation_radius 從 5 格變 7 格，每個障礙格的膨脹
+        #   計算量約 ×1.9。地圖 132×108 格、1 Hz，Pi 4 應該吃得下，
+        #   但要看 controller_server 有沒有掉出 10 Hz。
+        # 退路：兩個值放回 0.22 / 3.5，重跑 launch 即生效（symlink-install
+        #   連 colcon build 都不用）。
         inflation_radius: 0.22
         cost_scaling_factor: 3.5
       always_send_full_costmap: true

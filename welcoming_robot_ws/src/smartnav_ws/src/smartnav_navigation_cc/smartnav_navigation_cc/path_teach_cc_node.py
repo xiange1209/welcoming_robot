@@ -70,6 +70,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose, PoseStamped, Twist
 from nav_msgs.msg import Path
 from nav2_msgs.action import ComputePathToPose
+from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -374,6 +375,17 @@ class PathTeachNode(Node):
         # MPPI 控制器，不是規劃器。所以「用 nav2 規劃、用純追蹤執行」。
         self._planner_client = ActionClient(
             self, ComputePathToPose, "compute_path_to_pose", callback_group=cb)
+
+        # 規劃前先清一次全域成本地圖的 obstacle 層（2026-08-05）。
+        #
+        # 8/04 實測：清空前 13 個取樣點中 11 個 = 254（走廊全段不可通行），
+        # 清空後只剩 2 個 —— 同一個規劃請求從失敗變成產出 51 點含 2 折返點
+        # 的可行路徑。污染源已在 config 修掉（obstacle_layer 改吃 /scan_slam），
+        # 這裡是第二道保險：靜態層有完整地圖，obstacle 層在一次任務開始時
+        # 沒有任何值得保留的東西，清掉不會遺失資訊。
+        self._clear_costmap_client = self.create_client(
+            ClearEntireCostmap, "/global_costmap/clear_entirely_global_costmap",
+            callback_group=cb)
 
         self._action = ActionServer(
             self, FollowTaughtPath, "follow_taught_path",
@@ -989,10 +1001,29 @@ class PathTeachNode(Node):
 
         只往前搜尋不回頭，避免路徑自我交叉（例如折返、繞圈）時
         跳回已經走過的那一段。
+
+        ★ 2026-08-05：搜尋範圍**不可跨越折返點** —— 與 `_lookahead_point`
+        同一條規則。
+
+        折返路徑會折回自己：實測 `path_3d85e56c550d`（nav2 規劃的三點轉向）
+        的 pts[12] 與 pts[14] 只相距 **3.0 cm**、pts[13] 與 pts[15] 也是 3.0 cm
+        —— 車子把同一段 0.15 m 來回走了三趟。而循跡誤差本身就有 3~9 cm，
+        純 argmin 會直接跳到折返**之後**那一段，車子於是以為自己已經做完
+        折返動作，實際上根本還沒退。索引跳掉之後主迴圈也不會偵測到換向。
+
+        邊界含折返點本身（`limit = i + 1`）：主迴圈靠
+        `pts[idx].direction != cur_dir` 偵測折返並停車換向，索引必須
+        **到得了**那個點，否則會永遠停在它前面一格。
         """
+        limit = min(len(pts), hint + 120)      # 一次最多往前看 120 點（約 6 公尺）
+        cur_dir = pts[hint].direction
+        for i in range(hint, limit):
+            if pts[i].direction != cur_dir:
+                limit = i + 1                  # 含折返點，讓主迴圈偵測得到
+                break
+
         best_i, best_d = hint, float("inf")
-        upper = min(len(pts), hint + 120)      # 一次最多往前看 120 點（約 6 公尺）
-        for i in range(hint, upper):
+        for i in range(hint, limit):
             d = (pts[i].x - x) ** 2 + (pts[i].y - y) ** 2
             if d < best_d:
                 best_d, best_i = d, i
@@ -1576,15 +1607,37 @@ class PathTeachNode(Node):
 
             # 脫困方向也要看淨空，不能往牆裡開
             # 沿實際會走的弧線檢查，不是正前方的直帶（見 _arc_clearance）
+            # ★ 2026-08-05：以下兩個失敗出口都必須先發一筆 feedback ★
+            #
+            # 它們原本直接 return，而第一筆 `escaping` 的 _send_feedback 在
+            # 迴圈更下面（見下方）。第一圈就被擋的話 —— 貼牆時正是如此 ——
+            # **一筆 escaping 都不會發出去**，HMI 與 CSV 的 state 停在
+            # `following`，看起來就像「進度檢查根本沒觸發」。
+            #
+            # 8/03 記錄的「索引 66 卡 40 秒沒觸發脫困、原因未明」極可能就是
+            # 這個觀測缺口：主迴圈拿到 False 之後會重設 prog_t「讓它再試」，
+            # 於是每 5 秒無聲重來一次，10 次才 abort（約 50 秒），
+            # 而使用者在 40 秒（約 8 次）就人工取消了 —— 連 abort 訊息都沒出現。
+            #
+            # 這不是脫困的 bug，是**看不見脫困失敗**的 bug。
+            # 修好觀測之後，下次同樣的現象才查得下去。
             if self._arc_clearance(back_dir, curv) <= 0.12:
                 self._stop(3)
                 self.get_logger().warn(
                     f"脫困弧線上有障礙（轉了 {math.degrees(dyaw_signed):+.0f} 度就停）")
+                self._send_feedback(
+                    goal_handle, idx, len(pts), 0.0, "escaping",
+                    f"脫困第 {attempt} 次：弧線被擋，只轉了 "
+                    f"{math.degrees(dyaw_signed):+.0f} 度")
                 # 有轉到一點就算部分成功，值得重試
                 return dyaw > math.radians(5.0)
             if moved > self.escape_dist * 3.0:
                 self._stop(3)
                 self.get_logger().warn(f"已移動 {moved:.2f} m 但只轉了 {math.degrees(dyaw):.0f} 度")
+                self._send_feedback(
+                    goal_handle, idx, len(pts), 0.0, "escaping",
+                    f"脫困第 {attempt} 次：移動 {moved:.2f} m 但只轉了 "
+                    f"{math.degrees(dyaw):.0f} 度，放棄這次")
                 return dyaw > math.radians(5.0)
 
             v = speed if back_dir > 0 else -speed
@@ -1650,6 +1703,10 @@ class PathTeachNode(Node):
             resp.message = "等不到 /compute_path_to_pose 動作伺服器，nav2 有啟動嗎？"
             return resp
 
+        # ★ 規劃前先清一次全域成本地圖 —— 見 __init__ 裡的說明。
+        # 失敗不擋下規劃：清空是最佳化不是前提。
+        self._clear_global_costmap()
+
         all_pts: List[PathPoint] = []
         cur = start
         for leg, tgt in enumerate(targets, 1):
@@ -1714,6 +1771,30 @@ class PathTeachNode(Node):
         pose.orientation.z = qz
         pose.orientation.w = qw
         return pose
+
+    def _clear_global_costmap(self, timeout: float = 3.0) -> bool:
+        """清空全域成本地圖的 obstacle 層，回傳是否成功。
+
+        **失敗不該擋下規劃。** 清空是最佳化不是前提——服務不在
+        （nav2 還沒起來、或改用別的堆疊）時照樣讓規劃跑，
+        讓規劃器自己回報真正的錯誤，不要在這裡多一個失敗點。
+
+        用 `_spin_until` 輪詢而不是 `spin_until_future_complete`：
+        這是在服務回呼裡呼叫的，後者會在同一個 executor 上死鎖。
+        """
+        if not self._clear_costmap_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(
+                "清空成本地圖的服務不在，跳過（規劃仍會進行）。"
+                "若規劃失敗且訊息說「目標可能落在障礙物或膨脹區裡」，手動清一次：\n"
+                "  ros2 service call /global_costmap/clear_entirely_global_costmap "
+                "nav2_msgs/srv/ClearEntireCostmap '{}'")
+            return False
+        future = self._clear_costmap_client.call_async(ClearEntireCostmap.Request())
+        if not self._spin_until(future, timeout):
+            self.get_logger().warn("清空成本地圖逾時，仍繼續規劃")
+            return False
+        self.get_logger().info("已清空全域成本地圖的 obstacle 層")
+        return True
 
     def _plan_leg(self, start: Pose, goal: Pose) -> Optional[List[PathPoint]]:
         """呼叫 nav2 規劃一段，回傳路徑點；失敗回 None
