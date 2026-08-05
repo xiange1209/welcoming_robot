@@ -116,6 +116,34 @@ class SteeringTrimCcNode(Node):
         in_topic = self.get_parameter("input_topic").value
         out_topic = self.get_parameter("output_topic").value
 
+        # ★ 2026-08-04：讓 `ros2 param set trim_rad_per_m` 真的生效 ★
+        #
+        # 原本 self.trim 只在這裡讀一次。`ros2 param set` 會回報成功、
+        # `ros2 param get` 也讀得到新值，但 _cmd_cb 用的是快取，行為完全不變。
+        # 同一個坑今天在 path_teach_cc 的 merge_min_segment_m 也踩過一次
+        # （代價是白錄一趟路徑）。
+        # ★ `ros2 param get` 讀回新值只證明參數伺服器存了它，不證明節點會用它。
+        #
+        # 這條在熱路徑上（10~20 Hz），所以用回呼更新快取，不在 _cmd_cb 裡現讀。
+        #
+        # 為什麼需要**執行時**可調：轉向偏移不是固定的機械常數。
+        # 實測（2026-08-04）：白天三次導航都往左偏，收工前在同一條走廊量到的
+        # 卻是往右偏 1.87 度/m。中間差別是車子被人搬動過很多次——
+        # 停車時 hold_steer_on_stop=True 不會把前輪扳正，搬動時輪子是自由的，
+        # 舵機的指令位置與實際位置很容易脫節。**一個寫死的常數不可能一直對。**
+        def _on_param(params):
+            from rcl_interfaces.msg import SetParametersResult
+            for p in params:
+                if p.name == "trim_rad_per_m":
+                    self.trim = float(p.value)
+                    self.get_logger().info(
+                        f"轉向補償更新為 {self.trim:.4f} rad/m "
+                        f"({math.degrees(self.trim):+.2f} 度/m)")
+                elif p.name == "max_trim_rad_s":
+                    self.max_trim = float(p.value)
+            return SetParametersResult(successful=True)
+        self.add_on_set_parameters_callback(_on_param)
+
         self._steer_out = 0.0        # 濾波後的轉向輸出（狀態）
         self._steer_last_t = time.monotonic()
         # 抖動統計：反轉次數 = 轉向指令變號的次數，直接反映舵機來回動的次數

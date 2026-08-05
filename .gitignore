@@ -63,3 +63,24 @@ test_frames/
 *.tar.gz
 *.tgz
 *.zip
+
+# ── 內部開發文件不隨 repo 發布（見 README 的「開發文件」節）────
+#
+# 這些是逐日的除錯記錄與操作手冊，對外部讀者沒有參考價值，
+# 而且其中的韌體分析對象是廠商未公開發布的原始碼。
+# 它們隨部署包（tar）提供給實際操作的人。
+docs/
+HANDOFF_*.md
+AGENT交接指南.md
+README_本機開發.md
+本機開發與驗收.md
+廠商原始碼分析_*.md
+明天怎麼跑_*.md
+
+# ── 實驗逐筆記錄與 runtime 狀態 ────────────────────
+#
+# replay_*.csv 是重播時每一筆 feedback 的逐筆記錄（除錯用，
+# 一次上千列）。報告要用的是整理過的圖表，不是原始 log。
+replay_*.csv
+*.bak_*
+.smartnav/nav_state.json
