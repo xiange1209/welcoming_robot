@@ -76,11 +76,14 @@ README_本機開發.md
 本機開發與驗收.md
 廠商原始碼分析_*.md
 明天怎麼跑_*.md
+HMI_驗證步驟.md
+專題可行性評估_*.md
 
 # ── 實驗逐筆記錄與 runtime 狀態 ────────────────────
 #
 # replay_*.csv 是重播時每一筆 feedback 的逐筆記錄（除錯用，
 # 一次上千列）。報告要用的是整理過的圖表，不是原始 log。
 replay_*.csv
+odom_gyro_check_*.csv
 *.bak_*
 .smartnav/nav_state.json

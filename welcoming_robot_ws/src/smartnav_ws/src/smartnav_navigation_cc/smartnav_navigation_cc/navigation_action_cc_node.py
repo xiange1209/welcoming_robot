@@ -35,6 +35,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import PoseWithCovarianceStamped, Quaternion
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import ClearEntireCostmap
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
@@ -67,6 +68,18 @@ class NavigationActionCcNode(Node):
         self.declare_parameter("initial_pose_wait_sec", 5.0)
         # 每次導航前是否先重新對齊位姿
         self.declare_parameter("align_before_navigate", True)
+        # 導航前清一次全域成本地圖的 obstacle 層（2026-08-06 補上）。
+        #
+        # 為什麼要有：`path_teach_cc` 的 `_plan_cb` 從 8/05 起就會清，而這裡
+        # 不會 —— 同一台車、兩個導航入口、行為不一致。8/04 量到的污染是
+        # 「13 個取樣點中 11 個致命」，那種狀態下規劃器眼中的走廊是實心牆。
+        #
+        # 8/06 已驗證污染的根因修好了（obstacle_layer 改吃 /scan_slam，
+        # 未清空即規劃成功），所以這裡是**第二道保險**而不是主要手段。
+        # 靜態層有完整地圖，obstacle 層在一次任務開始時沒有值得保留的東西。
+        #
+        # 可關：清空要多一次服務往返，若之後量到它拖慢起步就設 false。
+        self.declare_parameter("clear_costmap_before_navigate", True)
 
         self.max_covariance_norm = float(self.get_parameter("max_covariance_norm").value)
         self.navigation_timeout_sec = float(self.get_parameter("navigation_timeout_sec").value)
@@ -74,6 +87,9 @@ class NavigationActionCcNode(Node):
         self.progress_epsilon_m = float(self.get_parameter("progress_epsilon_m").value)
         self.initial_pose_wait_sec = float(self.get_parameter("initial_pose_wait_sec").value)
         self.align_before_navigate = bool(self.get_parameter("align_before_navigate").value)
+        self.clear_costmap_before_navigate = bool(
+            self.get_parameter("clear_costmap_before_navigate").value
+        )
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = ReentrantCallbackGroup()
@@ -102,6 +118,12 @@ class NavigationActionCcNode(Node):
         # yaw 一直漂，帶著錯的角度起步會直接把目標算到牆裡)
         self.align_pose_client = self.create_client(
             Trigger, "/align_pose", callback_group=self.client_cb_group
+        )
+        # 導航前清全域成本地圖的 obstacle 層（見參數宣告處的說明）
+        self.clear_costmap_client = self.create_client(
+            ClearEntireCostmap,
+            "/global_costmap/clear_entirely_global_costmap",
+            callback_group=self.client_cb_group,
         )
 
         self.amcl_pose_sub = self.create_subscription(
@@ -193,6 +215,18 @@ class NavigationActionCcNode(Node):
                     self.get_logger().info(f"導航前位姿對齊: {res.message}")
                 except Exception as exc:  # noqa: BLE001
                     self.get_logger().warn(f"導航前位姿對齊失敗 (繼續導航): {exc}")
+
+            # 清一次全域成本地圖的 obstacle 層（見參數宣告處）。
+            # 失敗不擋下導航 —— 這是保險不是前提，讓 nav2 自己回報真正的問題。
+            if self.clear_costmap_before_navigate and self.clear_costmap_client.service_is_ready():
+                try:
+                    wait_for_future(
+                        self.clear_costmap_client.call_async(ClearEntireCostmap.Request()),
+                        timeout_sec=5.0,
+                    )
+                    self.get_logger().info("已清空全域成本地圖的 obstacle 層")
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(f"清空成本地圖失敗 (繼續導航): {exc}")
 
             if request.use_target_pose:
                 # HMI 直接點地圖導航：座標已經是 map frame，不必查地點資料庫

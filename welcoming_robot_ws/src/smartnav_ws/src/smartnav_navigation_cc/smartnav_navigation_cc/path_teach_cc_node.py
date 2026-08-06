@@ -135,6 +135,29 @@ class PathTeachNode(Node):
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("robot_frame", "base_footprint")
         self.declare_parameter("cmd_topic", "cmd_vel_smoothed")
+
+        # ── 脫困的防撞旁路（2026-08-06）★ 唯一會繞過 collision_monitor 的路徑 ──
+        #
+        # 實測：車子楔住時掃描點落進車身輪廓，collision_monitor 判定碰撞而
+        # **停止輸出**。指令到 cmd_vel_trimmed 還是 −0.05，到 cmd_vel 就沒有了。
+        #     cmd_vel_smoothed (送的)       −0.05  ✓
+        #     cmd_vel_trimmed  (補償後)      −0.05  ✓
+        #     cmd_vel          (防撞後→底盤)  沒有訊息  ← 擋在這裡
+        # 後果：_do_escape 發了 89 筆指令、車子位移 0.00 m，七段脫困全部無效。
+        # ★ 這也是 8/03「車子楔死」那個結論的真正原因 —— 不是判準錯，
+        #   是最後一關把指令吃掉了。
+        #
+        # 已經楔住的時候「不准動」不是安全，是死鎖。所以開一條**窄通道**：
+        #   - 只在 _do_escape 期間生效（_escape_bypass 旗標，try/finally 保證關閉）
+        #   - 速度硬上限 escape_bypass_speed（預設 0.05 m/s，人工救車實測值）
+        #   - 距離上限沿用 escape_distance_m
+        #   - 繞過 collision_monitor 之後**自己**做 _side_clearance 與
+        #     _arc_clearance 檢查（那兩個檢查本來就在 _do_escape 裡）
+        #
+        # ★ 不是關掉 collision_monitor —— 正常循跡、繞障、等待全部照舊走它。
+        self.declare_parameter("escape_bypass_enabled", True)
+        self.declare_parameter("escape_bypass_topic", "cmd_vel")
+        self.declare_parameter("escape_bypass_speed", 0.05)
         self.declare_parameter("scan_topic", "scan")
         # 錄製時要「聽」哪個話題判斷行進方向。
         # 這跟 cmd_topic 是**不同的東西**：cmd_topic 是重播時本節點自己
@@ -248,6 +271,10 @@ class PathTeachNode(Node):
         # 留一半餘裕。用弧長而不是索引數，才不會被點距影響
         # （教導路徑 5 cm、nav2 規劃路徑 15 cm，差三倍）。
         self.declare_parameter("stuck_min_advance_m", 0.08)
+        # 「有下指令卻沒動」的比例門檻：實際速率低於指令速率的這個比例，
+        # 且持續 no_progress_sec，才算卡住。0.3 = 只跑到指令的三成。
+        # ★ 不要用「沿路徑前進多快」當判準——慢慢開不是卡住（見 _follow_loop）。
+        self.declare_parameter("stuck_speed_ratio", 0.30)
         # base_footprint -> laser 的 x 偏移（查 TF：0.089）。
         # ★ 不要跟 0.311 搞混 —— 那是「雷達到車頭保險桿」的距離。
         #   用錯會讓每個雷射點多推 0.222 m；在走廊裡沿長軸看不出來
@@ -291,6 +318,7 @@ class PathTeachNode(Node):
         self.max_escapes = int(p("max_escapes").value)
         self.no_progress = float(p("no_progress_sec").value)
         self.stuck_min_advance = float(p("stuck_min_advance_m").value)
+        self.stuck_speed_ratio = float(p("stuck_speed_ratio").value)
         self.laser_x = float(p("laser_x_offset_m").value)
         self.wall_keepout = float(p("wall_keepout_m").value)
         self.wall_push_max = float(p("wall_push_max_m").value)
@@ -323,6 +351,23 @@ class PathTeachNode(Node):
         cmd_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              history=HistoryPolicy.KEEP_LAST)
         self.cmd_pub = self.create_publisher(Twist, p("cmd_topic").value, cmd_qos)
+
+        # 脫困旁路：直接發到底盤訂閱的話題，繞過 collision_monitor。
+        # 平時不發任何東西 —— 只有 _escape_bypass 為 True 時才會有輸出。
+        self._escape_bypass = False
+        self.escape_bypass_speed = abs(float(p("escape_bypass_speed").value))
+        self.bypass_pub = None
+        if bool(p("escape_bypass_enabled").value):
+            bypass_topic = p("escape_bypass_topic").value
+            if bypass_topic == p("cmd_topic").value:
+                # 兩者相同就沒有旁路可言，而且會變成對同一話題重複發布
+                self.get_logger().warn(
+                    f"escape_bypass_topic 與 cmd_topic 都是 {bypass_topic}，旁路停用")
+            else:
+                self.bypass_pub = self.create_publisher(Twist, bypass_topic, cmd_qos)
+                self.get_logger().info(
+                    f"脫困防撞旁路已啟用：{bypass_topic}，"
+                    f"速度上限 {self.escape_bypass_speed:.2f} m/s")
         # 讓 RViz / HMI 看得到目前在追哪條路徑
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -353,6 +398,7 @@ class PathTeachNode(Node):
         # 一串脫困共用的轉向（見 _do_escape）。每次真的往前推進就清掉，
         # 讓下一次卡住重新判斷。
         self._escape_steer: Optional[float] = None
+        self._cmd_v_last = 0.0        # 最後一次下的線速度指令（卡住判定用）
         from rclpy.qos import ReliabilityPolicy as _RP
         self.create_subscription(
             Twist, p("record_cmd_topic").value, self._cmd_cb,
@@ -898,7 +944,8 @@ class PathTeachNode(Node):
                 right = min(right, -y - half_w)
         return left, right
 
-    def _arc_clearance(self, direction: int, curvature: float, max_dist: float = 1.2) -> float:
+    def _arc_clearance(self, direction: int, curvature: float, max_dist: float = 1.2,
+                       lateral_offset: float = 0.0) -> float:
         """沿著「打舵之後實際會走的弧線」檢查淨空，而不是正前方的直帶。
 
         `_forward_clearance` 檢查的是以車頭為軸的矩形帶。脫困時車子打滿舵、
@@ -924,7 +971,9 @@ class PathTeachNode(Node):
                 continue
             if r > max_dist + 1.0:
                 continue
-            pts.append((r * math.cos(a), r * math.sin(a)))
+            # lateral_offset 正 = 假設車子往左平移（與 _forward_clearance、
+            # _do_escape 同一個慣例）。把掃描點反向平移即等效。
+            pts.append((r * math.cos(a), r * math.sin(a) - lateral_offset))
         if not pts:
             return max_dist
 
@@ -977,18 +1026,32 @@ class PathTeachNode(Node):
                     return arc
         return max_dist
 
-    def _pick_avoid_offset(self, direction: int) -> Optional[float]:
+    def _pick_avoid_offset(self, direction: int, curvature: float = 0.0) -> Optional[float]:
         """找一個能繞過去的橫向偏移量；找不到回 None
 
         從小到大試，左右交替（同樣大小優先試左邊只是為了行為一致，
         沒有偏好的理由）。可行的定義是「該偏移下前方淨空距離 > 停止距離 + 餘裕」。
         """
+        # ★ 2026-08-06：解決端必須跟觸發端量同一件事 ★
+        #
+        # 8/04 把主迴圈的觸發改成 `_arc_clearance`（沿實際會走的弧線）並換算了
+        # 門檻，卻沒有動這裡。於是變成：
+        #   觸發：arc_clearance <= obs_stop − bumper      （自由行程，已換算）
+        #   解決：_forward_clearance > obs_stop + 餘裕     （含車身長度，未換算）
+        # 兩個條件量的東西不同、門檻也不同單位，所以挑出來的偏移**不保證能
+        # 解決觸發它的那個問題** —— 觸發持續成立、狀態一直卡在 avoiding。
+        # 而且直帶忽略曲率，選邊也可能選錯。
+        #
+        # 實測（path_44ce57013a51，大廳->起點）：677 筆裡 avoiding 佔 69.1%，
+        # 車子整段貼著右牆走（右側 0.03 m、左側 0.57 m），平均偏離 25.99 cm。
         n = int(self.avoid_max / max(0.01, self.avoid_step))
+        bumper = 0.40 if direction > 0 else 0.09
+        stop_d = (self.obs_stop if direction > 0 else self.obs_stop_rev) - bumper
         for i in range(1, n + 1):
             for sign in (1.0, -1.0):
                 off = sign * i * self.avoid_step
-                stop_d = self.obs_stop if direction > 0 else self.obs_stop_rev
-                if self._forward_clearance(direction, off) > stop_d + self.avoid_clear:
+                if self._arc_clearance(direction, curvature, max_dist=self.obs_slow,
+                                       lateral_offset=off) > stop_d + self.avoid_clear:
                     return off
         return None
 
@@ -1082,10 +1145,28 @@ class PathTeachNode(Node):
         return v, w
 
     def _publish_cmd(self, lin: float, ang: float) -> None:
+        # 卡住判定要比對「指令 vs 實際」，所以指令值必須留下來（見 _follow_loop）
+        self._cmd_v_last = lin
         t = Twist()
         t.linear.x = lin
         t.angular.z = ang
         self.cmd_pub.publish(t)
+
+        # ★ 脫困期間額外走一條繞過 collision_monitor 的旁路（見 __init__ 的說明）。
+        #   正常循跡時 _escape_bypass 是 False，這段不會執行。
+        if self._escape_bypass and self.bypass_pub is not None:
+            b = Twist()
+            cap = self.escape_bypass_speed
+            b.linear.x = max(-cap, min(cap, lin))
+            # 角速度必須按同一個比例縮。阿克曼 ω = v·κ —— 只箝制 v 而讓 ω
+            # 不變，等於要求更小的轉彎半徑；韌體照 R = Vx/Vz 換算舵角，
+            # 會打得比 min_turning_radius 還緊（前輪刮地，正是教導路徑
+            # 產生不可行段的那個現象）。按比例縮才能保住曲率。
+            if abs(lin) > 1e-6:
+                b.angular.z = ang * (abs(b.linear.x) / abs(lin))
+            else:
+                b.angular.z = 0.0
+            self.bypass_pub.publish(b)
 
     def _stop(self, frames: int = 3) -> None:
         for _ in range(frames):
@@ -1170,6 +1251,7 @@ class PathTeachNode(Node):
                                                    pts[i].y - pts[i - 1].y)
         prog_s = -1.0
         self._escape_steer = None
+        move_hist: List[Tuple[float, float, float, float]] = []   # (t, x, y, |指令v|)
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -1233,26 +1315,54 @@ class PathTeachNode(Node):
             # 同一個門檻換條路徑就變成永久誤觸發。
             #
             # 改量實際弧長：走不到 stuck_min_advance 才算卡住，與點距無關。
-            s_now = path_s[idx]
-            if s_now - prog_s > self.stuck_min_advance:
+            # ★ 2026-08-06：判準改成「有下指令卻沒動」，不再看路徑推進速率 ★
+            #
+            # 前兩版都在量「沿路徑前進得多快」，那是**行進速率**，不是卡住：
+            #   v1 看索引變化   -> 被點距背叛（5 cm vs 15 cm 差三倍）
+            #   v2 看弧長推進   -> 點距無關了，但**慢仍然會被當成卡住**
+            # 實測 path_2fb1081910d7：走廊裡前方淨空長期低於 obs_slow，
+            # 速度被壓到 30%（0.03 m/s），第一次觸發脫困時偏離只有 3~6 cm
+            # 而且很穩定——車子沒卡住，只是慢。結果 78% 的時間在脫困。
+            #
+            # 卡住的定義是**指令與實際脫節**：有下速度指令、車子卻沒動。
+            # 慢慢開不是卡住。位移取自 map -> base_footprint（AMCL 修正過的
+            # 對地位姿），不是輪速——輪子打滑時輪速會謊報「有在動」，
+            # 而打滑正是我們見過的卡住模式之一。
+            now_t = time.monotonic()
+            move_hist.append((now_t, x, y, abs(self._cmd_v_last)))
+            while move_hist and now_t - move_hist[0][0] > self.no_progress:
+                move_hist.pop(0)
+            stuck_now = False
+            if len(move_hist) >= 2 and now_t - move_hist[0][0] >= self.no_progress * 0.8:
+                span = now_t - move_hist[0][0]
+                actual = math.hypot(x - move_hist[0][1], y - move_hist[0][2]) / max(1e-3, span)
+                want = sum(h[3] for h in move_hist) / len(move_hist)
+                # 有明確下指令，而實際速率不到指令的 stuck_speed_ratio
+                stuck_now = (want > 0.02 and actual < self.stuck_speed_ratio * want)
+
+            if not stuck_now:
                 prog_idx = idx
-                prog_s = s_now
-                prog_t = time.monotonic()
-                self._escape_steer = None      # 真的前進了，下次卡住重新判斷轉向
+                prog_s = path_s[idx]
+                prog_t = now_t
+                self._escape_steer = None      # 真的在動，下次卡住重新判斷轉向
             elif time.monotonic() - prog_t > self.no_progress:
                 if escapes < self.max_escapes:
                     escapes += 1
                     self.get_logger().warn(
-                        f"索引停在 {idx}/{len(pts)} 已 {self.no_progress:.0f} 秒沒前進，"
-                        f"判定卡住，嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
+                        f"有下速度指令但車子沒動（實際 < 指令的 "
+                        f"{self.stuck_speed_ratio*100:.0f}%）已 {self.no_progress:.0f} 秒，"
+                        f"索引 {idx}/{len(pts)}，判定卡住，"
+                        f"嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
                     self._stop(3)
                     if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
                         prog_t = time.monotonic()
                         avoid_offset = 0.0
                         wait_started = 0.0
                         state = "following"
+                        move_hist.clear()   # 脫困期間主迴圈沒跑，視窗裡是舊樣本
                         continue
                     prog_t = time.monotonic()      # 退不動也重計時，讓它再試
+                    move_hist.clear()
                 else:
                     self._stop()
                     goal_handle.abort()
@@ -1270,6 +1380,7 @@ class PathTeachNode(Node):
                 self.get_logger().info(f"折返點：{was} -> {now_dir}")
                 time.sleep(self.cusp_pause)
                 cur_dir = pts[idx].direction
+                move_hist.clear()   # 折返是刻意停車，不是卡住
                 continue
 
             # ── 障礙 ──
@@ -1318,7 +1429,7 @@ class PathTeachNode(Node):
 
             if clearance <= stop_d:
                 # 先試著繞開
-                off = self._pick_avoid_offset(cur_dir)
+                off = self._pick_avoid_offset(cur_dir, preview_curv)
                 if off is not None and abs(off) <= self.avoid_max:
                     if state != "avoiding":
                         self.get_logger().info(f"前方障礙，橫向偏移 {off * 100:+.0f} cm 繞過")
@@ -1345,6 +1456,7 @@ class PathTeachNode(Node):
                             wait_started = 0.0
                             avoid_offset = 0.0
                             state = "following"
+                            move_hist.clear()
                             continue
                         # 退不動就繼續等，等滿 wait_timeout 再放棄
 
@@ -1405,8 +1517,20 @@ class PathTeachNode(Node):
             # ── 純追蹤 ──
             ld = max(self.la_min, min(self.la_max, self.la_k * abs(speed) + self.la_min))
             _tgt_i, target = self._lookahead_point(pts, idx, x, y, ld)
-            lin, ang = self._pure_pursuit(pose, target, cur_dir, abs(speed),
-                                          avoid_offset + wall_push)
+            total_off = avoid_offset + wall_push
+            lin, ang = self._pure_pursuit(pose, target, cur_dir, abs(speed), total_off)
+
+            # ★ 把橫向偏移的組成放進 feedback（2026-08-06）★
+            # 實測車子在走廊裡一路貼右牆（右 0.03 / 左 0.56）而偏離持續變大，
+            # 但從外面分不出是「排斥沒算出來」「被繞障抵消」還是「被曲率箝制吃掉」。
+            # 這三個對應完全不同的修法。看不見就查不了——脫困失敗隱形了三天，
+            # 補一行 feedback 就真相大白（見 _do_escape 的兩個失敗出口）。
+            if abs(total_off) > 0.005 or state in ("avoiding", "slowing"):
+                max_curv = 1.0 / max(0.05, self.min_radius)
+                sat = "★飽和" if abs(ang) >= abs(lin) * max_curv * 0.98 else ""
+                dbg = (f"側 左{sl:.2f}/右{sr:.2f} 排斥{wall_push:+.2f} "
+                       f"繞障{avoid_offset:+.2f} 合計{total_off:+.2f} 曲率{sat}")
+                self._send_feedback(goal_handle, idx, len(pts), xte, state, dbg)
             self._publish_cmd(lin, ang)
 
             now = time.monotonic()
@@ -1422,6 +1546,25 @@ class PathTeachNode(Node):
         return result
 
     def _do_escape(self, pts, idx, cur_dir, goal_handle, attempt: int = 1) -> bool:
+        """脫困的外層：開啟防撞旁路，並保證無論從哪個出口離開都會關掉。
+
+        `_do_escape_inner` 有十幾個 return 點（淨空被擋、移動超標、取消、
+        逾時…），逐一在每個出口關旁路遲早會漏掉一個 —— 漏掉的後果是
+        **正常循跡也在繞過 collision_monitor**，那比原本的死鎖危險得多。
+        用 try/finally 把它變成不可能漏。
+
+        離開前主動送一筆零速到旁路：底盤的指令逾時是 1.0 秒，不送的話
+        車子會多滑一秒才停。
+        """
+        self._escape_bypass = True
+        try:
+            return self._do_escape_inner(pts, idx, cur_dir, goal_handle, attempt)
+        finally:
+            self._escape_bypass = False
+            if self.bypass_pub is not None:
+                self.bypass_pub.publish(Twist())
+
+    def _do_escape_inner(self, pts, idx, cur_dir, goal_handle, attempt: int = 1) -> bool:
         """卡住時的脫困：打舵前進改變車頭角度，不是直線退回去。
 
         === 為什麼要打舵（2026-08-03 實測後重寫）===
@@ -1551,10 +1694,20 @@ class PathTeachNode(Node):
         # 這裡不打舵、只沿 back_dir 直線走，直到兩側都有 side_min 的空間
         # 或走滿 escape_dist。走直線時車身掃掠的寬度就是車寬本身，
         # 是所有動作裡最小的，貼牆時唯一安全的選擇。
+        # ★ 2026-08-06 修正閘門用錯量測 ★
+        # 原本用 `left/right = _forward_clearance(back_dir, ±0.20)` 當判準，
+        # 但那回傳的是「把檢查帶往側邊平移之後，**前方**最近障礙有多遠」
+        # ——縱向距離，不是車身兩側的空隙。轉角處前方開闊，兩個值都很大，
+        # 於是 `min < 0.15` 永遠不成立，**這整段直線脫出從來沒被執行過**。
+        # 實測（path_2702ea459c8b 索引 49 楔住）：真正的側向空隙是
+        # 左 +0.08 / 右 −0.09 m，而 _forward_clearance 那兩個值遠大於 0.15。
+        # `_side_clearance()` 才是量車身旁邊還剩多少的函式（8/04 就寫好了，
+        # 給貼牆排斥用，只是當時忘了接到這個閘門上）。
         side_min = 0.15
-        if min(left, right) < side_min:
+        s_left, s_right = self._side_clearance()
+        if min(s_left, s_right) < side_min:
             self.get_logger().info(
-                f"側向太窄（左 {left:.2f} m、右 {right:.2f} m），先直線"
+                f"側向太窄（左 {s_left:.2f} m、右 {s_right:.2f} m），先直線"
                 f"{'前進' if back_dir > 0 else '後退'}拉開距離再打方向")
             ts = time.monotonic()
             while time.monotonic() - ts < 5.0 and rclpy.ok():
@@ -1567,8 +1720,7 @@ class PathTeachNode(Node):
                     return False
                 if math.hypot(p[0] - x0, p[1] - y0) >= self.escape_dist:
                     break
-                l2 = self._forward_clearance(back_dir, +0.20)
-                r2 = self._forward_clearance(back_dir, -0.20)
+                l2, r2 = self._side_clearance()
                 if min(l2, r2) >= side_min:
                     break
                 if self._arc_clearance(back_dir, 0.0) <= 0.12:

@@ -553,6 +553,29 @@ class CreateWaypointRequest(BaseModel):
     yaw: float = 0.0
 
 
+class SetPoseRequest(BaseModel):
+    """POST /api/localize/here —— 把定位直接設到一個已知位置
+
+    為什麼需要這支（2026-08-06）：
+    原本只有 `/api/localize`，它做的是 **GlobalLocalization**——把粒子撒滿
+    整張圖再收斂。走廊沿長軸重複，同一份掃描在任何縱向位置都匹配得上，
+    所以全域定位很可能收斂到**另一段走廊**。8/06 實測 AMCL 就沿縱向錯了
+    3 公尺，而掃描吻合度還顯示 90.4%。
+    而且全域定位的實作是 0.9 m 半徑的圓弧繞行——0.99 m 的走廊裡會撞牆。
+
+    已知車子在哪（例如剛從起點出發、或人工推回起點）時，直接把位姿設過去
+    再用 `/align_pose` 做局部修正，比讓它自己找可靠得多，也不需要移動。
+
+    waypoint_id 有值就用該地點的座標；否則用 x/y/yaw。
+    """
+
+    waypoint_id: str = ""
+    x: float = 0.0
+    y: float = 0.0
+    yaw: float = 0.0
+    align: bool = True          # 設完之後是否呼叫 /align_pose 做掃描對齊
+
+
 class NavigateRequest(BaseModel):
     """POST /api/navigate
 
@@ -933,7 +956,24 @@ class HmiServerNode(Node):
             "finish_map": self.create_client(Trigger, "/finish_map", callback_group=cb),
             "create_waypoint": self.create_client(CreateWaypoint, "create_waypoint", callback_group=cb),
             "list_waypoints": self.create_client(ListWaypoints, "list_waypoints", callback_group=cb),
+            # 掃描對齊：不需要移動車子的局部位姿修正（map_service_cc 提供）。
+            # 走廊裡優先用它，不要用會繞圈的全域定位——0.9 m 半徑的圓弧
+            # 在 0.99 m 的走廊會撞牆。
+            "align_pose": self.create_client(Trigger, "/align_pose", callback_group=cb),
         }
+        # AMCL 的初始位姿入口（給 POST /api/localize/here 用）。
+        # 用 VOLATILE 而不是 TRANSIENT_LOCAL：latched 的初始位姿會在 AMCL
+        # 重啟時把它推回一個可能早已過時的位置，那比收不到更難查。
+        self.initialpose_pub = self.create_publisher(
+            PoseWithCovarianceStamped,
+            "/initialpose",
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+            ),
+        )
         # smartnav_msgs 還沒重建時 DeleteWaypoint 會是 None，此時不建客戶端，
         # 由端點回報要重建；其餘功能完全不受影響。
         if DeleteWaypoint is not None:
@@ -2749,8 +2789,71 @@ class HmiServerNode(Node):
 
         @app.post("/api/localize", dependencies=admin_only)
         async def api_localize() -> JSONResponse:
+            """全域定位：把粒子撒滿整張圖再收斂。
+
+            ⚠️ 走廊裡不要用這支，用下面的 /api/localize/here。
+            理由見 SetPoseRequest 的說明（沿軸歧義 ＋ 會繞圈撞牆）。
+            """
             job_id = self._start_action("global_localization", GlobalLocalization.Goal(), "全域定位")
             return JSONResponse({"success": True, "message": "全域定位已開始", "job_id": job_id})
+
+        @app.post("/api/localize/here", dependencies=admin_only)
+        async def api_localize_here(req: SetPoseRequest) -> JSONResponse:
+            """把定位設到一個已知位置，不做全域搜尋（2026-08-06 新增）。
+
+            兩步：發 /initialpose 給 AMCL 一個先驗，再用 /align_pose 做
+            不需移動的掃描對齊。走廊裡這是唯一可靠的定位重設方式——
+            全域定位會沿長軸收斂到錯的那一段（8/06 實測錯 3 公尺，
+            而掃描吻合度還顯示 90.4%）。
+            """
+
+            def work():
+                # ── 1. 決定目標位姿 ──
+                if req.waypoint_id:
+                    res = self._call_service("list_waypoints", ListWaypoints.Request())
+                    hit = None
+                    for w in res.waypoints_info:
+                        if w.waypoint_id == req.waypoint_id:
+                            hit = w
+                            break
+                    if hit is None:
+                        return {"success": False,
+                                "message": f"找不到地點 {req.waypoint_id}"}
+                    pose = hit.pose
+                    where = hit.waypoint_name or req.waypoint_id
+                else:
+                    pose = make_pose(req.x, req.y, req.yaw)
+                    where = f"({req.x:.2f}, {req.y:.2f})"
+
+                # ── 2. 發初始位姿 ──
+                msg = PoseWithCovarianceStamped()
+                msg.header.frame_id = "map"
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.pose.pose = pose
+                # 對角線：x/y 各 0.25（≈0.5 m 標準差）、yaw 0.0685（≈15 度）。
+                # 這是 RViz「2D Pose Estimate」的預設值——表達「知道大概在哪
+                # 但不精確」。設太小 AMCL 會拒絕修正自己的誤差，設太大等於沒設。
+                msg.pose.covariance[0] = 0.25
+                msg.pose.covariance[7] = 0.25
+                msg.pose.covariance[35] = 0.0685
+                self.initialpose_pub.publish(msg)
+
+                if not req.align:
+                    return {"success": True, "message": f"已把定位設到「{where}」"}
+
+                # ── 3. 掃描對齊 ──
+                # 等 AMCL 把 initialpose 吸收進粒子群再對齊，否則對齊的是舊位姿。
+                time.sleep(0.5)
+                client = self.service_clients.get("align_pose")
+                if client is None or not client.service_is_ready():
+                    return {"success": True,
+                            "message": f"已把定位設到「{where}」；"
+                                       "/align_pose 服務不在，略過掃描對齊"}
+                ares = self._call_service("align_pose", Trigger.Request())
+                return {"success": True,
+                        "message": f"已把定位設到「{where}」；掃描對齊：{ares.message}"}
+
+            return await self._guard(work)
 
         # ── 遙控建圖 ─────────────────────────────────────
 

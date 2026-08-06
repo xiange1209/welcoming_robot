@@ -48,6 +48,22 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 
 
+def _yaw_from_quat(q) -> float:
+    """四元數取 yaw。只需要繞 z 的分量，不必引進 tf_transformations。"""
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
+def _norm_angle(a: float) -> float:
+    """正規化到 (-pi, pi]。跨 ±pi 時若不做這件事，朝向差會算成 2pi 的誤差。"""
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a <= -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
 class SteeringTrimCcNode(Node):
     """把「下 0 卻會轉」的機械偏移補回來"""
 
@@ -107,12 +123,65 @@ class SteeringTrimCcNode(Node):
         # 抖動量測：每隔這麼久印一次「每秒轉向反轉次數」，用來驗證有沒有改善
         self.declare_parameter("chatter_report_sec", 0.0)   # 0 = 不印
 
+        # ── 線上估測轉向偏移（2026-08-06 加）──────────────────────
+        #
+        # 為什麼需要：`trim_rad_per_m` 假設被補償的量是常數，但實測它不是。
+        # 同一個 session 內量到兩次，差了一個數量級：
+        #     稍早（trim -0.072 生效、經完整鏈路）  -1.87 度/m  往右
+        #     稍後（繞過 trim、直接發底盤）         +12.7 度/m  往左
+        # 中間發生的事：車子被搬動、楔住、人工救車、遙控來回多次。
+        # 使用者的觀察「轉向補償感覺每次都不太相同」因此從感覺變成資料。
+        #
+        # 而且「左右打滿反推中位」得到 −2.19°（偏右），
+        # 直接量中位卻是 +4.08°（偏左）——**方向相反**，
+        # 所以它也不是單純的零位偏移，反推模型不成立。
+        #
+        # 一個寫死的常數修不了一個會漂移的量。改成邊開邊估：
+        # 車子直行時（補償**之前**的指令角速度 ≈ 0），odom 量到的偏轉率
+        # 除以速度就是當下的殘餘，把它慢慢補進 trim。
+        # 輪子再被撞歪也會自己跟上，不需要專門的校正動作。
+        self.declare_parameter("auto_trim", True)
+        # 每次更新只走殘餘的這個比例。取小值：寧可收斂慢，
+        # 也不要在轉彎剛結束、yaw 還在安定時被一兩筆壞資料帶歪。
+        self.declare_parameter("auto_trim_gain", 0.02)
+        self.declare_parameter("auto_trim_min_speed", 0.03)      # 太慢時 yaw 訊噪比差
+        self.declare_parameter("auto_trim_straight_dz", 0.02)    # 指令 |ω| 小於這個才算直行
+        self.declare_parameter("auto_trim_settle_sec", 1.5)      # 直行滿這麼久才開始採信
+        self.declare_parameter("auto_trim_limit", 0.30)          # trim 的絕對值上限
+        # ── 時間平均視窗（2026-08-06）★ 這是把震盪變成收斂的關鍵 ──
+        #
+        # 原本逐筆 odom（20 Hz）算 residual = wz / v 就更新一次。實機 log：
+        #     殘餘  +3.49 度/m -> trim -0.0732    1 次
+        #     殘餘 -10.23 度/m -> trim -0.1009   29 次
+        #     殘餘  -2.32 度/m -> trim -0.0524   80 次
+        # 殘餘在 +3.49 / −10.23 / −2.32 之間跳，trim 跟著 −0.073 / −0.101 /
+        # −0.052 來回 —— 這是**震盪不是收斂**。單筆 odom 的 yaw 速率雜訊
+        # 遠大於我們要估的量（trim 等效約 1.3 度，而雜訊有好幾度）。
+        #
+        # 改成累積一段時間的**位移**與**朝向變化**再相除：
+        #     殘餘 = Δyaw / Δs
+        # 位置與朝向是積分量，雜訊會互相抵消；速率是微分量，雜訊被放大。
+        # 同樣的資料，換個算法訊噪比差一個數量級。
+        self.declare_parameter("auto_trim_window_sec", 2.0)
+
         self.trim = float(self.get_parameter("trim_rad_per_m").value)
         self.max_trim = float(self.get_parameter("max_trim_rad_s").value)
         self.steer_tau = float(self.get_parameter("steer_filter_tau").value)
         self.steer_deadband = float(self.get_parameter("steer_deadband_rad_s").value)
         self.hold_on_stop = bool(self.get_parameter("hold_steer_on_stop").value)
         self.chatter_report = float(self.get_parameter("chatter_report_sec").value)
+        self.auto_trim = bool(self.get_parameter("auto_trim").value)
+        self.at_gain = float(self.get_parameter("auto_trim_gain").value)
+        self.at_min_speed = float(self.get_parameter("auto_trim_min_speed").value)
+        self.at_dz = float(self.get_parameter("auto_trim_straight_dz").value)
+        self.at_settle = float(self.get_parameter("auto_trim_settle_sec").value)
+        self.at_limit = float(self.get_parameter("auto_trim_limit").value)
+        self.at_window = float(self.get_parameter("auto_trim_window_sec").value)
+        self._straight_since = 0.0     # 指令保持直行的起始時刻（0 = 目前不是直行）
+        self._at_updates = 0
+        self._at_last_log = 0.0
+        # 時間平均視窗的起點：(x, y, yaw, t, 行進方向)。None = 尚未開始累積。
+        self._at_win = None
         in_topic = self.get_parameter("input_topic").value
         out_topic = self.get_parameter("output_topic").value
 
@@ -169,6 +238,87 @@ class SteeringTrimCcNode(Node):
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._odom = msg
+        if self.auto_trim:
+            self._update_auto_trim(msg)
+
+    def _update_auto_trim(self, msg: Odometry) -> None:
+        """直行時把量到的殘餘偏轉率補進 trim（見參數宣告處的說明）
+
+        閘門有四道，任何一道不過就丟掉整個累積視窗：
+          1. 目前指令是直行（補償前的 |ω| < at_dz）
+          2. 已經直行滿 at_settle 秒（避免吃到轉彎後 yaw 還在安定的資料）
+          3. 車速夠快（太慢時 yaw 的訊噪比很差）
+          4. 行進方向在視窗中途沒有變號
+
+        ★ 2026-08-06：改成時間平均，不再逐筆更新。
+
+        殘餘用「一段時間走過的距離」與「同一段時間的朝向變化」相除，
+        而不是單筆的 `wz / v`：
+
+            residual = Δyaw / Δs        （帶號，倒車時 Δs 為負）
+
+        位置與朝向是**積分量**，感測雜訊會互相抵消；角速度是**微分量**，
+        雜訊被放大。同一批資料換個算法，訊噪比差一個數量級。
+        逐筆版本的實測是 +3.49 / −10.23 / −2.32 度/m 反覆跳（見參數處註解）。
+
+        閘門不過時**必須清掉視窗**，否則會把轉彎前後兩段接起來算，
+        得到一個完全不存在的「殘餘」。
+        """
+        now = time.monotonic()
+
+        # ── 四道閘門：任何一道不過，累積作廢 ──
+        if self._straight_since == 0.0 or now - self._straight_since < self.at_settle:
+            self._at_win = None
+            return
+        v = msg.twist.twist.linear.x
+        if abs(v) < self.at_min_speed:
+            self._at_win = None
+            return
+
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        yaw = _yaw_from_quat(msg.pose.pose.orientation)
+        cur_dir = 1 if v > 0 else -1
+
+        if self._at_win is None:
+            self._at_win = (x, y, yaw, now, cur_dir)
+            return
+        x0, y0, yaw0, t0, dir0 = self._at_win
+
+        # 視窗中途變換行進方向 -> 前進段與倒車段的殘餘不能混算
+        if cur_dir != dir0:
+            self._at_win = (x, y, yaw, now, cur_dir)
+            return
+        if now - t0 < self.at_window:
+            return
+
+        dist = math.hypot(x - x0, y - y0)
+        # 走得比「最低速 × 視窗長度的一半」還少 -> 打滑或被擋住，這段不可信。
+        # （這是第 4 道閘門在時間平均版本下的等價物：原本比對 odom 與指令
+        #   同號，現在直接看整段到底有沒有移動。）
+        if dist < self.at_min_speed * self.at_window * 0.5:
+            self._at_win = None
+            return
+
+        dyaw = _norm_angle(yaw - yaw0)
+        residual = dyaw / (dist * dir0)      # 每公尺的偏轉；倒車時距離帶負號
+        new = self.trim - self.at_gain * residual
+        new = max(-self.at_limit, min(self.at_limit, new))
+
+        # 視窗用掉就重開，下一段從現在的位姿重新累積
+        self._at_win = (x, y, yaw, now, cur_dir)
+
+        if abs(new - self.trim) < 1e-6:
+            return
+        self.trim = new
+        self._at_updates += 1
+        if now - self._at_last_log > 5.0:
+            self._at_last_log = now
+            self.get_logger().info(
+                f"線上估測（{self.at_window:.0f} 秒平均，走 {dist:.2f} m 轉 "
+                f"{math.degrees(dyaw):+.2f} 度）：殘餘 {math.degrees(residual):+.2f} 度/m -> "
+                f"trim {self.trim:+.4f} ({math.degrees(math.atan(self.trim * 0.322)):+.2f} 度)"
+                f"  已更新 {self._at_updates} 次")
 
     def _smooth_steer(self, target: float, moving: bool) -> float:
         """低通 + 遲滯死區 + 停車不回正。回傳實際要送出的角速度"""
@@ -262,6 +412,16 @@ class SteeringTrimCcNode(Node):
 
         out.angular.z = smoothed + corr
         self._tally_chatter(smoothed - prev)
+
+        # 記錄「補償之前的指令是不是直行」——線上估測的閘門之一。
+        # 用 msg.angular.z（上游要求的）而不是 out.angular.z（含補償），
+        # 否則補償量本身會被當成轉彎指令，估測永遠不會啟動。
+        now = time.monotonic()
+        if moving and abs(msg.angular.z) < self.at_dz:
+            if self._straight_since == 0.0:
+                self._straight_since = now
+        else:
+            self._straight_since = 0.0
 
         self.pub.publish(out)
 
