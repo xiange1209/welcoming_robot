@@ -203,6 +203,31 @@ class PathTeachNode(Node):
         self.declare_parameter("lookahead_max_m", 0.80)
         self.declare_parameter("lookahead_k", 1.2)      # L_d = k*|v| + min
         self.declare_parameter("min_turning_radius", 0.80)
+        # ── 路徑可行性檢查（2026-08-06）★ 門檻是 0.76 不是 0.80 ──
+        #
+        # 2026-08-06 實測：教導路徑 path_2702ea459c8b 的索引 44~49
+        #   長 0.2664 m、轉 22.19 度  ->  需要半徑 0.688 m
+        # 而車子的 min_turning_radius 是 0.80、韌體硬限 0.75。
+        # **人工遙控時前輪可以刮地，硬轉過比極限更緊的彎；控制器照 0.80
+        # 箝制，不會這樣做。** 所以示範裡有一個它無法重現的動作 ——
+        # 重播到那一段必定卡住，再多的脫困也沒用（那天七段脫困全滅）。
+        #
+        # ★ 門檻用 0.76（= 0.80 × 0.95），不要用 0.80：
+        #   SmacPlannerHybrid 就是**貼著** 0.80 規劃的，它的運動基元是
+        #   11.25 度一格，離散化讓實測落在 0.79872（差 0.2%）。
+        #   用 0.80 會對**每一條**規劃路徑誤報。實測對照：
+        #       規劃路徑  R = 0.79872   比值 0.998   <- 可行
+        #       教導壞段  R = 0.68795   比值 0.860   <- 真的做不到
+        #   韌體硬限是 0.75，所以 0.76 同時擋掉低於硬限的路徑。
+        self.declare_parameter("feasibility_min_radius", 0.76)
+        # 檢查用的滑動視窗最小弧長。
+        # 不逐點檢查：教導路徑點距 5 cm，單點對的朝向差被 AMCL 的 yaw 抖動
+        # 主導，會把雜訊誤判成緊彎。也不整段檢查：整段平均可能沒事，
+        # 而壞的是其中一小截（8/06 那個壞段只有 0.27 m，整段有 2 m 以上）。
+        self.declare_parameter("feasibility_window_m", 0.15)
+        # 檢查不過時是否拒絕重播。預設只警告 —— 一條路徑可能只有最後
+        # 一小段做不到，而走完前面 90% 仍有價值（例如錄影、或人工接手）。
+        self.declare_parameter("refuse_infeasible_path", False)
         self.declare_parameter("goal_tolerance_m", 0.12)
         self.declare_parameter("control_rate", 20.0)
         # 偏離路徑超過這個距離就中止：代表定位跑掉或被推走了，
@@ -658,6 +683,88 @@ class PathTeachNode(Node):
             out[i] = PathPoint(xs / k, ys / k, pts[i].yaw, pts[i].direction)
         return out
 
+    def _check_feasibility(self, pts: List[PathPoint]) -> Tuple[bool, str, list]:
+        """檢查路徑上每一小截所需的轉彎半徑，抓出車子做不到的地方。
+
+        回傳 `(可行, 一句話摘要, 最糟的幾段)`。
+
+        === 為什麼需要（2026-08-06 實測）===
+
+        教導路徑 `path_2702ea459c8b` 索引 44~49：長 0.2664 m、轉 22.19 度
+        -> 需要半徑 **0.688 m**，而車子的極限是 0.80、韌體硬限 0.75。
+
+        **人工遙控時前輪可以刮地，硬轉過比極限更緊的彎；控制器照
+        `min_turning_radius` 箝制，不會這樣做。** 所以示範裡有一個它
+        無法重現的動作 —— 重播到那裡必定卡住，脫困再多次也沒用
+        （那天七段脫困全滅、最後人工救車）。
+
+        對照同一個轉角的規劃路徑：`R = 0.79872 m`。
+        `SmacPlannerHybrid` 的 `minimum_turning_radius` 是**建構性保證**，
+        不會產生這種段落 —— 這也是「用 nav2 規劃、用純追蹤執行」
+        比「重播遙控結果」可靠的原因之一。
+
+        === 為什麼用滑動視窗 ===
+
+        **不逐點檢查**：教導路徑點距 5 cm，單點對的朝向差被 AMCL 的
+        yaw 抖動主導，會把雜訊誤判成緊彎。
+        **也不整段檢查**：整段的平均半徑可能完全正常，而壞的是其中
+        一小截 —— 8/06 那個壞段只有 0.27 m，它所在的方向段超過 2 m。
+        取一個約 0.15 m 的視窗滑過去，既平滑掉雜訊又抓得到局部。
+
+        折返點兩側不跨段檢查：車子在那裡會停下來換向，兩側的朝向差
+        不代表任何一次連續轉彎。
+        """
+        min_r = float(self.get_parameter("feasibility_min_radius").value)
+        win = float(self.get_parameter("feasibility_window_m").value)
+        if len(pts) < 3:
+            return True, "點數太少，略過檢查", []
+
+        segs = []
+        start = 0
+        for i in range(1, len(pts)):
+            if pts[i].direction != pts[i - 1].direction:
+                segs.append((start, i))
+                start = i
+        segs.append((start, len(pts)))
+
+        bad = []
+        worst_r = float("inf")
+        for a, b in segs:
+            for i in range(a, b - 1):
+                arc = 0.0
+                j = i + 1
+                while j < b and arc < win:
+                    arc += math.hypot(pts[j].x - pts[j - 1].x, pts[j].y - pts[j - 1].y)
+                    j += 1
+                if arc < win * 0.5:
+                    break        # 這一段剩下的長度湊不出視窗了，換下一段
+                dyaw = abs(norm_angle(pts[j - 1].yaw - pts[i].yaw))
+                if dyaw < math.radians(1.0):
+                    continue     # 幾乎直行，需要的半徑趨近無限大
+                r = arc / dyaw
+                worst_r = min(worst_r, r)
+                if r < min_r:
+                    bad.append({
+                        "from": i,
+                        "to": j - 1,
+                        "arc_m": round(arc, 4),
+                        "dyaw_deg": round(math.degrees(dyaw), 2),
+                        "radius_m": round(r, 4),
+                    })
+
+        if not bad:
+            note = (f"可行性檢查通過：最緊處需要半徑 {worst_r:.3f} m（門檻 {min_r:.2f}）"
+                    if worst_r < float("inf") else "可行性檢查通過：全程近似直線")
+            return True, note, []
+
+        bad.sort(key=lambda d: d["radius_m"])
+        w = bad[0]
+        note = (f"★ 有 {len(bad)} 處車子做不到：最緊的在索引 {w['from']}~{w['to']}，"
+                f"{w['arc_m']:.3f} m 內轉 {w['dyaw_deg']:.1f} 度 → 需要半徑 "
+                f"{w['radius_m']:.3f} m，低於門檻 {min_r:.2f} m"
+                f"（控制器箝制在 {self.min_radius:.2f} m、韌體硬限 0.75 m）")
+        return False, note, bad[:5]
+
     def _merge_short_segments(self, pts, min_seg_m=None):
         """把長度不足的方向段併進前一段，消掉假折返點。
 
@@ -774,6 +881,19 @@ class PathTeachNode(Node):
                 f"存檔前合併掉 {merged} 個短於 "
                 f"{float(self.get_parameter('merge_min_segment_m').value):.2f} m "
                 f"的方向段（視為假折返點）")
+
+        # 存檔時就檢查可行性，不要等到重播才發現（2026-08-06）。
+        # 教導路徑最容易出現車子做不到的段落 —— 人遙控時前輪可以刮地。
+        # 這裡**只警告不阻擋**：路徑仍然存檔，因為你可能就是要留著看，
+        # 或只想跑前面 90%。真正的攔截在重播開始時（見 _execute_follow）。
+        feasible, feas_note, _ = self._check_feasibility(pts)
+        if feasible:
+            self.get_logger().info(feas_note)
+        else:
+            self.get_logger().warn(f"⚠ 這條路徑{feas_note}")
+            self.get_logger().warn(
+                "   重播到那一段會卡住。建議在該處分成兩次轉，或改用 "
+                "/plan_taught_path 讓規劃器產生路徑（它對最小轉彎半徑是建構性保證）")
 
         name = (req.name or "").strip() or f"path_{len(self._paths) + 1}"
         pid = "path_" + uuid.uuid4().hex[:12]
@@ -1217,6 +1337,32 @@ class PathTeachNode(Node):
         if req.reverse:
             # 反向走：點序反轉，而且每個點的行進方向也要翻過來
             pts = [PathPoint(q.x, q.y, q.yaw, -q.direction) for q in reversed(pts)]
+
+        # ── 可行性檢查（2026-08-06）──
+        #
+        # 攔在這裡，不要讓它跑到一半才發現。8/06 實測：教導路徑索引 44~49
+        # 需要 0.688 m 的轉彎半徑（車子極限 0.80），重播到那裡卡住、
+        # 七段脫困全滅、最後人工救車。**那是幾何限制，脫困救不回來。**
+        #
+        # 在 reverse 之後才檢查 —— 雖然反轉不改變朝向差的絕對值、
+        # 所需半徑理論上相同，但檢查的應該是「實際要走的那條」。
+        #
+        # 注意這幾行必須在 self._following = True 之前：下面有 return 路徑，
+        # 提早離開時那個旗標還沒設，不會留下「以為還在重播」的狀態。
+        feasible, feas_note, _bad = self._check_feasibility(pts)
+        if feasible:
+            self.get_logger().info(feas_note)
+        else:
+            self.get_logger().warn(f"⚠ 「{meta.get('name')}」{feas_note}")
+            if bool(self.get_parameter("refuse_infeasible_path").value):
+                goal_handle.abort()
+                result.success = False
+                result.message = (f"{feas_note}。"
+                                  "要強制執行請設 refuse_infeasible_path:=false")
+                return result
+            self.get_logger().warn(
+                "   仍會執行（refuse_infeasible_path=false）。"
+                "預期會卡在那一段 —— 那是幾何限制，不是控制問題，脫困救不回來")
 
         scale = req.speed_scale if req.speed_scale > 0.0 else 1.0
         self._following = True
@@ -1901,6 +2047,18 @@ class PathTeachNode(Node):
             return resp
 
         self._publish_path_viz(all_pts)
+        # 規劃器對 minimum_turning_radius 是建構性保證，這裡檢查是為了**驗證
+        # 那個保證**，順便確認門檻沒設得太嚴。8/06 用 0.80 當門檻時，
+        # 規劃器的正常輸出（實測 0.79872，差 0.2%）被誤報成不可行 —— 那次
+        # 誤報讓人以為規劃器壞了。門檻改 0.76 之後對照組才分得開。
+        feasible, feas_note, _ = self._check_feasibility(all_pts)
+        if feasible:
+            self.get_logger().info(feas_note)
+        else:
+            self.get_logger().warn(
+                f"⚠ 規劃器產出的路徑{feas_note}\n"
+                "   規劃器本應保證這件事 —— 先確認 SmacPlannerHybrid 的 "
+                "minimum_turning_radius 沒有被改小，再看門檻是不是設太嚴")
         self.get_logger().info(
             f"規劃路徑已存檔「{name}」：{len(all_pts)} 點、{length:.2f} m、{cusps} 個折返點"
         )
