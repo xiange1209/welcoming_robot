@@ -121,18 +121,26 @@ class SteerAsym(Node):
             self.pub.publish(Twist())
             time.sleep(0.05)
 
-    def run_segment(self, label: str, curvature: float):
-        """走一段，回傳 (弧長, 朝向變化)。curvature 為 0 就是直走。"""
+    def run_segment(self, label: str, curvature: float, direction: int = 1):
+        """走一段，回傳 (弧長, 朝向變化)。curvature 為 0 就是直走。
+
+        direction: +1 前進、−1 倒車。
+        ★ 角速度用 `abs(v) * curvature` —— 前進與後退**同號**，
+          與本專案其他發布端一致（韌體的 Vz_to_Akm_Angle 會自己從
+          R = Vx/Vz 算出方向盤該打哪邊）。
+        """
         p0 = self.pose()
         if p0 is None:
             self.get_logger().error("拿不到 odom")
             return None
         x0, y0, yaw0 = p0
-        self.get_logger().info(f"▶ {label}：v={SPEED:.2f} m/s，κ={curvature:+.3f} /m，{SEG_SEC:.0f} 秒")
+        v = SPEED * (1 if direction > 0 else -1)
+        self.get_logger().info(
+            f"▶ {label}：v={v:+.2f} m/s，κ={curvature:+.3f} /m，{SEG_SEC:.0f} 秒")
 
         msg = Twist()
-        msg.linear.x = SPEED
-        msg.angular.z = SPEED * curvature       # 阿克曼 ω = v·κ
+        msg.linear.x = v
+        msg.angular.z = abs(v) * curvature      # 見 docstring：不隨方向翻號
         end = time.monotonic() + SEG_SEC
         while time.monotonic() < end and rclpy.ok():
             self.pub.publish(msg)               # 韌體逾時 1.0 秒，必須持續送
@@ -184,8 +192,19 @@ def main() -> None:
     results = {}
     try:
         node.stop(2.0)
-        for label, k in (("① 直走", 0.0), ("② 左打滿", +kappa), ("③ 右打滿", -kappa)):
-            r = node.run_segment(label, k)
+        # ★ ①② 必須連續、中間不可搬動車子 —— 它們是決定性的對照組。
+        #   8/06 量到「前進 −13.5、倒車 −12.4 度/分（同號）」，但那兩次
+        #   中間車子被搬動、楔住、人工救車過，而搬動會改變轉向零位
+        #   （停車時 hold_steer_on_stop 不扳正前輪，搬動時輪子是自由的）。
+        #   所以那不是乾淨對照，不能用來下結論。這裡連著做才算數。
+        SEGMENTS = (
+            ("① 前進直走", 0.0, +1),
+            ("② 倒車直走", 0.0, -1),
+            ("③ 左打滿", +kappa, +1),
+            ("④ 右打滿", -kappa, +1),
+        )
+        for label, k, d in SEGMENTS:
+            r = node.run_segment(label, k, d)
             if r is None:
                 print("量測中斷")
                 break
@@ -208,29 +227,61 @@ def main() -> None:
         print("  %-10s 走 %.3f m，轉 %+.2f 度   實際半徑 %s" % (label, arc, deg, r_txt))
 
     print()
-    if "① 直走" in results:
-        arc, dyaw = results["① 直走"]
+    if "① 前進直走" in results:
+        arc, dyaw = results["① 前進直走"]
         if arc > 0.05:
             per_m = math.degrees(dyaw) / arc
-            # δ₀ = atan(L / R)，其中 1/R = dyaw/arc
             delta0 = math.degrees(math.atan(WHEELBASE * dyaw / arc))
-            print("零位偏移（只由①決定，不從②③反推）：")
+            print("零位偏移（只由①決定，不從③④反推）：")
             print("    %+.2f 度/m  ->  等效舵角偏移 %+.2f 度（%s）" % (
                 per_m, delta0, "偏左" if dyaw > 0 else "偏右"))
-            print("    ★ trim_rad_per_m 應該設 %+.4f 來抵消它" % (-dyaw / arc))
+            print("    ★ 若偏轉是舵角造成的，trim_rad_per_m 設 %+.4f 可抵消" % (-dyaw / arc))
 
-    if "② 左打滿" in results and "③ 右打滿" in results:
-        al, dl = results["② 左打滿"]
-        ar, dr = results["③ 右打滿"]
+    # ═══ 決定性判定：偏轉隨不隨行進方向翻號 ═══
+    if "① 前進直走" in results and "② 倒車直走" in results:
+        af, df = results["① 前進直走"]
+        ab, db = results["② 倒車直走"]
+        if af > 0.05 and ab > 0.05:
+            pf = math.degrees(df) / af
+            pb = math.degrees(db) / ab
+            print()
+            print("★★ 前進 vs 倒車 —— 這一項決定 trim 的公式對不對")
+            print("    前進  %+.2f 度/m   （走 %.2f m 轉 %+.2f 度）" % (pf, af, math.degrees(df)))
+            print("    倒車  %+.2f 度/m   （走 %.2f m 轉 %+.2f 度）" % (pb, ab, math.degrees(db)))
+            print()
+            if pf * pb > 0:
+                print("    -> **同號**：偏轉與行進方向無關。")
+                print("       但補償公式是  angular.z += trim_rad_per_m * linear.x")
+                print("       倒車時 linear.x 變號 -> **補償方向相反、誤差加倍**。")
+                print("       ⇒ 這解釋了「前進沒問題、後退有問題」。")
+                print()
+                print("       兩個修法：")
+                print("         (a) 補償改成 trim * abs(linear.x)  —— 治標，但立刻有效")
+                print("         (b) 找出真正的成因 —— 時間比例、與方向無關的偏轉")
+                print("             不是舵角偏移造成的（舵角偏移必定隨方向翻號）。")
+                print("             候選：EKF 融合、陀螺零偏殘留、輪徑不一致。")
+            else:
+                print("    -> **反號**：符合舵角偏移的模型")
+                print("       （阿克曼 ω = v·tan(δ)/L，v 變號則 ω 必然變號）。")
+                print("       現行的 trim * linear.x 公式**是對的**，")
+                print("       後退的問題要往別處找（例如倒車時的純追蹤前視、或脫困邏輯）。")
+
+    if "③ 左打滿" in results and "④ 右打滿" in results:
+        al, dl = results["③ 左打滿"]
+        ar, dr = results["④ 右打滿"]
         if abs(dl) > math.radians(1.0) and abs(dr) > math.radians(1.0):
             rl, rr = al / abs(dl), ar / abs(dr)
             asym = abs(rl - rr) / max(rl, rr) * 100.0
             print()
-            print("左右不對稱：R_left %.3f m vs R_right %.3f m  ->  %.1f%%" % (rl, rr, asym))
-            if min(rl, rr) < 0.75:
-                print("    ⚠ 其中一邊 < 0.75 m（韌體硬限）——那一邊的舵角被 Servo_min/max 削掉了，")
+            print("左右不對稱：R_left %.3f m  vs  R_right %.3f m  ->  %.1f%%" % (rl, rr, asym))
+            print("    參考：廠商韌體的角度→PWM 是二次映射，增益差 28%")
+            print("          （右滿舵 1052、中位 916、左滿舵 824 PWM/rad）")
+            print("          -> 左轉的實際反應比右轉弱約 22%。**這是韌體特性，不是故障。**")
+            if min(rl, rr) < 0.76:
+                print("    ⚠ 其中一邊 < 0.76 m —— 那一邊的舵角被 Servo_min/max 削掉了")
+                print("      （右滿舵的 1014.10 PWM 被 Servo_min=1020 截斷，實際只到 0.7584 m）。")
                 print("      這個值代表『硬體極限』而不是『指令對應的角度』。")
-            print("    ★ 不要用這兩個值去反推零位 —— 被硬限截斷的資料推不出中位（8/06 就錯在這）。")
+            print("    ★ 不要用這兩個值反推零位 —— 被硬限截斷的資料推不出中位（8/06 就錯在這）。")
     print("=" * 68)
 
     node.destroy_node()
