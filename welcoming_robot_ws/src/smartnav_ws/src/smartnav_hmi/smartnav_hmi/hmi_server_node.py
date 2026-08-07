@@ -2142,7 +2142,7 @@ class HmiServerNode(Node):
             "detect": ["llm_service"],
             "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_llm", "llm_service"],
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_llm", "llm_service"],
-            "start_hint": "連遠端 Ollama（預設 192.168.11.101:11434），不是跑在這台 Pi 上",
+            "start_hint": "連遠端 Ollama（預設 192.168.137.1:11434 = 筆電），不是跑在這台 Pi 上",
         },
         "voice_trigger": {
             "label": "語音喚醒",

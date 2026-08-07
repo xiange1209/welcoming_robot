@@ -102,8 +102,12 @@ class LLMServiceNode(Node):
         super().__init__("llm_service_node")
 
         # 宣告與讀取參數
+        # 192.168.137.1 是 Windows 行動熱點 (ICS) 的閘道，也就是跑 Ollama 的筆電本身；
+        # Pi 在同一個熱點下拿到的是 192.168.137.106。舊值 192.168.11.101 是別的網段，連不到。
+        # ★ 沒有 launch 檔會覆寫這個值 —— HMI 經 run_node_cc.sh 直接 `ros2 run` 啟動，
+        #   參數來源鏈上只有這一環，所以這個預設值就是實際生效的值。
         self.ollama_base_url = (
-            self.declare_parameter("ollama_base_url", "http://192.168.11.101:11434").get_parameter_value().string_value
+            self.declare_parameter("ollama_base_url", "http://192.168.137.1:11434").get_parameter_value().string_value
         )
         self.model_name = self.declare_parameter("model_name", "orieg/gemma3-tools").get_parameter_value().string_value
         self.temperature = self.declare_parameter("temperature", 0.0).get_parameter_value().double_value
