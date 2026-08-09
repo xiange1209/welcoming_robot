@@ -5,7 +5,7 @@
 # 車子還會照最後一則指令跑滿 1 秒（0.15 m/s 下約 15 公分）。
 # 這裡在殺掉之後**主動補送零速**，把那 1 秒縮到幾十毫秒。
 #
-# 用 /proc 比對 argv，不用 pkill -f（這個專案被字串比對誤判過八次）。
+# 用 /proc 比對 argv，不用 pkill -f（這個專案被字串比對誤判過七次）。
 source /home/user/maprun/env.sh 2>/dev/null
 python3 - <<'PY'
 import os, signal

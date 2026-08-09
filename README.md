@@ -53,7 +53,13 @@
 | AMCL 掃描過濾 | 地圖吻合度 71% → **90%** |
 | 實機抓出並修復的缺陷 | 10 個（靜態檢查全都看不出來） |
 
-**未解**：門口窄轉角（走廊淨寬 0.967 m）自動脫困未成功。
+**未解**：門口窄轉角（**該處**淨寬 0.967 m；走廊本身 0.99 m）自動脫困未成功。
+
+> 2026-08-06 補充：人示範的三點轉向**也可能重現不了**——實測有一段需要
+> `R = 0.688 m`，低於韌體硬限 0.750 m，控制器照 0.80 箝制做不出來。
+> 存檔時已加入 0.76 m 的可行性檢查並在重播前攔截。
+> 目前**穩定通過窄轉角的組合是 SmacPlannerHybrid 規劃 + 純追蹤執行**。
+
 現行對策是錄製教導路徑時由人在轉角示範三點轉向：先把
 `merge_min_segment_m` 降到 0.15，否則短於預設門檻 0.35 m 的示範動作
 會在存檔時被當成假折返合併掉。
@@ -69,15 +75,16 @@ MPPI 控制器的預測視野只有 `30 × 0.1 × 0.25 = 0.75 m`，
 重播時用純追蹤跟隨。
 
 ```bash
-# 錄製
-ros2 service call /path_teach_cc/record smartnav_msgs/srv/RecordPath \
-  "{action: 0, name: '大廳到貴賓室'}"      # 0=START，開始遙控車子
-ros2 service call /path_teach_cc/record smartnav_msgs/srv/RecordPath \
-  "{action: 1}"                            # 1=STOP，存檔
+# 錄製（★ 服務在根命名空間，不是 /path_teach_cc/...）
+ros2 service call /record_path smartnav_msgs/srv/RecordPath \
+  "{action: 0}"                                     # 0=START，開始遙控車子
+ros2 service call /record_path smartnav_msgs/srv/RecordPath \
+  "{action: 1, name: '大廳到貴賓室'}"                # 1=STOP，存檔（name 在這裡才生效）
 
 # 重播
-ros2 action send_goal /path_teach_cc/follow smartnav_msgs/action/FollowTaughtPath \
-  "{path_id: 'path_xxxx', speed: 0.15, reverse: false}"
+ros2 action send_goal /follow_taught_path smartnav_msgs/action/FollowTaughtPath \
+  "{path_id: 'path_xxxx', reverse: false, speed_scale: 1.0}"
+#   speed_scale 是倍率不是絕對速度；實際速度由節點參數 follow_speed 決定（預設 0.15 m/s）
 ```
 
 **搜尋 vs 示範**：MPPI 是「讓機器在所有可能軌跡裡搜出一條」，
@@ -108,7 +115,7 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
    type hash 會變，只重建部分套件的症狀是「節點都在跑、topic list 看得到，
    但訂閱端一則訊息都收不到」，而且**不會有任何錯誤訊息**。
 
-2. **不要用 `pkill -f`。** 字串比對誤判過八次，最嚴重一次殺掉 IMU 補償節點
+2. **不要用 `pkill -f`。** 字串比對誤判過七次，最嚴重一次殺掉 IMU 補償節點
    導致兩次建圖全毀，而健檢只查 `/scan` 與 `/odom` 所以完全沒發現。
    用 `maprun/kill_node_cc.sh`。
 
