@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from geometry_msgs.msg import Pose, PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.srv import GetState
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from pydantic import BaseModel
 from rcl_interfaces.msg import Parameter, ParameterDescriptor, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
@@ -268,6 +268,14 @@ class HmiState:
             "started_at": time.time(),
             # llm_service_node 以 latched 話題發布，LLM 沒啟動時就一直是空字串
             "llm_model": "",
+            # ── 上方列的延伸資訊（2026-08-10 加）──────────────
+            # 全部維持 None 代表「沒有資料」，前端就顯示 —，
+            # 這樣底盤沒跑的時候不會謊報成 0。
+            "charging": None,        # 底盤 robot_charging_flag
+            "charge_current": None,  # 底盤 robot_charging_current（安培）
+            "speed": None,           # /odom 的前進速度（m/s，帶正負號）
+            "cpu_temp": None,        # Pi 核心溫度（°C）——導航時會逼近降頻門檻
+            "cpu_load": None,        # 1 分鐘平均負載；Pi 4 是四核，> 4 就是滿載
         }
         self.map_meta: Optional[Dict[str, Any]] = None
         self.robot_pose: Optional[Dict[str, float]] = None
@@ -800,6 +808,9 @@ class HmiServerNode(Node):
         self._pose_lock = threading.Lock()
         # 電壓節流用（見 _voltage_cb）
         self._last_voltage_at = 0.0
+        # 充電電流與車速也各自節流到 1 Hz（見對應 callback）
+        self._last_charge_cur_at = 0.0
+        self._last_speed_at = 0.0
 
         self._job_counter = itertools.count(1)
         # 進行中的動作 goal handle 登記簿，供取消使用
@@ -850,6 +861,13 @@ class HmiServerNode(Node):
         # 而且 HMI 忙起來時 RELIABLE 會逼 DDS 重送我們根本不看的舊資料。
         # （BEST_EFFORT 訂閱者相容於 RELIABLE 發布者，底盤那端不用改。）
         self.create_subscription(Float32, "PowerVoltage", self._voltage_cb, sensor_qos, callback_group=cb)
+        # 充電狀態也由底盤發布，跟電壓同一條線：充電中電壓會被充電器拉高，
+        # 只看電壓會把「正在充電」誤讀成「電池很飽」，所以兩個要一起顯示。
+        self.create_subscription(Bool, "robot_charging_flag", self._charging_cb, sensor_qos, callback_group=cb)
+        self.create_subscription(Float32, "robot_charging_current", self._charge_current_cb, sensor_qos, callback_group=cb)
+        # 車速取自 odom。上方列要回答的是「車子現在到底有沒有在動」——
+        # 這在脫困、防撞死鎖那類問題上是第一個要看的量（發了指令但車不動）。
+        self.create_subscription(Odometry, "odom", self._odom_speed_cb, sensor_qos, callback_group=cb)
 
         # ── 發布 ──────────────────────────────────────────
         # 網頁打字送出的文字進 user_text，與語音辨識、人臉事件走同一條路進 LLM
@@ -1521,6 +1539,42 @@ class HmiServerNode(Node):
             return
         self._last_voltage_at = now
         self.state.set_system(voltage=round(float(msg.data), 2))
+
+    def _charging_cb(self, msg: Bool) -> None:
+        """充電旗標。只在真的變了才寫，否則等於每則都推播一次整包狀態。"""
+        val = bool(msg.data)
+        if self.state.system.get("charging") is not val:
+            self.state.set_system(charging=val)
+
+    def _charge_current_cb(self, msg: Float32) -> None:
+        now = time.monotonic()
+        if now - self._last_charge_cur_at < 1.0:
+            return
+        self._last_charge_cur_at = now
+        self.state.set_system(charge_current=round(float(msg.data), 2))
+
+    def _odom_speed_cb(self, msg: Odometry) -> None:
+        """車速 + 順手抄 CPU 溫度與負載
+
+        odom 是 20 Hz，這裡節流到 1 Hz。CPU 兩個量沒有自己的話題來源，
+        搭這班車讀 /sys 與 getloadavg 最省事——沒有底盤時它們也就跟著沒有，
+        而沒有底盤的時候本來就不需要盯 CPU。
+        """
+        now = time.monotonic()
+        if now - self._last_speed_at < 1.0:
+            return
+        self._last_speed_at = now
+        fields: Dict[str, Any] = {"speed": round(float(msg.twist.twist.linear.x), 3)}
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as fh:
+                fields["cpu_temp"] = round(int(fh.read().strip()) / 1000.0, 1)
+        except (OSError, ValueError):
+            pass
+        try:
+            fields["cpu_load"] = round(os.getloadavg()[0], 2)
+        except OSError:
+            pass
+        self.state.set_system(**fields)
 
     def access_urls(self) -> List[str]:
         """平板可以打開的網址清單

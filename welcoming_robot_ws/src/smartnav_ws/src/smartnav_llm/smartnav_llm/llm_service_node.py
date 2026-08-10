@@ -38,10 +38,14 @@ from smartnav_llm import web_tools
 class RosStreamHandler(BaseCallbackHandler):
     """自訂串流處理器：將 LLM 回應的 Token 即時發布到 ROS 2 Topic"""
 
-    def __init__(self, stream_publisher, speech_text_publisher):
+    def __init__(self, stream_publisher, speech_text_publisher, convert=None):
         super().__init__()
         self.stream_publisher = stream_publisher
         self.speech_text_publisher = speech_text_publisher
+        # 簡轉繁。逐 token 轉沒有意義（一個字轉一個字），所以只在
+        # 「整句」送出去的時候轉——畫面上的串流字幕會短暫是簡體，
+        # 但送進 TTS 與最終回覆的都是繁體。
+        self.convert = convert or (lambda s: s)
         self.split_pattern = re.compile(r"([,.\!?;:，。！？；：\n])")
         self.clean_pattern = re.compile(r"[^\w\u4e00-\u9fa5\s]|[_-]")
         self.buffer = ""
@@ -64,7 +68,7 @@ class RosStreamHandler(BaseCallbackHandler):
             if self.split_pattern.match(item):
                 speech_sentence = " ".join(self.clean_pattern.sub("", self.current_sentence).split())
                 if speech_sentence:
-                    self.speech_text_publisher.publish(String(data=speech_sentence))
+                    self.speech_text_publisher.publish(String(data=self.convert(speech_sentence)))
                 self.current_sentence = ""
             else:
                 self.current_sentence += item
@@ -72,7 +76,7 @@ class RosStreamHandler(BaseCallbackHandler):
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         remaining_text = " ".join(self.clean_pattern.sub("", self.current_sentence + self.buffer).split())
         if remaining_text:
-            self.speech_text_publisher.publish(String(data=remaining_text))
+            self.speech_text_publisher.publish(String(data=self.convert(remaining_text)))
         self.buffer = ""
         self.current_sentence = ""
 
@@ -109,8 +113,29 @@ class LLMServiceNode(Node):
         self.ollama_base_url = (
             self.declare_parameter("ollama_base_url", "http://192.168.137.1:11434").get_parameter_value().string_value
         )
-        self.model_name = self.declare_parameter("model_name", "orieg/gemma3-tools").get_parameter_value().string_value
+        # 2026-08-10 實測換模型：orieg/gemma3-tools 是 11.8B，「你好」要 117 秒，
+        # 而且會為了打招呼誤叫 query_datetime_tool（回你日期而不是回你好）。
+        # qwen2.5:3b 同樣四題平均 4.1 秒（1.5~7.6，7.6 是模型冷載入那次），
+        # 工具觸發也正常：「你好」純閒聊、「現在幾點」才叫 datetime。
+        # 第 4 週驗收要端到端 < 6 秒，只有 3b 這條線達得到。
+        self.model_name = self.declare_parameter("model_name", "qwen2.5:3b").get_parameter_value().string_value
         self.temperature = self.declare_parameter("temperature", 0.0).get_parameter_value().double_value
+
+        # ── 簡體轉繁體 ───────────────────────────────────
+        # 系統提示詞早就寫了「回覆一律使用繁體中文」，但小模型會忽略它：
+        # 2026-08-10 實測 qwen2.5:3b 回「下午 3 点 57 分」「柜台位置」。
+        # 提示詞是請求，轉換才是保證，所以在輸出端強制轉一次。
+        # s2twp = 簡體 → 繁體（台灣正體，含用詞轉換）：柜台 → 櫃檯、鼠标 → 滑鼠。
+        # ★ 同樣的問題 ASR 也有（sherpa-onnx 的中文模型輸出簡體），
+        #   那一端要各自再轉一次，不要指望這裡幫它轉。
+        self._cc = None
+        if self.declare_parameter("to_traditional", True).get_parameter_value().bool_value:
+            try:
+                import opencc
+                self._cc = opencc.OpenCC("s2twp")
+                self.get_logger().info("✓ 簡轉繁已啟用（s2twp）")
+            except Exception as exc:                      # 沒裝就照原樣輸出，不要讓節點起不來
+                self.get_logger().warning(f"opencc 不可用，略過簡轉繁：{exc}")
 
         # 銀行知識庫與即時資訊查詢參數
         self.enable_rag = self.declare_parameter("enable_rag", True).get_parameter_value().bool_value
@@ -490,7 +515,7 @@ class LLMServiceNode(Node):
         self.get_logger().info(f"✓ 已載入 {len(self.tools_map)} 個工具: {', '.join(self.tools_map)}")
 
         # 初始化模型並綁定工具
-        stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub)
+        stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub, self._to_traditional)
         raw_llm = ChatOllama(
             base_url=self.ollama_base_url,
             model=self.model_name,
@@ -511,6 +536,15 @@ class LLMServiceNode(Node):
 
         # 定義整合工具的 Agent Chain，將提示模板與工具調用結合起來
         self.agent_chain = RunnablePassthrough() | self.prompt_template | self.llm_with_tools
+
+    def _to_traditional(self, text: str) -> str:
+        """把模型吐出來的簡體字轉成台灣正體。轉換器不可用時原樣回傳。"""
+        if not self._cc or not text:
+            return text
+        try:
+            return self._cc.convert(text)
+        except Exception:
+            return text
 
     def user_text_callback(self, msg: String) -> None:
         """處理使用者輸入"""
@@ -575,7 +609,7 @@ class LLMServiceNode(Node):
 
                 # 檢查 LLM 是否需要叫工具
                 if not response.tool_calls:
-                    final_reply = str(response.content)
+                    final_reply = self._to_traditional(str(response.content))
                     self.get_logger().info(f"🤖 Agent 最終決策回應: {final_reply}")
 
                     with self.memory_lock:

@@ -59,7 +59,9 @@
   #banner.vip   #who .tag { background: var(--gold); color: #2a1e00; }
   #banner.admin #who .tag { background: var(--accent); color: #04121f; }
   #sub { color: var(--muted); font-size: 13px; }
-  #stats { margin-left: auto; display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+  #stats { margin-left: auto; display: flex; gap: 14px; font-size: 13px; color: var(--muted); align-items: center; }
+  /* 需要注意的數值（低電壓、CPU 過熱或滿載）轉紅，其餘維持灰色不搶注意力 */
+  #stats .warn { color: var(--red); font-weight: 600; }
   .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--red); }
   .dot.on { background: var(--green); }
 
@@ -199,22 +201,20 @@
   #toast.bad { border-color: #6b2b2b; background: #3a1c1c; }
 
   /* ── 全域緊急停止 ─────────────────────────────────
-     96x96 遠大於觸控最小建議的 44x44：需要它的時候操作者正盯著車子
-     而不是螢幕，要能不用看就按到。固定右下角，不隨分頁切換消失。
+     2026-08-10 改版：原本是固定在右下角的 96x96 大圓鈕，但它會蓋住底下的
+     對話與地圖內容，在平板上尤其擋。改成放進上方列、緊接在管理者按鈕右邊，
+     外型與尺寸跟它一致，只用紅色區分——同一排、永遠在畫面上、但不覆蓋任何東西。
      touch-action:manipulation 關掉雙擊縮放的 300ms 延遲。 */
   #estop {
     display: none;
-    position: fixed; right: 18px; bottom: 18px;
-    width: 96px; height: 96px; border-radius: 50%;
     background: #b3261e; color: #fff;
-    border: 4px solid #ff8a80;
-    font-size: 17px; font-weight: 700; line-height: 1.25;
-    font-family: inherit; cursor: pointer; z-index: 60;
-    box-shadow: 0 4px 14px rgba(0,0,0,.5);
+    border: 1px solid #ff8a80; border-radius: 7px;
+    padding: 6px 12px; font-size: 13px; font-weight: 600;
+    font-family: inherit; cursor: pointer; white-space: nowrap;
     touch-action: manipulation; user-select: none;
   }
-  body.admin #estop { display: block; }
-  #estop:active { background: #7f1d1a; transform: scale(.94); }
+  body.admin #estop { display: inline-block; }
+  #estop:active { background: #7f1d1a; }
   /* 送出中：變暗並擋住重複點擊，但不改變大小以免手指跟丟 */
   #estop.busy { opacity: .55; pointer-events: none; }
   /* 剛停過：閃一下讓操作者確認「真的按到了」 */
@@ -319,8 +319,13 @@
     <span><span class="dot" id="wsdot"></span> 連線</span>
     <span id="fps">相機 —</span>
     <span id="volt">電壓 —</span>
+    <span id="speed">車速 —</span>
+    <span id="cpu">CPU —</span>
     <span id="mapname">地圖 —</span>
     <button id="adminbtn">管理者登入</button>
+    <!-- 緊急停止。2026-08-10 從右下角的浮動大圓鈕改到這裡：浮動版蓋住畫面內容，
+         而且在平板上會壓到對話與地圖。改成跟「登出」同一排、同樣大小，只用顏色區分。 -->
+    <button id="estop" title="立即停止所有動作">緊急停止</button>
   </div>
 </div>
 
@@ -362,7 +367,17 @@
     <div class="row" style="margin-top:10px">
       <input id="sayinput" placeholder="輸入要對機器人說的話…" style="flex:1" autocomplete="off">
       <button class="btn primary" id="saybtn">送出</button>
+      <button class="btn" id="ttsbtn" title="用這台裝置的喇叭唸出機器人的回覆">🔇 朗讀</button>
       <button class="btn danger" id="clearchatbtn">清除對話</button>
+    </div>
+    <!-- 朗讀設定。聲音清單來自這台裝置的作業系統，不是機器人，所以平板換了清單就會不一樣 -->
+    <div class="row" id="ttsrow" style="margin-top:8px; display:none; align-items:center; gap:8px; flex-wrap:wrap">
+      <span class="meta">聲音</span>
+      <select id="ttsvoice" style="flex:1; min-width:150px"></select>
+      <span class="meta">語速</span>
+      <input type="range" id="ttsrate" min="0.6" max="1.6" step="0.05" style="width:110px">
+      <span class="meta" id="ttsratev">1.05×</span>
+      <button class="btn" id="ttstest">試聽</button>
     </div>
     <div class="meta" id="llmmodel" style="margin-top:8px">模型 —</div>
   </div>
@@ -631,22 +646,24 @@
     <h3>語音測試（跳過 LLM 直接播報）</h3>
     <div class="row">
       <input id="speakinput" style="flex:1" value="歡迎光臨，我是智慧銀行迎賓機器人">
-      <button class="btn" id="speakbtn">播報</button>
+      <button class="btn primary" id="speakbtn">用這台裝置播報</button>
+      <button class="btn" id="speakrosbtn">走 ROS 語音鏈</button>
     </div>
     <p class="meta" style="line-height:1.8; margin-top:14px">
-      這裡送出的文字會直接進 TTS 播報，不經過 LLM，用來單獨確認語音鏈路是否正常。<br>
-      若要測整條對話流程（語音辨識 → LLM → 播報），請用「迎賓」頁下方的對話框。
+      <b>兩條路不一樣，按下去沒反應多半是按到第二條：</b><br>
+      ①「用這台裝置播報」——走瀏覽器內建的 <code>speechSynthesis</code>，
+      也就是「迎賓」頁那顆朗讀鈕用的同一套。<b>車上沒有喇叭</b>
+      （唯一的音訊裝置是 Astra S 的麥克風，只能錄不能放），所以聲音是從
+      <b>你手上這台平板</b>出來的。這條現在就能用。<br>
+      ②「走 ROS 語音鏈」——發到 <code>speech_text</code> 話題，需要
+      <code>speech_synthesizer_node</code> 在跑、而且 sherpa-onnx 的 TTS 模型已下載。
+      2026-08-10 現況：<b>兩者都還沒有，所以這條按了不會有聲音</b>，這是預期行為。
     </p>
   </div>
 </div>
 
 <div id="toast"></div>
 
-<!-- 全域緊急停止。
-     刻意做成固定在右下角、不隨分頁切換消失、且尺寸遠大於一般按鈕：
-     需要它的時候操作者正盯著車子而不是螢幕，必須不用看就按得到。
-     只有管理者登入後才出現（未登入本來就不能讓車子動）。 -->
-<button id="estop" title="立即停止所有動作">緊急<br>停止</button>
 
 <script>
 "use strict";
@@ -1532,7 +1549,25 @@ function render(s) {
   // 系統列
   const sys = s.system || {};
   $("fps").textContent  = "相機 " + (sys.camera_fps ? sys.camera_fps + " fps" : "—");
-  $("volt").textContent = "電壓 " + (sys.voltage != null ? sys.voltage + " V" : "—");
+  // 電壓與充電狀態要一起看：充電中電壓會被充電器拉高，
+  // 只看電壓會把「插著電」誤讀成「電池很飽」。
+  let vtxt = "電壓 " + (sys.voltage != null ? sys.voltage + " V" : "—");
+  if (sys.charging) {
+    vtxt += sys.charge_current ? ` ⚡充電 ${sys.charge_current}A` : " ⚡充電中";
+  }
+  $("volt").textContent = vtxt;
+  $("volt").classList.toggle("warn", sys.voltage != null && !sys.charging && sys.voltage < 22.0);
+
+  // 車速：脫困、防撞死鎖那類問題的第一個問診點是「有下指令但車不動」
+  $("speed").textContent = "車速 " +
+    (sys.speed != null ? (Math.abs(sys.speed) < 0.01 ? "靜止" : sys.speed.toFixed(2) + " m/s") : "—");
+
+  // Pi 4 四核：負載 > 4 就是滿載；溫度 80°C 開始降頻，導航跑起來很接近
+  const ct = sys.cpu_temp, cl = sys.cpu_load;
+  $("cpu").textContent = "CPU " +
+    (ct != null ? ct + "°C" : "—") + (cl != null ? " / 負載 " + cl : "");
+  $("cpu").classList.toggle("warn", (ct != null && ct >= 75) || (cl != null && cl >= 4.0));
+
   const m = mapsCache.find((x) => x.map_id === sys.map_id);
   $("mapname").textContent = "地圖 " + (m ? m.map_name : (sys.map_id || "—"));
   // 空字串代表 llm_service_node 還沒啟動（模型名稱是 latched 話題，一啟動就會收到）
@@ -1567,10 +1602,115 @@ function statsLine(st) {
   return parts.join("");
 }
 
+// ── 瀏覽器朗讀 ─────────────────────────────────────
+// 車上沒有喇叭、也沒有音訊輸出鏈（唯一的音訊裝置是 Astra S 的麥克風，只能錄不能放），
+// 所以「機器人開口說話」改由看著畫面的這台平板自己唸。用瀏覽器內建的
+// speechSynthesis：不裝套件、不連外、離線也能唸。
+const tts = {
+  on: localStorage.getItem("tts") === "1",
+  spoken: new Set(),   // 已唸過的內容，避免每次重繪都重唸
+  seeded: false,       // 開頁載入的歷史對話只登記、不朗讀
+  voice: null,
+  rate: parseFloat(localStorage.getItem("ttsRate") || "1.05"),
+  wantURI: localStorage.getItem("ttsVoice") || "",   // 使用者挑過的聲音
+};
+const ttsOK = "speechSynthesis" in window;
+
+// 偏好的聲音名稱（依序試）。★ 這份清單只能「優先選用」不能「保證」——
+// 聲音是裝置作業系統提供的，不是機器人提供的，換一台平板清單就不一樣。
+// 美嘉／Meijia 是 Apple 的 zh-TW 內建音；Google 系列在 Android 上常見。
+// 要真正做到跨裝置統一，得改成在 Pi 或筆電合成音檔再串給瀏覽器播，那是另一件工程。
+const TTS_PREFERRED = [/美[嘉佳]/, /Meijia/i, /Google.*(國語|Chinese \(Taiwan\))/i, /Hanhan/i];
+
+/** 依偏好挑一個聲音：使用者選過的最優先，其次偏好清單，再其次台灣中文、任何中文 */
+function ttsPickVoice() {
+  const vs = speechSynthesis.getVoices();
+  if (tts.wantURI) {
+    const picked = vs.find((v) => v.voiceURI === tts.wantURI);
+    if (picked) return picked;
+  }
+  for (const re of TTS_PREFERRED) {
+    const hit = vs.find((v) => re.test(v.name) && /^(zh|cmn)/i.test(v.lang));
+    if (hit) return hit;
+  }
+  return vs.find((v) => /^zh[-_]TW/i.test(v.lang))
+      || vs.find((v) => /^zh/i.test(v.lang))
+      || null;
+}
+
+/** 把這台裝置有的聲音填進選單。中文排前面，其餘仍列出（有些系統中文標成 cmn） */
+function ttsFillVoices() {
+  const sel = $("ttsvoice");
+  if (!sel || !ttsOK) return;
+  const vs = speechSynthesis.getVoices();
+  if (!vs.length) return;                       // 還沒載入，等 onvoiceschanged 再來
+  const zh = vs.filter((v) => /^(zh|cmn|yue)/i.test(v.lang));
+  const other = vs.filter((v) => !/^(zh|cmn|yue)/i.test(v.lang));
+  sel.innerHTML = "";
+  const add = (v) => {
+    const o = document.createElement("option");
+    o.value = v.voiceURI;
+    o.textContent = `${v.name}（${v.lang}）`;
+    sel.appendChild(o);
+  };
+  zh.forEach(add);
+  if (zh.length && other.length) {
+    const sep = document.createElement("option");
+    sep.disabled = true; sep.textContent = "── 其他語言 ──";
+    sel.appendChild(sep);
+  }
+  other.forEach(add);
+  if (!tts.voice) tts.voice = ttsPickVoice();
+  if (tts.voice) sel.value = tts.voice.voiceURI;
+}
+
+// 語音清單是非同步載入的，第一次呼叫幾乎一定是空陣列
+if (ttsOK) speechSynthesis.onvoiceschanged = () => { tts.voice = ttsPickVoice(); ttsFillVoices(); };
+
+function ttsSay(text) {
+  if (!ttsOK || !text) return;
+  if (!tts.voice) tts.voice = ttsPickVoice();
+  const u = new SpeechSynthesisUtterance(text);
+  if (tts.voice) u.voice = tts.voice;
+  u.lang = (tts.voice && tts.voice.lang) || "zh-TW";
+  u.rate = tts.rate;
+  speechSynthesis.cancel();   // 上一句還沒唸完就被新回覆蓋過時不要排隊，直接換
+  speechSynthesis.speak(u);
+}
+
+/** 只唸「新出現的、已完成的」機器人訊息；串流中的 ghost 不唸，否則會逐字重唸 */
+function ttsOnChat(items) {
+  const done = items.filter((i) => i.role === "robot" && !i.ghost);
+  if (!done.length) return;
+  if (!tts.seeded) {
+    for (const i of done) tts.spoken.add(i.text);
+    tts.seeded = true;
+    return;
+  }
+  const last = done[done.length - 1].text;
+  if (tts.spoken.has(last)) return;
+  tts.spoken.add(last);
+  if (tts.on) ttsSay(last);
+}
+
+function ttsSyncBtn() {
+  const b = $("ttsbtn");
+  if (!b) return;
+  if (!ttsOK) { b.textContent = "朗讀不支援"; b.disabled = true; return; }
+  b.textContent = tts.on ? "🔊 朗讀中" : "🔇 朗讀";
+  b.classList.toggle("primary", tts.on);
+  const row = $("ttsrow");
+  if (row) row.style.display = tts.on ? "flex" : "none";
+  const r = $("ttsrate"), rv = $("ttsratev");
+  if (r) r.value = tts.rate;
+  if (rv) rv.textContent = tts.rate.toFixed(2) + "×";
+}
+
 function renderChat(s) {
   const box = $("chat");
   if (Array.isArray(s.messages)) cachedMessages = s.messages;
   const items = cachedMessages.slice();
+  ttsOnChat(items);
   // 串流中的暫時訊息。後端會把 token 累積起來，所以這裡是逐字長出來的完整段落
   if (s.llm_streaming) items.push({role: "robot", text: s.llm_streaming, ghost: true});
   if (s.partial_text)  items.push({role: "user",  text: s.partial_text,  ghost: true});
@@ -1640,6 +1780,36 @@ function sendSay() {
 $("saybtn").onclick = sendSay;
 $("sayinput").onkeydown = (e) => { if (e.key === "Enter") sendSay(); };
 
+$("ttsbtn").onclick = () => {
+  if (!ttsOK) return;
+  tts.on = !tts.on;
+  localStorage.setItem("tts", tts.on ? "1" : "0");
+  // ★ iOS/Safari 規定第一次發聲必須發生在使用者手勢的呼叫堆疊裡，
+  //   否則之後所有程式主動觸發的朗讀都會被靜默丟棄。這一句就是那把鑰匙。
+  if (tts.on) { ttsFillVoices(); ttsSay("朗讀已開啟"); } else speechSynthesis.cancel();
+  ttsSyncBtn();
+};
+
+$("ttsvoice").onchange = (e) => {
+  tts.wantURI = e.target.value;
+  localStorage.setItem("ttsVoice", tts.wantURI);
+  tts.voice = ttsPickVoice();
+  ttsSay("這是這個聲音的效果");
+};
+
+$("ttsrate").oninput = (e) => {
+  tts.rate = parseFloat(e.target.value);
+  localStorage.setItem("ttsRate", String(tts.rate));
+  $("ttsratev").textContent = tts.rate.toFixed(2) + "×";
+};
+// 放開才試聽——拖曳中每動一格就唸一次會吵死
+$("ttsrate").onchange = () => ttsSay("語速調整後聽起來像這樣");
+
+$("ttstest").onclick = () => ttsSay("您好，歡迎光臨。請問需要我帶您過去嗎？");
+
+ttsSyncBtn();
+if (ttsOK) ttsFillVoices();
+
 $("clearchatbtn").onclick = () => {
   if (!confirm("確定要清除目前所有對話嗎？機器人的對話記憶也會一併清空。")) return;
   post("/api/chat/clear").then((r) => {
@@ -1652,9 +1822,25 @@ $("clearchatbtn").onclick = () => {
   });
 };
 
+// ① 瀏覽器播報。這是目前唯一真的會出聲的路徑（車上沒有喇叭）。
 $("speakbtn").onclick = () => {
   const text = $("speakinput").value.trim();
-  if (text) post("/api/speak", {text}).then((r) => toast(r.message, !r.success));
+  if (!text) return;
+  if (!ttsOK) { toast("這個瀏覽器不支援語音合成", true); return; }
+  ttsFillVoices();          // 第一次按的時候聲音清單可能還沒載入
+  ttsSay(text);
+  toast("已用這台裝置播報（音量與靜音鍵要開）");
+};
+
+// ② 原本的 ROS 語音鏈。留著是為了之後 speech_synthesizer_node 上線時能單獨驗它，
+//    但現在按下去不會有聲音——把原因講清楚，不要讓人以為是網頁壞了。
+$("speakrosbtn").onclick = () => {
+  const text = $("speakinput").value.trim();
+  if (!text) return;
+  post("/api/speak", {text}).then((r) => {
+    toast(r.success ? "已發到 speech_text —— 沒聲音代表 speech_synthesizer_node 沒在跑"
+                    : r.message, !r.success);
+  });
 };
 
 // ── 地圖 ───────────────────────────────────────────

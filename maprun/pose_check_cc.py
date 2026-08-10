@@ -165,6 +165,33 @@ class PoseCheck(Node):
                 hit += 1
         return (hit / total if total else 0.0), total
 
+    def raycast_fan(self, grid, x: float, y: float, theta: float):
+        """對 ±BEAM_HALF_DEG 的扇形射一把射線，取最小值。
+
+        ★ 2026-08-10 修：原本地圖端只射「一條」沿朝向的射線，實測端卻取
+        「±10 度扇區的最小值」——兩邊量的不是同一件事。
+
+        在 0.99 m 寬的走廊裡這個不對稱是致命的：離軸 10 度打到側牆的距離是
+        0.5/sin(10°) ≈ 2.9 m，而正前方可能有 5.4 m。於是工具會報出
+        「地圖 5.375 / 實測 2.480 / 差 2.895 ★超標」——但定位其實完全正確，
+        它量到的是走廊有多窄，不是定位差多少。實測那天正前方地圖 5.375、
+        雷射 5.40，只差 2.5 公分。
+
+        （這與 8/06 那個「繞障觸發端用 _arc_clearance、解決端用
+        _forward_clearance」是同一類缺陷：比較兩個量之前先確認它們同單位、
+        同定義。）
+        """
+        half = math.radians(BEAM_HALF_DEG)
+        # 用與雷達相近的角解析度掃過扇形，1 度夠了（雷達 450 線約 0.8 度）
+        steps = max(2, int(math.degrees(half) * 2) + 1)
+        best = None
+        for i in range(steps):
+            a = theta - half + (2 * half) * i / (steps - 1)
+            d = self.raycast(grid, x, y, a)
+            if d is not None and (best is None or d < best):
+                best = d
+        return best
+
     # ── 條件 B：前後淨空 ─────────────────────────────────
     def measured_clearance(self, scan, forward: bool) -> float:
         """從掃描取車頭（或車尾）方向 ±BEAM_HALF_DEG 扇區的最小距離。"""
@@ -215,7 +242,7 @@ class PoseCheck(Node):
         for label, forward in (("車頭", True), ("車尾", False)):
             theta = yaw if forward else yaw + math.pi
             bumper = FRONT_BUMPER if forward else REAR_BUMPER
-            map_d = self.raycast(grid, lx, ly, theta)
+            map_d = self.raycast_fan(grid, lx, ly, theta)
             meas_d = self.measured_clearance(scan, forward)
             if map_d is None or meas_d == float("inf"):
                 rows.append((label, map_d, meas_d, None))

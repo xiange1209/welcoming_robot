@@ -202,7 +202,51 @@ class PathTeachNode(Node):
         self.declare_parameter("lookahead_min_m", 0.30)
         self.declare_parameter("lookahead_max_m", 0.80)
         self.declare_parameter("lookahead_k", 1.2)      # L_d = k*|v| + min
-        self.declare_parameter("min_turning_radius", 0.80)
+        # ★★ 2026-08-10：最小轉彎半徑分左右，不是一個數字 ★★
+        #
+        # 這台車左右轉的能力差 26%，而且是**設計必然、不是故障**。
+        # 8/06 直接量（不是反推）：
+        #     R_right = 0.751 m   右打滿舵 23.21 度   <- 正好撞韌體硬限
+        #     R_left  = 0.944 m   左打滿舵 18.83 度
+        #
+        # 韌體原始碼給的三個成因（`廠商原始碼分析_阿克曼控制鏈.md`）：
+        #   1. 阿克曼幾何：AngleR 是**右前輪**。右轉時它是內輪（0.50 rad），
+        #      左轉時是外輪（0.34 rad）——同一個舵機，兩種行程。
+        #   2. PWM 映射不對稱：右滿舵 1052 / 左滿舵 824 PWM/rad，左轉弱 22%。
+        #   3. 右滿舵 −0.50 rad 算出 1014.10，撞上 Servo_min=1020 被截斷，
+        #      實際只到 0.7584（損失 1.1%）。左邊反而有 88 counts 空頭。
+        #
+        # ★ 韌體的箝制是**對稱**的（usartx.c:622，R < 0.750 就拉大到 0.750），
+        #   它不知道左右不一樣。所以下一個左轉 0.76 的指令，韌體會照單全收、
+        #   算出舵機到不了的角度、**然後什麼都不回報**。車子就是欠轉。
+        #
+        # 這很可能就是「走廊持續貼右牆 32.8 cm」的機制：
+        # 左轉指令被物理欠轉 -> 車子往右漂。方向完全吻合。
+        #   （仍是假說——那行 側/排斥/繞障/合計/曲率 診斷還沒撈到。）
+        #
+        # nav2 的 minimum_turning_radius 只吃單一對稱值，描述不了這台車；
+        # 但**控制器可以**，所以在這裡分開。
+        # ★ 為什麼右邊用 0.80 而不是 0.76（2026-08-10 決定）★
+        #
+        # 8/10 車上把 nav2 的 minimum_turning_radius 調到 0.76，理由是
+        # 「0.80 時大廳→起點一律 2 折返，0.76 規劃得出 0 折返」。方向是對的
+        # （十趟實測 0 折返 6 勝、多折返 5 敗），但 0.76 的餘裕太薄：
+        #     韌體硬限                 0.750
+        #     右滿舵被 Servo_min 截斷   0.7584   <- 廠商韌體實際做得到的
+        #     8/06 直接量               0.751
+        #   -> 設 0.76 只剩 0.2%~1.2% 餘裕，而那筆 0.751 是在「零位偏移
+        #      still 有爭議」的當下量的（反推說偏右 2.19 度、直接量卻是
+        #      偏左 17.75 度，方向相反）。拿它當唯一依據不夠穩。
+        #
+        # 所以先用**有大量運行時數背書的 0.80**，並在明天用
+        # `~/maprun/steer_asym_check_cc.py` 把左右極限量準，再依數據調。
+        # ★ 這條路線本來就跑不通（多折返 5 敗），所以退回 0.80 沒有失去
+        #   任何「原本會動的能力」——真正要修的是折返做不好，見 _do_escape。
+        self.declare_parameter("min_turning_radius", 0.80)          # 相容用的舊參數
+        self.declare_parameter("min_turning_radius_right", 0.80)    # 實測 0.751，留 6.5% 餘裕
+        self.declare_parameter("min_turning_radius_left", 0.95)     # 實測 0.944，留 0.6% 餘裕
+        # 關掉就退回舊行為（左右都用 min_turning_radius）——出事時的退路
+        self.declare_parameter("asymmetric_turning", True)
         # ── 路徑可行性檢查（2026-08-06）★ 門檻是 0.76 不是 0.80 ──
         #
         # 2026-08-06 實測：教導路徑 path_2702ea459c8b 的索引 44~49
@@ -281,6 +325,15 @@ class PathTeachNode(Node):
         # 但三次前後退太少」。窄轉角的三點轉向本來就要來回好幾趟才轉得夠，
         # 每次只轉 20 度，要轉過 60~90 度的彎需要 4~6 次。
         self.declare_parameter("max_escapes", 10)
+        # ── 連續三點轉向（2026-08-10，依使用者現場示範）──────────────
+        # 「方向打滿 -> 前後反向打 -> 多次 -> 需要開啟避障」。
+        # 一次 _do_escape 裡連做幾段（而不是做一段就把控制權還給純追蹤，
+        # 讓它在段與段之間把車推回夾點、而且那幾秒沒有防撞旁路）。
+        # 3 段的理由：一段目標 35 度，三段約 105 度，足夠應付 90 度轉角；
+        # 再多會把車推出可用空間，而走廊淨寬只有 0.99 m。
+        self.declare_parameter("escape_legs_max", 3)
+        # 累計轉夠這麼多就收手，不必做滿段數
+        self.declare_parameter("escape_total_dyaw_deg", 80.0)
         # 進度檢查：索引這麼久沒前進就當卡住。
         #
         # 2026-08-03 實測：脫困原本只掛在 waiting 狀態，但車子頂到牆時
@@ -300,6 +353,33 @@ class PathTeachNode(Node):
         # 且持續 no_progress_sec，才算卡住。0.3 = 只跑到指令的三成。
         # ★ 不要用「沿路徑前進多快」當判準——慢慢開不是卡住（見 _follow_loop）。
         self.declare_parameter("stuck_speed_ratio", 0.30)
+        # 第二個卡住判準：no_progress_sec 內沿路徑推進不到這麼多公尺就算卡住，
+        # 即使車子有在動。0 = 停用。用弧長不用索引（索引會被點距背叛）。
+        # 0.10 m 的來源：正常最慢也有 0.03 m/s × 5 s = 0.15 m。
+        self.declare_parameter("stall_progress_m", 0.10)
+        # 脫困時側向淨空低於這個值就否決「往那一邊轉」的決定（0 = 停用）。
+        # 車身半寬 0.185，0.15 表示已經非常貼牆了才介入，不干擾正常朝向修正。
+        self.declare_parameter("wall_veto_m", 0.15)
+        # 橫移置中（使用者配方：前進打一邊走多、再回打另一邊走少）。
+        # 只在側向淨空低於 centre_trigger_m 時才做——它會佔用前方空間。
+        self.declare_parameter("centre_enable", True)
+        self.declare_parameter("centre_trigger_m", 0.12)
+        self.declare_parameter("centre_leg_sec", 1.6)
+        self.declare_parameter("centre_back_ratio", 0.65)
+        # 脫困方向改由「哪一端空間大」決定，而不是路徑行進方向。
+        # margin 是推翻預設所需的最小差距，避免兩端差不多時反覆橫跳。
+        self.declare_parameter("escape_dir_by_space", True)
+        self.declare_parameter("escape_dir_margin_m", 0.15)
+        # 打滑偵測：no_progress_sec 內掃描簽章的**中位數**變化低於這個值（公尺）
+        # 而且一直在下指令，就判定輪子在空轉。0 = 停用。
+        #
+        # 0.02 的來源：2026-08-10 實測車子靜止時中位數雜訊是 0.10~0.75 cm，
+        # 取 2 cm 留約三倍餘裕。
+        # ⚠️ **門檻的另一半還沒驗**：「車子真的在動時中位數會是多少」需要
+        #    實機移動量測，使用者不在場時不做。走廊裡沿長軸移動時，打到側牆
+        #    的光束其垂直距離幾乎不變，中位數可能比預期小 —— 這是這個判準
+        #    最可能失效的地方，上機第一件事就是量它。
+        self.declare_parameter("scan_still_m", 0.02)
         # base_footprint -> laser 的 x 偏移（查 TF：0.089）。
         # ★ 不要跟 0.311 搞混 —— 那是「雷達到車頭保險桿」的距離。
         #   用錯會讓每個雷射點多推 0.222 m；在走廊裡沿長軸看不出來
@@ -308,7 +388,18 @@ class PathTeachNode(Node):
         # 單側空隙低於這個值就啟動貼牆排斥，把追蹤目標往外推。
         # 做成「靠太近才推開」而不是「隨時往中間拉」：後者會跟路徑追蹤打架，
         # 有些路徑本來就該貼一邊走。
-        self.declare_parameter("wall_keepout_m", 0.15)
+        # ★ 2026-08-10 從 0.15 拉到 0.25 ★
+        #
+        # 實測診斷行：「側 左0.20/右0.39  排斥+0.00  曲率（未飽和）」——
+        # 車子已經明顯偏左，但 0.20 > 0.15 所以排斥完全不作用；
+        # 等它漂到 0.05 才開始推，那時需要的修正量已經超過曲率上限
+        # （最小轉彎半徑 0.80 m -> 曲率上限 1.25/m），推了也做不到。
+        # 使用者的描述是「太貼近左邊門框了」。
+        #
+        # 走廊 0.99 m、車寬 0.37 m -> 置中時兩側各約 0.31 m。
+        # 0.25 的選法：置中時仍然不推（不跟循跡打架，維持原設計意圖），
+        # 但一偏到 0.25 就開始溫和修正 —— 在曲率還夠用的時候。
+        self.declare_parameter("wall_keepout_m", 0.25)
         self.declare_parameter("wall_push_max_m", 0.12)
 
         p = self.get_parameter
@@ -323,6 +414,14 @@ class PathTeachNode(Node):
         self.la_max = float(p("lookahead_max_m").value)
         self.la_k = float(p("lookahead_k").value)
         self.min_radius = float(p("min_turning_radius").value)
+        # 左右分開的最小轉彎半徑（見宣告處的長註解）。
+        # 韌體是原廠的、不動它——不對稱在 ROS 2 端補償。
+        self.asym_turn = bool(p("asymmetric_turning").value)
+        self.min_radius_right = float(p("min_turning_radius_right").value)
+        self.min_radius_left = float(p("min_turning_radius_left").value)
+        if not self.asym_turn:
+            self.min_radius_right = self.min_radius
+            self.min_radius_left = self.min_radius
         self.jump_dist_limit = float(p("jump_dist_limit_m").value)
         # merge_min_segment_m 刻意**不**在這裡快取（見宣告處）：它要能在
         # 錄製前用 `ros2 param set` 臨時調整，快取了就永遠讀不到新值。
@@ -341,9 +440,21 @@ class PathTeachNode(Node):
         self.escape_after = float(p("escape_after_sec").value)
         self.escape_dist = float(p("escape_distance_m").value)
         self.max_escapes = int(p("max_escapes").value)
+        self.escape_legs_max = int(p("escape_legs_max").value)
+        self.escape_total_dyaw = math.radians(float(p("escape_total_dyaw_deg").value))
+        self._escape_leg_yaw = None
         self.no_progress = float(p("no_progress_sec").value)
         self.stuck_min_advance = float(p("stuck_min_advance_m").value)
         self.stuck_speed_ratio = float(p("stuck_speed_ratio").value)
+        self.stall_progress = float(p("stall_progress_m").value)
+        self.wall_veto_m = float(p("wall_veto_m").value)
+        self.centre_enable = bool(p("centre_enable").value)
+        self.centre_trigger_m = float(p("centre_trigger_m").value)
+        self.centre_leg_sec = float(p("centre_leg_sec").value)
+        self.centre_back_ratio = float(p("centre_back_ratio").value)
+        self.escape_dir_by_space = bool(p("escape_dir_by_space").value)
+        self.escape_dir_margin = float(p("escape_dir_margin_m").value)
+        self.scan_still_m = float(p("scan_still_m").value)
         self.laser_x = float(p("laser_x_offset_m").value)
         self.wall_keepout = float(p("wall_keepout_m").value)
         self.wall_push_max = float(p("wall_push_max_m").value)
@@ -379,6 +490,7 @@ class PathTeachNode(Node):
 
         # 脫困旁路：直接發到底盤訂閱的話題，繞過 collision_monitor。
         # 平時不發任何東西 —— 只有 _escape_bypass 為 True 時才會有輸出。
+        self._live_start = None      # _plan_cb 標記用，見 _plan_leg
         self._escape_bypass = False
         self.escape_bypass_speed = abs(float(p("escape_bypass_speed").value))
         self.bypass_pub = None
@@ -393,6 +505,32 @@ class PathTeachNode(Node):
                 self.get_logger().info(
                     f"脫困防撞旁路已啟用：{bypass_topic}，"
                     f"速度上限 {self.escape_bypass_speed:.2f} m/s")
+
+        # ★ 把三層轉彎半徑一次印出來（2026-08-10）★
+        #
+        # 這三個數字**必須滿足 韌體 ≤ 控制器 ≤ 規劃器**，否則會出現
+        # 「規劃器產生控制器做不到的路徑」或「控制器發舵機到不了的指令」。
+        # 8/10 就同時踩到兩個：規劃器被調到 0.76 而控制器還是 0.80，
+        # 且左右都用同一個值而實車左轉只到 0.944。
+        # 這種不一致在 log 裡看不見、跑起來也不報錯，只會表現成「循跡變差」，
+        # 所以每次啟動都印一次，讓它變成看得見的東西。
+        if self.asym_turn:
+            self.get_logger().info(
+                f"轉彎半徑（左右分開）：左 {self.min_radius_left:.2f} m / "
+                f"右 {self.min_radius_right:.2f} m　"
+                f"| 實測極限 左 0.944 / 右 0.751　| 韌體硬限 0.750（對稱）")
+            self.get_logger().info(
+                f"　→ 曲率上限：左 {1.0/self.min_radius_left:.3f} / "
+                f"右 {1.0/self.min_radius_right:.3f} /m　"
+                f"（可行性門檻 左 {self.min_radius_left*0.95:.2f} / "
+                f"右 {self.min_radius_right*0.95:.2f}）")
+            self.get_logger().warn(
+                "　★ nav2 的 minimum_turning_radius 是單一對稱值，請確認它 ≥ "
+                f"{self.min_radius_right:.2f}；規劃器比控制器緊會產生跟不上的路徑")
+        else:
+            self.get_logger().warn(
+                f"轉彎半徑用對稱舊行為：{self.min_radius:.2f} m（asymmetric_turning=false）"
+                "　★ 實車左轉極限是 0.944，這個設定會在左轉時發出舵機到不了的指令")
         # 讓 RViz / HMI 看得到目前在追哪條路徑
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -525,6 +663,67 @@ class PathTeachNode(Node):
     def _scan_cb(self, msg: LaserScan) -> None:
         with self._scan_lock:
             self._scan = msg
+
+    def _scan_signature(self, bins: int = 60) -> Optional[List[float]]:
+        """把當前掃描壓成 bins 個數字，用來判斷「車子到底有沒有真的移動」。
+
+        ★ 為什麼需要這個（2026-08-10 實測）★
+
+        既有的兩個卡住判準都建立在**位姿**上（map->base_footprint 的位移、
+        沿路徑的弧長推進）。但在走廊裡這條鏈是會說謊的：
+
+            車子右側頂住牆 -> 輪子空轉打滑 -> 里程計謊報「有在前進」
+            -> EKF 照收 -> AMCL 想修正，但走廊沿長軸沒有分辨力
+            （掃描匹配對縱向位置給不出反對意見）-> AMCL 跟著里程計一路跑掉
+
+        於是位姿一直在變、索引一直在推進，**兩個判準都被同一個謊言騙過去**。
+        2026-08-10 大廳->起點 實測：偏離單調長到 282 cm、吻合度掉到 59.9%、
+        AMCL 報出地圖邊界外的座標，而脫困**一次都沒被觸發**。
+
+        雷射掃描不經過這條鏈。車子真的移動 10 cm，走廊裡的掃描剖面會明顯改變；
+        頂著牆空轉時它幾乎不動。這是打滑偽造不了的證據。
+
+        取每個扇區的**最小值**而不是平均：對單點雜訊穩健，
+        而牆面距離正是我們要看的量。
+        """
+        with self._scan_lock:
+            scan = self._scan
+        if scan is None or not scan.ranges:
+            return None
+        n = len(scan.ranges)
+        if n < bins:
+            return None
+        step = n / float(bins)
+        out: List[float] = []
+        rmax = scan.range_max
+        for i in range(bins):
+            lo, hi = int(i * step), max(int(i * step) + 1, int((i + 1) * step))
+            best = rmax
+            for r in scan.ranges[lo:hi]:
+                if r == r and scan.range_min < r < rmax and r < best:
+                    best = r
+            out.append(best)
+        return out
+
+    @staticmethod
+    def _sig_diff(a: Optional[List[float]], b: Optional[List[float]]) -> Optional[float]:
+        """兩份掃描簽章的**中位數**絕對差（公尺）。任一為 None 就回 None。
+
+        ★ 為什麼是中位數不是平均（2026-08-10 實測）★
+        車子完全靜止、連量四次、每次間隔 5 秒：
+
+            平均   0.98 / 0.93 / 5.26 / 5.89 cm     <- 雜訊上限 5.89 cm
+            中位數 0.10 / 0.10 / 0.10 / 0.75 cm     <- 雜訊上限 0.75 cm
+
+        平均被少數亂跳的扇區主導（掃到門框邊緣、或某些角度時有時無回波），
+        雜訊比我們要偵測的訊號還大——用平均的話門檻根本訂不出來。
+        中位數對這種離群值免疫，靜止時穩定在 1 cm 以內。
+        """
+        if not a or not b or len(a) != len(b):
+            return None
+        d = sorted(abs(x - y) for x, y in zip(a, b))
+        n = len(d)
+        return d[n // 2] if n % 2 else (d[n // 2 - 1] + d[n // 2]) / 2.0
 
     def _map_cb(self, msg: String) -> None:
         self.current_map = msg.data
@@ -714,7 +913,24 @@ class PathTeachNode(Node):
         折返點兩側不跨段檢查：車子在那裡會停下來換向，兩側的朝向差
         不代表任何一次連續轉彎。
         """
-        min_r = float(self.get_parameter("feasibility_min_radius").value)
+        # ★ 門檻由「控制器實際做得到的半徑」推導，不是寫死（2026-08-10）★
+        #
+        # 舊版寫死 0.76（＝當時的 min_turning_radius 0.80 × 0.95）。今天規劃器
+        # 改成 0.76 之後，那個常數就同時是「規劃器的目標值」和「檢查門檻」——
+        # 規劃器貼著 0.76 規劃、離散化後落在 0.7585，**每一條規劃路徑都會誤報**。
+        #
+        # 改成跟著控制器的能力走，兩者永遠同步，不會再各自漂走：
+        #     門檻 = 該方向的最小半徑 × 0.95
+        # 那 5% 是留給離散化的：SmacPlannerHybrid 的運動基元是 11.25 度一格，
+        # 實測輸出落在標稱值的 0.998 倍；再加上 AMCL 的 yaw 抖動，5% 才夠。
+        margin = 0.95
+        min_r_right = self.min_radius_right * margin
+        min_r_left = self.min_radius_left * margin
+        # 相容：舊參數若被明確設過（非預設 0.76），仍以它為準覆寫兩邊
+        _explicit = float(self.get_parameter("feasibility_min_radius").value)
+        if abs(_explicit - 0.76) > 1e-6:
+            min_r_right = min_r_left = _explicit
+        min_r = min_r_right      # 預設值；下面每段會依轉向覆寫
         win = float(self.get_parameter("feasibility_window_m").value)
         if len(pts) < 3:
             return True, "點數太少，略過檢查", []
@@ -738,11 +954,18 @@ class PathTeachNode(Node):
                     j += 1
                 if arc < win * 0.5:
                     break        # 這一段剩下的長度湊不出視窗了，換下一段
-                dyaw = abs(norm_angle(pts[j - 1].yaw - pts[i].yaw))
+                # ★ 帶號：正 = 往左轉，負 = 往右轉（2026-08-10）★
+                # 舊版取 abs() 把方向資訊丟掉了，於是只能用單一門檻。
+                # 但這台車左右能力差 26%（左 0.944 / 右 0.751），
+                # 一個門檻必然在一邊太鬆、另一邊太緊。
+                dyaw_signed = norm_angle(pts[j - 1].yaw - pts[i].yaw)
+                dyaw = abs(dyaw_signed)
                 if dyaw < math.radians(1.0):
                     continue     # 幾乎直行，需要的半徑趨近無限大
                 r = arc / dyaw
                 worst_r = min(worst_r, r)
+                # 該轉向做不做得到，用該轉向的門檻判
+                min_r = min_r_left if dyaw_signed > 0 else min_r_right
                 if r < min_r:
                     bad.append({
                         "from": i,
@@ -750,19 +973,26 @@ class PathTeachNode(Node):
                         "arc_m": round(arc, 4),
                         "dyaw_deg": round(math.degrees(dyaw), 2),
                         "radius_m": round(r, 4),
+                        # 哪一邊轉不過去——左右門檻不同，沒有這欄看不出原因
+                        "turn": "左" if dyaw_signed > 0 else "右",
+                        "limit_m": round(min_r, 4),
                     })
 
+        thr_txt = (f"門檻 左{min_r_left:.2f}／右{min_r_right:.2f}"
+                   if abs(min_r_left - min_r_right) > 1e-6 else f"門檻 {min_r_right:.2f}")
         if not bad:
-            note = (f"可行性檢查通過：最緊處需要半徑 {worst_r:.3f} m（門檻 {min_r:.2f}）"
+            note = (f"可行性檢查通過：最緊處需要半徑 {worst_r:.3f} m（{thr_txt}）"
                     if worst_r < float("inf") else "可行性檢查通過：全程近似直線")
             return True, note, []
 
         bad.sort(key=lambda d: d["radius_m"])
         w = bad[0]
+        side = w.get("turn", "?")
         note = (f"★ 有 {len(bad)} 處車子做不到：最緊的在索引 {w['from']}~{w['to']}，"
-                f"{w['arc_m']:.3f} m 內轉 {w['dyaw_deg']:.1f} 度 → 需要半徑 "
-                f"{w['radius_m']:.3f} m，低於門檻 {min_r:.2f} m"
-                f"（控制器箝制在 {self.min_radius:.2f} m、韌體硬限 0.75 m）")
+                f"{w['arc_m']:.3f} m 內往{side}轉 {w['dyaw_deg']:.1f} 度 → 需要半徑 "
+                f"{w['radius_m']:.3f} m（{thr_txt}）"
+                f"。控制器箝制：左 {self.min_radius_left:.2f}／右 "
+                f"{self.min_radius_right:.2f} m，韌體硬限 0.75 m")
         return False, note, bad[:5]
 
     def _merge_short_segments(self, pts, min_seg_m=None):
@@ -1257,12 +1487,29 @@ class PathTeachNode(Node):
             bx, by = -bx, -by
 
         curvature = 2.0 * by / (ld * ld)
-        max_curv = 1.0 / max(0.05, self.min_radius)
-        curvature = max(-max_curv, min(max_curv, curvature))
+        # ★ 曲率上限分左右（2026-08-10）★
+        #
+        # 舊寫法 `max_curv = 1.0/min_radius` 對兩邊用同一個上限，於是左轉時
+        # 會發出舵機根本到不了的曲率（左極限 0.944，右極限 0.751）。
+        # 韌體不會報錯——它照算 AngleR，只是舵機轉不到那麼多，車子欠轉。
+        # 結果就是「指令看起來對、車子卻一路往右漂」。
+        #
+        # 曲率為正 = 往左（CCW），所以正的用左半徑、負的用右半徑。
+        curvature = self._clamp_curv(curvature)
 
         v = speed if direction >= 0 else -speed
         w = abs(v) * curvature
         return v, w
+
+    def _clamp_curv(self, curvature: float) -> float:
+        """把曲率箝制在**該方向**做得到的範圍內。
+
+        正 = 逆時針 = 往左；負 = 順時針 = 往右。
+        兩邊上限不同的理由見 `min_turning_radius_left/right` 的宣告註解。
+        """
+        if curvature >= 0.0:
+            return min(curvature, 1.0 / max(0.05, self.min_radius_left))
+        return max(curvature, -1.0 / max(0.05, self.min_radius_right))
 
     def _publish_cmd(self, lin: float, ang: float) -> None:
         # 卡住判定要比對「指令 vs 實際」，所以指令值必須留下來（見 _follow_loop）
@@ -1388,6 +1635,7 @@ class PathTeachNode(Node):
         state = "following"
         last_fb = 0.0
         escapes = 0
+        sig_hist: List[Tuple[float, List[float]]] = []   # 打滑偵測用的掃描簽章歷史
         prog_idx = -1
         prog_t = time.monotonic()
         # 每個路徑點的累計弧長，給進度檢查用（見迴圈裡的說明）
@@ -1486,6 +1734,54 @@ class PathTeachNode(Node):
                 # 有明確下指令，而實際速率不到指令的 stuck_speed_ratio
                 stuck_now = (want > 0.02 and actual < self.stuck_speed_ratio * want)
 
+            # ★ 2026-08-10 第三個判準：掃描沒變 = 車子真的沒動（打滑偵測）★
+            #
+            # 前兩個判準都建立在位姿上，而走廊裡位姿會被打滑的里程計拖著跑
+            # （AMCL 沿長軸沒有分辨力，擋不住這個謊）。詳見 _scan_signature。
+            # 這一條完全不看位姿，只問「雷射看到的世界有沒有變」。
+            if not stuck_now and self.scan_still_m > 0:
+                sig = self._scan_signature()
+                if sig is not None:
+                    sig_hist.append((now_t, sig))
+                    while sig_hist and now_t - sig_hist[0][0] > self.no_progress:
+                        sig_hist.pop(0)
+                    if len(sig_hist) >= 2 and now_t - sig_hist[0][0] >= self.no_progress * 0.8:
+                        d = self._sig_diff(sig_hist[0][1], sig)
+                        want_v = sum(h[3] for h in move_hist) / max(1, len(move_hist))
+                        if d is not None and want_v > 0.02 and d < self.scan_still_m:
+                            self.get_logger().warn(
+                                f"掃描 {now_t - sig_hist[0][0]:.1f} 秒內中位數只變了 {d*100:.1f} cm"
+                                f"（門檻 {self.scan_still_m*100:.0f} cm），"
+                                f"但一直在下指令（平均 {want_v:.2f} m/s）"
+                                f" —— 判定輪子在打滑，車子其實沒動")
+                            stuck_now = True
+
+            # ★ 2026-08-10 補上第二個判準：「有在動，但沿路徑沒有推進」。
+            #
+            # 上面那個判準只問「有下指令卻沒動」。它治好了 v2 的誤觸發
+            # （慢被當成卡住，78% -> 0%），但**也失去了偵測打轉/貼牆的能力** ——
+            # 車子左右擺盪時實際位移跟得上指令，判準就認為它沒卡住。
+            #
+            # 2026-08-10 大廳→起點 實測：300 秒走到 47/48（最後一點），
+            # 然後在 idx 47 原地擺盪 **116 秒**，偏離從 0 長到 60 cm 觸及上限中止，
+            # 全程 `escaping` 只有 2 筆 —— 脫困根本沒被叫到。
+            #
+            # 兩個判準的症狀不同，缺一不可：
+            #   有下指令卻沒動   -> 楔住（防撞死鎖那種）
+            #   有在動但索引不動 -> 打轉、貼牆擺盪（這一種）
+            #
+            # 這裡用弧長而不是索引：索引會被點距背叛（v1 的教訓，5 cm 與 15 cm
+            # 點距差三倍），弧長與點距無關。門檻取 stall_progress_m，
+            # 預設 0.10 m —— 比 no_progress_sec 內正常前進距離小一個量級
+            # （0.03 m/s × 5 s = 0.15 m），慢慢開不會誤判。
+            if not stuck_now and self.stall_progress > 0:
+                if path_s[idx] - prog_s < self.stall_progress:
+                    if now_t - prog_t > self.no_progress:
+                        stuck_now = True        # 有在動，但這段時間幾乎沒往前
+                else:
+                    prog_s = path_s[idx]        # 有實質推進，重新計起
+                    prog_t = now_t
+
             if not stuck_now:
                 prog_idx = idx
                 prog_s = path_s[idx]
@@ -1497,7 +1793,8 @@ class PathTeachNode(Node):
                     self.get_logger().warn(
                         f"有下速度指令但車子沒動（實際 < 指令的 "
                         f"{self.stuck_speed_ratio*100:.0f}%）已 {self.no_progress:.0f} 秒，"
-                        f"索引 {idx}/{len(pts)}，判定卡住，"
+                        f"索引 {idx}/{len(pts)}（或有在動但推進 < "
+                        f"{self.stall_progress:.2f} m），判定卡住，"
                         f"嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
                     self._stop(3)
                     if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
@@ -1506,9 +1803,11 @@ class PathTeachNode(Node):
                         wait_started = 0.0
                         state = "following"
                         move_hist.clear()   # 脫困期間主迴圈沒跑，視窗裡是舊樣本
+                        sig_hist.clear()
                         continue
                     prog_t = time.monotonic()      # 退不動也重計時，讓它再試
                     move_hist.clear()
+                    sig_hist.clear()
                 else:
                     self._stop()
                     goal_handle.abort()
@@ -1527,6 +1826,7 @@ class PathTeachNode(Node):
                 time.sleep(self.cusp_pause)
                 cur_dir = pts[idx].direction
                 move_hist.clear()   # 折返是刻意停車，不是卡住
+                sig_hist.clear()
                 continue
 
             # ── 障礙 ──
@@ -1603,6 +1903,7 @@ class PathTeachNode(Node):
                             avoid_offset = 0.0
                             state = "following"
                             move_hist.clear()
+                            sig_hist.clear()
                             continue
                         # 退不動就繼續等，等滿 wait_timeout 再放棄
 
@@ -1672,10 +1973,17 @@ class PathTeachNode(Node):
             # 這三個對應完全不同的修法。看不見就查不了——脫困失敗隱形了三天，
             # 補一行 feedback 就真相大白（見 _do_escape 的兩個失敗出口）。
             if abs(total_off) > 0.005 or state in ("avoiding", "slowing"):
-                max_curv = 1.0 / max(0.05, self.min_radius)
+                # ★ 飽和判定要用**該方向**的上限（2026-08-10）。
+                #   用對稱的 min_radius 會在左轉時低估飽和程度：左邊真正的
+                #   上限是 1/0.95 而不是 1/0.80，本來已經飽和的會被標成沒飽和。
+                #   這一行是明天要撈的關鍵診斷，判錯等於白跑一趟。
+                r_dir = self.min_radius_left if ang >= 0 else self.min_radius_right
+                max_curv = 1.0 / max(0.05, r_dir)
                 sat = "★飽和" if abs(ang) >= abs(lin) * max_curv * 0.98 else ""
+                turn_side = "左" if ang >= 0 else "右"
                 dbg = (f"側 左{sl:.2f}/右{sr:.2f} 排斥{wall_push:+.2f} "
-                       f"繞障{avoid_offset:+.2f} 合計{total_off:+.2f} 曲率{sat}")
+                       f"繞障{avoid_offset:+.2f} 合計{total_off:+.2f} "
+                       f"曲率{sat}(轉{turn_side}/上限{max_curv:.2f})")
                 self._send_feedback(goal_handle, idx, len(pts), xte, state, dbg)
             self._publish_cmd(lin, ang)
 
@@ -1704,11 +2012,83 @@ class PathTeachNode(Node):
         """
         self._escape_bypass = True
         try:
-            return self._do_escape_inner(pts, idx, cur_dir, goal_handle, attempt)
+            return self._escape_legs(pts, idx, cur_dir, goal_handle, attempt)
         finally:
             self._escape_bypass = False
             if self.bypass_pub is not None:
                 self.bypass_pub.publish(Twist())
+
+    def _escape_legs(self, pts, idx, cur_dir, goal_handle, attempt: int) -> bool:
+        """★ 2026-08-10：一次呼叫做**連續多段**三點轉向，中間不還給純追蹤。
+
+        === 為什麼要連起來 ===
+
+        使用者現場示範的掉頭訣竅是：
+            「方向打滿 -> 前後反向打 -> 多次 -> **需要開啟避障，
+              不然每次都自己卡住還在做動**」
+
+        最後那句是關鍵。原本的結構是「一次 `_do_escape` = 一段」，做完就
+        `return`，主迴圈把控制權交回**純追蹤**，等它再卡住才呼叫下一次。
+        兩個後果：
+
+        1. **段與段之間沒有避障回饋**。純追蹤只追路徑、不看牆，它會把
+           剛轉出來的角度又帶回去，甚至直接把車推回夾點。
+        2. **防撞旁路只在 `_do_escape` 期間開**（那正是它該有的行為），
+           所以段間那幾秒是 collision_monitor 說了算——車子貼牆時它會
+           停止輸出，於是「還在做動卻不會動」。
+
+        三點轉向的本質是**一連串動作的累積效果**，把它拆開執行等於沒做。
+        所以改成：一次呼叫裡連跑 `escape_legs_max` 段，旁路全程開著，
+        而每一段內部本來就有 `_side_clearance` / `_arc_clearance` 檢查
+        ——那就是使用者要的「開啟避障」，只是它現在真的全程有效了。
+
+        === 為什麼不是無限制地做下去 ===
+
+        每段之間重新量朝向，累積轉夠 `escape_total_dyaw` 就收手：
+        繼續轉只會把車推出可用空間。若某一段完全沒轉到（< 2 度），
+        代表被擋死了，再做也是一樣，直接停——這比做滿次數快很多，
+        也避免 8/04 那種「10 段轉了 250 度、淨變化 +9 度」的極限環。
+        """
+        p0 = self._robot_pose()
+        yaw_start = p0[2] if p0 is not None else None
+        legs = max(1, int(self.escape_legs_max))
+        ok_any = False
+
+        for leg in range(legs):
+            if goal_handle.is_cancel_requested:
+                return ok_any
+            # attempt 的奇偶決定前進/後退，所以 +leg 就是自動交替
+            ok = self._do_escape_inner(pts, idx, cur_dir, goal_handle, attempt + leg)
+            ok_any = ok_any or ok
+
+            p = self._robot_pose()
+            if p is None or yaw_start is None:
+                return ok_any
+            total = abs(norm_angle(p[2] - yaw_start))
+
+            if total >= self.escape_total_dyaw:
+                self.get_logger().info(
+                    f"連續脫困完成：{leg + 1} 段共轉了 "
+                    f"{math.degrees(total):.0f} 度（目標 "
+                    f"{math.degrees(self.escape_total_dyaw):.0f} 度）")
+                return True
+
+            # 這一段幾乎沒轉到 -> 被擋死了，再做也一樣
+            if leg > 0 and not ok:
+                p_prev_ok = getattr(self, "_escape_leg_yaw", None)
+                if p_prev_ok is not None and abs(norm_angle(p[2] - p_prev_ok)) < math.radians(2.0):
+                    self.get_logger().warn(
+                        f"第 {leg + 1} 段幾乎沒轉到（< 2 度），停止連續脫困"
+                        f"（累計 {math.degrees(total):.0f} 度）")
+                    return ok_any
+            self._escape_leg_yaw = p[2]
+
+        p = self._robot_pose()
+        if p is not None and yaw_start is not None:
+            self.get_logger().info(
+                f"連續脫困做滿 {legs} 段，累計轉了 "
+                f"{math.degrees(abs(norm_angle(p[2] - yaw_start))):.0f} 度")
+        return ok_any
 
     def _do_escape_inner(self, pts, idx, cur_dir, goal_handle, attempt: int = 1) -> bool:
         """卡住時的脫困：打舵前進改變車頭角度，不是直線退回去。
@@ -1751,6 +2131,37 @@ class PathTeachNode(Node):
         #   翻了反而是把剛轉過來的角度又轉回去（實測：前進轉 20 度、
         #   後退只轉 17→14→8 度）。
         back_dir = -cur_dir if attempt % 2 == 1 else cur_dir
+
+        # ★ 2026-08-10：改成「空間在哪就往哪」，而不是從路徑方向推 ★
+        #
+        # 上面那行只看 cur_dir（路徑的行進方向）與 attempt 的奇偶，
+        # **完全沒有問過空間在哪一端**。2026-08-10 實測的後果：
+        # 車子車尾楔進門框（左右車尾角各剩 1~2 cm），前方 0.63 m、後方 0.34 m，
+        # 而它決定「先直線**後退**拉開距離」—— 往夾點的方向走，當然退不動。
+        #
+        # 同一時間使用者手動遙控脫困，錄下來的三段**全部是前進**
+        # （0.01 m 試探、0.03 m 試探、2.08 m 開出去），餘隙 0.012 -> 0.368 m。
+        # 人做的事很簡單：往空的那邊走。
+        #
+        # ★ 使用者的提醒很重要：「每次卡住都不太相同」。
+        #   所以能寫進程式的**不是動作序列，是選法** ——
+        #   每次都重新量前後淨空再決定，這對各種卡法都成立。
+        #
+        # 這與今天另外兩個修正是同一個病：用間接的量代替直接的量
+        # （轉向只看朝向差不看牆、地圖端與實測端量不同東西）。
+        if self.escape_dir_by_space:
+            f_clear = self._arc_clearance(+1, 0.0, max_dist=1.5)
+            r_clear = self._arc_clearance(-1, 0.0, max_dist=1.5)
+            # 差距要夠明顯才推翻預設，免得在兩邊差不多時反覆橫跳
+            if abs(f_clear - r_clear) >= self.escape_dir_margin:
+                want = 1 if f_clear > r_clear else -1
+                if want != back_dir:
+                    self.get_logger().info(
+                        f"脫困方向改由空間決定：前 {f_clear:.2f} m / 後 {r_clear:.2f} m"
+                        f"，改成{'前進' if want > 0 else '後退'}"
+                        f"（原本依路徑方向要{'前進' if back_dir > 0 else '後退'}）")
+                back_dir = want
+
         start = self._robot_pose()
         if start is None:
             return False
@@ -1793,6 +2204,29 @@ class PathTeachNode(Node):
         if abs(yaw_err) < math.radians(5.0):
             steer = 1.0 if left >= right else -1.0
 
+        # ★ 2026-08-10 貼牆否決權 ★
+        #
+        # 上面只看「路徑朝向差」，完全沒看**車子正貼著哪面牆**。
+        # 於是貼右牆時，只要朝向差說要往右轉，它就往右轉——直接轉進牆裡。
+        # 使用者實測看到的就是這個：「他退後的方向打錯邊了」。
+        #
+        # 朝向差是「想去哪」，牆是「不能去哪」。不能去的優先。
+        # 只有真的很貼（< wall_veto_m）才否決，否則會干擾正常的朝向修正。
+        veto = self.wall_veto_m
+        if veto > 0:
+            if right < veto and left > right:
+                if steer < 0:
+                    self.get_logger().warn(
+                        f"貼牆否決：右側只剩 {right:.2f} m，"
+                        f"原本要往順時針（右）轉會撞牆，改成逆時針")
+                steer = 1.0
+            elif left < veto and right > left:
+                if steer > 0:
+                    self.get_logger().warn(
+                        f"貼牆否決：左側只剩 {left:.2f} m，"
+                        f"原本要往逆時針（左）轉會撞牆，改成順時針")
+                steer = -1.0
+
         # ★ 整串脫困只決定一次轉向，之後沿用（2026-08-04）★
         #
         # 上面那個判準本身是對的，但把它放在「每次嘗試都重算」的迴圈裡，
@@ -1823,7 +2257,10 @@ class PathTeachNode(Node):
         )
 
         speed = (self.follow_speed if back_dir > 0 else self.reverse_speed) * 0.6
-        curv = steer / max(0.05, self.min_radius)     # 打滿舵
+        # 打滿舵 —— 但「滿」在左右是不同的量（左 0.95 / 右 0.80）。
+        # 用對稱值的話，往左脫困時會發出舵機到不了的曲率：指令看起來更急，
+        # 車子卻轉得一樣多，於是「已轉角度」的判定會一直不達標而空轉。
+        curv = steer / max(0.05, self.min_radius_left if steer > 0 else self.min_radius_right)
         # 20 -> 35 度（2026-08-03）。每段轉得多，需要的來回次數就少。
         # 上限來自空間：0.80 m 轉彎半徑下轉 35 度，車子會前進約
         # 0.80 * 0.61 = 0.49 m 的弧長，走廊寬度撐得住。
@@ -1882,6 +2319,67 @@ class PathTeachNode(Node):
             p = self._robot_pose()
             if p is not None:
                 x0, y0, yaw0 = p
+
+        # ── 橫移置中（2026-08-10，依使用者現場描述實作）────────────────
+        #
+        # 使用者的配方：「往前打左（走多一點）→ 往前打右（走少一點）修正姿態
+        # 置中走廊 → 再往後退（微幅修左右）」。
+        #
+        # 為什麼需要這一段：前面的直線階段只能沿車身方向拉開，**不會改變
+        # 車子在走廊裡的橫向位置**；而打舵階段是在原位轉頭。兩者都解不了
+        # 「整台車貼在右牆上」。這一段是阿克曼版的橫移——兩段反向弧的
+        # 淨效果是側移，朝向回到原值。
+        #
+        # 第二段刻意走得比第一段短（centre_back_ratio）：
+        # 完全等長會把側移抵消掉一部分，短一點才留得住位移，
+        # 而剩下的朝向差就交給後面的打舵階段。
+        if self.centre_enable:
+            s_left, s_right = self._side_clearance()
+            near = min(s_left, s_right)
+            if near < self.centre_trigger_m:
+                away = 1.0 if s_left >= s_right else -1.0     # 往空的那邊
+                side_txt = "左" if away > 0 else "右"
+                self.get_logger().info(
+                    f"橫移置中：左 {s_left:.2f} / 右 {s_right:.2f} m，"
+                    f"往{side_txt}橫移（前進打{side_txt} -> 回打反向）")
+                v_c = self.follow_speed * 0.5
+                for leg, (sgn, dur) in enumerate((
+                        (away, self.centre_leg_sec),
+                        (-away, self.centre_leg_sec * self.centre_back_ratio))):
+                    # ★ 每一段用**該方向**做得到的曲率（2026-08-10）。
+                    #   兩段方向相反，共用一個 w_c 的話一定有一邊超出能力：
+                    #   往左那段會被舵機物理欠轉，於是側移量比預期小，
+                    #   而「回打」那段卻是足量的 —— 淨效果反而往反方向偏。
+                    curv_c = self._clamp_curv(sgn / max(0.05, self.min_radius_left
+                                                        if sgn > 0 else self.min_radius_right))
+                    w_c = v_c * abs(curv_c)
+                    tl = time.monotonic()
+                    while time.monotonic() - tl < dur and rclpy.ok():
+                        if goal_handle.is_cancel_requested:
+                            self._stop(); return False
+                        # 前方被擋就立刻收手——這一段一律往前走
+                        if self._arc_clearance(1, curv_c) <= 0.25:
+                            self.get_logger().warn("橫移置中：前方不足，中止這一段")
+                            break
+                        l3, r3 = self._side_clearance()
+                        if min(l3, r3) < 0.02:          # 真的要碰到了
+                            self.get_logger().warn(
+                                f"橫移置中：側向剩 {min(l3, r3):.2f} m，中止")
+                            break
+                        self._publish_cmd(v_c, sgn * w_c)
+                        self._send_feedback(
+                            goal_handle, idx, len(pts), 0.0, "escaping",
+                            f"橫移置中（第 {leg+1}/2 段，前進打"
+                            f"{'左' if sgn > 0 else '右'}）左{l3:.2f}/右{r3:.2f}")
+                        time.sleep(self.control_dt)
+                    self._stop(2)
+                l4, r4 = self._side_clearance()
+                self.get_logger().info(
+                    f"橫移置中完成：左 {s_left:.2f}->{l4:.2f}、"
+                    f"右 {s_right:.2f}->{r4:.2f} m")
+                p = self._robot_pose()
+                if p is not None:
+                    x0, y0, yaw0 = p
 
         t0 = time.monotonic()
         while time.monotonic() - t0 < 8.0 and rclpy.ok():
@@ -1989,6 +2487,8 @@ class PathTeachNode(Node):
                 resp.message = "取不到車子目前位置，無法從車子開始規劃"
                 return resp
             start = self._make_pose(pose[0], pose[1], pose[2])
+            # 標記「起點＝車子現在位置」，_plan_leg 據此改用 use_start=False
+            self._live_start = start
         else:
             if len(targets) < 2:
                 resp.success = False
@@ -2113,8 +2613,20 @@ class PathTeachNode(Node):
         而且節點用的是 MultiThreadedExecutor，不會卡住其他回呼。
         """
         req = ComputePathToPose.Goal()
-        req.use_start = True
-        req.start = self._stamped(start)
+        # ★ 2026-08-10：起點就是車子現在位置時，改用 use_start=False ★
+        #
+        # 原本一律 use_start=True，把 self._robot_pose() 明確餵進去。實測
+        #（車子在 0.99 m 走廊中段，定位 100% 吻合、車頭淨空差 4.6 cm）：
+        #     use_start=True   -> 任何目標都失敗，連正前方 1 m 也失敗
+        #     use_start=False  -> 同一位置同一目標，status=4、8 個路徑點
+        # 明確餵進去的起點會被 nav2 驗證，車子貼近膨脹邊界時判 START_OCCUPIED；
+        # 讓 nav2 自己查 TF 就通過。
+        # ★ 只有第一段能這樣做——第二段之後的起點是上一段終點，車子還沒到，
+        #   那時必須明確餵。
+        use_live = (self._live_start is not None and start is self._live_start)
+        req.use_start = not use_live
+        if not use_live:
+            req.start = self._stamped(start)
         req.goal = self._stamped(goal)
 
         send_future = self._planner_client.send_goal_async(req)
