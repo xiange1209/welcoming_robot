@@ -2191,6 +2191,16 @@ class HmiServerNode(Node):
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_brain", "user_auth"],
             "start_hint": "辨識到人之後決定要不要迎賓、走哪個流程",
         },
+        # ★ 2026-08-10 補上：面板原本沒有這一項，而它正是完整故事線的核心。
+        #   其餘 10 項都能從平板一鍵開，唯獨迎賓劇本要 ssh 進去手打——
+        #   發表當天最不該需要鍵盤的就是這一個。
+        "bank_reception": {
+            "label": "迎賓劇本（銀行）",
+            "detect": ["bank_reception"],
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_brain", "bank_reception"],
+            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_brain", "bank_reception"],
+            "start_hint": "訂 /user_identity 出迎賓詞到 /speech_text；需先開「使用者認證 / 決策」",
+        },
         "llm": {
             "label": "LLM 對話",
             "detect": ["llm_service"],

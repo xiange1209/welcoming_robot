@@ -40,8 +40,8 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
 
-from smartnav_msgs.action import Navigate
-from smartnav_msgs.srv import GetWaypoint
+from smartnav_msgs.action import FollowTaughtPath, Navigate
+from smartnav_msgs.srv import DeleteTaughtPath, GetWaypoint, PlanTaughtPath
 
 
 def wait_for_future(future, timeout_sec: float) -> Any:
@@ -81,6 +81,33 @@ class NavigationActionCcNode(Node):
         # 可關：清空要多一次服務往返，若之後量到它拖慢起步就設 false。
         self.declare_parameter("clear_costmap_before_navigate", True)
 
+        # ★★ 2026-08-10：導航預設改走「nav2 規劃 + 純追蹤執行」★★
+        #
+        # 這個節點原本一律送 nav2 的 /navigate_to_pose，控制器是 MPPI。
+        # 但 MPPI 在這台車的走廊裡**已證實走不通**：
+        #     預測視野 = 30 x 0.1 x 0.25 = 0.75 m
+        #     90 度轉彎需要 (pi/2) x 0.80 = 1.26 m      <- 只看得到所需的 60%
+        # 2026-08-03 正式判定，2026-08-06 再次實測確認：
+        # 直接叫 /compute_path_to_pose **規劃兩個目標都成功**
+        # （起點 8 點 0.92 m、門口 30 點 4.46 m）——失敗在 MPPI 這一層。
+        #
+        # 同一天，教導-重現的 follow_taught_path 是 **escaping 0%、success x3**。
+        # 也就是說系統裡同時存在「已證實過得去」與「已證實過不去」兩條路，
+        # 而 HMI 的導航按鈕接的是後者。這不是還沒調好，是接錯線。
+        #
+        # 改法就是 PlanTaughtPath.srv 自己寫在檔頭的那句話：
+        #   「規劃器沒有問題，出問題的是 MPPI 控制器，
+        #     所以『用 nav2 規劃、用純追蹤執行』是最省事也最可靠的組合。」
+        #
+        # 流程：/plan_taught_path（內部逐段呼叫 nav2 規劃器）-> path_id
+        #       -> /follow_taught_path（純追蹤執行，含貼牆排斥與脫困）
+        # 任何一步不成就**自動退回 nav2/MPPI**，不會比原本更糟。
+        self.declare_parameter("prefer_taught_path", True)
+        self.declare_parameter("taught_plan_timeout_sec", 30.0)
+        # 成功後把這條臨時路徑刪掉，否則每按一次導航就多一條，paths.json 會長爆。
+        # ★ 失敗時**故意保留**——那正是要拿去查為什麼跑不完的東西。
+        self.declare_parameter("delete_temp_taught_path", True)
+
         self.max_covariance_norm = float(self.get_parameter("max_covariance_norm").value)
         self.navigation_timeout_sec = float(self.get_parameter("navigation_timeout_sec").value)
         self.progress_stall_timeout_sec = float(self.get_parameter("progress_stall_timeout_sec").value)
@@ -90,6 +117,10 @@ class NavigationActionCcNode(Node):
         self.clear_costmap_before_navigate = bool(
             self.get_parameter("clear_costmap_before_navigate").value
         )
+        self.prefer_taught_path = bool(self.get_parameter("prefer_taught_path").value)
+        self.taught_plan_timeout = float(self.get_parameter("taught_plan_timeout_sec").value)
+        self.delete_temp_taught = bool(self.get_parameter("delete_temp_taught_path").value)
+        self._taught_seq = 0
 
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = ReentrantCallbackGroup()
@@ -124,6 +155,16 @@ class NavigationActionCcNode(Node):
             ClearEntireCostmap,
             "/global_costmap/clear_entirely_global_costmap",
             callback_group=self.client_cb_group,
+        )
+        # 「nav2 規劃 + 純追蹤執行」用的兩個入口（見 prefer_taught_path 的說明）
+        self.plan_taught_client = self.create_client(
+            PlanTaughtPath, "plan_taught_path", callback_group=self.client_cb_group
+        )
+        self.delete_taught_client = self.create_client(
+            DeleteTaughtPath, "delete_taught_path", callback_group=self.client_cb_group
+        )
+        self.follow_taught_client = ActionClient(
+            self, FollowTaughtPath, "follow_taught_path", callback_group=self.client_cb_group
         )
 
         self.amcl_pose_sub = self.create_subscription(
@@ -252,6 +293,13 @@ class NavigationActionCcNode(Node):
             if abs(q.x) + abs(q.y) + abs(q.z) + abs(q.w) < 1e-6:
                 target_pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
 
+            # ★ 先試「nav2 規劃 + 純追蹤執行」，不成才退回 nav2/MPPI（見參數說明）
+            if self.prefer_taught_path:
+                taught = self._try_taught_path(goal_handle, target_pose, waypoint_name, result)
+                if taught is not None:
+                    return taught
+                self.get_logger().warn("教導-重現路線不可用，退回 nav2/MPPI")
+
             if not self.nav2_client.wait_for_server(timeout_sec=10.0):
                 return self._abort(goal_handle, result, "Nav2 導航伺服器不在線上，導航失敗")
 
@@ -311,6 +359,106 @@ class NavigationActionCcNode(Node):
             self.get_logger().error(f"導航發生例外: {exc}")
             self.nav_active_pub.publish(Bool(data=False))
             return self._abort(goal_handle, result, "系統出現異常，導航失敗")
+
+    def _try_taught_path(self, goal_handle, target_pose, waypoint_name, result):
+        """用「nav2 規劃 + 純追蹤執行」導航。
+
+        回傳 `Navigate.Result` 代表這條路已經處理完（成功或失敗都算數）；
+        回傳 `None` 代表**根本沒能起跑**，呼叫端應該退回 nav2/MPPI。
+
+        ★ 這個區分很重要：規劃不出路徑（服務沒開、目標不可達）要讓 MPPI 有機會試；
+          但**路徑跑到一半失敗**不該再讓 MPPI 跑一次——同一段路它只會更糟，
+          而且車子已經不在起點了，再送一次會從奇怪的位置重新規劃。
+        """
+        if not self.plan_taught_client.service_is_ready():
+            self.get_logger().info("plan_taught_path 服務未就緒")
+            return None
+        if not self.follow_taught_client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().info("follow_taught_path 動作伺服器未就緒")
+            return None
+
+        self._taught_seq += 1
+        req = PlanTaughtPath.Request()
+        # 名稱帶 _auto_ 前綴，一眼看得出是導航自動產生的、不是人錄的
+        req.name = f"_auto_{waypoint_name}_{self._taught_seq}"
+        req.start_from_robot = True          # 從車子現在的位置規劃過去
+        req.waypoints = [target_pose]
+        try:
+            plan = wait_for_future(
+                self.plan_taught_client.call_async(req), timeout_sec=self.taught_plan_timeout
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"規劃教導路徑失敗: {exc}")
+            return None
+        if plan is None or not plan.success:
+            msg = plan.message if plan is not None else "無回應"
+            self.get_logger().warn(f"規劃教導路徑不成功: {msg}")
+            return None
+
+        # 折返點數是這條路好不好走的最強預測指標：
+        # 2026-08-10 十趟實測「0 折返 6 勝（誤差 11~12 cm）／多折返 5 敗」。
+        # 不因為有折返就放棄（它仍然比 MPPI 好），但要讓 log 說得出來。
+        cusp_note = "（0 折返）" if plan.num_cusps == 0 else f"（★ {plan.num_cusps} 個折返，較易失敗）"
+        self.get_logger().info(
+            f"教導路徑規劃完成：{plan.num_points} 點、{plan.length_m:.2f} m {cusp_note}")
+
+        follow = FollowTaughtPath.Goal()
+        follow.path_id = plan.path_id
+        follow.reverse = False
+        follow.speed_scale = 0.0             # 0 = 用節點預設速度（follow_speed）
+        try:
+            fh = wait_for_future(
+                self.follow_taught_client.send_goal_async(follow), timeout_sec=10.0)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"送出重播請求失敗: {exc}")
+            return None
+        if fh is None or not fh.accepted:
+            self.get_logger().warn("重播請求被拒絕")
+            return None
+
+        self.speech_text_pub.publish(String(data=f"開始導航到 {waypoint_name}"))
+        self.get_logger().info(f"開始導航到 {waypoint_name}（純追蹤執行）")
+        self.nav_active_pub.publish(Bool(data=True))
+        try:
+            res = wait_for_future(fh.get_result_async(),
+                                  timeout_sec=self.navigation_timeout_sec)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"等待重播結果逾時或失敗: {exc}")
+            self._cancel_taught(fh)
+            return self._abort(goal_handle, result, "導航逾時，已自動取消")
+        finally:
+            self.nav_active_pub.publish(Bool(data=False))
+
+        ok = res is not None and res.status == GoalStatus.STATUS_SUCCEEDED \
+            and getattr(res.result, "success", False)
+
+        # 成功才刪臨時路徑；失敗故意留著，那是查問題的證據
+        if ok and self.delete_temp_taught and self.delete_taught_client.service_is_ready():
+            try:
+                d = DeleteTaughtPath.Request()
+                d.path_id = plan.path_id
+                wait_for_future(self.delete_taught_client.call_async(d), timeout_sec=5.0)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"刪除臨時路徑失敗（不影響導航結果）: {exc}")
+
+        if ok:
+            result.success = True
+            result.message = (f"導航成功（終點誤差 {res.result.final_error_m:.2f} m、"
+                              f"朝向差 {res.result.final_yaw_error_deg:.1f} 度）")
+            goal_handle.succeed()
+            self.get_logger().info(f"✓ {result.message}")
+            return result
+
+        why = getattr(res.result, "message", "未知") if res is not None else "無回應"
+        self.get_logger().error(
+            f"教導-重現導航失敗：{why}　★ 臨時路徑 {plan.path_id} 已保留供查驗")
+        return self._abort(goal_handle, result, f"導航失敗：{why}")
+
+    def _cancel_taught(self, follow_goal_handle) -> None:
+        try:
+            wait_for_future(follow_goal_handle.cancel_goal_async(), timeout_sec=5.0)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"取消重播失敗: {exc}")
 
     def _nav2_feedback(self, feedback_msg) -> None:
         distance = feedback_msg.feedback.distance_remaining
