@@ -1690,16 +1690,24 @@ function ttsOnChat(items) {
   //
   // 而明天的驗證動線正好是：開頁 -> 按朗讀（聽到「朗讀已開啟」以為好了）
   // -> 打一句話 -> 平板安靜。會被誤判成 TTS 壞掉或 LLM 沒回，其實兩者都好的。
+  // ★ 2026-08-10：去重 key 從「純文字」換成「時間戳＋文字」★
+  //
+  // 迎賓詞是固定樣板（bank_reception「{name}貴賓您好，歡迎蒞臨…」），
+  // 同一位 VIP 每次的字串完全相同。用文字當 key 的話，第二次迎賓
+  // （冷卻 60 秒後走回來）會被判成「已經唸過」而靜音 —— 錄影時反覆
+  // 走進走出必定踩到，而且完全沒有徵兆可查。
+  const keyOf = (i) => (i.ts || 0) + "|" + i.text;
   if (!tts.seeded) {
-    for (const i of done) tts.spoken.add(i.text);
+    for (const i of done) tts.spoken.add(keyOf(i));
     tts.seeded = true;
     return;
   }
   if (!done.length) return;
-  const last = done[done.length - 1].text;
-  if (tts.spoken.has(last)) return;
-  tts.spoken.add(last);
-  if (tts.on) ttsSay(last);
+  const last = done[done.length - 1];
+  const k = keyOf(last);
+  if (tts.spoken.has(k)) return;
+  tts.spoken.add(k);
+  if (tts.on) ttsSay(last.text);
 }
 
 function ttsSyncBtn() {

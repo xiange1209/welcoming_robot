@@ -56,6 +56,24 @@ SEG_SEC = 6.0              # 每段時間
 NEED_FRONT = 1.2           # 開始前要求的前方淨空
 
 
+
+def radius_of(chord: float, dyaw: float) -> float:
+    """從**弦長**與轉角求轉彎半徑。
+
+    ★ 2026-08-10：原本直接寫 `chord / abs(dyaw)`，但那是把弦長當弧長。
+      正確關係是 c = 2R sin(theta/2)，所以 chord/theta = R * sinc(theta/2)，
+      **系統性地把半徑報得比實際小**（左 theta=0.51 rad 低估 1.1%、
+      右 theta=0.64 rad 低估 1.7%）。
+
+      偏誤方向剛好是最糟的那一邊：讓車看起來比實際**更能轉**。
+      而這支工具的用途正是去量「左右極限到底是多少」，
+      而 path_teach 的餘裕只留 0.6%~6.5% —— 同一個量級，會影響結論。
+    """
+    a = abs(dyaw)
+    if a < 1e-3:
+        return chord / max(a, 1e-9)
+    return chord / (2.0 * math.sin(a / 2.0))
+
 def yaw_of(msg: Odometry) -> float:
     q = msg.pose.pose.orientation
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -166,9 +184,11 @@ class SteerAsym(Node):
         p1 = self.pose()
         if p1 is None:
             return None
-        arc = math.hypot(p1[0] - x0, p1[1] - y0)
+        # ★ 這是**弦長**（起訖兩點的直線距離），不是弧長。
+        #   換算半徑要用 c = 2R sin(theta/2)，不能直接除以轉角——見 radius_of()。
+        chord = math.hypot(p1[0] - x0, p1[1] - y0)
         dyaw = norm(p1[2] - yaw0)
-        return arc, dyaw
+        return chord, dyaw
 
 
 def main() -> None:
@@ -239,7 +259,7 @@ def main() -> None:
         deg = math.degrees(dyaw)
         r_txt = "—（直走）"
         if abs(dyaw) > math.radians(1.0):
-            r_txt = "%.3f m" % (arc / abs(dyaw))
+            r_txt = "%.3f m" % radius_of(arc, dyaw)
         print("  %-10s 走 %.3f m，轉 %+.2f 度   實際半徑 %s" % (label, arc, deg, r_txt))
 
     print()
@@ -286,7 +306,7 @@ def main() -> None:
         al, dl = results["③ 左打滿"]
         ar, dr = results["④ 右打滿"]
         if abs(dl) > math.radians(1.0) and abs(dr) > math.radians(1.0):
-            rl, rr = al / abs(dl), ar / abs(dr)
+            rl, rr = radius_of(al, dl), radius_of(ar, dr)
             asym = abs(rl - rr) / max(rl, rr) * 100.0
             print()
             print("左右不對稱：R_left %.3f m  vs  R_right %.3f m  ->  %.1f%%" % (rl, rr, asym))

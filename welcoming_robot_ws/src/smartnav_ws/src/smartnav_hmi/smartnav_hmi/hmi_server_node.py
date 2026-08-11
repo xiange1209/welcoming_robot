@@ -102,9 +102,20 @@ NODE_GROUPS = [
             "speech_recognizer_node",
             "speech_synthesizer_node",
             "audio_playback_node",
-            "map_service_node",
-            "waypoint_service_node",
-            "navigation_service_node",
+            # ★ 2026-08-10：這三個原本寫的是 map_service_node /
+            #   waypoint_service_node / navigation_service_node —— 那是**舊套件**
+            #   smartnav_navigation 的節點名，實機從不啟動，於是健康頁上
+            #   永遠有三行紅色的「尚未啟動」，久了就被當背景雜訊忽略，
+            #   真的有東西沒起來時反而看不出來。
+            #   實機 nav_bringup_cc.launch.py 起的是 _cc 版：
+            "map_service_cc_node",
+            "waypoint_service_cc_node",
+            "navigation_action_cc_node",
+            "path_teach_cc_node",
+            "scan_filter_cc_node",
+            "steering_trim_cc_node",
+            # 迎賓劇本沒起來時要看得出來——它是完整故事線的核心
+            "bank_reception_node",
         ],
     ),
     ("nav2 定位", ["map_server", "amcl"]),
@@ -301,7 +312,21 @@ class HmiState:
             return
         with self._lock:
             # 同一角色連續送出完全相同的內容就不重複記（TTS 與 LLM 常會重疊）
-            if self.messages and self.messages[-1]["role"] == role and self.messages[-1]["text"] == text:
+            #
+            # ★ 2026-08-10：加上 3 秒的時間窗 ★
+            # 原本是無時限的「連續相同就丟」。但迎賓詞是**固定樣板**
+            # （bank_reception_node:97「{name}貴賓您好，歡迎蒞臨…」），
+            # 同一位 VIP 每次產生的字串完全一樣；而冷卻是 VIP 60 秒／訪客 300 秒，
+            # 也就是「過了冷卻就該再迎賓一次」正是設計意圖。
+            # 中間沒有別的訊息時，第二次迎賓詞會被這道閘直接丟掉 ——
+            # `/speech_text` 看得到、對話卻不更新、平板也不會唸。
+            # 錄影時反覆走進走出必定踩到。
+            #
+            # 3 秒遠小於 60 秒冷卻：同一輪 speech_text 與 llm_response 的重疊
+            # 照樣擋得掉，隔一輪的迎賓詞則放行。
+            if (self.messages and self.messages[-1]["role"] == role
+                    and self.messages[-1]["text"] == text
+                    and time.time() - self.messages[-1].get("ts", 0.0) < 3.0):
                 return
             entry: Dict[str, Any] = {"role": role, "text": text, "ts": time.time()}
             if stats:

@@ -965,7 +965,9 @@ class PathTeachNode(Node):
                 r = arc / dyaw
                 worst_r = min(worst_r, r)
                 # 該轉向做不做得到，用該轉向的門檻判
-                min_r = min_r_left if dyaw_signed > 0 else min_r_right
+                # ★ 實際打哪邊 = sign(轉向 x 行進方向)（見 _clamp_curv 的推導）
+                _left = (dyaw_signed > 0) if pts[i].direction >= 0 else (dyaw_signed < 0)
+                min_r = min_r_left if _left else min_r_right
                 if r < min_r:
                     bad.append({
                         "from": i,
@@ -1495,21 +1497,34 @@ class PathTeachNode(Node):
         # 結果就是「指令看起來對、車子卻一路往右漂」。
         #
         # 曲率為正 = 往左（CCW），所以正的用左半徑、負的用右半徑。
-        curvature = self._clamp_curv(curvature)
+        curvature = self._clamp_curv(curvature, direction)
 
         v = speed if direction >= 0 else -speed
         w = abs(v) * curvature
         return v, w
 
-    def _clamp_curv(self, curvature: float) -> float:
-        """把曲率箝制在**該方向**做得到的範圍內。
+    def _clamp_curv(self, curvature: float, direction: int = 1) -> float:
+        """把曲率箝制在**該方向實際打哪邊**做得到的範圍內。
 
-        正 = 逆時針 = 往左；負 = 順時針 = 往右。
-        兩邊上限不同的理由見 `min_turning_radius_left/right` 的宣告註解。
+        ★★ 2026-08-10 修正：不能只看曲率符號，要看 `曲率 × 行進方向` ★★
+
+        第一版寫成「正 = 往左」就結案，但那只在**前進**時成立。
+        韌體 `Vz_to_Akm_Angle` 是從 **`R = Vx/Vz`** 算舵角的，而 `Vx` 帶號：
+
+            前進 ω>0 → R=+0.800 → AngleR=+0.323 rad → **左打**
+            倒車 ω>0 → R=−0.800 → AngleR=−0.467 rad → **右打**   ← 翻了
+
+        （用廠商 `Axle_spacing=Wheel_spacing=0.322` 代入 `atan(0.322/(R+0.161))` 驗算過。）
+
+        所以倒車時第一版會把「物理上的左打」（極限 0.944）用右邊的 0.80 去箝，
+        發出舵機到不了的角度、韌體不報錯 → **靜默欠轉**；
+        而「物理上的右打」（極限 0.751）被箝到 0.95，白白少用 21% 的能力。
+
+        脫困的後退段、折返點之後的倒車段、HMI 的「反向重播」都會走到這裡。
         """
-        if curvature >= 0.0:
-            return min(curvature, 1.0 / max(0.05, self.min_radius_left))
-        return max(curvature, -1.0 / max(0.05, self.min_radius_right))
+        left = (curvature >= 0.0) if direction >= 0 else (curvature <= 0.0)
+        cap = 1.0 / max(0.05, self.min_radius_left if left else self.min_radius_right)
+        return max(-cap, min(cap, curvature))
 
     def _publish_cmd(self, lin: float, ang: float) -> None:
         # 卡住判定要比對「指令 vs 實際」，所以指令值必須留下來（見 _follow_loop）
@@ -1898,6 +1913,7 @@ class PathTeachNode(Node):
                         escapes += 1
                         self.get_logger().info(
                             f"等了 {waited:.0f} 秒仍不通，嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
+                        _t_esc = time.monotonic()
                         if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
                             wait_started = 0.0
                             avoid_offset = 0.0
@@ -1905,6 +1921,18 @@ class PathTeachNode(Node):
                             move_hist.clear()
                             sig_hist.clear()
                             continue
+                        # ★ 2026-08-10：脫困花掉的時間不算在「等障礙移開」的頭上 ★
+                        #
+                        # wait_started 是在脫困**之前**起算的，而 _escape_legs 改成
+                        # 連跑 3 段之後，楔死時最久要 3 x (5 直線 + 2.6 橫移 + 8 打舵)
+                        # = 47 秒，遠超過 wait_timeout(20)。結果是下一圈必定 abort，
+                        # max_escapes=10 實質只剩 1 次，而且錯誤訊息會把脫困耗時
+                        # 記成「障礙持續 N 秒未移開」——現場會往「誰擋著」查，
+                        # 但其實是自己的脫困把時鐘吃光了。
+                        #
+                        # 不改用調高 wait_timeout：那樣訊息仍然是錯的。
+                        wait_started += time.monotonic() - _t_esc
+                        waited = time.monotonic() - wait_started
                         # 退不動就繼續等，等滿 wait_timeout 再放棄
 
                     if waited > self.wait_timeout:
@@ -1977,7 +2005,9 @@ class PathTeachNode(Node):
                 #   用對稱的 min_radius 會在左轉時低估飽和程度：左邊真正的
                 #   上限是 1/0.95 而不是 1/0.80，本來已經飽和的會被標成沒飽和。
                 #   這一行是明天要撈的關鍵診斷，判錯等於白跑一趟。
-                r_dir = self.min_radius_left if ang >= 0 else self.min_radius_right
+                # ★ 倒車時 lin<0，同一個 ang 打的是反邊（見 _clamp_curv）
+                _lft = (ang * lin >= 0)
+                r_dir = self.min_radius_left if _lft else self.min_radius_right
                 max_curv = 1.0 / max(0.05, r_dir)
                 sat = "★飽和" if abs(ang) >= abs(lin) * max_curv * 0.98 else ""
                 turn_side = "左" if ang >= 0 else "右"
@@ -2260,7 +2290,8 @@ class PathTeachNode(Node):
         # 打滿舵 —— 但「滿」在左右是不同的量（左 0.95 / 右 0.80）。
         # 用對稱值的話，往左脫困時會發出舵機到不了的曲率：指令看起來更急，
         # 車子卻轉得一樣多，於是「已轉角度」的判定會一直不達標而空轉。
-        curv = steer / max(0.05, self.min_radius_left if steer > 0 else self.min_radius_right)
+        curv = steer / max(0.05, self.min_radius_left
+                                 if steer * back_dir > 0 else self.min_radius_right)
         # 20 -> 35 度（2026-08-03）。每段轉得多，需要的來回次數就少。
         # 上限來自空間：0.80 m 轉彎半徑下轉 35 度，車子會前進約
         # 0.80 * 0.61 = 0.49 m 的弧長，走廊寬度撐得住。
