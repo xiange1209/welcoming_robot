@@ -479,6 +479,9 @@ class UserAuthNode(Node):
     def _synced_face_image_callback(self, face_msg: FaceEmbedding, image_msg: CompressedImage) -> None:
         """比對人臉向量訊息進行身份驗證"""
         face_embedding = np.array(face_msg.embedding, dtype=np.float32)
+        # 註冊模式走的是另一條分支、不做比對，但下面一律會呼叫
+        # _publish_identity，所以先給預設值，避免 UnboundLocalError
+        similarity = 0.0
 
         with self.face_lock:
             if self.is_registering_face and self.current_registration:
@@ -524,17 +527,19 @@ class UserAuthNode(Node):
                     target=target,
                 )
 
-            user_uuid = self._process_face_recognition(face_embedding)
+            user_uuid, similarity = self._process_face_recognition(face_embedding)
             user_info = self.user_manager.get_user_info(user_uuid) if user_uuid else None
             if user_info:
                 self.get_logger().info(
                     f"身份驗證成功: {user_info['user_name']} (UUID: {user_uuid}, "
-                    f"類型: {user_info['user_type']}, 描述: {user_info['description']}"
+                    f"類型: {user_info['user_type']}, 相似度: {similarity:.3f}, "
+                    f"描述: {user_info['description']}"
                 )
 
-        self._publish_identity(user_uuid, user_info, face_msg)
+        self._publish_identity(user_uuid, user_info, face_msg, similarity)
 
-    def _publish_identity(self, user_uuid, user_info, face_msg: FaceEmbedding) -> None:
+    def _publish_identity(self, user_uuid, user_info, face_msg: FaceEmbedding,
+                          similarity: float = 0.0) -> None:
         """發布身份辨識結果"""
         key = user_uuid if user_info else "__unknown__"
         now = self.get_clock().now().nanoseconds / 1e9
@@ -558,10 +563,30 @@ class UserAuthNode(Node):
             msg.description = ""
             msg.user_type.type = UserType.GUEST.value
             msg.recognized = False
+        # ★ 2026-08-10 補上：這一行漏掉會讓 bank_reception 的 VIP／黑名單
+        #   劇本永遠不觸發（它有一道 similarity < 0.5 就 return 的門檻），
+        #   而且全程沒有任何錯誤訊息。E1/E2 要記的也正是這個欄位。
+        msg.similarity = float(similarity)
         self.user_identity_pub.publish(msg)
 
-    def _process_face_recognition(self, embedding: np.ndarray) -> Optional[str]:
-        """處理人臉識別邏輯"""
+    def _process_face_recognition(self, embedding: np.ndarray):
+        """處理人臉識別邏輯。
+
+        回傳 `(best_match_uuid, max_similarity)`。
+
+        ★ 2026-08-10：原本只回 uuid，把 `max_similarity` 算完就丟掉。後果有兩層：
+
+        1. `_publish_identity` 沒東西可填 -> `UserIdentity.similarity` 恆為 **0.0**
+        2. `bank_reception_node:146` 對 VIP/BLACKLIST 有一道
+           `similarity < min_confidence`(0.5) 就 return 的門檻
+           -> **0.0 < 0.5 恆成立 -> VIP 迎賓與黑名單通報永遠不會觸發**
+
+        整條路上沒有任何錯誤訊息：節點在跑、`/user_identity` 有發、
+        `recognized` 也是 True，只有「劇本不動」。這是專題的主秀。
+
+        ★ 未認出時也要回實際的最高分（不是 0），E2 誤認率分析要的
+        就是「未註冊者拿到多少分」的分布。
+        """
         all_embeddings = self.user_manager.get_all_embeddings()
 
         max_similarity = 0.0
@@ -576,9 +601,9 @@ class UserAuthNode(Node):
                 best_match_uuid = user_uuid
 
         if max_similarity < self.recognition_threshold:
-            return None
+            return None, max_similarity
 
-        return best_match_uuid
+        return best_match_uuid, max_similarity
 
 
 def main(args=None):

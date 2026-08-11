@@ -76,10 +76,26 @@ class SteerAsym(Node):
         self._lock = threading.Lock()
         self.odom = None
         self.scan = None
-        # ★ 發到 cmd_vel_trimmed 而不是 cmd_vel：這樣會經過 steering_trim_cc，
-        #   量到的是**補償後**的實際行為。要量硬體原始的不對稱，
-        #   先把 auto_trim 關掉並把 trim_rad_per_m 設 0。
-        self.pub = self.create_publisher(Twist, "cmd_vel_smoothed", 10)
+        # ★★ 2026-08-10 修正：改直接發 /cmd_vel ★★
+        #
+        # 原本發 `cmd_vel_smoothed`（而上面的舊註解寫的是 cmd_vel_trimmed，
+        # 兩者還互相矛盾）。那條話題**唯一的訂閱者是 steering_trim_cc**，
+        # 而它只在 nav_bringup_cc.launch.py 裡啟動 —— 但本檔用法段寫的是
+        # 「只跑 run_sensors_cc.sh」。
+        #
+        # 後果是**完全靜默的**：發布成功、節點正常、四段照樣印「▶ ① 前進直走」、
+        # 等滿秒數、最後印出完整結果表，只是每段都「走 0.000 m、轉 +0.00 度」，
+        # 三個判定區塊因為 arc > 0.05 的門檻沒過而全部跳過。
+        # 現場會先去查電量、舵機、串口——查錯方向。
+        #
+        # 而且**這支工具本來就不該經過 steering_trim**：它的目的是量
+        # 硬體原始的左右不對稱，補償器會把要量的東西改掉。
+        # 對照組：odom_gyro_check_cc.py:101 就是直接發 cmd_vel，
+        # 同樣只跑 sensors 卻會動。
+        #
+        # ⚠️ 直接發 cmd_vel 會繞過 collision_monitor，所以本檔自己的
+        #    掃描淨空檢查是唯一的防線 —— 執行前務必確認前後左右各 1.5 m。
+        self.pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.create_subscription(Odometry, "odom_combined", self._odom_cb, 10)
         self.create_subscription(LaserScan, "scan", self._scan_cb,
                                  qos_profile_sensor_data)

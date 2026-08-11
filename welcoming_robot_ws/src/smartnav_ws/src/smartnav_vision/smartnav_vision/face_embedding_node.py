@@ -23,10 +23,22 @@ class FaceEmbeddingNode(Node):
         super().__init__("face_embedding_node")
 
         # 宣告參數
+        # ★ 2026-08-10 修正：預設值原本是 "/camera/color/image_raw"，
+        #   但這個節點訂的型別是 **CompressedImage**，而相機在那條話題上
+        #   發的是 sensor_msgs/Image（astra_camera 的 ob_camera_node.cpp
+        #   直接 create_publisher<Image>，沒有走 image_transport）。
+        #   型別對不上 -> 訂閱建立成功、節點正常跑、log 也印「訂閱話題: ...」，
+        #   但**一則影像都收不到**，/face_embedding 永遠沒有輸出。
+        #   整條人臉線靜默卡死，不報錯。
+        #
+        #   CompressedImage 是 wheeltec_camera.launch.py 的 image_transport
+        #   republish 節點另外發到 ".../compressed" 的。
+        #   而且 user_auth_node 的預設值本來就是 compressed 那條——兩個節點
+        #   原本連話題都不在一起，同步器也不可能對上。
         self.declare_parameter(
             "image_capture_topic",
-            "/camera/color/image_raw",
-            ParameterDescriptor(description="相機影像話題"),
+            "/camera/color/image_raw/compressed",
+            ParameterDescriptor(description="相機影像話題（CompressedImage）"),
         )
         self.declare_parameter(
             "face_embedding_topic",
@@ -124,7 +136,8 @@ class FaceEmbeddingNode(Node):
                 # 建立並發佈人臉向量訊息
                 face_msg = FaceEmbedding()
                 face_msg.header = msg.header
-                face_msg.bbox = face.bbox.tolist()
+                # 明確轉 float：msg 欄位是 float32[4]，rosidl 會 assert 型別
+                face_msg.bbox = [float(v) for v in face.bbox]
                 face_msg.embedding = face.embedding.tolist()
                 self.face_embedding_pub.publish(face_msg)
         except Exception as e:
@@ -148,7 +161,7 @@ class FaceEmbeddingNode(Node):
 
             response.success = True
             response.message = "ok"
-            response.bbox = face.bbox.tolist()
+            response.bbox = [float(v) for v in face.bbox]
             response.embedding = face.embedding.tolist()
         except Exception as e:
             self.get_logger().error(f"抽取特徵失敗: {e}")

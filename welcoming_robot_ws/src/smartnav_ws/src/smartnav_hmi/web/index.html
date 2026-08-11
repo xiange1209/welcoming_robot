@@ -1681,12 +1681,21 @@ function ttsSay(text) {
 /** 只唸「新出現的、已完成的」機器人訊息；串流中的 ghost 不唸，否則會逐字重唸 */
 function ttsOnChat(items) {
   const done = items.filter((i) => i.role === "robot" && !i.ghost);
-  if (!done.length) return;
+  // ★ 2026-08-10 修正：seeding 要在「對話是空的」時也完成 ★
+  //
+  // 原本第一行是 `if (!done.length) return;`，於是新開機（或按過「清除對話」
+  // 之後重新整理）時 seeded 一直是 false；等第一句真正的新回覆到達，
+  // 才走進下面的 seeding 分支被登記成「歷史訊息」然後 return
+  // —— **機器人的第一句話永遠不會被唸出來**，第二句以後才正常。
+  //
+  // 而明天的驗證動線正好是：開頁 -> 按朗讀（聽到「朗讀已開啟」以為好了）
+  // -> 打一句話 -> 平板安靜。會被誤判成 TTS 壞掉或 LLM 沒回，其實兩者都好的。
   if (!tts.seeded) {
     for (const i of done) tts.spoken.add(i.text);
     tts.seeded = true;
     return;
   }
+  if (!done.length) return;
   const last = done[done.length - 1].text;
   if (tts.spoken.has(last)) return;
   tts.spoken.add(last);
@@ -1809,6 +1818,30 @@ $("ttstest").onclick = () => ttsSay("您好，歡迎光臨。請問需要我帶�
 
 ttsSyncBtn();
 if (ttsOK) ttsFillVoices();
+
+// ★ 2026-08-10：從 localStorage 還原成「已開啟」時，要補一次解鎖 ★
+//
+// tts.on 是從 localStorage 讀回來的，所以昨天開過、今天重新整理，按鈕會直接
+// 顯示「🔊 朗讀中」。但 iOS/Safari 的規定是**第一次發聲必須發生在使用者手勢的
+// 呼叫堆疊裡**，而那把鑰匙（ttsbtn.onclick 裡的 ttsSay）只在「從關轉開」時才轉
+// —— 按鈕已經是開著的，操作者不會去按它（按了反而是關掉）。
+// 結果是整場都不會有聲音，也不會有任何錯誤訊息。
+//
+// 桌機 Chrome 沒有這個限制，所以在筆電上重現不出來 —— 只有平板會中。
+//
+// 修法：還原成開啟時先不當作已解鎖，掛一次性的 pointerdown，
+// 使用者在畫面上點任何地方就完成解鎖。解鎖前按鈕明講要點一下。
+if (ttsOK && tts.on) {
+  const b = $("ttsbtn");
+  if (b) b.textContent = "🔇 點一下啟用朗讀";
+  const unlock = () => {
+    // 唸一個空白就夠了：目的只是在使用者手勢裡呼叫過一次 speak()
+    try { speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); } catch (e) {}
+    ttsFillVoices();
+    ttsSyncBtn();
+  };
+  document.addEventListener("pointerdown", unlock, { once: true });
+}
 
 $("clearchatbtn").onclick = () => {
   if (!confirm("確定要清除目前所有對話嗎？機器人的對話記憶也會一併清空。")) return;

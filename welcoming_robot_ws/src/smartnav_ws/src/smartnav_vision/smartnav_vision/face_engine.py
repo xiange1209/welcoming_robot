@@ -117,7 +117,15 @@ class FaceEngine:
                 return None
 
             face = FaceDetectResult(
-                bbox=faces[0].bbox.astype(int),
+                # ★ 2026-08-10：原本是 .astype(int)，但 FaceEmbedding.msg 的
+                #   欄位是 `float32[4] bbox`。rosidl 產生的 setter 會 assert
+                #   每個值 isinstance(v, float)，而 Python int 不是 float 的
+                #   instance -> 每偵測到一張臉就 AssertionError，被上層的
+                #   `except Exception` 吃掉，只在 log 印一行「處理影像時發生錯誤」，
+                #   節點照跑、話題存在、但 /face_embedding 一則都發不出去。
+                #   同一個寫法也讓 ExtractFaceEmbedding 服務永遠回 success=False
+                #   （HMI 的照片註冊 /register_face_photo 一起壞）。
+                bbox=faces[0].bbox.astype(np.float32),
                 embedding=faces[0].embedding.astype(np.float32),
             )
 
