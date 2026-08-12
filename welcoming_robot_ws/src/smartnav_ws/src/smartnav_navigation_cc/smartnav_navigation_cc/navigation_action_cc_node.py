@@ -420,14 +420,18 @@ class NavigationActionCcNode(Node):
         self.get_logger().info(f"開始導航到 {waypoint_name}（純追蹤執行）")
         self.nav_active_pub.publish(Bool(data=True))
         try:
-            res = wait_for_future(fh.get_result_async(),
-                                  timeout_sec=self.navigation_timeout_sec)
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().error(f"等待重播結果逾時或失敗: {exc}")
-            self._cancel_taught(fh)
-            return self._abort(goal_handle, result, "導航逾時，已自動取消")
+            res, outcome = self._wait_taught_result(goal_handle, fh)
         finally:
             self.nav_active_pub.publish(Bool(data=False))
+
+        if outcome == "cancel":
+            result.success = False
+            result.message = "導航請求已被系統或使用者取消"
+            goal_handle.canceled()
+            self.get_logger().info(result.message)
+            return result
+        if outcome == "timeout":
+            return self._abort(goal_handle, result, "導航逾時，已自動取消")
 
         ok = res is not None and res.status == GoalStatus.STATUS_SUCCEEDED \
             and getattr(res.result, "success", False)
@@ -453,6 +457,46 @@ class NavigationActionCcNode(Node):
         self.get_logger().error(
             f"教導-重現導航失敗：{why}　★ 臨時路徑 {plan.path_id} 已保留供查驗")
         return self._abort(goal_handle, result, f"導航失敗：{why}")
+
+    def _wait_taught_result(self, goal_handle, fh):
+        """等重播結果，同時把外層 Navigate 的「取消」轉發進去。
+
+        回傳 (結果, outcome)，outcome 是 done / cancel / timeout / failed。
+
+        ★ 2026-08-12 修正：原本這裡直接 `wait_for_future(..., 300 秒)`，
+          整條執行緒被阻塞住，期間**沒有任何人去看 goal_handle 的取消旗標**。
+          後果是 HMI 按「取消導航」完全沒有作用 —— 動作伺服器收到取消請求、
+          cancel_callback 也回了 ACCEPT，但車子照樣一路開到底。
+
+          nav2/MPPI 那條路早就有 `_monitor_navigation` 在輪詢取消，
+          教導-重現這條沒有。同一台車兩個導航入口，只有一個煞得住，
+          而 8/10 之後預設走的正是**煞不住的那一個**。
+
+          `path_teach_cc` 的 `_follow_loop` 自己是有查 `is_cancel_requested` 的
+          （見該檔 :1666），所以只要把取消**送到**它那裡，車子就會停穩、
+          回報 canceled。缺的一直只是這段轉發。
+        """
+        result_future = fh.get_result_async()
+        deadline = time.monotonic() + self.navigation_timeout_sec
+        while rclpy.ok() and not result_future.done():
+            if goal_handle.is_cancel_requested:
+                self.get_logger().warn("收到取消請求，轉發給重播動作")
+                self._cancel_taught(fh)
+                # 給重播端時間把車停穩並回報結果，再回覆上層
+                try:
+                    wait_for_future(result_future, timeout_sec=5.0)
+                except Exception:  # noqa: BLE001
+                    pass
+                return None, "cancel"
+            if time.monotonic() > deadline:
+                self.get_logger().error("重播逾時，取消重播")
+                self._cancel_taught(fh)
+                return None, "timeout"
+            time.sleep(0.2)
+
+        if not result_future.done():
+            return None, "failed"
+        return result_future.result(), "done"
 
     def _cancel_taught(self, follow_goal_handle) -> None:
         try:

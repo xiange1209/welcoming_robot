@@ -172,10 +172,28 @@ def decode_photo(payload: str) -> CompressedImage:
 
 # 各動作的等待上限（秒）。比動作節點自己的逾時再多留一點餘裕——
 # 這裡的值只在動作伺服器整個掛掉時才會用到，避免留下永不結束的執行緒。
+# 這些值必須**大於**對應節點自己的逾時。小於的話 HMI 會先放棄等待，
+# 而車子還在動 —— 見下面 navigate 那條的血淚。
 ACTION_TIMEOUTS = {
     "create_map": 480.0,          # 節點內建 400 秒
     "global_localization": 260.0,  # 節點內建 200 秒
-    "navigate": 160.0,             # 節點內建 100 秒
+    # ★★ 2026-08-12：160 -> 340（原註解「節點內建 100 秒」早就過期了）★★
+    #
+    # navigation_action_cc_node 的 navigation_timeout_sec 預設是 **300 秒**
+    # （見該檔 :63，當初從 100 放大就是因為「阿克曼車要繞路又要倒車，
+    # 100 秒常常只夠走到一半」）。HMI 這邊卻還停在替 100 秒配的 160。
+    #
+    # 超過 160 秒會發生什麼（連鎖三段，全部在展示中看得到）：
+    #   1. _await_future 逾時 -> 作業被標成「失敗／動作執行錯誤」，
+    #      但**車子還在開**，因為導航節點根本沒被通知
+    #   2. finally 把 goal handle 從 _job_handles 移除
+    #   3. ★ 此後按「緊急停止」找不到任何進行中的作業，只會回
+    #      「已緊急停止（當時沒有進行中的作業）」—— 停不了正在跑的導航
+    #
+    # 而 160 秒非常容易超過：7 m 教導路徑 @ 0.15 m/s 已經 47 秒，
+    # 再加上讓行等待（每次最多 20 秒）與脫困（三段），破 160 是常態。
+    # 340 = 節點的 300 秒再加 40 秒餘裕，維持「HMI 永遠比節點晚放棄」。
+    "navigate": 340.0,             # 節點內建 300 秒（navigation_timeout_sec）
 }
 
 
@@ -1958,9 +1976,34 @@ class HmiServerNode(Node):
             self.state.set_job(job_id, status="running", message="執行中…")
 
             result_future = goal_handle.get_result_async()
-            # 動作本身有自己的逾時（建圖 400 秒、全域定位 200 秒、導航 100 秒），
+            # 動作本身有自己的逾時（見 ACTION_TIMEOUTS 的註解），
             # 這裡的上限只是為了在動作伺服器整個掛掉時不要留下永遠不結束的執行緒。
-            wrapped = self._await_future(result_future, timeout=ACTION_TIMEOUTS.get(name, 300.0))
+            action_timeout = ACTION_TIMEOUTS.get(name, 300.0)
+            try:
+                wrapped = self._await_future(result_future, timeout=action_timeout)
+            except TimeoutError:
+                # ★ 2026-08-12：等不到結果時**主動叫停**，不能只是自己放棄。
+                #
+                # 這條路只有在「動作節點沒有依約回報」時才會走到，而那正是最危險
+                # 的情形：HMI 認定作業結束、finally 把 goal handle 從登記簿移除，
+                # 於是連緊急停止都找不到它 —— 而車子完全沒被通知過，還在照原本的
+                # 路徑開。送出取消至少讓節點端的取消檢查有機會把車停穩（導航是
+                # navigation_action_cc 的 _wait_taught_result，重播是 _follow_loop）。
+                #
+                # ⚠ 這裡一定要接 TimeoutError 而不是判斷回傳值：_await_future 逾時
+                #   是 **raise** 不是回傳 None（見該方法 :2544）。
+                self.get_logger().error(
+                    f"動作 {name} 等待結果逾時（{action_timeout:.0f} 秒），"
+                    "主動送出取消以免車子繼續移動"
+                )
+                try:
+                    goal_handle.cancel_goal_async()
+                except Exception as e:  # noqa: BLE001
+                    self.get_logger().error(f"逾時後送出取消也失敗: {e}")
+                self.state.set_job(job_id, status="failed",
+                                   message="等待結果逾時，已送出取消（請確認車輛已停止）")
+                return
+
             result = getattr(wrapped, "result", None)
             status = getattr(wrapped, "status", None)
 
