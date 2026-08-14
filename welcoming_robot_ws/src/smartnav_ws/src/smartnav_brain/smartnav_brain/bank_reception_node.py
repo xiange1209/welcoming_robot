@@ -85,6 +85,21 @@ class BankReceptionNode(Node):
         self.telegram_chat_id = self.declare_parameter(
             "telegram_chat_id", "").get_parameter_value().string_value
 
+        # ★★ 2026-08-14：沒給參數時自己去讀密鑰檔。★★
+        #
+        # 問題：HMI 系統面板走 `run_node_cc.sh`，而它（在今天之前）**不傳任何參數**，
+        # 所以從平板按「迎賓劇本」啟動 = `notify_backend` 停在預設的 "none"
+        # = **Telegram 通報靜默關閉，只印 log**。而發表當天沒有鍵盤，
+        # 面板就是唯一的啟動路徑 —— 等於黑名單通報永遠不會真的送出。
+        #
+        # 為什麼不是把權杖寫進面板指令：那會讓 Bot token 出現在
+        # 行程指令列（`ps` 看得到）、log 裡、以及任何人截的圖裡。
+        # 讓節點自己讀權限 600 的檔案是唯一乾淨的做法。
+        #
+        # ★ 只在「參數沒設」時才讀 —— 明確用 `--ros-args -p` 指定的值優先，
+        #   否則現場想臨時關掉通報就沒辦法了。
+        self._load_secrets_if_unset()
+
         self.enable_visit_log = self.declare_parameter(
             "enable_visit_log", True).get_parameter_value().bool_value
         self.visit_log_path = self.declare_parameter(
@@ -127,6 +142,48 @@ class BankReceptionNode(Node):
             f"通報後端 {self.notify_backend}"
             f"{'（dry-run，只印 log 不實際送出）' if self.notify_backend != 'telegram' else ''}"
         )
+
+    # ── 密鑰檔 ────────────────────────────────────────────────
+    SECRETS_PATH = Path.home() / ".smartnav" / "secrets" / "bank_reception.yaml"
+
+    def _load_secrets_if_unset(self) -> None:
+        """參數沒設時，從 ~/.smartnav/secrets/bank_reception.yaml 補上。
+
+        檔案格式（權限請設 600）：
+
+            notify_backend: telegram
+            telegram_bot_token: "123456:AA..."
+            telegram_chat_id: "987654321"
+
+        ★ 這個檔案**不在打包裡**（`.smartnav` 一律排除），也不該進版控。
+        ★ 讀不到就安靜地維持 dry-run —— 沒有密鑰檔仍然要能完整演一遍劇本。
+          但**有檔案卻讀失敗**要出聲，那是設定錯誤不是沒設定。
+        """
+        if self.notify_backend and self.notify_backend != "none":
+            return                      # 已經用 --ros-args 明確指定了，尊重它
+        if not self.SECRETS_PATH.exists():
+            return
+        try:
+            import yaml
+            with open(self.SECRETS_PATH, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            backend = str(data.get("notify_backend", "") or "")
+            token = str(data.get("telegram_bot_token", "") or "")
+            chat = str(data.get("telegram_chat_id", "") or "")
+            if backend:
+                self.notify_backend = backend
+            if token and not self.telegram_bot_token:
+                self.telegram_bot_token = token
+            if chat and not self.telegram_chat_id:
+                self.telegram_chat_id = chat
+            # ★ 只印「有沒有讀到」，絕不印權杖本身 —— log 會被截圖、會被貼進交接文件
+            self.get_logger().info(
+                f"✓ 已從密鑰檔載入通報設定：backend={self.notify_backend}"
+                f"、token={'有' if self.telegram_bot_token else '無'}"
+                f"、chat_id={'有' if self.telegram_chat_id else '無'}")
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(
+                f"✗ 密鑰檔存在但讀取失敗（維持 dry-run）: {self.SECRETS_PATH} — {e}")
 
     # ==================================================================
     def identity_callback(self, msg: UserIdentity) -> None:

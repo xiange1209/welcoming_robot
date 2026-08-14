@@ -49,6 +49,11 @@
   }
   #banner.vip   { background: linear-gradient(90deg, #4a3708, #1f1a0a); }
   #banner.admin { background: linear-gradient(90deg, #0b3358, #101b26); }
+  /* ★ 黑名單用紅色而且明顯 —— 這是要讓行員一眼看到的警示。
+     ⚠ 但車上的語音**刻意只說中性的話**（「已通知行員前來協助」），
+     當著本人的面播報「偵測到黑名單」會讓情況立刻升溫，
+     而且對誤判的人是嚴重冒犯。細節只給行員看，不出聲。 */
+  #banner.blacklist { background: linear-gradient(90deg, #5a1111, #26100f); }
 
   #who { font-size: 22px; font-weight: 700; }
   #who .tag {
@@ -186,6 +191,7 @@
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--line); color: var(--muted); }
   .badge.VIP   { background: var(--gold);   color: #2a1e00; }
   .badge.ADMIN { background: var(--accent); color: #04121f; }
+  .badge.BLACKLIST { background: #c0392b; color: #fff; font-weight: 700; }
   .badge.run   { background: #12324d; color: #7fc5ff; }
   .badge.ok    { background: #123d29; color: #7fe0ad; }
   .badge.bad   { background: #3d1414; color: #ff9d9d; }
@@ -573,6 +579,10 @@
         <option value="0">訪客 GUEST</option>
         <option value="1">貴賓 VIP</option>
         <option value="2">管理員 ADMIN</option>
+        <!-- ★ 2026-08-14 補：BLACKLIST=3 從 8/01 就存在於 UserType.msg，
+             但平板一直沒得選 —— 等於**沒辦法在現場註冊黑名單**，
+             而黑名單通報是專題三個角色之一。 -->
+        <option value="3">黑名單 BLACKLIST</option>
       </select>
     </div>
     <div class="row" style="margin-bottom:8px">

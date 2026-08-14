@@ -28,4 +28,13 @@ if [ -z "$PKG" ] || [ -z "$EXE" ]; then
   exit 2
 fi
 
-exec ros2 run "$PKG" "$EXE" > "$LOGDIR/${LOGNAME}.log" 2>&1
+# ★★ 2026-08-14：第 4 個之後的參數原封傳給 ros2 run。★★
+#
+# 原本這行是寫死的 `ros2 run $PKG $EXE`，**任何參數都傳不進去**。
+# 而 HMI 的系統面板走的就是這支腳本 —— 於是「從平板啟動的節點一律吃預設值」。
+# 實際後果（8/14 稽核抓到，兩個都是靜默的）：
+#   bank_reception  notify_backend 預設 "none" -> Telegram 通報變成只印 log
+#   user_auth       recognition_threshold 0.8  -> 8/14 實測會漏掉 3/9
+# 這與 ASR 那個坑是同一個病：終端機跑得動的方法，面板完全沒有採用。
+# ★ 發表當天沒有鍵盤，面板路徑就是唯一路徑。
+exec ros2 run "$PKG" "$EXE" "${@:4}" > "$LOGDIR/${LOGNAME}.log" 2>&1

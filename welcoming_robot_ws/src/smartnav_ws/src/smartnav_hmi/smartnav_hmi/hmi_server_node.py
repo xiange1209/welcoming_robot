@@ -86,7 +86,22 @@ except ImportError:  # pragma: no cover
     FollowTaughtPath = None
     TAUGHT_PATH_AVAILABLE = False
 
-USER_TYPE_NAMES = {UserType.GUEST: "GUEST", UserType.VIP: "VIP", UserType.ADMIN: "ADMIN"}
+# ★★ 2026-08-14 補上 BLACKLIST —— 它從 8/01 就存在於 UserType.msg，這裡卻漏了。★★
+#
+# 後果是**系統對評審說謊**：下面兩處都用 `.get(type, "GUEST")`，
+# 所以辨識到黑名單時，平板橫幅會顯示成「訪客 GUEST」。
+# 語音與 Telegram 通報其實都正確觸發了（bank_reception_node 讀的是原始
+# uint8，不經過這張表），**只有畫面是錯的** —— 這種「後端對、前端錯」
+# 最難發現，因為功能看起來是好的。
+#
+# 三個角色是整個專題的骨架（docs/完整故事線_報告骨架.md），
+# 其中一個在平板上被標成另一個，是不能上場的。
+USER_TYPE_NAMES = {
+    UserType.GUEST: "GUEST",
+    UserType.VIP: "VIP",
+    UserType.ADMIN: "ADMIN",
+    UserType.BLACKLIST: "BLACKLIST",
+}
 
 # 健康頁的「預期節點」清單。列在這裡的節點沒啟動時會顯示成「未啟動」，
 # 沒列到的只要有在跑就會出現在「其他」那組——兩者合起來才看得出「該在卻不在」。

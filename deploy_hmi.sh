@@ -33,7 +33,6 @@ ssh "${PI_USER}@${PI_IP}" "
 echo "--- 傳送 ---"
 scp "$SRC/smartnav_hmi/hmi_server_node.py" "${PI_USER}@${PI_IP}:${WS}/smartnav_hmi/hmi_server_node.py"
 scp "$SRC/web/index.html"                  "${PI_USER}@${PI_IP}:${WS}/web/index.html"
-scp "$HERE/HANDOFF_遙控修正驗證.md"         "${PI_USER}@${PI_IP}:~/HANDOFF_遙控修正驗證.md"
 
 # 3. 建置並驗證
 echo "--- 建置 ---"
@@ -56,7 +55,6 @@ echo
 echo "════════════════════════════════════════════"
 echo " 部署完成。接下來："
 echo "   1. 重啟 hmi_server 節點（其他節點不用動）"
-echo "   2. 照 ~/HANDOFF_遙控修正驗證.md 跑 T1~T5"
 echo
 echo " 退回舊版： ls ~/hmi_backup/ 找最新那個時間戳"
 echo "════════════════════════════════════════════"
