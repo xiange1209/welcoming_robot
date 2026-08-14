@@ -626,6 +626,14 @@
     </div>
   </div>
   <div class="card" style="flex:1">
+    <h3>周邊硬體</h3>
+    <div class="list" id="hwlist"></div>
+    <p class="meta" style="margin:6px 0 14px">
+      直接問核心有沒有抓到裝置（相當於 <code>lsusb</code> / <code>arecord -l</code>），不是看設定檔。
+      <b>驅動建置過 ≠ 硬體在車上。</b><br>
+      「喇叭」灰色是<b>預期的</b>——車上刻意不裝，語音走平板瀏覽器。
+    </p>
+
     <h3>邊緣裝置（筆電）</h3>
     <div class="list" id="edgelist"></div>
     <p class="meta" style="line-height:1.7; margin-top:10px">
@@ -2449,7 +2457,28 @@ function renderNodeGroups(box, nodes) {
   return [nodes.filter((x) => x.ok).length, nodes.length];
 }
 
+async function refreshHardware() {
+  const box = $("hwlist");
+  if (!box) return;
+  const r = await api("/api/hardware");
+  const items = (r && r.items) || [];
+  box.innerHTML = "";
+  items.forEach((h) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    // 喇叭缺席是設計，不是故障 —— 用灰色不用紅色，否則操作者會跑去「修」它
+    const expectedMissing = h.key === "speaker";
+    const dot = h.present ? "🟢" : (expectedMissing ? "⚪" : "🔴");
+    row.innerHTML =
+      `<div><b>${dot} ${h.label}</b><div class="meta">${h.detail || ""}</div>` +
+      (h.hint && !h.present ? `<div class="meta" style="opacity:.75">${h.hint}</div>` : "") +
+      "</div>";
+    box.appendChild(row);
+  });
+}
+
 async function refreshHealth() {
+  refreshHardware();          // 硬體偵測與節點狀態一起更新
   const h = await api("/api/health");
   const pi = $("pilist"), edge = $("edgelist");
   pi.innerHTML = "";

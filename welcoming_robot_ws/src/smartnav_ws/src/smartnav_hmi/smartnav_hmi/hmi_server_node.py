@@ -7,6 +7,7 @@ import json
 import base64
 import binascii
 import math
+import glob
 import os
 import re
 import secrets
@@ -851,6 +852,9 @@ class HmiServerNode(Node):
         # lifecycle 查詢用的 get_state 客戶端。只在 _node_status() 一次查詢期間存在，
         # 查完就銷毀——留著會永久墊高執行器每一輪 wait set 的實體數（見 _node_status）
         self._state_clients: Dict[str, Any] = {}
+        self._hw_lock = threading.Lock()
+        self._hw_cache: list = []
+        self._hw_cache_at = 0.0
         self._nodes_cache: List[Dict[str, Any]] = []
         self._nodes_cache_at = 0.0
         self._nodes_lock = threading.Lock()
@@ -2496,6 +2500,91 @@ class HmiServerNode(Node):
     # 而模組裝沒裝在一次執行期間不會變。
     _requires_cache: Dict[str, str] = {}
 
+    # ── 周邊硬體偵測（2026-08-14 新增）────────────────────────
+    #
+    # 專案鐵則：**硬體問題用列舉指令回答，不要用文件回答**。
+    # 「驅動套件建置過」不等於「硬體在車上」——8/07 就是靠這條抓到
+    # 「以為有 6 麥陣列，其實只有驅動」。這支端點把那些列舉搬到平板上。
+    #
+    # ★ 兩層都要看，只看一層會得到錯的結論：
+    #     核心層  裝置節點在不在（插了沒、驅動認得嗎）
+    #     資料層  話題有沒有在發（認得到 ≠ 有資料，相機常態是關的）
+    #   只看核心層 -> 相機插著但沒啟動，會誤報「正常」
+    #   只看資料層 -> 節點沒開時全部紅字，分不出「沒開」還是「沒插」
+    #
+    # ★ 全部走 /proc 與 /sys，不開子行程：這支會被平板輪詢，
+    #   每次 fork 一個 lsusb 在 Pi 4 上是不必要的負擔。
+    @staticmethod
+    def _read(path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def _usb_products(self) -> list:
+        """USB 裝置的產品名清單（相當於 lsusb，但不開子行程）"""
+        names = []
+        for f in glob.glob("/sys/bus/usb/devices/*/product"):
+            v = self._read(f).strip()
+            if v:
+                names.append(v)
+        return names
+
+    def hardware_status(self) -> list:
+        now = time.time()
+        with self._hw_lock:
+            if self._hw_cache and now - self._hw_cache_at < 3.0:
+                return self._hw_cache
+
+        pcm = self._read("/proc/asound/pcm")
+        usb = self._usb_products()
+        usb_l = " | ".join(usb).lower()
+        videos = sorted(glob.glob("/dev/video*"))
+        serials = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+                         + glob.glob("/dev/wheeltec_*"))
+        sysinfo = self.state.snapshot().get("system", {})
+
+        def item(key, label, present, detail, hint=""):
+            return {"key": key, "label": label, "present": bool(present),
+                    "detail": detail, "hint": hint}
+
+        out = [
+            item("camera", "深度相機 Astra S",
+                 any("astra" in u.lower() or "orbbec" in u.lower() for u in usb) or bool(videos),
+                 (f"{len(videos)} 個 /dev/video*" if videos else "找不到 /dev/video*")
+                 + (f"；USB: {[u for u in usb if 'astra' in u.lower() or 'orbbec' in u.lower()]}"
+                    if any('astra' in u.lower() or 'orbbec' in u.lower() for u in usb) else ""),
+                 "沒抓到就把 Astra S 手動插拔一次 —— 它有開機列舉失敗的老問題，"
+                 "而且**麥克風長在同一顆裝置上，會一起消失**"),
+            item("mic", "麥克風（在相機裡）",
+                 "capture" in pcm,
+                 "有錄音裝置" if "capture" in pcm else "/proc/asound/pcm 沒有 capture",
+                 "跟相機同一顆 USB 裝置。ASR 要用它"),
+            item("speaker", "喇叭",
+                 "playback" in pcm,
+                 "有播放裝置" if "playback" in pcm else "沒有播放裝置（正常）",
+                 "★ 車上刻意不裝喇叭（2026-08-07 決定）。語音輸出走平板瀏覽器，"
+                 "所以這一項紅色是**預期的**，不用處理"),
+            item("serial", "序列埠（底盤／光達）",
+                 bool(serials),
+                 "、".join(serials) if serials else "找不到任何 ttyUSB/ttyACM",
+                 "底盤 STM32 與 N10 光達都走 USB 序列埠。少一個就會有一個節點起不來"),
+        ]
+
+        # ── 資料層：話題有沒有在發 ──
+        # 這幾個量本來就在 state 裡（由既有訂閱更新），直接借用，不另外訂閱。
+        out.append(item(
+            "chassis_data", "底盤回報（電壓）",
+            sysinfo.get("voltage") is not None,
+            f"{sysinfo.get('voltage')} V" if sysinfo.get("voltage") is not None else "沒收到 /PowerVoltage",
+            "★ 有序列埠但沒有電壓 = 線接上了但節點沒起來（或起來了但通訊失敗）"))
+
+        with self._hw_lock:
+            self._hw_cache = out
+            self._hw_cache_at = now
+        return out
+
     def _check_requires(self, requires: Optional[dict]) -> str:
         """回傳「缺什麼」的說明，都齊全就回空字串"""
         if not requires:
@@ -2868,6 +2957,13 @@ class HmiServerNode(Node):
             # 前端用 ?v=<version> 破快取，這裡明確禁止快取避免拿到舊圖
             return Response(content=png, media_type="image/png", headers={"Cache-Control": "no-store"})
 
+        @app.get("/api/hardware")
+        async def api_hardware() -> JSONResponse:
+            """周邊硬體偵測。★ 刻意不要求登入 ——
+            這是純唯讀的診斷資訊，而「東西壞了看不出來」比「被人看到有幾個 USB」嚴重。"""
+            items = await asyncio.get_running_loop().run_in_executor(None, self.hardware_status)
+            return JSONResponse({"success": True, "items": items})
+
         @app.get("/api/map/meta")
         async def api_map_meta() -> JSONResponse:
             self.note_map_interest()
@@ -3194,7 +3290,16 @@ class HmiServerNode(Node):
             self.apply_teleop(0.0, 0.0)
             return JSONResponse({"success": True, "message": "已停止"})
 
-        @app.post("/api/estop", dependencies=admin_only)
+        # ★★ 2026-08-14：拿掉 admin_only —— 緊急停止不可以需要登入。★★
+        #
+        # 原本它跟導航、建圖一起被 admin_only 保護。那個分類是錯的：
+        # 其他端點保護的是「不要讓路人亂開車」，而這一顆的作用是**讓車停下來**。
+        # 登入 12 小時後過期（admin_session_hours），而展示當天平板可能整天開著
+        # —— 真的要急停時跳出登入框，是最糟的失敗方式。
+        #
+        # 濫用風險評估過：最壞情況是有人惡意讓車停下來，那正是安全的方向。
+        # 對照「該停停不下來」，這個代價完全值得。
+        @app.post("/api/estop")
         async def api_estop() -> JSONResponse:
             """全域緊急停止：**一個動作停下所有會讓車子移動的來源**
 
