@@ -77,6 +77,49 @@ class SpeechRecognizerNode(Node):
             "enable_corrections", True,
             ParameterDescriptor(description="是否套用內建的銀行詞彙同音修正表"))
 
+        # ── 資源保護（2026-08-14 新增）★ 使用者：「我怕跟他講太多話它會把整機卡死」──
+        #
+        # 這個擔心是對的，而且**有一個具體的無界成長點**：
+        #
+        #   `is_final` 是由 voice_trigger 的 VAD 決定的，**不是** sherpa 自己判斷的。
+        #   （`enable_endpoint_detection=True` 有設，但程式從來沒呼叫 `is_endpoint()`
+        #     去問它 —— 那三條 rule 目前是死設定，見 _init_sherpa_onnx_asr。）
+        #   所以只要 VAD 一直判定「還在講話」（持續噪音、冷氣、人聲背景），
+        #   同一個 stream 會一直被餵音訊，**永遠不會 reset**：
+        #     - stream 內部的特徵緩衝隨時間線性成長
+        #     - modified_beam_search 的假設集合也跟著長
+        #   Pi 4 只有 8 GB 而相機＋導航已經吃掉大半，這是真的會撐爆的路徑。
+        #
+        # 對策：自己計時，超過 max_utterance_sec 就**強制收尾**（把目前結果發出去、
+        # 重建 stream）。這同時也修好「一句話講太長就再也不出結果」的體感問題。
+        # 20 秒是 sherpa 原本 rule3 的值，沿用它保持一致。
+        self.declare_parameter(
+            "max_utterance_sec", 20.0,
+            ParameterDescriptor(description="單一語句最長時間，超過就強制收尾並重建 stream（防記憶體無界成長）"))
+        # 佇列積壓警告門檻。RTF 實測 0.76，餘裕只有 24%，導航/相機一忙就會
+        # 超過 1.0 -> 佇列愈積愈多 -> 延遲愈來愈大，而**這件事原本完全看不見**。
+        self.declare_parameter(
+            "queue_warn_depth", 20,
+            ParameterDescriptor(description="音訊佇列積壓超過這個數就警告（上限 50）"))
+
+        # ── 熱詞（contextual biasing）：專治同音錯字，見 _init_sherpa_onnx_asr ──
+        self.declare_parameter(
+            "hotwords_file", "",
+            ParameterDescriptor(description="熱詞檔路徑；留空會自動找模型目錄或 config/hotwords.txt"))
+        self.declare_parameter(
+            "hotwords_score", 1.8,
+            ParameterDescriptor(description="熱詞加分權重。太高會讓模型把不相干的話也扭曲成熱詞"))
+        self.declare_parameter(
+            "max_active_paths", 4,
+            ParameterDescriptor(
+                description="beam 寬度。調大較準但較慢 —— 實測 RTF 已經 0.76，"
+                            "只剩 24% 餘裕，調到 8 很可能讓佇列積壓，先確認 CPU 有空再動"))
+
+        self.max_utterance_sec = self.get_parameter("max_utterance_sec").get_parameter_value().double_value
+        self.queue_warn_depth = self.get_parameter("queue_warn_depth").get_parameter_value().integer_value
+        self._stream_samples = 0          # 目前這個 stream 已經吃進多少取樣點
+        self._queue_warned = False
+
         self.min_text_length = self.get_parameter("min_text_length").get_parameter_value().integer_value
         self.drop_uniform_text = self.get_parameter("drop_uniform_text").get_parameter_value().bool_value
         self.collapse_repeats = self.get_parameter("collapse_repeats").get_parameter_value().integer_value
@@ -180,8 +223,40 @@ class SpeechRecognizerNode(Node):
 
                 self.get_logger().info(f"載入 ASR 模型: {asr_model_dir}")
 
-                # 創建 ASR 模型配置
-                recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                # ★★ 2026-08-14：啟用熱詞（contextual biasing）★★
+                #
+                # 使用者回報「辨識錯誤」，而中文 ASR 的錯幾乎都是**同音字**
+                # （開護/開戶、帶款/貸款、題款/提款）。熱詞就是為這件事設計的：
+                # 解碼時對清單裡的詞加分，讓同音候選裡的正確那個勝出。
+                #
+                # ★ 前提條件本來就已經滿足：熱詞只在 decoding_method 為
+                #   "modified_beam_search" 時有效，而這裡本來就是。
+                #   （greedy_search 用不了 —— 它每步只留一個候選，沒有東西可以加分。）
+                #
+                # 檔案格式：一行一個詞，字與字之間空一格（char-based 中文模型的
+                # token 就是單字）。詞尾可加 `:分數` 覆寫個別權重。
+                # 預設檔在 smartnav_audio/config/hotwords.txt。
+                #
+                # ⚠ hotwords_score 不要調太高：分數過大會讓模型「聽到什麼都往
+                #   熱詞靠」，把不相干的句子也扭曲成銀行詞彙。1.5~2.0 是常用區間，
+                #   這裡取 1.8。調高之前先確認錯的真的是同音字而不是漏字。
+                hot_file = self.get_parameter("hotwords_file").get_parameter_value().string_value
+                hot_score = self.get_parameter("hotwords_score").get_parameter_value().double_value
+                if not hot_file:
+                    # asr_model_dir = <share>/smartnav_audio/models/asr
+                    #   .parent        -> models/
+                    #   .parent.parent -> <share>/smartnav_audio/
+                    # ★ 不要用 get_model_path("config") —— 那個函式一律接在
+                    #   models/ 底下，會解析成 models/config（不存在）。
+                    share_dir = asr_model_dir.parent.parent
+                    for cand in (share_dir / "config" / "hotwords.txt",
+                                 asr_model_dir.parent / "hotwords.txt",
+                                 asr_model_dir / "hotwords.txt"):
+                        if cand.exists():
+                            hot_file = str(cand)
+                            break
+
+                kwargs = dict(
                     tokens=str(tokens_file),
                     encoder=str(encoder_file),
                     decoder=str(decoder_file),
@@ -190,12 +265,37 @@ class SpeechRecognizerNode(Node):
                     sample_rate=self.sample_rate,
                     feature_dim=80,
                     decoding_method="modified_beam_search",
-                    max_active_paths=4,
+                    max_active_paths=self.get_parameter(
+                        "max_active_paths").get_parameter_value().integer_value,
+                    # ★ 這三條 rule 目前**不會生效** —— 程式從來沒有呼叫
+                    #   `recognizer.is_endpoint(stream)` 去問它。斷句是由
+                    #   voice_trigger 的 VAD 透過 AudioData.is_final 決定的。
+                    #   保留設定是為了日後若改用 sherpa 自己的端點偵測，
+                    #   但**不要以為調這幾個數字會改變斷句延遲**（會白調）。
+                    #   真正影響延遲的是 voice_trigger 的 silence_timeout（預設 500 ms）。
                     enable_endpoint_detection=True,
                     rule1_min_trailing_silence=2.4,
                     rule2_min_trailing_silence=1.2,
                     rule3_min_utterance_length=20.0,
                 )
+
+                recognizer = None
+                if hot_file:
+                    try:
+                        recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                            hotwords_file=hot_file, hotwords_score=hot_score, **kwargs)
+                        self.get_logger().info(
+                            f"✓ 熱詞已啟用：{hot_file}（score {hot_score:.1f}）")
+                    except Exception as e:  # noqa: BLE001
+                        # 不同 sherpa-onnx 版本的參數名不一定相同。熱詞是加分項，
+                        # 不能因為它讓整個 ASR 起不來 —— 退回沒有熱詞的版本。
+                        self.get_logger().warning(
+                            f"熱詞載入失敗（沿用無熱詞模式，辨識仍可用）: {e}")
+                        recognizer = None
+                if recognizer is None:
+                    recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
+                    if not hot_file:
+                        self.get_logger().info("未提供熱詞檔（hotwords_file），跳過熱詞")
 
                 self.recognizer = recognizer
                 self.stream = recognizer.create_stream()
@@ -313,6 +413,18 @@ class SpeechRecognizerNode(Node):
             # 接受波形數據
             self.stream.accept_waveform(self.sample_rate, audio)
 
+            # ★ 2026-08-14 防記憶體無界成長：VAD 一直不說結束時強制收尾。
+            #   `is_final` 來自 voice_trigger 的 VAD，不是 sherpa 自己判斷的，
+            #   所以持續噪音會讓同一個 stream 永遠不 reset（見 __init__ 的長註解）。
+            self._stream_samples += len(audio)
+            if not is_final and self.max_utterance_sec > 0:
+                secs = self._stream_samples / float(self.sample_rate)
+                if secs >= self.max_utterance_sec:
+                    self.get_logger().warning(
+                        f"⏱ 單句已達 {secs:.1f} 秒（上限 {self.max_utterance_sec:.0f}），"
+                        "強制收尾並重建 stream —— VAD 可能被持續噪音卡在『還在講話』")
+                    is_final = True
+
             # 最終塊，通知引擎結束輸入
             if is_final:
                 self.stream.input_finished()
@@ -350,6 +462,7 @@ class SpeechRecognizerNode(Node):
             if is_final:
                 # 立即重置流，準備下一句識別
                 self.stream = self.recognizer.create_stream()
+                self._stream_samples = 0   # ★ 重建 stream 一定要歸零，否則計時器會一路累加
         except Exception as e:
             self.get_logger().error(f"✗ 語音辨識失敗: {e}")
             # 重置流
@@ -444,6 +557,7 @@ class SpeechRecognizerNode(Node):
 
             if self.recognizer and self.stream:
                 self.stream = self.recognizer.create_stream()
+                self._stream_samples = 0   # ★ 重建 stream 一定要歸零，否則計時器會一路累加
 
             self.last_partial_result = None
 

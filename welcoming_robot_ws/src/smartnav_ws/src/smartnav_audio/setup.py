@@ -16,6 +16,14 @@ setup(
             for f in glob.glob("models/**", recursive=True)
             if os.path.isfile(f)
         ],
+        # ★ 2026-08-14：config/ 原本沒被安裝，所以放在裡面的檔案 colcon build
+        #   之後**不會出現在 share/ 底下**，節點自然找不到 —— 而且不會報錯，
+        #   只會安靜地少一個功能（熱詞）。加上 hotwords.txt 時踩到，補上規則。
+        *[
+            (os.path.join("share", package_name, os.path.dirname(f)), [f])
+            for f in glob.glob("config/**", recursive=True)
+            if os.path.isfile(f)
+        ],
     ],
     install_requires=["setuptools"],
     zip_safe=True,

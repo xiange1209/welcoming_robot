@@ -1458,6 +1458,7 @@ document.querySelectorAll("#tabs button").forEach((btn) => {
 // ── 狀態推播 ───────────────────────────────────────
 let lastMapVersion = -1;
 let mapMeta = null;
+let navPath = null;   // 規劃路徑（2026-08-14），由 snapshot 的 nav_path 帶進來
 let robotPose = null;
 let waypoints = [];
 let mapsCache = [];
@@ -1609,6 +1610,7 @@ function render(s) {
 
   mapMeta = s.map_meta;
   robotPose = s.robot_pose;
+  navPath = s.nav_path || null;
   if (mapMeta && mapMeta.version !== lastMapVersion) {
     lastMapVersion = mapMeta.version;
     loadMapImage(mapMeta.version);   // 圖載完會自己重畫
@@ -1997,6 +1999,44 @@ function drawMap() {
     ctx.fillText(w.waypoint_name, c.x + 9, c.y + 4);
   }
 
+  // ── 規劃路徑（2026-08-14 新增）──────────────────────────
+  //
+  // 按下導航或開始重播時，車子打算怎麼走就畫在這裡。
+  // 畫在地點與機器人**之前**，這樣路徑不會蓋住那兩個更重要的標記。
+  //
+  // 兩個來源用不同顏色，因為它們代表完全不同的執行方式，
+  // 而「現在到底走哪一條」是除錯時第一個要確認的事：
+  //     taught（藍）= nav2 規劃 + 純追蹤執行  ← 主力
+  //     nav2 （橘）= nav2 規劃 + MPPI 執行    ← 備援
+  if (navPath && navPath.points && navPath.points.length > 1) {
+    const isTaught = navPath.source === "taught";
+    ctx.save();
+    // 先畫一條半透明粗線當底，再畫細實線 —— 地圖是灰階的，
+    // 單一細線在深色格子上會看不見。
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.strokeStyle = isTaught ? "rgba(56,152,236,0.35)" : "rgba(240,140,50,0.35)";
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    navPath.points.forEach((p, i) => {
+      const c = worldToCanvas(t, p[0], p[1]);
+      if (i === 0) ctx.moveTo(c.x, c.y); else ctx.lineTo(c.x, c.y);
+    });
+    ctx.stroke();
+    ctx.strokeStyle = isTaught ? "#3898ec" : "#f08c32";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // 終點畫一個小圈：路徑末端在轉折多的地方很難一眼看出是哪一頭
+    const last = navPath.points[navPath.points.length - 1];
+    const lc = worldToCanvas(t, last[0], last[1]);
+    ctx.fillStyle = isTaught ? "#3898ec" : "#f08c32";
+    ctx.beginPath();
+    ctx.arc(lc.x, lc.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   // 已選的點（含朝向）
   if (picked) {
     const c = worldToCanvas(t, picked.x, picked.y);
@@ -2010,9 +2050,13 @@ function drawMap() {
   }
 
   const meters = (mapMeta.width * mapMeta.resolution).toFixed(1);
+  const pathHint = (navPath && navPath.points && navPath.points.length > 1)
+    ? `　路徑 ${navPath.points.length} 點（${navPath.source === "taught" ? "純追蹤" : "MPPI"}）`
+    : "";
   $("maphint").textContent =
     `${mapMeta.width}×${mapMeta.height} @ ${mapMeta.resolution} m/px（約 ${meters} m 寬）　` +
-    (robotPose ? `機器人 (${robotPose.x.toFixed(2)}, ${robotPose.y.toFixed(2)})` : "機器人位置未知");
+    (robotPose ? `機器人 (${robotPose.x.toFixed(2)}, ${robotPose.y.toFixed(2)})` : "機器人位置未知") +
+    pathHint;
 }
 
 /** 畫一個代表位置與朝向的箭頭。畫布 y 軸向下，所以角度取負 */

@@ -31,6 +31,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from geometry_msgs.msg import Pose, PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.srv import GetState
 from nav_msgs.msg import OccupancyGrid, Odometry
+# ★ 改名匯入：這個檔案第 17 行已經有 `from pathlib import Path`，
+#   直接 `from nav_msgs.msg import Path` 會把它蓋掉，而 web_dir 那邊還在用。
+from nav_msgs.msg import Path as RosPath
 from pydantic import BaseModel
 from rcl_interfaces.msg import Parameter, ParameterDescriptor, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
@@ -308,6 +311,8 @@ class HmiState:
         }
         self.map_meta: Optional[Dict[str, Any]] = None
         self.robot_pose: Optional[Dict[str, float]] = None
+        # 要畫在地圖上的規劃路徑（見 set_nav_path）
+        self.nav_path: Optional[Dict[str, Any]] = None
         self.jobs: Dict[str, Dict[str, Any]] = {}
         # 人臉註冊進度。放在共用狀態而不是前端區域變數，這樣平板、筆電
         # 等所有連線中的裝置看到的採樣倒數與結果都是同一份。
@@ -404,6 +409,35 @@ class HmiState:
             self.map_meta = meta
             self._bump()
 
+    def set_nav_path(self, source: str, pts: list) -> None:
+        """更新要畫在地圖上的路徑（2026-08-14 新增）
+
+        使用者要求：「我想要在 HMI 看到它規劃的路徑（按下導航或錄製重現）」。
+        資料本來就存在，只是從來沒有被送到前端 ——
+          `taught_path`  path_teach_cc 在重播開始與規劃完成時發（latched）
+          `plan`         nav2 planner_server 的全域路徑
+
+        ★ 這裡**不做座標轉換**。前端已經有 map_meta（resolution/origin）與現成的
+          世界座標→像素轉換（畫機器人用的那個），所以送原始 map frame 的公尺值
+          最單純，也不會因為換地圖而失效。
+
+        ★ 空清單代表「清掉畫面上的路徑」（導航結束時）。
+        """
+        with self._lock:
+            new = {"source": source, "points": pts} if pts else None
+            old = self.nav_path
+            # 點數與來源都一樣時就不算變 —— 這個東西會 5 Hz 進來，
+            # 每次都 _bump() 會讓 WebSocket 一直推整包狀態。
+            same = (
+                (old is None and new is None)
+                or (old is not None and new is not None
+                    and old["source"] == new["source"]
+                    and len(old["points"]) == len(new["points"]))
+            )
+            self.nav_path = new
+            if not same:
+                self._bump()
+
     def set_robot_pose(self, pose: Optional[Dict[str, float]]) -> None:
         """更新機器人位姿
 
@@ -485,6 +519,7 @@ class HmiState:
                 "system": dict(self.system),
                 "map_meta": dict(self.map_meta) if self.map_meta else None,
                 "robot_pose": dict(self.robot_pose) if self.robot_pose else None,
+                "nav_path": dict(self.nav_path) if self.nav_path else None,
                 "jobs": [dict(j) for j in self.jobs.values()],
                 "registration": dict(self.registration) if self.registration else None,
             }
@@ -911,6 +946,17 @@ class HmiServerNode(Node):
         # 車速取自 odom。上方列要回答的是「車子現在到底有沒有在動」——
         # 這在脫困、防撞死鎖那類問題上是第一個要看的量（發了指令但車不動）。
         self.create_subscription(Odometry, "odom", self._odom_speed_cb, sensor_qos, callback_group=cb)
+
+        # ── 規劃路徑（2026-08-14 新增，使用者要求在 HMI 上看得到）──
+        #   taught_path  path_teach_cc 發的：規劃完成與重播開始時（latched）
+        #   plan         nav2 planner_server 的全域路徑（走 MPPI 那條時才有）
+        # 兩條都畫，用 source 欄位區分顏色。latched 讓晚開的平板也拿得到。
+        self.create_subscription(
+            RosPath, "taught_path",
+            lambda m: self._nav_path_cb(m, "taught"), latched_qos, callback_group=cb)
+        self.create_subscription(
+            RosPath, "plan",
+            lambda m: self._nav_path_cb(m, "nav2"), 10, callback_group=cb)
 
         # ── 發布 ──────────────────────────────────────────
         # 網頁打字送出的文字進 user_text，與語音辨識、人臉事件走同一條路進 LLM
@@ -1596,6 +1642,26 @@ class HmiServerNode(Node):
         self._last_charge_cur_at = now
         self.state.set_system(charge_current=round(float(msg.data), 2))
 
+    def _nav_path_cb(self, msg, source: str) -> None:
+        """把規劃路徑送給前端畫。
+
+        ★ 降採樣：規劃路徑動輒 30~150 點、教導路徑可以到 20000 點
+          （record_spacing 5 cm × 長路徑）。整包塞進 WebSocket 每次狀態推播
+          都要重傳，Pi 4 撐不住也沒必要 —— 畫在 300 px 寬的地圖上，
+          相鄰兩點差幾公分根本看不出來。
+          取樣到最多 MAX_PATH_POINTS 點，**但保證留下最後一點**（終點位置
+          是操作者最想確認的東西，被降採樣切掉就白畫了）。
+        """
+        pts = [(round(p.pose.position.x, 3), round(p.pose.position.y, 3))
+               for p in msg.poses]
+        if len(pts) > self.MAX_PATH_POINTS:
+            step = len(pts) / float(self.MAX_PATH_POINTS)
+            idx = sorted({int(i * step) for i in range(self.MAX_PATH_POINTS)})
+            if idx[-1] != len(pts) - 1:
+                idx.append(len(pts) - 1)
+            pts = [pts[i] for i in idx]
+        self.state.set_nav_path(source, pts)
+
     def _odom_speed_cb(self, msg: Odometry) -> None:
         """車速 + 順手抄 CPU 溫度與負載
 
@@ -2037,6 +2103,10 @@ class HmiServerNode(Node):
     # 速度上限。遙控建圖要慢——slam_toolbox 的 minimum_travel_distance 是 0.2 m，
     # 開太快等於每兩幀之間跳過一大段，scan matching 會失準。
     # 也刻意比導航時的 vx_max (0.25) 更保守。
+    # 送到前端畫的路徑最多幾點。地圖畫布只有幾百像素寬，超過這個數的細節
+    # 眼睛看不出來，卻要每次狀態推播都重傳一遍。
+    MAX_PATH_POINTS = 120
+
     TELEOP_MAX_LINEAR = 0.18
     TELEOP_MAX_ANGULAR = 0.45
 
@@ -2312,6 +2382,8 @@ class HmiServerNode(Node):
             "detect": ["speech_synthesizer"],
             "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "speech_synthesizer"],
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "speech_synthesizer"],
+            "requires": {"audio_output": True},
+            "hide_when_missing": True,
             "start_hint": "車上沒有喇叭，展示時的語音輸出是平板瀏覽器唸的，不需要開這個",
         },
         "voice_playback": {
@@ -2319,7 +2391,8 @@ class HmiServerNode(Node):
             "detect": ["voice_playback"],
             "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "voice_playback"],
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "voice_playback"],
-            "requires": {"module": "sounddevice"},
+            "requires": {"module": "sounddevice", "audio_output": True},
+            "hide_when_missing": True,
             "start_hint": "同上：車上沒有喇叭。要平板出聲請開右上角的朗讀開關",
         },
     }
@@ -2352,6 +2425,22 @@ class HmiServerNode(Node):
         """回傳「缺什麼」的說明，都齊全就回空字串"""
         if not requires:
             return ""
+        # ★ 2026-08-14：硬體檢查。使用者要求「HMI 要自己把沒在用的設備剔除」。
+        #   做成偵測而不是刪掉單元 —— 日後真的裝了喇叭，按鈕會自己回來。
+        if requires.get("audio_output"):
+            cached = self._requires_cache.get("__aplay__")
+            if cached is None:
+                try:
+                    # 問核心而不是看設定檔。/proc/asound/pcm 每行結尾是
+                    # "playback 1" / "capture 1"，只有播放裝置才有 playback。
+                    txt = open("/proc/asound/pcm", encoding="utf-8", errors="ignore").read()
+                    cached = "" if "playback" in txt else "車上沒有喇叭（找不到播放裝置）"
+                except OSError:
+                    cached = "車上沒有喇叭（找不到播放裝置）"
+                self._requires_cache["__aplay__"] = cached
+            if cached:
+                return cached
+
         module = requires.get("module")
         if not module:
             return ""
@@ -2372,6 +2461,11 @@ class HmiServerNode(Node):
         mypid = os.getpid()
         units = []
         for key, spec in self.SYSTEM_UNITS.items():
+            # ★ 缺硬體而且標了 hide_when_missing 的單元直接不列出來。
+            #   面板上一顆永遠按不動的按鈕，比沒有這顆按鈕更糟 ——
+            #   操作者會在「沒聲音」時去按它，然後以為是它壞了。
+            if spec.get("hide_when_missing") and self._check_requires(spec.get("requires")):
+                continue
             found = []
             for needle in spec["detect"]:
                 for pid, cmd in procs:
