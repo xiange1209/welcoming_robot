@@ -1292,10 +1292,23 @@ async function refreshMapList() {
 
 /* ── 系統開關 ───────────────────────────────────────── */
 // 十個開關擠成一列很難找，照迎賓流程的順序分三組
+//
+// ★★ 2026-08-14 修正兩處，兩處都是「不報錯但難用」：
+//
+//   (1) `bank_reception` 從來不在任何一組裡。它不會消失（refreshSystem 會把
+//       沒分組的單元追加到最後），但它會排在四個語音開關**後面** ——
+//       而它是整條故事線的核心（認出人之後要做什麼全在那個節點）。
+//       發表當天在平板上往下滑找按鈕，是最不該發生的事。
+//
+//   (2) `voice_trigger` / `speech_recognizer` 兩個 key 已合併成 `asr_chain`
+//       （後端把它們改成同一支 run_asr_cc.sh 啟動，理由見 hmi_server_node.py）。
+//       ★ 這一行沒跟著改的話，新按鈕會掉到分組外、排到最後，
+//         而舊的兩個 key 找不到對應單元被靜默略過 —— 看起來就像「功能不見了」。
+//         **前端寫死 key、後端改 key** 是這個檔案第二次踩到的坑。
 const SYS_GROUPS = [
   {title: "移動與感測", keys: ["sensors", "camera", "nav"]},
-  {title: "迎賓互動", keys: ["face", "user_auth", "llm"]},
-  {title: "語音", keys: ["voice_trigger", "speech_recognizer", "speech_synthesizer", "voice_playback"]},
+  {title: "迎賓互動", keys: ["face", "user_auth", "bank_reception", "llm"]},
+  {title: "語音", keys: ["asr_chain", "speech_synthesizer", "voice_playback"]},
 ];
 
 // 「剛按下去、還沒看到結果」的單元。導航堆疊要 60 秒才會全部起來，
@@ -1329,13 +1342,32 @@ async function refreshSystem() {
   // 依分組排序；不在任何分組裡的（之後新增的）排最後，不會消失
   const seen = new Set();
   const units = [];
+  // ★ 2026-08-14 防呆：後端改了單元 key、這裡忘了跟著改時，舊 key 會被
+  //   `filter(Boolean)` 靜默丟掉，畫面上看起來就是「那個功能不見了」，
+  //   而且不會有任何錯誤。已經發生過兩次，所以這裡主動喊一聲。
+  //   只印一次（用旗標），免得 2 秒一輪的輪詢把 console 洗版。
+  if (!refreshSystem._keysChecked) {
+    refreshSystem._keysChecked = true;
+    const known = new Set(all.map((u) => u.key));
+    const missing = SYS_GROUPS.flatMap((g) => g.keys).filter((k) => !known.has(k));
+    if (missing.length) {
+      console.warn("[HMI] SYS_GROUPS 裡有後端不認得的單元 key（會被靜默略過）:", missing);
+    }
+  }
+
   SYS_GROUPS.forEach((g) => {
     const inGroup = g.keys.map((k) => all.find((u) => u.key === k)).filter(Boolean);
     if (!inGroup.length) return;
     units.push({_header: g.title});
     inGroup.forEach((u) => { units.push(u); seen.add(u.key); });
   });
-  all.filter((u) => !seen.has(u.key)).forEach((u) => units.push(u));
+  // 沒被分組的單元仍然要顯示（追加在最後），但那代表 SYS_GROUPS 漏了它
+  const ungrouped = all.filter((u) => !seen.has(u.key));
+  if (ungrouped.length && !refreshSystem._ungroupedWarned) {
+    refreshSystem._ungroupedWarned = true;
+    console.warn("[HMI] 這些單元沒有分組，被排在最後:", ungrouped.map((u) => u.key));
+  }
+  ungrouped.forEach((u) => units.push(u));
 
   units.forEach((u) => {
     if (u._header) {

@@ -2276,32 +2276,51 @@ class HmiServerNode(Node):
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_llm", "llm_service"],
             "start_hint": "連遠端 Ollama（預設 192.168.137.1:11434 = 筆電），不是跑在這台 Pi 上",
         },
-        "voice_trigger": {
-            "label": "語音喚醒",
-            "detect": ["voice_trigger"],
-            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "voice_trigger"],
-            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "voice_trigger"],
+        # ★★ 2026-08-14：原本這裡是「語音喚醒」與「語音辨識」兩顆分開的按鈕，
+        #    兩顆都走 run_node_cc.sh —— 而那條路**啟動出來的 ASR 收不到人聲**。
+        #
+        #    缺的三件事（8/14 實機才查出來，全部不報錯）：
+        #      1. Astra S 的 ALSA 卡號**每次開機都會變**（那天一天內 1 -> 2 -> 3），
+        #         裝置索引必須當場問 sounddevice，不能沿用預設
+        #      2. 增益有 'Mic',0 與 'Mic',1 **兩個**控制項，只設一個沒有用；
+        #         而預設的 48（24 dB）底噪 -35 dBFS、人聲埋在裡面 -> VAD 一次都沒觸發
+        #      3. voice_trigger 要收到 `device:=<索引>`，否則抓到別張音效卡
+        #
+        #    這三件事都在 `~/maprun/run_asr_cc.sh` 裡（8/14 實測校準過，增益 66 = 33 dB）。
+        #
+        # ★ 為什麼合併成一顆而不是修兩顆：這兩個節點**只有一起跑才有意義** ——
+        #   voice_trigger 只在 VAD 判定有人講話時才送 /audio_in，
+        #   speech_recognizer 收到才吐 /user_text。分開按只會製造「開了一半」的狀態。
+        #   而且發表當天沒有鍵盤，**面板上一顆會動的按鈕勝過兩顆不會動的**。
+        #
+        # detect 兩個都列：只起來一個時前端會顯示 partial（半亮），一眼看得出不對。
+        "asr_chain": {
+            "label": "語音輸入（麥克風 → 文字）",
+            "detect": ["voice_trigger", "speech_recognizer"],
+            "start": ["/home/user/maprun/run_asr_cc.sh"],
+            "stop": ["/home/user/maprun/run_asr_cc.sh", "stop"],
             "requires": {"module": "sounddevice"},
+            "start_hint": "麥克風長在 Astra S 相機裡；相機沒插好就沒有它。載入模型約 10~25 秒",
         },
-        "speech_recognizer": {
-            "label": "語音辨識",
-            "detect": ["speech_recognizer"],
-            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "speech_recognizer"],
-            "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "speech_recognizer"],
-            "requires": {"module": "sounddevice"},
-        },
+        # ★ 這兩個是「車上出聲」用的，而**車上沒有喇叭**（2026-08-07 決定不採購）。
+        #   實際的語音輸出走平板瀏覽器的 speechSynthesis：
+        #       /speech_text -> HMI -> 平板唸出來
+        #   保留按鈕是因為之後若真的加了喇叭就能直接用，但要在面板上寫清楚，
+        #   否則操作者會在「沒聲音」時來按這兩顆，然後以為是它們壞了。
         "speech_synthesizer": {
-            "label": "語音合成",
+            "label": "語音合成（需車上喇叭）",
             "detect": ["speech_synthesizer"],
             "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "speech_synthesizer"],
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "speech_synthesizer"],
+            "start_hint": "車上沒有喇叭，展示時的語音輸出是平板瀏覽器唸的，不需要開這個",
         },
         "voice_playback": {
-            "label": "語音播放",
+            "label": "語音播放（需車上喇叭）",
             "detect": ["voice_playback"],
             "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_audio", "voice_playback"],
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_audio", "voice_playback"],
             "requires": {"module": "sounddevice"},
+            "start_hint": "同上：車上沒有喇叭。要平板出聲請開右上角的朗讀開關",
         },
     }
 
