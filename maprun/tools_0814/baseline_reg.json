@@ -1,0 +1,326 @@
+[
+ {
+  "rep": 0,
+  "qid": "R1_現在幾點",
+  "question": "現在幾點",
+  "expect": "query_datetime_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": true,
+  "first_latency_s": 2.45,
+  "total_s": 5.49,
+  "speech": [
+   "現在是西元 2026 年 8 月 14 日民國 115 年",
+   "星期五",
+   "下午 5 點 37 分"
+  ],
+  "llm_response": [
+   "現在是西元 2026 年 8 月 14 日（民國 115 年），星期五，下午 5 點 37 分。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R2_打招呼",
+  "question": "你好",
+  "expect": null,
+  "tools": [],
+  "first_tool": null,
+  "hit": true,
+  "first_latency_s": 0.54,
+  "total_s": 9.38,
+  "speech": [
+   "您好",
+   "請問有什麼可以幫助您的嗎",
+   "您提到的FREQUENTLY應該是FREQUENT",
+   "這是用來描述某種情況發生得比較常見的意思",
+   "在這裡",
+   "我們使用的是它的原形不加ES",
+   "因為它是一個形容詞",
+   "至於ES",
+   "在這句話中並沒有出現",
+   "您可能是在說一個句子的時態問題嗎",
+   "請問您是什麼意思呢",
+   "如果您有其他問題或需要進一步幫助",
+   "請告訴我"
+  ],
+  "llm_response": [
+   "您好，請問有什麼可以幫助您的嗎？",
+   "您提到的“FREQUENTLY”應該是“FREQUENT”，這是用來描述某種情況發生得比較常見的意思。在這裡，我們使用的是它的原形（不加ES），因為它是一個形容詞。\n\n至於“ES”，在這句話中並沒有出現，您可能是在說一個句子的時態問題嗎？請問您是什麼意思呢？\n\n如果您有其他問題或需要進一步幫助，請告訴我！"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R3_帶位",
+  "question": "帶我去貴賓室",
+  "expect": "guide_to_vip_room_tool",
+  "tools": [],
+  "first_tool": null,
+  "hit": false,
+  "first_latency_s": 0.96,
+  "total_s": 4.48,
+  "speech": [
+   "請問您是希望我自動導航到貴賓室",
+   "還是需要先查詢貴賓室的位置呢",
+   "如果您知道貴賓室的具體位置",
+   "也可以告訴我"
+  ],
+  "llm_response": [
+   "請問您是希望我自動導航到貴賓室，還是需要先查詢貴賓室的位置呢？如果您知道貴賓室的具體位置，也可以告訴我。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R4_匯率",
+  "question": "美金匯率多少",
+  "expect": "query_exchange_rate_tool",
+  "tools": [
+   "query_exchange_rate_tool"
+  ],
+  "first_tool": "query_exchange_rate_tool",
+  "hit": true,
+  "first_latency_s": 3.15,
+  "total_s": 8.15,
+  "speech": [
+   "目前的美金匯率是 1 美元USD等於 32",
+   "0050 新臺幣",
+   "而 1000 新臺幣可以換成約 31",
+   "25 美元",
+   "實際上",
+   "外幣轉換以本行櫃檯的牌告匯率為準"
+  ],
+  "llm_response": [
+   "目前的美金匯率是 1 美元(USD)等於 32.0050 新臺幣；而 1000 新臺幣可以換成約 31.25 美元。實際上，外幣轉換以本行櫃檯的牌告匯率為準。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R5_營業時間",
+  "question": "你們營業時間是幾點到幾點",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": false,
+  "first_latency_s": 2.01,
+  "total_s": 5.21,
+  "speech": [
+   "我們的營業時間是從下午1點到晚上9點",
+   "現在是下午5點37分",
+   "所以還在營業時間內"
+  ],
+  "llm_response": [
+   "我們的營業時間是從下午1點到晚上9點。現在是下午5點37分，所以還在營業時間內。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R1_現在幾點",
+  "question": "現在幾點",
+  "expect": "query_datetime_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": true,
+  "first_latency_s": 2.52,
+  "total_s": 5.53,
+  "speech": [
+   "現在是西元 2026 年 8 月 14 日民國 115 年",
+   "星期五",
+   "下午 5 點 37 分"
+  ],
+  "llm_response": [
+   "現在是西元 2026 年 8 月 14 日（民國 115 年），星期五，下午 5 點 37 分。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R2_打招呼",
+  "question": "你好",
+  "expect": null,
+  "tools": [],
+  "first_tool": null,
+  "hit": true,
+  "first_latency_s": 0.56,
+  "total_s": 3.43,
+  "speech": [
+   "您好",
+   "請問有什麼可以幫助您的嗎"
+  ],
+  "llm_response": [
+   "您好，請問有什麼可以幫助您的嗎？"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R3_帶位",
+  "question": "帶我去貴賓室",
+  "expect": "guide_to_vip_room_tool",
+  "tools": [],
+  "first_tool": null,
+  "hit": false,
+  "first_latency_s": 1.08,
+  "total_s": 4.61,
+  "speech": [
+   "請問您是希望我自動導航到貴賓室",
+   "還是需要先查詢貴賓室的位置呢",
+   "如果您知道貴賓室的具體位置",
+   "也可以告訴我"
+  ],
+  "llm_response": [
+   "請問您是希望我自動導航到貴賓室，還是需要先查詢貴賓室的位置呢？如果您知道貴賓室的具體位置，也可以告訴我。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R4_匯率",
+  "question": "美金匯率多少",
+  "expect": "query_exchange_rate_tool",
+  "tools": [
+   "query_exchange_rate_tool"
+  ],
+  "first_tool": "query_exchange_rate_tool",
+  "hit": true,
+  "first_latency_s": 2.93,
+  "total_s": 7.86,
+  "speech": [
+   "目前的美金匯率是 1 美元USD等於 32",
+   "0050 新臺幣",
+   "而 1000 新臺幣可以換成約 31",
+   "25 美元",
+   "實際上",
+   "外幣轉換以本行櫃檯的牌告匯率為準"
+  ],
+  "llm_response": [
+   "目前的美金匯率是 1 美元(USD)等於 32.0050 新臺幣；而 1000 新臺幣可以換成約 31.25 美元。實際上，外幣轉換以本行櫃檯的牌告匯率為準。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R5_營業時間",
+  "question": "你們營業時間是幾點到幾點",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": false,
+  "first_latency_s": 2.64,
+  "total_s": 5.89,
+  "speech": [
+   "我們的營業時間是從下午1點到晚上9點",
+   "現在是下午5點38分",
+   "所以還在營業時間內"
+  ],
+  "llm_response": [
+   "我們的營業時間是從下午1點到晚上9點。現在是下午5點38分，所以還在營業時間內。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R1_現在幾點",
+  "question": "現在幾點",
+  "expect": "query_datetime_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": true,
+  "first_latency_s": 2.67,
+  "total_s": 5.7,
+  "speech": [
+   "現在是西元 2026 年 8 月 14 日民國 115 年",
+   "星期五",
+   "下午 5 點 38 分"
+  ],
+  "llm_response": [
+   "現在是西元 2026 年 8 月 14 日（民國 115 年），星期五，下午 5 點 38 分。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R2_打招呼",
+  "question": "你好",
+  "expect": null,
+  "tools": [],
+  "first_tool": null,
+  "hit": true,
+  "first_latency_s": 0.83,
+  "total_s": 3.73,
+  "speech": [
+   "您好",
+   "請問有什麼可以幫助您的嗎"
+  ],
+  "llm_response": [
+   "您好，請問有什麼可以幫助您的嗎？"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R3_帶位",
+  "question": "帶我去貴賓室",
+  "expect": "guide_to_vip_room_tool",
+  "tools": [],
+  "first_tool": null,
+  "hit": false,
+  "first_latency_s": 1.44,
+  "total_s": 4.91,
+  "speech": [
+   "請問您是希望我自動導航到貴賓室",
+   "還是需要先查詢貴賓室的位置呢",
+   "如果您知道貴賓室的具體位置",
+   "也可以告訴我"
+  ],
+  "llm_response": [
+   "請問您是希望我自動導航到貴賓室，還是需要先查詢貴賓室的位置呢？如果您知道貴賓室的具體位置，也可以告訴我。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R4_匯率",
+  "question": "美金匯率多少",
+  "expect": "query_exchange_rate_tool",
+  "tools": [
+   "query_exchange_rate_tool"
+  ],
+  "first_tool": "query_exchange_rate_tool",
+  "hit": true,
+  "first_latency_s": 2.85,
+  "total_s": 7.57,
+  "speech": [
+   "目前的美金匯率是 1 美元USD等於 32",
+   "0050 新臺幣",
+   "而 1000 新臺幣可以換成約 31",
+   "25 美元",
+   "實際上",
+   "外幣轉換以本行櫃檯的牌告匯率為準"
+  ],
+  "llm_response": [
+   "目前的美金匯率是 1 美元(USD)等於 32.0050 新臺幣；而 1000 新臺幣可以換成約 31.25 美元。實際上，外幣轉換以本行櫃檯的牌告匯率為準。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R5_營業時間",
+  "question": "你們營業時間是幾點到幾點",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": false,
+  "first_latency_s": 2.4,
+  "total_s": 5.67,
+  "speech": [
+   "我們的營業時間是從下午1點到晚上9點",
+   "現在是下午5點38分",
+   "所以還在營業時間內"
+  ],
+  "llm_response": [
+   "我們的營業時間是從下午1點到晚上9點。現在是下午5點38分，所以還在營業時間內。"
+  ]
+ }
+]

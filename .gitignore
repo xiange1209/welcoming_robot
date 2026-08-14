@@ -94,3 +94,11 @@ replay_*.csv
 odom_gyro_check_*.csv
 *.bak_*
 .smartnav/nav_state.json
+
+# 2026-08-14：車上實測產出的工作文件。與上面 HANDOFF_*/驗證清單* 同一個理由——
+# 它們是給實際操作機器人的人看的，隨部署 tar 提供，不隨公開 repo 發布。
+MPPI診斷_*.md
+MPPI實測_*.md
+ASR接線_*.md
+LLM工具選擇_*.md
+交接_*.md

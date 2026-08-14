@@ -36,7 +36,28 @@ from smartnav_llm import web_tools
 
 
 class RosStreamHandler(BaseCallbackHandler):
-    """自訂串流處理器：將 LLM 回應的 Token 即時發布到 ROS 2 Topic"""
+    """自訂串流處理器：將 LLM 回應的 Token 即時發布到 ROS 2 Topic
+
+    ★ 2026-08-14：加入「暫扣」機制。
+
+    這個 handler 掛在 ChatOllama 上，所以 agent 迴圈的**每一輪**推論都會觸發它，
+    包含「決定要呼叫工具」那一輪。qwen2.5:3b 在呼叫工具前常會先講一段話
+    （「我會嘗試為您安排與櫃檯行員的連線，請問是否有特定櫃檯…」），
+    那段話原本會直接進 /speech_text 被平板唸出來，等工具跑完之後真正的答案
+    再唸一次 —— 現場聽起來就是機器人把同一件事講兩遍，而且第一遍還會問一個
+    它自己不會等答案的問題。
+
+    2026-08-14 實測（見 ~/LLM工具選擇_20260814.md）：「我要找真人服務」一題的
+    /speech_text 有 10 段，前 5 段全是這種旁白。使用者觀察到的
+    「模型用講的而不是真的呼叫工具」也是同一件事 —— 工具其實有呼叫
+    （節點 log 有 🛠️），只是旁白先被唸出去了。
+
+    作法：每一輪開始前呼叫 begin_turn()，句子先扣在 held 裡；invoke() 回來後
+    由 agent 迴圈判斷這一輪有沒有 tool_calls：
+      有   → drop_held()  旁白丟掉，不唸
+      沒有 → flush_held() 這是最終答案，才唸出來
+    /llm_stream 的逐字串流不受影響，畫面字幕仍然是即時的。
+    """
 
     def __init__(self, stream_publisher, speech_text_publisher, convert=None):
         super().__init__()
@@ -50,6 +71,38 @@ class RosStreamHandler(BaseCallbackHandler):
         self.clean_pattern = re.compile(r"[^\w\u4e00-\u9fa5\s]|[_-]")
         self.buffer = ""
         self.current_sentence = ""
+        self.held: List[str] = []
+        self.hold = True
+
+    def begin_turn(self, hold: bool = True) -> None:
+        """開始新一輪推論：清掉上一輪的殘留與暫扣區
+
+        Args:
+            hold: True 表示這一輪的句子先扣著不唸（還不知道會不會去呼叫工具）。
+                  只有第一輪需要扣 —— 旁白只出現在「還沒呼叫工具」那一輪。
+                  第二輪之後幾乎一定是最終答案，直接即時串流，
+                  免得客戶要多等一整輪的生成時間才聽到聲音。
+        """
+        self.buffer = ""
+        self.current_sentence = ""
+        self.held = []
+        self.hold = hold
+
+    def _emit(self, sentence: str) -> None:
+        if self.hold:
+            self.held.append(sentence)
+        else:
+            self.speech_text_publisher.publish(String(data=self.convert(sentence)))
+
+    def flush_held(self) -> None:
+        """這一輪是最終答案，把暫扣的句子依序送去語音"""
+        for sentence in self.held:
+            self.speech_text_publisher.publish(String(data=self.convert(sentence)))
+        self.held = []
+
+    def drop_held(self) -> None:
+        """這一輪只是去呼叫工具，旁白不要唸出來"""
+        self.held = []
 
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         if not token:
@@ -68,7 +121,7 @@ class RosStreamHandler(BaseCallbackHandler):
             if self.split_pattern.match(item):
                 speech_sentence = " ".join(self.clean_pattern.sub("", self.current_sentence).split())
                 if speech_sentence:
-                    self.speech_text_publisher.publish(String(data=self.convert(speech_sentence)))
+                    self._emit(speech_sentence)
                 self.current_sentence = ""
             else:
                 self.current_sentence += item
@@ -76,7 +129,7 @@ class RosStreamHandler(BaseCallbackHandler):
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         remaining_text = " ".join(self.clean_pattern.sub("", self.current_sentence + self.buffer).split())
         if remaining_text:
-            self.speech_text_publisher.publish(String(data=self.convert(remaining_text)))
+            self._emit(remaining_text)
         self.buffer = ""
         self.current_sentence = ""
 
@@ -165,6 +218,23 @@ class LLMServiceNode(Node):
         # ── 銀行場景（2026-08-01 復原）────────────────────────
         self.enable_bank_tools = self.declare_parameter(
             "enable_bank_tools", True).get_parameter_value().bool_value
+        # ── 系統提示詞要用哪一份 ────────────────────────────────
+        # ★ 2026-08-14：這裡原本寫死讀 system_prompt.txt。
+        #
+        # config/ 底下一直有兩份提示詞：
+        #   system_prompt.txt       導航／地圖版（沒有一句提到通報行員）
+        #   system_prompt_bank.txt  銀行迎賓版（明寫真人服務→notify_staff_tool）
+        # 但 _run_agent_loop 寫死讀前者，**銀行版從來沒有被載入過**。
+        #
+        # 而導航版第 6 節寫著「凡是問題出現『今天』『現在』『幾點』『星期幾』，
+        # 都必須先呼叫查詢時間的工具」——「你們幾點關門」裡有「幾點」，
+        # 模型是**照著提示詞做**才去叫 query_datetime_tool 的。
+        # 2026-08-14 實測：冷開場（無對話歷史）5 次全部叫 query_datetime_tool，
+        # 然後拿當下時刻去幻覺出「我們銀行今天晚上 17:30 已經關門了」。
+        #
+        # 留空 = 自動：有銀行工具就用銀行版，沒有就用導航版。
+        self.system_prompt_file = self.declare_parameter(
+            "system_prompt_file", "").get_parameter_value().string_value
         # 帶位目標的地點名稱。做成參數而不是寫死：地圖上的地點名是使用者
         # 自己取的，寫死「貴賓室」會在他取名「VIP室」時直接失敗。
         self.vip_room_waypoint_name = self.declare_parameter(
@@ -205,6 +275,15 @@ class LLMServiceNode(Node):
         # 初始化工具鏈
         self._init_modern_llm_tools()
 
+        # ★ 啟動時就把「實際會載入哪一份提示詞」印出來並確認檔案存在。
+        #   ros2 param get 只證明參數伺服器存了值，不證明節點讀得到那個檔，
+        #   所以這裡直接去解析路徑（這個坑專案裡踩過三次）。
+        prompt_name = self._resolve_system_prompt_name()
+        prompt_path = get_config_path(prompt_name)
+        self.get_logger().info(
+            f"✓ 系統提示詞: {prompt_name} "
+            f"({'已找到' if prompt_path else '★找不到，會用內建預設'})"
+        )
         self.get_logger().info(f"✓ LLM 對話服務節點已初始化 (模型: {self.model_name})")
 
     def _init_knowledge_store(self):
@@ -466,7 +545,9 @@ class LLMServiceNode(Node):
 
         @tool
         def query_datetime_tool() -> str:
-            """查詢現在的日期、星期與時間。凡是提到「今天」「現在」「幾點」的問題都必須先呼叫此工具"""
+            """查詢**此刻的鐘面時間**，例如「現在幾點」「今天幾號」「今天星期幾」。
+            ★ 只在客戶問當下時刻時使用。客戶問「你們幾點關門」「營業到幾點」問的是
+            本行的營業時段，那要用查銀行業務資料的工具，不要用這個"""
             try:
                 return web_tools.query_datetime()
             except Exception as e:
@@ -483,7 +564,16 @@ class LLMServiceNode(Node):
             "global_localization_tool": global_localization_tool,
         }
 
-        if self.knowledge_store:
+        # ★ 2026-08-14：知識庫工具與銀行 FAQ 工具**不可以同時掛上**。
+        #
+        # search_bank_knowledge_tool 的描述寫「營業時間、櫃檯位置、開戶、換匯…
+        # 都必須先呼叫此工具」，query_bank_faq_tool 的描述寫「營業時間、開戶、
+        # 匯兌等」——兩個工具對同一批問題都宣稱自己是正解，機率被劈成兩半，
+        # 3B 模型挑哪個變成擲骰子。（兩者的資料來源其實還是同一份 FAQ。）
+        #
+        # 銀行場景下統一走 query_bank_faq_tool，它內部會優先用 RAG 檢索
+        # （見 bank_tools.py），所以知識庫的檢索能力沒有損失，只是入口收斂成一個。
+        if self.knowledge_store and not self.enable_bank_tools:
             self.tools_map["search_bank_knowledge_tool"] = search_bank_knowledge_tool
 
         if self.enable_web_tools:
@@ -515,7 +605,8 @@ class LLMServiceNode(Node):
         self.get_logger().info(f"✓ 已載入 {len(self.tools_map)} 個工具: {', '.join(self.tools_map)}")
 
         # 初始化模型並綁定工具
-        stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub, self._to_traditional)
+        self.stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub, self._to_traditional)
+        stream_handler = self.stream_handler
         raw_llm = ChatOllama(
             base_url=self.ollama_base_url,
             model=self.model_name,
@@ -576,18 +667,33 @@ class LLMServiceNode(Node):
 
         self.get_logger().info("🧹 已清除對話記憶")
 
+    def _resolve_system_prompt_name(self) -> str:
+        """決定要載入哪一份系統提示詞
+
+        Returns:
+            str: 提示詞檔名。參數留空時依 enable_bank_tools 自動選擇。
+        """
+        if self.system_prompt_file:
+            return self.system_prompt_file
+        return "system_prompt_bank.txt" if self.enable_bank_tools else "system_prompt.txt"
+
+    def _load_system_prompt(self) -> str:
+        """讀取系統提示詞（讀不到就退回內建預設）"""
+        name = self._resolve_system_prompt_name()
+        path = get_config_path(name)
+        if path:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+
+        self.get_logger().warning(f"✗ 無法找到 {name}，使用內建預設提示語")
+        return (
+            "你是一個專業的智慧導航機器人助手，職責是幫助使用者管理地圖並完成多步驟導航\n"
+            "你可以連續、分步驟地呼叫工具來完成任務，如果使用者給予複合指令，請一步一步調用工具\n"
+        )
+
     def _run_agent_loop(self, user_input: str) -> None:
         """ReAct 自主思考迴圈"""
-        system_content_path = get_config_path("system_prompt.txt")
-        if system_content_path:
-            with open(system_content_path, "r", encoding="utf-8") as f:
-                system_content = f.read()
-        else:
-            system_content = (
-                "你是一個專業的智慧導航機器人助手，職責是幫助使用者管理地圖並完成多步驟導航\n"
-                "你可以連續、分步驟地呼叫工具來完成任務，如果使用者給予複合指令，請一步一步調用工具\n"
-            )
-            self.get_logger().warning("✗ 無法找到 system_prompt.txt 使用內建預設提示語")
+        system_content = self._load_system_prompt()
 
         with self.memory_lock:
             chat_history = self.memory.get_history_messages()
@@ -597,7 +703,10 @@ class LLMServiceNode(Node):
         self.get_logger().info("🧠 LLM 開始進入多步驟決策鏈...")
 
         try:
-            for _ in range(max_iterations):
+            for iteration in range(max_iterations):
+                # 第 0 輪先扣著（旁白只可能出現在這一輪），之後即時串流
+                self.stream_handler.begin_turn(hold=(iteration == 0))
+
                 response = self.agent_chain.invoke(
                     {
                         "system_prompt": system_content,
@@ -609,6 +718,8 @@ class LLMServiceNode(Node):
 
                 # 檢查 LLM 是否需要叫工具
                 if not response.tool_calls:
+                    # 沒有工具呼叫 = 這是要講給客戶聽的最終答案
+                    self.stream_handler.flush_held()
                     final_reply = self._to_traditional(str(response.content))
                     self.get_logger().info(f"🤖 Agent 最終決策回應: {final_reply}")
 
@@ -618,6 +729,14 @@ class LLMServiceNode(Node):
 
                     self.llm_response_pub.publish(String(data=final_reply))
                     return
+
+                # 這一輪是去呼叫工具，模型講的旁白不要唸出去
+                if self.stream_handler.held:
+                    self.get_logger().info(
+                        f"🔇 已扣住呼叫工具前的旁白（{len(self.stream_handler.held)} 段）: "
+                        f"{self.stream_handler.held[0][:40]}..."
+                    )
+                self.stream_handler.drop_held()
 
                 # 記錄 LLM 的工具調用請求
                 agent_scratchpad.append(response)

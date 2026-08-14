@@ -58,6 +58,10 @@ class VoiceTriggerNode(Node):
 
         # VAD 參數
         self.declare_parameter("vad_num_threads", 2)
+        # ★ 2026-08-14 加：silero VAD 的判定門檻，越低越靈敏。
+        #   sherpa-onnx 預設 0.5 在這台車實測只有 2% 正幀，湊不出連續三幀。
+        #   0.25 是實測掃出來的值，推導見 _init_vad 裡的註解。
+        self.declare_parameter("vad_threshold", 0.25)
 
         # 狀態轉移參數 (毫秒)
         self.declare_parameter("speech_start_timeout", 100)
@@ -154,8 +158,35 @@ class VoiceTriggerNode(Node):
                     vad_config.sample_rate = self.sample_rate
                     vad_config.num_threads = self.vad_num_threads
 
+                    # ★★ 2026-08-14：threshold 原本沒設，吃 sherpa-onnx 預設 0.5，
+                    #    在這台車的 SNR 下**太嚴，VAD 一次都觸發不了**。
+                    #
+                    #    拿一段「ASR 確實認得出『你好请问柜台在哪里』」的 15 秒實錄
+                    #    離線掃門檻，正幀比例：
+                    #
+                    #        0.50（預設） 10/468 =  2%
+                    #        0.40         14/468 =  3%
+                    #        0.30         14/468 =  3%
+                    #        0.20         64/468 = 14%
+                    #
+                    #    而 `speech_start_timeout` 要求**連續 3 幀**才算語音起點 ——
+                    #    2% 且分散的正幀湊不出連續三幀，所以狀態機永遠停在 IDLE，
+                    #    `/audio_in` 一則都不會發，看起來像「ASR 壞了」，
+                    #    實際上模型與收音都是好的。**全程沒有任何錯誤訊息。**
+                    #
+                    #    ⚠ 這個值跟 SNR 綁在一起。當時的條件是：麥克風增益 33 dB
+                    #    （`run_asr_cc.sh` 的 GAIN=66）、距離約 30~50 cm、底噪 -26.5 dBFS、
+                    #    人聲高出 6~13 dB。**換場地或改增益要重新掃這個門檻。**
+                    #    調太低的代價是誤觸發（把冷氣聲當人聲），要一起看
+                    #    `voice_trigger` 有沒有在沒人講話時亂進 COMMAND。
+                    vad_threshold = self.get_parameter("vad_threshold").get_parameter_value().double_value
+                    try:
+                        vad_config.silero_vad.threshold = vad_threshold
+                    except Exception as e:
+                        self.get_logger().warning(f"✗ 設定 vad_threshold 失敗，沿用預設: {e}")
+
                     self.vad = sherpa_onnx.VadModel.create(vad_config)
-                    self.get_logger().info("✓ VAD 模型已載入")
+                    self.get_logger().info(f"✓ VAD 模型已載入（threshold {vad_threshold:.2f}）")
                 else:
                     self.get_logger().warning(f"✗ VAD 模型文件不存在: {vad_model_path}")
             else:

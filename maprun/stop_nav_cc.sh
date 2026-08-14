@@ -6,7 +6,13 @@
 # 於是 shell 會先把自己殺掉，指令只執行到一半。
 # 把樣式放進腳本檔就沒這問題：這支腳本的命令列只有它自己的路徑。
 
-PATTERNS='nav2_|map_service_cc|waypoint_service_cc|navigation_action_cc|async_slam_toolbox|frontier_explorer|smartnav_navigation_cc nav_bringup'
+# ★ 2026-08-14 補上 path_teach_cc 與 steering_trim_cc。
+#   在那之前它們不在清單裡，所以 stop_nav_cc.sh 收不掉，而 run_nav_cc.sh 會再開一份
+#   —— 重啟一次導航就變成**兩個 path_teach_cc 同時提供同名服務**，
+#   呼叫隨機落到其中一個。當天的症狀是「plan_taught_path 回傳失敗，
+#   log 卻顯示路徑存檔成功」，看起來像程式自相矛盾，實際是在跟兩個節點講話。
+#   ★ 做任何 A/B 對照之前，先確認節點只有一個。
+PATTERNS='nav2_|map_service_cc|waypoint_service_cc|navigation_action_cc|path_teach_cc|steering_trim_cc|async_slam_toolbox|frontier_explorer|smartnav_navigation_cc nav_bringup'
 
 MYPID=$$
 MYPPID=$PPID

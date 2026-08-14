@@ -140,9 +140,32 @@ class UserAuthNode(Node):
             image_capture_topic,
         )
 
+        # ★★ 2026-08-14：queue_size 從寫死的 10 改成可調，預設放大到 60 ★★
+        #
+        # 這個佇列是**固定格數**，所以它涵蓋的時間長度 = 格數 ÷ 影像速率，
+        # 而向量要等 InsightFace 在 CPU 上推論完（實測落後約 1.1 秒）才發得出來。
+        # 兩者一比就知道會不會配得到對：
+        #
+        #     影像 6.4 Hz（相機開深度時）-> 10 格 = 1.56 秒 > 1.1 秒  配得到
+        #     影像  25 Hz（只開彩色）    -> 10 格 = 0.40 秒 < 1.1 秒  **永遠配不到**
+        #
+        # 8/14 為了省 CPU 把深度關掉（load 51 -> 3.2、影像 6.4 -> 25 Hz），
+        # 結果**把人臉辨識弄壞了**：/user_identity 完全靜默、註冊收 0/10 張、
+        # 20 秒後 `_face_registration_timeout` 把剛建好的使用者刪掉。
+        # 三個症狀沒有一個指向同步佇列，全程不報錯。
+        #
+        # ★ 教訓：固定格數的佇列不該跟一個會變的來源速率耦合。
+        #   60 格在 25 Hz 下涵蓋 2.4 秒，比推論延遲多一倍餘裕；
+        #   相機日後再變速也還有空間。記憶體代價是多存 50 張壓縮影像，可忽略。
+        sync_queue = self.declare_parameter(
+            "sync_queue_size",
+            60,
+            ParameterDescriptor(description="影像與人臉向量同步佇列格數（要 > 推論延遲 × 影像速率）"),
+        ).get_parameter_value().integer_value
+
         self.face_image_sync = message_filters.ApproximateTimeSynchronizer(
             [self.face_embedding_sub, self.image_capture_sub],
-            queue_size=10,
+            queue_size=sync_queue,
             slop=0.1,
         )
         self.face_image_sync.registerCallback(self._synced_face_image_callback)

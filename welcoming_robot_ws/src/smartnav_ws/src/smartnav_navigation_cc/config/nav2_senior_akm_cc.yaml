@@ -13,10 +13,29 @@
 #   只到 0.24 m —— 實際車頭有 16 公分是「隱形」的，規劃器覺得過得去、
 #   車子卻會撞上，這很可能是實測撞到雜物的原因之一。
 #
-#   註：inflation_radius (0.22) 小於 circumscribed (0.461) 是刻意的，
-#   原廠自己也是 0.1~0.25。走廊淨寬只有 0.99 m，膨脹半徑若真的放到 0.46
-#   會把整條走廊封死。實際碰撞由 MPPI 的 consider_footprint (真實車形檢查)
-#   與 collision_monitor 的 PolygonStop 把關，不靠膨脹層硬擋。
+#   ██ 這一段從 7/29 到 8/14 都是錯的，2026-08-14 實機推翻，保留當教訓 ██
+#
+#   原文寫：「inflation_radius (0.22) 小於 circumscribed (0.461) 是刻意的，
+#   走廊淨寬只有 0.99 m，膨脹半徑若真的放到 0.46 會把整條走廊封死。」
+#
+#   ★ 「封死」這個推論是錯的。**膨脹層不決定可行性**：nav2 的 253
+#     （內接致命）帶固定在 inscribed_radius = 0.205，與 inflation_radius 無關；
+#     inflation_radius 只決定 253 之外那條衰減尾巴多長。把它放大只是讓
+#     成本變高，不是讓格子變成障礙物。可通行帶始終是 0.967 - 2×0.205 = 0.557 m。
+#
+#   ★ 而且方向剛好相反：小於 circumscribed 時 nav2 **無法用位能場快篩**，
+#     每輪都要做完整車體碰撞檢查。實測 0.35 -> 0.55 讓 /cmd_vel 從
+#     6.14 Hz 變 9.01 Hz、車速從 0.089 m/s 爬行變 0.257 m/s 滿速。
+#     nav2 自己也一直在噴 ERROR 說「HIGHLY recommended 至少設成最大截面的一半」。
+#
+#   ★★ 這個錯誤信念擋了正確的修法整整兩週 —— HANDOFF_20260731.md 就記過
+#      那則 ERROR，但因為相信「放大會封死走廊」而沒有人去試。
+#      **教訓：當上游套件持續警告你某個設定不對，而你的理由是一句沒算過的推論，
+#      先算一次或試一次，不要把推論當成已知。**
+#
+#   現值 0.55（local 與 global 皆同），> circumscribed 0.467。
+#   實際碰撞仍由 MPPI 的 consider_footprint (真實車形檢查)
+#   與 collision_monitor 的 FootprintApproach 把關，不靠膨脹層硬擋。
 #
 # 座標系：map -> odom_combined -> base_footprint
 #   odom_combined 由 turn_on_wheeltec_robot 的 robot_localization ekf_node 發布。
@@ -367,7 +386,31 @@ controller_server:
         trajectory_point_step: 4
         threshold_to_consider: 0.5
         offset_from_furthest: 20
-        use_path_orientations: true
+        # ★★ 2026-08-14：true -> false ★★
+        #
+        # 病因（8/14 診斷，見 ~/MPPI診斷_20260814.md 第一節）：
+        # 規劃器的 angle_quantization_bins 是 **32**，也就是每格 360/32 = 11.25 度。
+        # 路徑點存的 yaw 因此不是連續曲線，是 11.25 度一階的**階梯**。
+        #
+        # 8/14 log 裡 path_teach_cc 對規劃路徑量到的朝向階躍，全部是那一格的整數倍：
+        #     11.2 度 = 1 格(11.25)   21.5 / 21.6 度 = 2 格   22.5 度 = 2 格(剛好)
+        #     R=0.80 的單格基元弧長 0.80 x 2pi/32 = 0.157 m，實測 0.154~0.155 m
+        #
+        # use_path_orientations: true 時，PathAlignCritic 會把取樣軌跡的**朝向**
+        # 拿去對齊路徑點存的那個階梯 yaw，權重 25.0（與 PathFollowCritic 並列全場最高）。
+        # 等於每經過一格就餵給最佳化器一次 ±5.6 度的階躍誤差。
+        #
+        # ★ 為什麼教導-重現不會這樣：純追蹤是 k = 2y/L^2，**只吃橫向位置偏移，
+        #   完全不讀路徑點的 yaw 欄位**。同一條路徑、同一個階梯，對它不存在。
+        #   這就是「MPPI 不像錄製教導那麼順」的其中一個結構性差異，
+        #   而且它是四項差異裡唯一一個「改一個布林值就能測」的。
+        #
+        # 代價：MPPI 失去「對齊路徑行進方向」的能力，可能更會抄近路，
+        #       折返點(cusp)附近的判斷也可能變差 —— **驗收時要一起看**。
+        # 退路：改回 true，重跑 launch 即生效（symlink-install 不用重建）。
+        #
+        # ⚠ 2026-08-14 當下**尚未實機驗證**（車子架空中，導航堆疊停著）。
+        use_path_orientations: false
       PathFollowCritic:
         enabled: true
         cost_power: 1
@@ -481,10 +524,27 @@ local_costmap:
         #   控制器（讀 local）是**壞的**。只動壞的那一邊，出事才歸得了因。
         #   global 一起動還會牽扯 analytic_expansion_max_cost: 200 的耦合。
         #
-        # ⚠ CPU：cell_inflation_radius 5 格 -> 7 格，每個障礙格膨脹計算約 x1.9。
-        #   local 是 100x100 格、5 Hz，Pi 4 應該吃得下，但**要看 controller_server
-        #   有沒有掉出 10 Hz**（ros2 topic hz /cmd_vel 或看 log 的 warn）。
-        # 退路：改回 0.22 / 3.5，重跑 launch 即生效（symlink-install 不用重建）。
+        # ██ 2026-08-14 實機推翻了上面兩段的一部分，先讀這裡再讀上面 ██
+        #
+        # (1) 0.35 這個**值**選錯了，而且錯的方向跟我下面警告的相反。
+        #     我警告「膨脹格數變多會吃 CPU、掉速就改回 0.22」——實機量到的是
+        #     **0.35 時 6.14 Hz、0.55 時 9.01 Hz**，愈大愈快，因為 nav2 需要
+        #     inflation_radius >= circumscribed(0.467) 才能用位能場快篩碰撞。
+        #     0.35 仍小於 0.467，等於強迫每一輪都做完整車體檢查。詳見下方 8/14 那段。
+        #     ★ 所以「掉速就改回 0.22」是**錯的處置**，照做會更慢。已作廢。
+        #
+        # (2) 「只改 local 不改 global」也已作廢 —— 8/14 兩邊都改成 0.55，
+        #     並實測規劃沒壞（大廳 17 點 1 折返、起點 36 點 0 折返，都成功）。
+        #
+        # (3) 但 analytic_expansion_max_cost 的耦合是**真的**，而且 0.55 讓它更緊：
+        #     成本 200 對應的離牆距離 d = 0.205 + ln(252/200)/4.0 = 0.263 m。
+        #     0.22 時代 d>0.22 的成本就是 0，超過 200 的只有 1.5 cm 的窄帶；
+        #     0.55 之後那條帶變成 5.8 cm（0.205~0.263），**寬了約四倍**。
+        #     窄轉角做三點轉向時車心本來就會偏離中線，正好落進那一帶
+        #     -> Reeds-Shepp 的解析展開被拒 -> 規劃變慢或多繞。
+        #     ★ 已同步把 analytic_expansion_max_cost 放到 260（見 planner_server 段）。
+        #
+        # 退路：三個值一起回到 local 0.22/3.5、global 0.22/3.5、max_cost 200。
         #
         # ★★ 與 HANDOFF_20260731.md:127「不要用 inflation_radius 解決這個」的關係 ★★
         # 那句話**沒有被推翻，它講的是另一件事**，兩者不衝突：
@@ -520,7 +580,33 @@ local_costmap:
         # 調快衰減等於「只有真的很貼近障礙才算貴」，把中間的可行帶讓出來。
         # 安全性由 collision_monitor 的 PolygonStop 與 MPPI 的
         # consider_footprint 真實碰撞檢查把關，不是靠膨脹層硬擋。
-        inflation_radius: 0.35
+        # ★★ 2026-08-14 實測：0.35 -> 0.55，理由跟先前寫的完全相反 ★★
+        #
+        # 上面那段 CPU 警告（5 格 -> 7 格、x1.9）**方向是錯的**。實機 log 顯示：
+        #
+        #   [controller_server] ERROR computeCircumscribedCost:
+        #     The inflation radius (0.350000) is smaller than the circumscribed
+        #     radius (0.467360) ... cannot use costmap potential field to speed up
+        #     collision checking ... This may significantly slow down planning times!
+        #
+        # inflation_radius **小於** circumscribed(0.467) 時，nav2 無法用位能場快篩，
+        # 每一次都得做完整車體碰撞檢查 —— 所以 0.35 不是「比較省」，是**強迫走慢路徑**。
+        #
+        # 同一段走廊、同一個目標，只改這一項的前後對照（2026-08-14 兩趟實跑）：
+        #
+        #                    0.35          0.55
+        #   /cmd_vel        6.14 Hz       9.01 Hz    （目標 10）
+        #   最高速度        0.089 m/s     0.257 m/s  （上限 0.25，等於滿速）
+        #   零速指令        2 則          0 則
+        #   circumscribed ERROR  持續刷屏   完全消失
+        #
+        # 附帶好處：0.55 在 0.99~1.41 m 的走廊裡等於**整條走廊都有梯度**，
+        # 不再是「48% 零成本區 + 一道斷崖」，而 MPPI 正是靠梯度分辨 300 條取樣軌跡的好壞。
+        #
+        # ★ 仍然沒有解決的：跑約 3 m 後 `Optimizer fail to compute path` ×3
+        #   -> `Failed to make progress` 而中止。窄轉角過不去是另一個病
+        #   （視野 0.75 m < 90 度轉彎需要的 1.26 m），見 MPPI診斷_20260814.md 的 R5。
+        inflation_radius: 0.55
         cost_scaling_factor: 4.0
       always_send_full_costmap: true
 
@@ -645,7 +731,15 @@ global_costmap:
         #   但要看 controller_server 有沒有掉出 10 Hz。
         # 退路：兩個值放回 0.22 / 3.5，重跑 launch 即生效（symlink-install
         #   連 colcon build 都不用）。
-        inflation_radius: 0.22
+        # ★★ 2026-08-14：0.22 -> 0.55，與 local_costmap 同一個理由 ★★
+        # planner_server 也在刷同一則 ERROR，而且多附一句：
+        #   "Inflation layer either not found or inflation is not set sufficiently
+        #    for optimized non-circular collision checking capabilities.
+        #    It is HIGHLY recommended to set the inflation radius to be at MINIMUM
+        #    half of the robot's largest cross-section."
+        # 最大截面的一半就是 circumscribed 0.467，所以 0.22 連建議值的一半都不到。
+        # 詳細前後對照見 local_costmap 那段。
+        inflation_radius: 0.55
         cost_scaling_factor: 3.5
       always_send_full_costmap: true
 
@@ -717,6 +811,49 @@ planner_server:
       #   ⚠️ 這個參數是**單一對稱值**，而實車左轉極限 0.944、右轉 0.751
       #      ——它描述不了這台車，左右不對稱的補償做在 path_teach_cc 端。
       minimum_turning_radius: 0.80
+      # ★★ 2026-08-14：32 -> 64（每格 11.25 度 -> 5.625 度）★★
+      #
+      # 病因：「路徑上有 N 處車子做不到」的警告，**有一部分是量化的假象**。
+      # 可行性檢查是量相鄰點的離散曲率 R = 點距 / 朝向差，而朝向差最小就是一格：
+      #
+      #     bins 32（11.25 度 = 0.196 rad）：點距 0.15 m -> R = 0.77 m
+      #     bins 64（5.625 度 = 0.098 rad）：點距 0.15 m -> R = 1.53 m
+      #
+      # 也就是說**不管 minimum_turning_radius 設多少**，只要點距夠短，
+      # 一格量化就會算出低於門檻的半徑。實測佐證：8/14 六筆可行性警告的角度
+      # 全是 11.25 的整數倍（10.8 / 11.2 / 21.5 / 21.6 / 22.5），最緊的都是 0.799 m
+      # —— 0.15/0.196 = 0.77，對得上。
+      #
+      # ★ 這一項對**路線 B（主力）也有效**，不只是 MPPI。
+      #   MPPI 那邊的關聯是 PathAlignCritic 在追這個階梯（見 R1 那段）。
+      #
+      # ⚠ 代價：狀態空間變兩倍，規劃時間與記憶體都會增加。若規劃明顯變慢就退回 32。
+      #
+      # ★★ 實測紀錄：`ros2 param set /planner_server GridBased.angle_quantization_bins 64`
+      #   **回報 "Set parameter successful"、param get 也讀得到 64，但角度仍是 11.2 度**
+      #   —— SmacPlannerHybrid 在 configure() 就建好查表，執行期改不動。
+      #   這是「param set 不算驗證」的教科書案例，**必須改 yaml 重啟**。
+      #
+      # ★★★ 2026-08-14 結論：改 yaml 重啟真的測了，**沒有用，已退回 32** ★★★
+      #
+      #   上面「一格量化造成假象」的推導**只對了一半**。角度確實一律是格子的整數倍
+      #   （那是離散化的必然），但**規劃器選的是兩格的轉彎，不是一格**：
+      #   bins=64 時仍看到 11.1 度（= 2 × 5.625）配 0.155 m 點距 -> 一樣是 0.799 m。
+      #   把格子切細，規劃器照樣用兩格湊出同樣的曲率，**可行性警告完全沒減少**。
+      #
+      #   而且有代價（同一台車、同一位置、只差這一項的純規劃對照）：
+      #
+      #                bins=32              bins=64
+      #     大廳     17 點 2.42 m 1 折返   20 點 2.64 m **3 折返**
+      #     起點     36 點 5.13 m 0 折返   37 點 5.08 m   0 折返
+      #
+      #   2026-08-10 十趟實測的規律是「0 折返 6 勝／多折返 5 敗」，
+      #   所以把大廳那條從 1 折返變成 3 折返是**明確的退步**。
+      #
+      #   ⚠ 那次比較差點被另一個問題毀掉：`stop_nav_cc.sh` **收不掉 path_teach_cc**，
+      #   重啟導航後同時有兩個節點提供同名服務，呼叫隨機落到其中一個，
+      #   於是出現「服務回傳失敗、log 卻顯示路徑存檔成功」的矛盾。
+      #   做 A/B 之前務必確認節點只有一個。
       angle_quantization_bins: 32
       analytic_expansion_ratio: 3.5
       # 3.0 -> 2.0：解析展開段越長，規劃器越傾向用一條大弧線一次到位，
@@ -725,7 +862,25 @@ planner_server:
       analytic_expansion_max_length: 2.0
       # 允許在原始運動基元之間插值，路徑更貼合窄空間的可行區
       allow_primitive_interpolation: true
-      analytic_expansion_max_cost: 200.0
+      # ★★ 2026-08-14：200 -> 260，跟著 inflation_radius 0.22 -> 0.55 一起調 ★★
+      #
+      # 這個值本身沒有意義，**它的意義取決於膨脹層**：它是「解析展開路徑上
+      # 任一格的成本上限」，而成本是膨脹層算出來的。膨脹一改，同一個數字的
+      # 嚴格程度就變了 —— 這是典型的「參數沒動、行為卻變了」。
+      #
+      # 成本公式 252·exp(-cost_scaling·(d - 0.205))，反推超過 200 的離牆距離：
+      #     舊 0.22 / 3.5   ->  d > 0.22 的成本直接是 0，超標帶只有 1.5 cm
+      #     新 0.55 / 4.0   ->  d < 0.263 才超標，超標帶 5.8 cm（寬了約四倍）
+      #
+      # 為什麼這 4 公分要緊：0.967 m 的門口轉角做三點轉向時，車心一定會偏離
+      # 中線（那正是轉向的意思），偏到離牆 0.21~0.26 m 是常態。落在超標帶裡
+      # 就會讓 Reeds-Shepp 的解析展開被拒 —— 而解析展開正是規劃器產生
+      # 「乾淨的三點轉向」的手段，被拒之後只能退回一格一格搜，變慢或多繞。
+      #
+      # 260 > 253：等於「只要不是致命格就允許解析展開」。安全性不受影響 ——
+      # 真正的碰撞由 253/254 那條硬邊界擋，這個值只管「要不要走捷徑」。
+      # ⚠ 若出現「規劃出來的路徑貼牆」就把它調回 200 並回報。
+      analytic_expansion_max_cost: 260.0
       analytic_expansion_max_cost_override: false
       # === 2.0 -> 1.3 -> 1.05 (2026-07-28) ===
       # 再降一階：使用者要求「可以連續前進後退或轉彎來調整姿態，達到脫困或回頭」。

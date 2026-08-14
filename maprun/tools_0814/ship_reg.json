@@ -1,0 +1,257 @@
+[
+ {
+  "rep": 0,
+  "qid": "R1_現在幾點",
+  "question": "現在幾點",
+  "expect": "query_datetime_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": true,
+  "first_latency_s": 2.89,
+  "total_s": 5.92,
+  "speech": [
+   "現在是西元 2026 年 8 月 14 日民國 115 年",
+   "星期五",
+   "下午 6 點 4 分"
+  ],
+  "llm_response": [
+   "現在是西元 2026 年 8 月 14 日（民國 115 年），星期五，下午 6 點 4 分。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R2_打招呼",
+  "question": "你好",
+  "expect": null,
+  "tools": [],
+  "first_tool": null,
+  "hit": true,
+  "first_latency_s": 1.04,
+  "total_s": 3.62,
+  "speech": [
+   "您好",
+   "請問有什麼可以幫助您的嗎"
+  ],
+  "llm_response": [
+   "您好，請問有什麼可以幫助您的嗎？"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R4_匯率",
+  "question": "美金匯率多少",
+  "expect": "query_exchange_rate_tool",
+  "tools": [
+   "query_exchange_rate_tool"
+  ],
+  "first_tool": "query_exchange_rate_tool",
+  "hit": true,
+  "first_latency_s": 4.16,
+  "total_s": 9.02,
+  "speech": [
+   "目前1美元等於新臺幣31",
+   "9960",
+   "而1000新臺幣則約等於31",
+   "25美元",
+   "請注意",
+   "實際的換匯金額會以本行臨櫃當前公佈的牌告匯率為準"
+  ],
+  "llm_response": [
+   "目前1美元等於新臺幣31.9960，而1000新臺幣則約等於31.25美元。請注意，實際的換匯金額會以本行臨櫃當前公佈的牌告匯率為準。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "R5_營業時間",
+  "question": "你們營業時間是幾點到幾點",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 3.55,
+  "total_s": 7.27,
+  "speech": [
+   "我們銀行的營業時間是週一至週五早上九點到下午三點半",
+   "週六週日及國定假日休息",
+   "如果您有其他問題",
+   "可以隨時向櫃檯行員詢問"
+  ],
+  "llm_response": [
+   "我們銀行的營業時間是週一至週五早上九點到下午三點半，週六、週日及國定假日休息。如果您有其他問題，可以隨時向櫃檯行員詢問。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R1_現在幾點",
+  "question": "現在幾點",
+  "expect": "query_datetime_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": true,
+  "first_latency_s": 2.67,
+  "total_s": 5.75,
+  "speech": [
+   "現在是西元 2026 年 8 月 14 日民國 115 年",
+   "星期五",
+   "下午 6 點 05 分"
+  ],
+  "llm_response": [
+   "現在是西元 2026 年 8 月 14 日（民國 115 年），星期五，下午 6 點 05 分。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R2_打招呼",
+  "question": "你好",
+  "expect": null,
+  "tools": [],
+  "first_tool": null,
+  "hit": true,
+  "first_latency_s": 1.16,
+  "total_s": 3.67,
+  "speech": [
+   "您好",
+   "請問有什麼可以幫助您的嗎"
+  ],
+  "llm_response": [
+   "您好，請問有什麼可以幫助您的嗎？"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R4_匯率",
+  "question": "美金匯率多少",
+  "expect": "query_exchange_rate_tool",
+  "tools": [
+   "query_exchange_rate_tool"
+  ],
+  "first_tool": "query_exchange_rate_tool",
+  "hit": true,
+  "first_latency_s": 2.41,
+  "total_s": 7.21,
+  "speech": [
+   "目前1美元等於新臺幣31",
+   "9960",
+   "而1000新臺幣則約等於31",
+   "25美元",
+   "請注意",
+   "實際的換匯金額會以本行臨櫃當前公佈的牌告匯率為準"
+  ],
+  "llm_response": [
+   "目前1美元等於新臺幣31.9960，而1000新臺幣則約等於31.25美元。請注意，實際的換匯金額會以本行臨櫃當前公佈的牌告匯率為準。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "R5_營業時間",
+  "question": "你們營業時間是幾點到幾點",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 3.46,
+  "total_s": 7.01,
+  "speech": [
+   "我們銀行的營業時間是週一至週五早上九點到下午三點半",
+   "週六週日及國定假日休息",
+   "如果您有其他問題",
+   "可以隨時向櫃檯行員詢問"
+  ],
+  "llm_response": [
+   "我們銀行的營業時間是週一至週五早上九點到下午三點半，週六、週日及國定假日休息。如果您有其他問題，可以隨時向櫃檯行員詢問。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R1_現在幾點",
+  "question": "現在幾點",
+  "expect": "query_datetime_tool",
+  "tools": [
+   "query_datetime_tool"
+  ],
+  "first_tool": "query_datetime_tool",
+  "hit": true,
+  "first_latency_s": 2.41,
+  "total_s": 5.45,
+  "speech": [
+   "現在是西元 2026 年 8 月 14 日民國 115 年",
+   "星期五",
+   "下午 6 點 05 分"
+  ],
+  "llm_response": [
+   "現在是西元 2026 年 8 月 14 日（民國 115 年），星期五，下午 6 點 05 分。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R2_打招呼",
+  "question": "你好",
+  "expect": null,
+  "tools": [],
+  "first_tool": null,
+  "hit": true,
+  "first_latency_s": 0.84,
+  "total_s": 3.38,
+  "speech": [
+   "您好",
+   "請問有什麼可以幫助您的嗎"
+  ],
+  "llm_response": [
+   "您好，請問有什麼可以幫助您的嗎？"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R4_匯率",
+  "question": "美金匯率多少",
+  "expect": "query_exchange_rate_tool",
+  "tools": [
+   "query_exchange_rate_tool"
+  ],
+  "first_tool": "query_exchange_rate_tool",
+  "hit": true,
+  "first_latency_s": 2.4,
+  "total_s": 7.11,
+  "speech": [
+   "目前1美元等於新臺幣31",
+   "9960",
+   "而1000新臺幣則約等於31",
+   "25美元",
+   "請注意",
+   "實際的換匯金額會以本行臨櫃當前公佈的牌告匯率為準"
+  ],
+  "llm_response": [
+   "目前1美元等於新臺幣31.9960，而1000新臺幣則約等於31.25美元。請注意，實際的換匯金額會以本行臨櫃當前公佈的牌告匯率為準。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "R5_營業時間",
+  "question": "你們營業時間是幾點到幾點",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 3.37,
+  "total_s": 6.98,
+  "speech": [
+   "我們銀行的營業時間是週一至週五早上九點到下午三點半",
+   "週六週日及國定假日休息",
+   "如果您有其他問題",
+   "可以隨時向櫃檯行員詢問"
+  ],
+  "llm_response": [
+   "我們銀行的營業時間是週一至週五早上九點到下午三點半，週六、週日及國定假日休息。如果您有其他問題，可以隨時向櫃檯行員詢問。"
+  ]
+ }
+]

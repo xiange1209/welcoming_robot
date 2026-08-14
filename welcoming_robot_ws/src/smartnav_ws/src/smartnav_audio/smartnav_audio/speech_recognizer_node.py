@@ -50,6 +50,38 @@ class SpeechRecognizerNode(Node):
         )
         self.declare_parameter("audio_topic", "/audio_in", ParameterDescriptor(description="音訊數據流話題"))
 
+        # ── 後處理（2026-08-14 新增）────────────────────────────
+        #
+        # 使用者實測後的原話：「有時候會抓不到字或是辨識錯誤等等，
+        # 它沒有自動修正或是自動刪除」。在這之前，辨識結果是**原封不動**
+        # 直接發到 /user_text 的 —— 一個字的雜訊、重複字、同音錯字全部照發。
+        #
+        # ★ 分工刻意這樣切：
+        #   這裡只做「一定是錯的」那種清洗（太短、整句同一個字）；
+        #   同音錯字交給 LLM 的系統提示詞用語意判斷（見 system_prompt_bank.txt 第 10 節）。
+        #   理由：同音字修正表是**脆的** —— 表越大，把對的改成錯的機會越高，
+        #   而且每個新場景都要重寫。LLM 本來就在做語意理解，讓它一併吃掉更穩。
+        #   下面的 corrections 只留「銀行情境下幾乎不可能是別的意思」那幾條當保險。
+        self.declare_parameter(
+            "min_text_length", 2,
+            ParameterDescriptor(description="短於這個字數的最終結果直接丟棄（雜訊）"))
+        self.declare_parameter(
+            "drop_uniform_text", True,
+            ParameterDescriptor(description="整句都是同一個字時丟棄，例如『嗯嗯嗯嗯』"))
+        self.declare_parameter(
+            "collapse_repeats", 3,
+            ParameterDescriptor(
+                description="同一個字連續達到這個次數就截短，保留前 N-1 個。"
+                            "預設 3 = 連三個以上截成兩個（中文疊字合法，兩個要留）；0 = 關閉"))
+        self.declare_parameter(
+            "enable_corrections", True,
+            ParameterDescriptor(description="是否套用內建的銀行詞彙同音修正表"))
+
+        self.min_text_length = self.get_parameter("min_text_length").get_parameter_value().integer_value
+        self.drop_uniform_text = self.get_parameter("drop_uniform_text").get_parameter_value().bool_value
+        self.collapse_repeats = self.get_parameter("collapse_repeats").get_parameter_value().integer_value
+        self.enable_corrections = self.get_parameter("enable_corrections").get_parameter_value().bool_value
+
         # 參數獲取
         self.sample_rate = self.get_parameter("sample_rate").get_parameter_value().integer_value
         self.num_threads = self.get_parameter("num_threads").get_parameter_value().integer_value
@@ -60,7 +92,10 @@ class SpeechRecognizerNode(Node):
         # 初始化 OpenCC 轉換器 (簡體中文 -> 繁體中文)
         self.opencc = None
         try:
-            self.opencc = OpenCC("s2twp.json")  # 簡體 -> 繁體
+            # 2026-08-14：這裡原本寫 "s2twp.json"，但這版 opencc 會自己補上 .json 副檔名，
+            # 變成找 s2twp.json.json → 初始化失敗被 except 吃掉，辨識結果就一直是簡體。
+            # smartnav_llm/llm_service_node.py 用的是不帶副檔名的 "s2twp"，這裡對齊它。
+            self.opencc = OpenCC("s2twp")  # 簡體 -> 繁體
             self.get_logger().info("OpenCC 轉換器已初始化")
         except Exception as e:
             self.get_logger().warning(f"OpenCC 初始化失敗: {e}")
@@ -296,7 +331,13 @@ class SpeechRecognizerNode(Node):
                 if converted_text:
                     if is_final:
                         self.get_logger().info(f"✓ 最終結果: '{converted_text}'")
-                        self.user_text_pub.publish(String(data=converted_text))
+                        # ★ 2026-08-14：發出去之前先清洗。回傳 None 代表這句是雜訊，
+                        #   直接不發 —— 這就是使用者要的「自動刪除」。
+                        #   ⚠ 丟棄要 log，否則現場會變成「我明明有講話卻沒反應」，
+                        #     而那跟麥克風壞掉、VAD 沒觸發長得一模一樣。
+                        cleaned = self._postprocess(converted_text)
+                        if cleaned:
+                            self.user_text_pub.publish(String(data=cleaned))
                         # 重置上一次部分結果
                         self.last_partial_result = None
                     else:
@@ -313,6 +354,81 @@ class SpeechRecognizerNode(Node):
             self.get_logger().error(f"✗ 語音辨識失敗: {e}")
             # 重置流
             self.stream = self.recognizer.create_stream()
+
+    # ── 後處理 ────────────────────────────────────────────────
+    #
+    # 只放「銀行情境下幾乎不可能是別的意思」的詞。★ 加新條目前先問一句：
+    # 「有沒有哪個客人可能真的想講左邊那個詞？」有的話就不要加，交給 LLM 判斷。
+    # 例：不要加「保鮮->保險」——真的有人會問保鮮膜；那條放在系統提示詞裡由語意處理。
+    ASR_CORRECTIONS = {
+        "開護": "開戶",
+        "開互": "開戶",
+        "題款": "提款",
+        "帶款": "貸款",
+        "代款": "貸款",
+        "櫃台": "櫃檯",
+        "服務台": "服務檯",
+        "型員": "行員",
+    }
+
+    def _postprocess(self, text: str) -> Optional[str]:
+        """清洗最終辨識結果。回傳 None 代表這句該丟掉。
+
+        ★ 每一條規則都會 log「改了什麼」，因為**沒有量測就不知道規則是幫忙還是幫倒忙**。
+          明天要拿這些 log 統計各條規則的觸發次數，觸發卻改錯的就砍掉。
+        """
+        raw = text.strip()
+        if not raw:
+            return None
+
+        # (1) 太短 = 雜訊。VAD 誤觸發時常常吐出一兩個字。
+        if len(raw) < self.min_text_length:
+            self.get_logger().info(f"⊘ 丟棄（太短 {len(raw)} < {self.min_text_length}）: '{raw}'")
+            return None
+
+        # (2) 整句同一個字：「嗯嗯嗯」「啊啊啊啊」。這是持續噪音的典型輸出。
+        #
+        # ★ 必須排除長度 2 —— 中文的兩字疊詞是合法且高頻的：
+        #   **「謝謝」**、「好好」、「慢慢」、「快快」。第一版寫成
+        #   `len(set(raw)) == 1` 就把「謝謝」丟掉了，而那是迎賓場景最常聽到的一句。
+        #   症狀會是「我明明有講謝謝，它完全沒反應」，跟麥克風壞掉一模一樣。
+        #   （寫完當場用假資料跑一遍才發現的 —— 這種規則一定要先餵幾句真實例句。）
+        if self.drop_uniform_text and len(raw) >= 3 and len(set(raw)) == 1:
+            self.get_logger().info(f"⊘ 丟棄（整句同一個字）: '{raw}'")
+            return None
+
+        out = raw
+
+        # (3) 連續重複字摺疊。串流辨識在音訊斷斷續續時會把同一個字吐很多次。
+        #     ★ 門檻設 3 而不是 2 —— 中文本來就有「謝謝」「好好」「慢慢」這種疊字，
+        #       連續兩個字是正常的，三個以上才幾乎一定是辨識問題。
+        if self.collapse_repeats and self.collapse_repeats >= 2:
+            chars, run, prev = [], 0, None
+            for ch in out:
+                run = run + 1 if ch == prev else 1
+                prev = ch
+                if run <= self.collapse_repeats - 1:
+                    chars.append(ch)
+            collapsed = "".join(chars)
+            if collapsed != out:
+                self.get_logger().info(f"✎ 摺疊重複字: '{out}' -> '{collapsed}'")
+                out = collapsed
+
+        # (4) 同音修正表（保守，只有幾條）
+        if self.enable_corrections:
+            for wrong, right in self.ASR_CORRECTIONS.items():
+                if wrong in out:
+                    out = out.replace(wrong, right)
+                    self.get_logger().info(f"✎ 同音修正: '{wrong}' -> '{right}'")
+
+        # 摺疊之後可能又變太短
+        if len(out) < self.min_text_length:
+            self.get_logger().info(f"⊘ 丟棄（處理後太短）: '{raw}' -> '{out}'")
+            return None
+
+        if out != raw:
+            self.get_logger().info(f"✓ 後處理: '{raw}' -> '{out}'")
+        return out
 
     def _playback_status_callback(self, msg: Bool) -> None:
         """說話狀態回呼函數"""

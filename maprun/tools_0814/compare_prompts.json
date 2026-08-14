@@ -1,0 +1,256 @@
+{
+ "A_原導航版": {
+  "hit": 23,
+  "total": 24,
+  "prose": 0,
+  "rows": [
+   [
+    "Q1_開戶證件",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ],
+   [
+    "Q2_幾點關門",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ],
+   [
+    "Q3_找真人",
+    "notify_staff_tool",
+    {
+     "None": 1,
+     "notify_staff_tool": 2
+    }
+   ],
+   [
+    "R1_現在幾點",
+    "query_datetime_tool",
+    {
+     "query_datetime_tool": 3
+    }
+   ],
+   [
+    "R2_打招呼",
+    "None",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "R3_帶位",
+    "guide_to_vip_room_tool",
+    {
+     "guide_to_vip_room_tool": 3
+    }
+   ],
+   [
+    "R4_匯率",
+    "query_exchange_rate_tool",
+    {
+     "query_exchange_rate_tool": 3
+    }
+   ],
+   [
+    "R5_營業時間",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ]
+  ]
+ },
+ "B_新銀行版(有工具名)": {
+  "hit": 12,
+  "total": 24,
+  "prose": 0,
+  "rows": [
+   [
+    "Q1_開戶證件",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ],
+   [
+    "Q2_幾點關門",
+    "query_bank_faq_tool",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "Q3_找真人",
+    "notify_staff_tool",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "R1_現在幾點",
+    "query_datetime_tool",
+    {
+     "query_datetime_tool": 3
+    }
+   ],
+   [
+    "R2_打招呼",
+    "None",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "R3_帶位",
+    "guide_to_vip_room_tool",
+    {
+     "guide_to_vip_room_tool": 3
+    }
+   ],
+   [
+    "R4_匯率",
+    "query_exchange_rate_tool",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "R5_營業時間",
+    "query_bank_faq_tool",
+    {
+     "None": 3
+    }
+   ]
+  ]
+ },
+ "C_新銀行版(無工具名)": {
+  "hit": 20,
+  "total": 24,
+  "prose": 0,
+  "rows": [
+   [
+    "Q1_開戶證件",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ],
+   [
+    "Q2_幾點關門",
+    "query_bank_faq_tool",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "Q3_找真人",
+    "notify_staff_tool",
+    {
+     "notify_staff_tool": 3
+    }
+   ],
+   [
+    "R1_現在幾點",
+    "query_datetime_tool",
+    {
+     "query_datetime_tool": 3
+    }
+   ],
+   [
+    "R2_打招呼",
+    "None",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "R3_帶位",
+    "guide_to_vip_room_tool",
+    {
+     "guide_to_vip_room_tool": 3
+    }
+   ],
+   [
+    "R4_匯率",
+    "query_exchange_rate_tool",
+    {
+     "None": 1,
+     "query_exchange_rate_tool": 2
+    }
+   ],
+   [
+    "R5_營業時間",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ]
+  ]
+ },
+ "D_導航版+補真人與營業時間": {
+  "hit": 24,
+  "total": 24,
+  "prose": 0,
+  "rows": [
+   [
+    "Q1_開戶證件",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ],
+   [
+    "Q2_幾點關門",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ],
+   [
+    "Q3_找真人",
+    "notify_staff_tool",
+    {
+     "notify_staff_tool": 3
+    }
+   ],
+   [
+    "R1_現在幾點",
+    "query_datetime_tool",
+    {
+     "query_datetime_tool": 3
+    }
+   ],
+   [
+    "R2_打招呼",
+    "None",
+    {
+     "None": 3
+    }
+   ],
+   [
+    "R3_帶位",
+    "guide_to_vip_room_tool",
+    {
+     "guide_to_vip_room_tool": 3
+    }
+   ],
+   [
+    "R4_匯率",
+    "query_exchange_rate_tool",
+    {
+     "query_exchange_rate_tool": 3
+    }
+   ],
+   [
+    "R5_營業時間",
+    "query_bank_faq_tool",
+    {
+     "query_bank_faq_tool": 3
+    }
+   ]
+  ]
+ }
+}

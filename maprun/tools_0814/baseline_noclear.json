@@ -1,0 +1,354 @@
+[
+ {
+  "rep": 0,
+  "qid": "Q1_開戶證件",
+  "question": "請問開戶要帶什麼證件",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 4.03,
+  "total_s": 8.88,
+  "speech": [
+   "開立新臺幣存款帳戶時",
+   "您需要攜帶雙證件身分證加上健保卡或駕照以及印章",
+   "對於未成年客戶",
+   "則需法定代理人陪同",
+   "開戶大約需要30分鐘的時間",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "開立新臺幣存款帳戶時，您需要攜帶雙證件（身分證加上健保卡或駕照）以及印章。對於未成年客戶，則需法定代理人陪同。開戶大約需要30分鐘的時間。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "Q2_幾點關門",
+  "question": "你們幾點關門",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.91,
+  "total_s": 6.85,
+  "speech": [
+   "我們銀行週一至週五的營業時間是早上09",
+   "00到下午15",
+   "30",
+   "週六週日及國定假日則會關門",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "我們銀行週一至週五的營業時間是早上09:00到下午15:30，週六、週日及國定假日則會關門。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 0,
+  "qid": "Q3_找真人",
+  "question": "我要找真人服務",
+  "expect": "notify_staff_tool",
+  "tools": [
+   "notify_staff_tool"
+  ],
+  "first_tool": "notify_staff_tool",
+  "hit": true,
+  "first_latency_s": 2.03,
+  "total_s": 5.6,
+  "speech": [
+   "您好",
+   "我們已經通知了櫃檯人員",
+   "他們會盡快為您服務",
+   "請稍等一下"
+  ],
+  "llm_response": [
+   "您好，我們已經通知了櫃檯人員，他們會盡快為您服務。請稍等一下。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "Q1_開戶證件",
+  "question": "請問開戶要帶什麼證件",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.89,
+  "total_s": 7.81,
+  "speech": [
+   "開立新臺幣存款帳戶時",
+   "您需要攜帶雙證件身分證和健保卡或駕照以及印章",
+   "如果客戶是未成年人",
+   "則需法定代理人陪同",
+   "開戶大約需要30分鐘的時間",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "系統目前正在處理上一個指令，請稍後再試...",
+   "開立新臺幣存款帳戶時，您需要攜帶雙證件（身分證和健保卡或駕照）以及印章。如果客戶是未成年人，則需法定代理人陪同。開戶大約需要30分鐘的時間。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "Q2_幾點關門",
+  "question": "你們幾點關門",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 3.04,
+  "total_s": 6.9,
+  "speech": [
+   "我們銀行週一至週五的營業時間是早上09",
+   "00到下午15",
+   "30",
+   "週六週日以及國定假日則會關門",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "我們銀行週一至週五的營業時間是早上09:00到下午15:30，週六、週日以及國定假日則會關門。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 1,
+  "qid": "Q3_找真人",
+  "question": "我要找真人服務",
+  "expect": "notify_staff_tool",
+  "tools": [
+   "notify_staff_tool"
+  ],
+  "first_tool": "notify_staff_tool",
+  "hit": true,
+  "first_latency_s": 2.03,
+  "total_s": 5.54,
+  "speech": [
+   "您好",
+   "我們已經通知了櫃檯人員會盡快前來提供服務",
+   "請稍等片刻"
+  ],
+  "llm_response": [
+   "您好，我們已經通知了櫃檯人員會盡快前來提供服務。請稍等片刻。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "Q1_開戶證件",
+  "question": "請問開戶要帶什麼證件",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.8,
+  "total_s": 7.65,
+  "speech": [
+   "開立新臺幣存款帳戶時",
+   "您需要攜帶雙證件身分證和健保卡或駕照以及印章",
+   "如果客戶是未成年人",
+   "則需法定代理人陪同",
+   "開戶大約需要30分鐘的時間",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "開立新臺幣存款帳戶時，您需要攜帶雙證件（身分證和健保卡或駕照）以及印章。如果客戶是未成年人，則需法定代理人陪同。開戶大約需要30分鐘的時間。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "Q2_幾點關門",
+  "question": "你們幾點關門",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.65,
+  "total_s": 6.58,
+  "speech": [
+   "我們銀行週一至週五的營業時間是早上09",
+   "00到下午15",
+   "30",
+   "週六週日以及國定假日則會關門",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "我們銀行週一至週五的營業時間是早上09:00到下午15:30，週六、週日以及國定假日則會關門。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 2,
+  "qid": "Q3_找真人",
+  "question": "我要找真人服務",
+  "expect": "notify_staff_tool",
+  "tools": [
+   "notify_staff_tool"
+  ],
+  "first_tool": "notify_staff_tool",
+  "hit": true,
+  "first_latency_s": 1.69,
+  "total_s": 5.18,
+  "speech": [
+   "您好",
+   "我們已經通知了櫃檯人員會盡快前來提供服務",
+   "請稍等片刻"
+  ],
+  "llm_response": [
+   "您好，我們已經通知了櫃檯人員會盡快前來提供服務。請稍等片刻。"
+  ]
+ },
+ {
+  "rep": 3,
+  "qid": "Q1_開戶證件",
+  "question": "請問開戶要帶什麼證件",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.87,
+  "total_s": 7.73,
+  "speech": [
+   "開立新臺幣存款帳戶時",
+   "您需要攜帶雙證件身分證和健保卡或駕照以及印章",
+   "如果客戶是未成年人",
+   "則需法定代理人陪同",
+   "開戶大約需要30分鐘的時間",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "開立新臺幣存款帳戶時，您需要攜帶雙證件（身分證和健保卡或駕照）以及印章。如果客戶是未成年人，則需法定代理人陪同。開戶大約需要30分鐘的時間。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 3,
+  "qid": "Q2_幾點關門",
+  "question": "你們幾點關門",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.48,
+  "total_s": 6.39,
+  "speech": [
+   "我們銀行週一至週五的營業時間是早上09",
+   "00到下午15",
+   "30",
+   "週六週日以及國定假日則會關門",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "我們銀行週一至週五的營業時間是早上09:00到下午15:30，週六、週日以及國定假日則會關門。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 3,
+  "qid": "Q3_找真人",
+  "question": "我要找真人服務",
+  "expect": "notify_staff_tool",
+  "tools": [
+   "notify_staff_tool"
+  ],
+  "first_tool": "notify_staff_tool",
+  "hit": true,
+  "first_latency_s": 1.75,
+  "total_s": 5.14,
+  "speech": [
+   "您好",
+   "我們已經通知了櫃檯人員會盡快前來提供服務",
+   "請稍等片刻"
+  ],
+  "llm_response": [
+   "您好，我們已經通知了櫃檯人員會盡快前來提供服務。請稍等片刻。"
+  ]
+ },
+ {
+  "rep": 4,
+  "qid": "Q1_開戶證件",
+  "question": "請問開戶要帶什麼證件",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.86,
+  "total_s": 7.72,
+  "speech": [
+   "開立新臺幣存款帳戶時",
+   "您需要攜帶雙證件身分證和健保卡或駕照以及印章",
+   "如果客戶是未成年人",
+   "則需法定代理人陪同",
+   "開戶大約需要30分鐘的時間",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "開立新臺幣存款帳戶時，您需要攜帶雙證件（身分證和健保卡或駕照）以及印章。如果客戶是未成年人，則需法定代理人陪同。開戶大約需要30分鐘的時間。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 4,
+  "qid": "Q2_幾點關門",
+  "question": "你們幾點關門",
+  "expect": "query_bank_faq_tool",
+  "tools": [
+   "query_bank_faq_tool"
+  ],
+  "first_tool": "query_bank_faq_tool",
+  "hit": true,
+  "first_latency_s": 2.51,
+  "total_s": 6.35,
+  "speech": [
+   "我們銀行週一至週五的營業時間是早上09",
+   "00到下午15",
+   "30",
+   "週六週日以及國定假日則會關門",
+   "如果您有其他問題",
+   "請隨時告訴我"
+  ],
+  "llm_response": [
+   "我們銀行週一至週五的營業時間是早上09:00到下午15:30，週六、週日以及國定假日則會關門。如果您有其他問題，請隨時告訴我。"
+  ]
+ },
+ {
+  "rep": 4,
+  "qid": "Q3_找真人",
+  "question": "我要找真人服務",
+  "expect": "notify_staff_tool",
+  "tools": [
+   "notify_staff_tool"
+  ],
+  "first_tool": "notify_staff_tool",
+  "hit": true,
+  "first_latency_s": 1.78,
+  "total_s": 5.29,
+  "speech": [
+   "您好",
+   "我們已經通知了櫃檯人員會盡快前來提供服務",
+   "請稍等片刻"
+  ],
+  "llm_response": [
+   "您好，我們已經通知了櫃檯人員會盡快前來提供服務。請稍等片刻。"
+  ]
+ }
+]

@@ -32,7 +32,8 @@ def make_bank_tools(node) -> dict:
 
     @tool
     def guide_to_vip_room_tool() -> str:
-        """帶領 VIP 貴賓前往貴賓室。當 VIP 貴賓要求帶位、或同意前往貴賓室時呼叫此工具"""
+        """帶客戶走到貴賓室。客戶說「帶我去貴賓室」「請帶路」「我要去 VIP 室」或同意前往貴賓室時，
+        一定要呼叫此工具，機器人會實際開過去帶路。不要只用嘴巴指路，也不要反問客戶要不要帶位"""
         room_name = node.vip_room_waypoint_name
         try:
             if not node.list_waypoints_client.service_is_ready():
@@ -69,7 +70,9 @@ def make_bank_tools(node) -> dict:
 
     @tool
     def notify_staff_tool(reason: str) -> str:
-        """通報行員前來處理。遇到黑名單人員、客戶要求真人服務、或發生機器人無法處理的狀況時呼叫此工具，reason 填通報原因"""
+        """客戶要找真人、找行員、找專員、要求真人服務或轉接櫃檯時，一定要呼叫此工具通報行員前來。
+        遇到黑名單人員、或發生機器人無法處理的狀況時也呼叫此工具。reason 填通報原因。
+        機器人本身沒有辦法「轉接」或「安排連線」，唯一能做的就是呼叫此工具請行員過來"""
         try:
             from std_msgs.msg import String
 
@@ -80,7 +83,21 @@ def make_bank_tools(node) -> dict:
 
     @tool
     def query_bank_faq_tool(question: str) -> str:
-        """查詢銀行常見問題資料（營業時間、開戶、匯兌等）。客戶詢問銀行業務相關問題時，先呼叫此工具取得正確資訊再回答"""
+        """查詢本行的營業與業務資料。客戶問「幾點開門」「幾點關門」「營業到幾點」「假日有沒有開」
+        這類**本行營業時間**的問題，以及開戶、要帶什麼證件、換匯、外幣、貸款、信用卡、掛失、
+        櫃台位置、手續費、貴賓室等本行業務問題時，都必須先呼叫此工具取得正確資訊再回答。
+        注意：問「本行幾點關門」要用這個工具，不是查現在時刻的工具。請把客戶問題原句傳入"""
+        # ★ 2026-08-14：資料來源刻意**不走** knowledge_store（RAG）。
+        #
+        # 一度改成優先用 node.knowledge_store.build_context()，因為知識庫工具
+        # 已經在銀行模式下取消掛載（見 llm_service_node），想把檢索能力搬進來。
+        # 實測後撤回：knowledge/bank_faq.md 是一份**還沒填的範本**，
+        # 整份有 62 個「（請填寫）」。模型會把括號裡的「例如 …」當成答案唸出來，
+        # 還會自己補值——實測回答「開戶約需 15 分鐘」，但 config/bank_faq.txt
+        # 寫的是 30 分鐘，那個 15 是憑空生出來的。
+        #
+        # config/bank_faq.txt 是目前唯一填好的一份，所以就讀它。
+        # 等 knowledge/bank_faq.md 填完，再考慮切回 RAG（那時才有檢索的價值）。
         faq_path = get_config_path("bank_faq.txt")
         if faq_path is None:
             return "執行結果: 失敗, 詳細信息: 找不到銀行FAQ資料檔，請告知客戶洽詢櫃台"
