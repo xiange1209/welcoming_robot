@@ -307,6 +307,8 @@ class HmiState:
             "charge_current": None,  # 底盤 robot_charging_current（安培）
             "speed": None,           # /odom 的前進速度（m/s，帶正負號）
             "cpu_temp": None,        # Pi 核心溫度（°C）——導航時會逼近降頻門檻
+            "mem_avail_mb": None,    # ★ 可用記憶體。這個歸零才是真的會死機
+            "mem_used_pct": None,
             "cpu_load": None,        # 1 分鐘平均負載；Pi 4 是四核，> 4 就是滿載
         }
         self.map_meta: Optional[Dict[str, Any]] = None
@@ -946,6 +948,11 @@ class HmiServerNode(Node):
         # 車速取自 odom。上方列要回答的是「車子現在到底有沒有在動」——
         # 這在脫困、防撞死鎖那類問題上是第一個要看的量（發了指令但車不動）。
         self.create_subscription(Odometry, "odom", self._odom_speed_cb, sensor_qos, callback_group=cb)
+
+        # 資源監看：★ 獨立計時器，不掛在任何話題上。
+        # 掛話題的話「沒開底盤就沒有 CPU 資訊」，而最需要看的時候
+        # （相機＋人臉＋LLM 全開、底盤沒開）剛好就是沒有底盤的時候。
+        self.create_timer(5.0, self._resource_tick, callback_group=cb)
 
         # ── 規劃路徑（2026-08-14 新增，使用者要求在 HMI 上看得到）──
         #   taught_path  path_teach_cc 發的：規劃完成與重播開始時（latched）
@@ -1663,17 +1670,40 @@ class HmiServerNode(Node):
         self.state.set_nav_path(source, pts)
 
     def _odom_speed_cb(self, msg: Odometry) -> None:
-        """車速 + 順手抄 CPU 溫度與負載
+        """車速。1 Hz 節流（odom 本身是 20 Hz）。
 
-        odom 是 20 Hz，這裡節流到 1 Hz。CPU 兩個量沒有自己的話題來源，
-        搭這班車讀 /sys 與 getloadavg 最省事——沒有底盤時它們也就跟著沒有，
-        而沒有底盤的時候本來就不需要盯 CPU。
+        ★ 2026-08-14：CPU 溫度／負載已經搬到 _resource_tick 的獨立計時器。
+          原本它們搭在這班車上，代價是「沒開底盤就沒有 CPU 資訊」——
+          而 8/14 把整台機器跑到 load 51、SSH 被擠掉的那次，正好是
+          相機＋人臉＋LLM 全開而底盤沒開。最需要看的時候剛好看不到。
         """
         now = time.monotonic()
         if now - self._last_speed_at < 1.0:
             return
         self._last_speed_at = now
-        fields: Dict[str, Any] = {"speed": round(float(msg.twist.twist.linear.x), 3)}
+        self.state.set_system(speed=round(float(msg.twist.twist.linear.x), 3))
+
+    def _resource_tick(self) -> None:
+        """獨立的資源監看（2026-08-14 新增）
+
+        使用者要求 ASR 常駐等待，而常駐服務最怕的是**慢性資源漂移**：
+        當下看起來都好，跑兩小時之後記憶體被吃光、SSH 進不去、只能斷電重開。
+        8/14 就發生過一次（load average **51**、四核心、SSH 被擠掉）。
+
+        ★ 三個量的分工不同，缺一不可：
+          cpu_load   反應快，但**負載高不一定會死** —— 排隊而已
+          mem_avail  ★ 這個才是致命的那個。可用記憶體歸零 = OOM killer
+                     開始亂殺行程，或瘋狂 swap 導致整機失去回應
+          cpu_temp   Pi 4 到 80°C 會降頻，症狀是「什麼都變慢」而不是壞掉
+
+        ★ 為什麼讀 MemAvailable 而不是 MemFree：Linux 會把空閒記憶體拿去當
+          快取，MemFree 常態就很低，看它會天天誤報。MemAvailable 是核心自己
+          估的「不觸發 swap 能給出多少」，才是真正該看的數字。
+
+        跨過門檻時**寫進 log**（不只是更新畫面）—— 事後查當機原因時，
+        沒有人會有當時的平板畫面，但 log 一定留著。
+        """
+        fields: Dict[str, Any] = {}
         try:
             with open("/sys/class/thermal/thermal_zone0/temp", "r") as fh:
                 fields["cpu_temp"] = round(int(fh.read().strip()) / 1000.0, 1)
@@ -1683,7 +1713,45 @@ class HmiServerNode(Node):
             fields["cpu_load"] = round(os.getloadavg()[0], 2)
         except OSError:
             pass
-        self.state.set_system(**fields)
+        try:
+            avail = total = None
+            with open("/proc/meminfo", "r") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) / 1024.0          # kB -> MB
+                    elif line.startswith("MemTotal:"):
+                        total = int(line.split()[1]) / 1024.0
+                    if avail is not None and total is not None:
+                        break
+            if avail is not None:
+                fields["mem_avail_mb"] = round(avail)
+                if total:
+                    fields["mem_used_pct"] = round(100.0 * (1.0 - avail / total))
+        except (OSError, ValueError, IndexError):
+            pass
+
+        if fields:
+            self.state.set_system(**fields)
+
+        # ── 門檻警告 ────────────────────────────────────────
+        # throttle_duration_sec 讓它最多每分鐘唸一次，不會洗版。
+        load = fields.get("cpu_load")
+        if load is not None and load >= self.LOAD_WARN:
+            self.get_logger().warn(
+                f"⚠ 系統負載 {load:.1f}（四核心，>{self.LOAD_WARN:.0f} 就已經在排隊）"
+                "——考慮關掉深度相機或導航堆疊",
+                throttle_duration_sec=60.0)
+        mem = fields.get("mem_avail_mb")
+        if mem is not None and mem <= self.MEM_WARN_MB:
+            self.get_logger().error(
+                f"⚠⚠ 可用記憶體只剩 {mem} MB（<{self.MEM_WARN_MB}）"
+                "——再下去 OOM killer 會開始殺行程、SSH 會進不來，請立刻停掉非必要節點",
+                throttle_duration_sec=60.0)
+        temp = fields.get("cpu_temp")
+        if temp is not None and temp >= self.TEMP_WARN:
+            self.get_logger().warn(
+                f"⚠ CPU {temp:.1f}°C（>{self.TEMP_WARN:.0f} 會開始降頻，症狀是全部變慢）",
+                throttle_duration_sec=60.0)
 
     def access_urls(self) -> List[str]:
         """平板可以打開的網址清單
@@ -2106,6 +2174,13 @@ class HmiServerNode(Node):
     # 送到前端畫的路徑最多幾點。地圖畫布只有幾百像素寬，超過這個數的細節
     # 眼睛看不出來，卻要每次狀態推播都重傳一遍。
     MAX_PATH_POINTS = 120
+
+    # 資源警戒線（見 _resource_tick）。四核心 Pi 4：
+    #   load 4 = 剛好滿載；8/14 那次量到 51，SSH 已經進不去
+    #   記憶體 8 GB，留 600 MB 是「還救得回來」的下限
+    LOAD_WARN = 6.0
+    MEM_WARN_MB = 600
+    TEMP_WARN = 78.0
 
     TELEOP_MAX_LINEAR = 0.18
     TELEOP_MAX_ANGULAR = 0.45
