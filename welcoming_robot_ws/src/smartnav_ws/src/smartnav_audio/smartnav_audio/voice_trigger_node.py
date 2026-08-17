@@ -5,6 +5,7 @@
 監聽麥克風，在檢測到喚醒詞時發佈音訊
 """
 
+import math
 import threading
 import sherpa_onnx
 import numpy as np
@@ -21,6 +22,13 @@ from std_msgs.msg import Bool
 from smartnav_msgs.msg import AudioData
 from smartnav_audio.voice_utils import AudioCodec, get_model_path, validate_audio_data
 from smartnav_audio.audio_recorder import AudioRecorder
+from smartnav_audio.mic_array import (
+    DEFAULT_COEFFS,
+    DEFAULT_GAIN,
+    DEFAULT_LAG,
+    DEFAULT_PRE,
+    DualMicMixer,
+)
 
 
 class TriggerState(Enum):
@@ -55,6 +63,43 @@ class VoiceTriggerNode(Node):
         self.declare_parameter("device", -1)
         self.declare_parameter("dtype", "float32")
         self.declare_parameter("output_format", "pcm_s16le")
+
+        # ★ 2026-08-17 加：Astra S 的雙麥克風處理模式。
+        #   可選：left / right / average / beamform / cancel
+        #
+        #   預設 cancel：離線量到人站正前方時 SNR 比 left 好 +8.2 dB
+        #   （噪音 -13.6 dB、人聲 -5.4 dB，差值就是淨賺），
+        #   且 ±86 度內每個角度都是正的。係數的泛化跨過一次完整重開機驗證過。
+        #
+        #   ★ 單聲道退路：mic_mode:=left 就完全回到 2026-08-17 之前的行為
+        #     —— 連 InputStream 都會退回開單聲道，不只是繞過 mixer。
+        #     實機如果變差，先改這個參數，不要改程式。
+        self.declare_parameter(
+            "mic_mode", "cancel", ParameterDescriptor(description="雙麥克風處理模式 left/right/average/beamform/cancel")
+        )
+        # 預設就是驗證過的那組係數（定義在 mic_array.DEFAULT_COEFFS，
+        # 讓節點與 ~/maprun/tools_0817 的分析工具共用同一份，不會各改各的）。
+        #
+        # ★ 絕對不要把預設值寫成空 list []。rclpy 從預設值推型別時，
+        #   空 list 會走到 `all(isinstance(v, bytes) for v in [])` == True 這一條，
+        #   被推成 BYTE_ARRAY；之後用 -p mic_cancel_coeffs:=[1.0,...] 傳浮點數
+        #   會直接丟型別錯誤，而且訊息看起來跟麥克風完全無關。
+        #   現在給的是非空的 float list，型別會正確推成 DOUBLE_ARRAY。
+        self.declare_parameter(
+            "mic_cancel_coeffs",
+            list(DEFAULT_COEFFS),
+            ParameterDescriptor(description="mic_mode=cancel 用的 FIR 係數，由 mic_snr_cc.py --fit 產生"),
+        )
+        self.declare_parameter("mic_cancel_pre", DEFAULT_PRE)
+        self.declare_parameter("mic_lag", DEFAULT_LAG)
+        # ★ 補回 cancel 壓掉的人聲位準（+5.41 dB = x1.86）。
+        #   不補的話人聲會比現況小 5.4 dB，VAD threshold 0.25 是在現況位準下
+        #   校出來的，可能反而更難觸發。設 1.0 就是不補。
+        self.declare_parameter(
+            "mic_output_gain",
+            DEFAULT_GAIN,
+            ParameterDescriptor(description="雙麥克風輸出補回增益（倍率），1.0 = 不補"),
+        )
 
         # VAD 參數
         self.declare_parameter("vad_num_threads", 2)
@@ -194,18 +239,69 @@ class VoiceTriggerNode(Node):
         except Exception as e:
             self.get_logger().warning(f"✗ 載入 VAD 模型失敗: {e}")
 
+    def _build_mic_mixer(self):
+        """依 mic_mode 建立雙麥克風處理器
+
+        Returns:
+            (channels, mixer)：channels=1 表示沿用舊的單聲道路徑
+        """
+        mode = self.get_parameter("mic_mode").get_parameter_value().string_value or "left"
+        if mode == "left":
+            # ★ 單聲道退路：完全走 2026-08-17 之前的路徑，連 InputStream 都還是
+            #   開單聲道，確保行為一個位元組都沒變。
+            self.get_logger().info("  雙麥克風模式: left（單聲道擷取，與 2026-08-17 之前完全相同）")
+            return 1, None
+
+        # 有預設值了，正常情況不會丟；但參數若被外部覆寫成空陣列還是要接得住。
+        try:
+            coeffs = list(self.get_parameter("mic_cancel_coeffs").get_parameter_value().double_array_value)
+        except Exception:
+            coeffs = []
+        pre = self.get_parameter("mic_cancel_pre").get_parameter_value().integer_value
+        lag = self.get_parameter("mic_lag").get_parameter_value().integer_value
+        gain = self.get_parameter("mic_output_gain").get_parameter_value().double_value
+        try:
+            mixer = DualMicMixer(mode=mode, coeffs=coeffs or None, lag=lag, pre=pre, gain=gain)
+        except Exception as e:
+            # ★ 任何一步失敗都退回單聲道。這個專題不能因為麥克風處理壞掉就整個沒聲音。
+            self.get_logger().error(f"✗ 建立雙麥克風處理器失敗（退回 left 單聲道）: {e}")
+            return 1, None
+
+        # ★ 這幾行是實機驗證唯一的憑據（ros2 param get 不算）。
+        #   把真正生效的數字全印出來，才能確認參數有吃進去。
+        self.get_logger().info(f"  雙麥克風模式: {mode}（雙聲道擷取）")
+        if mode == "cancel":
+            is_default = (len(coeffs) == len(DEFAULT_COEFFS)
+                          and all(abs(a - b) < 1e-9 for a, b in zip(coeffs, DEFAULT_COEFFS)))
+            src = "內建驗證過的預設值" if is_default else "外部覆寫"
+            self.get_logger().info(
+                f"    FIR {len(coeffs)} 抽頭（{src}）  pre={pre}  "
+                f"係數最大絕對值 {max(abs(c) for c in coeffs):.2f}"
+            )
+            self.get_logger().info(
+                "    預期：底噪 -13.6 dB、人聲 -5.4 dB -> SNR 淨賺 +8.2 dB（正前方）"
+            )
+        elif mode == "beamform":
+            self.get_logger().info(f"    lag={lag}（2 = 指向車子側面，不是正前方）")
+        gain_db = 20.0 * math.log10(gain) if gain > 0 else float("-inf")
+        self.get_logger().info(f"    輸出補回增益: x{gain:.2f}（{gain_db:+.2f} dB）")
+        return 2, mixer
+
     def _init_recorder(self) -> None:
         """初始化並啟動麥克風錄製器
 
         建立 AudioRecorder 實例並啟動音訊捕獲
         """
         try:
+            channels, mixer = self._build_mic_mixer()
             self._recorder = AudioRecorder(
                 sample_rate=self.sample_rate,
                 chunk_size=self.chunk_size,
                 device=self.device,
                 audio_callback=self.process_audio_chunk,
                 logger=self.get_logger(),
+                channels=channels,
+                mono_mixer=mixer,
             )
             self._recorder.start()
             self.get_logger().info("✓ 麥克風錄製已啟動")

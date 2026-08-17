@@ -72,8 +72,50 @@ nohup ros2 run smartnav_audio speech_recognizer \
     > "$LOGDIR/asr_recognizer.log" 2>&1 &
 echo "[run_asr] speech_recognizer 已啟動（載入模型約需 10-25 秒）"
 
+# ── 3b. 雙麥克風模式（2026-08-17 加）─────────────────────
+# Astra S 有兩顆實體麥克風，間距約 4.3 cm。
+#
+# ★ 2026-08-17 起預設改成 cancel（FIR 噪音消除）。離線量到人站正前方時
+#   SNR 比 left 好 +8.2 dB，且係數的泛化跨過一次完整重開機驗證過
+#   （舊係數在重開機後新錄音上 -13.62 dB，重訓上界 -13.68 dB，只差 0.06 dB）。
+#
+#   ASR_MIC_MODE=cancel    ★ FIR 噪音消除（預設）
+#   ASR_MIC_MODE=left      只讀左聲道 = 2026-08-17 之前的行為【單聲道退路】
+#   ASR_MIC_MODE=average   兩聲道平均（實測 ΔSNR 只有 +0.14 dB，等於沒用）
+#   ASR_MIC_MODE=beamform  延遲相加，指向車子側面（實測 ΔSNR -0.07 dB）
+#
+# ★ 實機如果比以前差，第一件事是跑：
+#       ASR_MIC_MODE=left ~/maprun/run_asr_cc.sh
+#   就完全回到舊行為，不要改程式。
+#
+# 係數：節點裡已內建驗證過的那組（smartnav_audio/mic_array.py 的 DEFAULT_COEFFS），
+# 所以 $COEF_FILE 不存在也能跑。檔案存在時以檔案為準，方便換場地重訓後直接覆蓋。
+# 重訓：錄一段「安靜、沒有人講話」的雙聲道 wav，然後
+#   ~/maprun/tools_0817/mic_snr_cc.py --fit 安靜.wav
+# 把印出來的係數存成 $COEF_FILE（逗號分隔）。
+# ⚠ 係數跟環境／麥克風增益綁在一起，換場地或改 amixer 增益要重訓。
+MIC_MODE="${ASR_MIC_MODE:-cancel}"
+COEF_FILE="${ASR_MIC_COEFFS:-/home/user/maprun/tools_0817/mic_cancel_coeffs.txt}"
+MIC_ARGS="-p mic_mode:=$MIC_MODE"
+if [ "$MIC_MODE" = "cancel" ]; then
+    if [ -f "$COEF_FILE" ]; then
+        COEFS=$(tr -d ' \n' < "$COEF_FILE")
+        MIC_ARGS="$MIC_ARGS -p mic_cancel_coeffs:=[$COEFS]"
+        echo "[run_asr] 雙麥克風模式 cancel，係數取自 $COEF_FILE"
+    else
+        echo "[run_asr] 雙麥克風模式 cancel，使用節點內建的預設係數"
+    fi
+else
+    echo "[run_asr] 雙麥克風模式 $MIC_MODE"
+fi
+# 補回 cancel 壓掉的人聲位準（倍率）。1.0 = 不補。預設由節點決定（x1.86）。
+if [ -n "$ASR_MIC_GAIN" ]; then
+    MIC_ARGS="$MIC_ARGS -p mic_output_gain:=$ASR_MIC_GAIN"
+    echo "[run_asr] 輸出補回增益覆寫為 $ASR_MIC_GAIN"
+fi
+
 nohup ros2 run smartnav_audio voice_trigger \
-    --ros-args -p device:=$IDX -p vad_num_threads:=1 \
+    --ros-args -p device:=$IDX -p vad_num_threads:=1 $MIC_ARGS \
     > "$LOGDIR/asr_voice_trigger.log" 2>&1 &
 echo "[run_asr] voice_trigger 已啟動"
 

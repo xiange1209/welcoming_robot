@@ -181,6 +181,11 @@ class NavigationActionCcNode(Node):
         self.align_pose_client = self.create_client(
             Trigger, "/align_pose", callback_group=self.client_cb_group
         )
+        # ★ 2026-08-17：規劃器回 "Start occupied" 時的唯一自救管道，
+        #   見 _call_unwedge 與 path_teach_cc._unwedge_cb 的說明。
+        self.unwedge_client = self.create_client(
+            Trigger, "/unwedge", callback_group=self.client_cb_group
+        )
         # 導航前清全域成本地圖的 obstacle 層（見參數宣告處的說明）
         self.clear_costmap_client = self.create_client(
             ClearEntireCostmap,
@@ -452,6 +457,19 @@ class NavigationActionCcNode(Node):
 
             plan = self._plan_taught_once(waypoint_name, target_pose)
             if plan is None:
+                # ★★ 2026-08-17：規劃不出來時先試著把車子推開再規劃一次 ★★
+                #
+                # 8/17 實測到的死結：車子跑完一趟停在牆邊，車體壓在成本地圖的
+                # 內切格上，規劃器對**每一個目標**都回 "Start occupied"。
+                # 這時候「重新規劃」再多次也沒用 —— 起點本身就是不合法的，
+                # 而 nav2 內建的 backup / drive_on_heading 一樣要做碰撞檢查，
+                # 實測也跟著失敗（`backup failed`）。當天使用者手動救了三次車。
+                #
+                # `/unwedge` 繞過規劃器直接打舵推開，是唯一有效的一條路。
+                # ★ 只試一次：推不開就是真的推不開，多試只是拖時間又耗電。
+                if self._call_unwedge():
+                    plan = self._plan_taught_once(waypoint_name, target_pose)
+            if plan is None:
                 if attempt == 1:
                     # 一次都沒跑過 -> 車子還在原地，讓 MPPI 有機會試
                     return None
@@ -582,6 +600,30 @@ class NavigationActionCcNode(Node):
             wait_for_future(self.delete_taught_client.call_async(d), timeout_sec=5.0)
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"刪除臨時路徑失敗（不影響導航結果）: {exc}")
+
+    def _call_unwedge(self) -> bool:
+        """請 path_teach_cc 把車子從「規劃器不肯出手」的位置推開。
+
+        回傳 True 代表車子有被推動過，值得再規劃一次；False 就別白費力氣。
+        ★ 這支**會讓車子移動**，而且是繞過 collision_monitor 的
+          （楔住時它會停止輸出，指令根本到不了底盤）。所以只在規劃已經失敗、
+          也就是「不動就什麼都做不了」的時候呼叫。
+        """
+        if not self.unwedge_client.service_is_ready():
+            self.get_logger().warn("規劃失敗，但 /unwedge 服務不在，無法自救")
+            return False
+        try:
+            res = wait_for_future(
+                self.unwedge_client.call_async(Trigger.Request()), timeout_sec=60.0)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"呼叫 /unwedge 失敗: {exc}")
+            return False
+        if res is None:
+            self.get_logger().warn("/unwedge 沒有回應")
+            return False
+        self.get_logger().warn(
+            f"規劃不出路徑，已嘗試脫困：{'成功' if res.success else '失敗'} —— {res.message}")
+        return bool(res.success)
 
     def _clear_costmap_quiet(self) -> None:
         """清全域成本地圖的 obstacle 層；失敗只警告不擋流程。"""

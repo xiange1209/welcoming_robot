@@ -300,6 +300,9 @@
     #mapwrap  { height: 58vh; min-height: 240px; }
     #chat     { height: 46vh; min-height: 180px; }
     .list     { max-height: 46vh; }
+    /* ★ 2026-08-17：系統開關頁整頁就只有這張清單，46vh 會讓它只剩半個畫面，
+       10 個單元要捲很久。這一頁讓它吃滿卡片高度（仍然是 overflow-y:auto 可捲）。 */
+    #p-system .list { max-height: none; }
 
     /* 登入後有 5 個分頁，窄螢幕塞不下就橫向捲 */
     #tabs { overflow-x: auto; }
@@ -398,7 +401,12 @@
       綠燈＝執行中。啟動需要時間（導航堆疊約 60 秒），按下後請等狀態變綠再操作下一項。<br>
       一般順序：<b>底盤 → 導航堆疊</b>；要相機避障就在中間加開相機。
     </div>
-    <div id="syslist" class="list" style="flex:none"></div>
+    <!-- ★ 2026-08-17：原本這裡寫 style="flex:none"，平板上**整頁捲不動**。
+         `.list` 本身是 `overflow-y:auto; flex:1`（可捲），但行內 flex:none 把
+         flex:1 蓋掉 -> div 高度等於內容高度，而外層 `.page` 是 overflow:hidden
+         -> 超出畫面的單元被裁掉而且捲不到。單元有 10 個，後面幾顆等於按不到。
+         拿掉行內樣式，讓 .list 的 flex:1 + overflow-y:auto 生效即可。 -->
+    <div id="syslist" class="list"></div>
     <div class="row" style="margin-top:10px">
       <button class="btn" id="sysrefresh">重新整理狀態</button>
       <span id="sysmsg" class="meta spacer"></span>
@@ -1227,14 +1235,10 @@ function drawTeleopMap() {
   if (typeof robotPose !== "undefined" && robotPose && mapMeta) {
     const px = ox + ((robotPose.x - mapMeta.origin_x) / mapMeta.resolution) * s;
     const py = oy + dh - ((robotPose.y - mapMeta.origin_y) / mapMeta.resolution) * s;
-    ctx.save();
-    ctx.translate(px, py);
-    ctx.rotate(-robotPose.yaw);
-    ctx.fillStyle = "#2ee6a8";
-    ctx.beginPath();
-    ctx.moveTo(12, 0); ctx.lineTo(-7, 7); ctx.lineTo(-7, -7);
-    ctx.closePath(); ctx.fill();
-    ctx.restore();
+    // 2026-08-17：三角形 → 真實比例的四輪車，與主地圖同一支函式。
+    // 這張畫布沒做 devicePixelRatio 縮放（cv.width 直接吃 CSS 寬），
+    // 所以 s 已經是「每個影像像素幾個畫布像素」，換算方式與主地圖相同。
+    drawRobotCar(ctx, px, py, robotPose.yaw, s / mapMeta.resolution);
   }
 }
 window.addEventListener("resize", drawTeleopMap);
@@ -2061,10 +2065,12 @@ function drawMap() {
     drawArrow(c.x, c.y, picked.yaw, "#f0b429", 20);
   }
 
-  // 機器人
+  // 機器人（2026-08-17：箭頭 → 真實比例的四輪車，見 drawRobotCar）
   if (robotPose) {
     const c = worldToCanvas(t, robotPose.x, robotPose.y);
-    drawArrow(c.x, c.y, robotPose.yaw, "#35c27a", 16);
+    // 每公尺像素數 = 地圖縮放 ÷ 解析度。
+    // t.scale 是「1 個地圖影像像素佔幾個畫布像素」，而 1 個影像像素 = 1 格 = resolution 公尺。
+    drawRobotCar(ctx, c.x, c.y, robotPose.yaw, t.scale / mapMeta.resolution);
   }
 
   const meters = (mapMeta.width * mapMeta.resolution).toFixed(1);
@@ -2077,7 +2083,150 @@ function drawMap() {
     pathHint;
 }
 
-/** 畫一個代表位置與朝向的箭頭。畫布 y 軸向下，所以角度取負 */
+// ── 車輛圖示（2026-08-17 新增）──────────────────────────────
+//
+// 機器人從「箭頭」改成「真實比例的四輪俯視車」。
+// 目的不是好看，是讓使用者能**對照現實判斷會不會撞牆**，
+// 所以圖示的外框必須是真的車身邊界，絕不能為了造型縮小。
+//
+// 幾何常數（公尺，base_footprint 座標系：x 向前、y 向左）。
+// 後端 state 沒有傳車體尺寸，也沒有轉向角，所以寫死在這裡；出處：
+//   footprint / padding … smartnav_navigation_cc/config/nav2_senior_akm_cc.yaml:491,492
+//                         （global 與 local costmap 兩份相同，另見 :670,:671）
+//   軸距 / 輪距 / 輪徑  … 廠商韌體 robot_select_init.h:26,31,54
+//                         （整理於 ~/廠商原始碼分析_阿克曼控制鏈.md 第 1 節）
+//
+// ★ base_footprint 在**後輪軸心**，不是車體中心：
+//   車頭在原點前方 0.40 m，車尾只在後方 0.09 m。
+//   舊的箭頭是「固定 16 px、以原點前後對稱」，既不隨地圖縮放、也沒有這個偏移，
+//   所以它代表的長度完全不對應任何真實尺寸，誤差還會隨縮放變動
+//   （例：地圖縮放到 70 px/m 時，箭頭尖端只到 0.23 m，車頭其實在 0.40 m）。
+//   而那正好是使用者要拿來判斷撞牆的那段距離。
+const CAR = {
+  rear:      -0.09,   // 車尾
+  front:      0.40,   // 車頭（保險桿最前緣）
+  halfW:      0.185,  // 半車寬
+  pad:        0.02,   // costmap footprint_padding：規劃器實際多留的餘裕
+  wheelbase:  0.322,  // 後軸（x=0）→ 前軸
+  track:      0.322,  // 左右輪中心距
+  wheelD:     0.125,  // 輪徑 = 俯視圖上輪子的長度
+  wheelW:     0.045,  // 胎寬：目視估值，只影響外觀，不影響碰撞邊界
+};
+
+/** 圓角矩形路徑。刻意不用 ctx.roundRect()——平板瀏覽器版本不確定，arcTo 才是到處都有的。 */
+function carRRect(c2d, x0, y0, x1, y1, r) {
+  const xa = Math.min(x0, x1), xb = Math.max(x0, x1);
+  const ya = Math.min(y0, y1), yb = Math.max(y0, y1);
+  r = Math.max(0, Math.min(r, (xb - xa) / 2, (yb - ya) / 2));
+  c2d.beginPath();
+  c2d.moveTo(xa + r, ya);
+  c2d.arcTo(xb, ya, xb, yb, r);
+  c2d.arcTo(xb, yb, xa, yb, r);
+  c2d.arcTo(xa, yb, xa, ya, r);
+  c2d.arcTo(xa, ya, xb, ya, r);
+  c2d.closePath();
+}
+
+/**
+ * 畫一台真實比例的俯視車輛，代表機器人。主地圖與遙控頁小地圖共用。
+ *
+ *   c2d    2D context（兩張畫布各自的）
+ *   cx,cy  base_footprint 在畫布上的像素位置
+ *   yaw    世界座標朝向（rad）
+ *   ppm    每公尺對應幾個畫布像素 = 地圖縮放 scale ÷ mapMeta.resolution
+ *          （地圖影像 1 px 就是 1 格 = resolution 公尺，
+ *            所以圖示會跟著地圖一起縮放，不是固定像素大小）
+ *
+ * 座標換算：畫布 y 軸向下、世界 y 軸向上，所以旋轉取 -yaw（沿用 drawArrow 的作法）。
+ * 在旋轉後的座標系裡，車體局部座標（前 f、左 l）要畫成 (f*ppm, -l*ppm)。
+ */
+function drawRobotCar(c2d, cx, cy, yaw, ppm) {
+  const X = (m) => m * ppm;    // 前後：局部 +x（前）→ 畫布 +x
+  const Y = (m) => -m * ppm;   // 左右：局部 +y（左）→ 畫布 -y（螢幕上方）
+  const len = (CAR.front - CAR.rear) * ppm;   // 車身在畫面上的長度（像素）
+
+  c2d.save();
+  c2d.translate(cx, cy);
+  c2d.rotate(-yaw);
+
+  // ① 規劃器真正在用的安全邊界（footprint + padding）。
+  //    畫成淡虛線：車身碰到牆之前，是這條線先碰到。
+  if (len >= 14) {
+    c2d.setLineDash([3, 3]);
+    c2d.strokeStyle = "rgba(53,194,122,0.45)";
+    c2d.lineWidth = 1;
+    carRRect(c2d, X(CAR.rear - CAR.pad), Y(CAR.halfW + CAR.pad),
+                  X(CAR.front + CAR.pad), Y(-(CAR.halfW + CAR.pad)), X(0.03));
+    c2d.stroke();
+    c2d.setLineDash([]);
+  }
+
+  // ② 車身：填滿**真實 footprint**，圓角純粹是造型（只切掉四角各數公釐）
+  c2d.fillStyle = "rgba(53,194,122,0.88)";
+  carRRect(c2d, X(CAR.rear), Y(CAR.halfW), X(CAR.front), Y(-CAR.halfW), X(0.05));
+  c2d.fill();
+
+  // ③ 座艙：往車頭收窄的梯形，讓人一眼看出哪一頭是車頭
+  //    （只是外觀，車身外框仍是完整寬度）
+  if (len >= 22) {
+    c2d.fillStyle = "rgba(9,32,23,0.55)";
+    c2d.beginPath();
+    c2d.moveTo(X(0.27), Y( 0.095));
+    c2d.lineTo(X(0.27), Y(-0.095));
+    c2d.lineTo(X(0.11), Y(-0.145));
+    c2d.lineTo(X(0.11), Y( 0.145));
+    c2d.closePath();
+    c2d.fill();
+  }
+
+  // ④ 四個輪子。後軸就在原點（base_footprint = 後輪軸心），前軸在 wheelbase。
+  //    輪距 0.322 < 車寬 0.37，所以輪子整個在車身底下——畫在車身之上才看得見。
+  //    轉向角前端拿不到（後端 state 沒有這個欄位），一律畫直的。
+  if (len >= 18) {
+    c2d.fillStyle = "#0e1418";
+    for (const ax of [0, CAR.wheelbase]) {
+      for (const sy of [1, -1]) {
+        carRRect(c2d,
+          X(ax - CAR.wheelD / 2), Y(sy * CAR.track / 2 + CAR.wheelW / 2),
+          X(ax + CAR.wheelD / 2), Y(sy * CAR.track / 2 - CAR.wheelW / 2),
+          X(0.012));
+        c2d.fill();
+      }
+    }
+  }
+
+  // ⑤ 真實 footprint 的精確矩形外框（直角，不圓角）。
+  //    ② 的圓角會把四個角各切掉幾公釐，判斷貼牆時一律以這條線為準。
+  c2d.strokeStyle = "#eafff4";
+  c2d.lineWidth = Math.max(1, X(0.012));
+  c2d.beginPath();
+  c2d.rect(X(CAR.rear), Y(CAR.halfW), X(CAR.front - CAR.rear), X(2 * CAR.halfW));
+  c2d.stroke();
+
+  // ⑥ 車頭橫桿：位置就是保險桿最前緣，撞牆時第一個碰到的地方
+  const noseT = Math.max(1, X(0.035));
+  c2d.fillStyle = "#ffffff";
+  c2d.beginPath();
+  c2d.rect(X(CAR.front) - noseT, Y(CAR.halfW * 0.78), noseT, X(2 * CAR.halfW * 0.78));
+  c2d.fill();
+
+  // ⑦ base_footprint 原點（後輪軸心）。狀態列那組座標指的就是這一點，
+  //    不是車體中心——標出來使用者才對得上。
+  if (len >= 18) {
+    c2d.fillStyle = "#0b3d28";
+    c2d.beginPath();
+    c2d.arc(0, 0, Math.max(1.5, X(0.028)), 0, Math.PI * 2);
+    c2d.fill();
+    c2d.strokeStyle = "rgba(255,255,255,0.85)";
+    c2d.lineWidth = 1;
+    c2d.stroke();
+  }
+
+  c2d.restore();
+}
+
+/** 畫一個代表位置與朝向的箭頭。畫布 y 軸向下，所以角度取負
+ *  （機器人已改用 drawRobotCar；這支現在只給導航目標點用） */
 function drawArrow(x, y, yaw, color, size) {
   ctx.save();
   ctx.translate(x, y);

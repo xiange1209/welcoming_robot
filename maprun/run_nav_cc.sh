@@ -24,6 +24,24 @@ if [ -n "$CYCLONEDDS_FILE" ] && [ ! -f "$CYCLONEDDS_FILE" ]; then
   unset CYCLONEDDS_URI
 fi
 
+# ★★ 2026-08-17：啟動前先擋兩件事 ★★
+#
+# (1) 重複堆疊。stop_nav_cc.sh 的註解記著實測結果：一天內重啟幾次導航之後，
+#     機器上同時有**四份 stuck_detector_cc、三份 scan_filter_cc**。
+#     除了白吃 26% CPU / 365 MB，更嚴重的是多份 scan_filter_cc 會**同時發布
+#     過濾後的雷達**，下游 amcl 收到交錯訊息 -> 吻合度掉到 88%。
+#     ★ 這是「導航忽然變準／忽然變爛」最可能的隱形變因，做 A/B 前必須排除。
+#     偵測用 pgrep -x（比對執行檔名，不是命令列字串）—— 專案禁用 `pgrep -f`，
+#     因為字串比對誤殺過七次。
+if pgrep -x controller_server > /dev/null 2>&1 || pgrep -x amcl > /dev/null 2>&1; then
+  echo "[run_nav_cc] ✗ 偵測到導航堆疊已經在跑（controller_server / amcl）。" >&2
+  echo "[run_nav_cc]   再啟動一次會產生重複節點，雷達與定位會開始互相干擾。" >&2
+  echo "[run_nav_cc]   請先執行：~/maprun/stop_nav_cc.sh" >&2
+  echo "[run_nav_cc]   確定要強制啟動請設 FORCE_NAV=1 再跑一次。" >&2
+  [ "$FORCE_NAV" = "1" ] || exit 1
+  echo "[run_nav_cc] ⚠ FORCE_NAV=1，照使用者要求繼續啟動" >&2
+fi
+
 START_MODE="${1:-auto}"
 # 第二個參數：自動探索開關。false = 建圖時不自動跑，改用遙控走完再 /finish_map
 USE_EXPLORATION="${2:-true}"
@@ -42,9 +60,24 @@ USE_EXPLORATION="${2:-true}"
 #
 # 這兩個要一起設。想要「explorer 在線但待命、由 /start_exploration 手動觸發」
 # 的話，請直接呼叫 ros2 launch 並分別指定，不要走這支腳本。
+# ★★ (2) 日誌不再被覆蓋 ★★
+#
+# 原本是 `> $LOGDIR/nav_cc.log`，**每次重啟都把上一輪整個蓋掉**。
+# 8/17 的代價很具體：當天 8 趟成功導航的 log 全部消失，收工時 nav_cc.log
+# 只剩最後一次重啟（19:08:30）之後的內容，而那一段裡只有失敗。
+# ★ 12 月報告要引用的實驗數據就是從這裡來的 —— 覆蓋等於銷毀證據。
+#
+# 改成「每次一個帶時間戳的檔 + nav_cc.log 符號連結指向最新」：
+#   既有的 `tail -f $LOGDIR/nav_cc.log` 習慣完全不用改，
+#   但歷史留得下來。舊檔只保留最近 20 份，避免把 SD 卡塞爆。
+NAV_LOG="$LOGDIR/nav_cc_$(date +%Y%m%d_%H%M%S).log"
+ln -sfn "$NAV_LOG" "$LOGDIR/nav_cc.log"
+ls -1t "$LOGDIR"/nav_cc_*.log 2>/dev/null | tail -n +21 | xargs -r rm -f
+echo "[run_nav_cc] 日誌 -> $NAV_LOG"
+
 exec ros2 launch smartnav_navigation_cc nav_bringup_cc.launch.py \
   use_sim_time:=false use_rviz:=false \
   start_mode:="$START_MODE" \
   use_exploration:="$USE_EXPLORATION" \
   auto_start_exploration:="$USE_EXPLORATION" \
-  > "$LOGDIR/nav_cc.log" 2>&1
+  > "$NAV_LOG" 2>&1

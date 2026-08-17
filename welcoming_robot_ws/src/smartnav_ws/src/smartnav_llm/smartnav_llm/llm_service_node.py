@@ -79,9 +79,20 @@ class RosStreamHandler(BaseCallbackHandler):
 
         Args:
             hold: True 表示這一輪的句子先扣著不唸（還不知道會不會去呼叫工具）。
-                  只有第一輪需要扣 —— 旁白只出現在「還沒呼叫工具」那一輪。
-                  第二輪之後幾乎一定是最終答案，直接即時串流，
-                  免得客戶要多等一整輪的生成時間才聽到聲音。
+
+        ★★ 2026-08-17 修正：原本只在第 0 輪扣，註解寫「第二輪之後幾乎一定是最終答案」
+        —— **實機 log 證偽了這句話**。`LLM修復_20260817.md` §1.3 的 8/17 log：
+
+            iteration 0  旁白 -> 呼叫 global_localization_tool
+            iteration 1  旁白（「全域定位已經完成，現在我可以開始導航了…」）-> 又呼叫工具
+
+        那句「全域定位已經完成…」就是 iteration 1 的旁白，客戶**真的聽到了**，
+        而它根本不是最終答案（7 分鐘後真正的回覆是完全不同的另一句）。
+        所以只扣第 0 輪擋不住 —— 現在每一輪都扣。
+
+        代價：最終答案那一輪不再逐句串流，要整輪生成完才開口（qwen2.5:3b 約多等
+        2~5 秒）。這是刻意的取捨：**寧可晚幾秒開口，也不要先唸一句假的**。
+        要換回舊行為（低延遲、但可能唸旁白）：`-p hold_all_iterations:=false`。
         """
         self.buffer = ""
         self.current_sentence = ""
@@ -239,6 +250,10 @@ class LLMServiceNode(Node):
         # 自己取的，寫死「貴賓室」會在他取名「VIP室」時直接失敗。
         self.vip_room_waypoint_name = self.declare_parameter(
             "vip_room_waypoint_name", "貴賓室").get_parameter_value().string_value
+        # ★ 2026-08-17：每一輪都扣住旁白（見 RosStreamHandler.begin_turn 的 docstring）。
+        #   false = 只扣第 0 輪 = 2026-08-17 之前的行為（較低延遲、但可能唸出旁白）。
+        self.hold_all_iterations = self.declare_parameter(
+            "hold_all_iterations", True).get_parameter_value().bool_value
         # 通報只發話題，實際送出由 bank_reception_node 負責（通報中樞）
         self.staff_notify_pub = self.create_publisher(String, "staff_notify_request", 10)
         self.global_localization_client = ActionClient(
@@ -253,6 +268,19 @@ class LLMServiceNode(Node):
         # 建立發佈者和訂閱者
         self.llm_response_pub = self.create_publisher(String, "llm_response", 10)
         self.llm_stream_pub = self.create_publisher(String, "llm_stream", 10)
+        # ★ 2026-08-17：串流「作廢」訊號。
+        #
+        # HMI 端的 llm_streaming 緩衝只會「累加」（append_stream），而清空它的
+        # 只有兩件事：新的 user_text，或 llm_response 抵達。
+        # agent 迴圈每一輪的旁白都會被逐字送到 /llm_stream，但呼叫工具那幾輪
+        # **不會**發 llm_response —— 於是那段旁白就以灰色斜體卡在畫面上，
+        # 一路撐到整個迴圈跑完為止（8/17 實測卡了 7 分鐘，見修復筆記）。
+        #
+        # 不能改用「補發 llm_response」來清：llm_response 會被 HMI 當成一則
+        # 已完成的機器人訊息加進對話，而平板前端會把「已完成且非 ghost」的
+        # 訊息唸出來（index.html renderChat / ttsOnChat）——那正是 8/14
+        # 「旁白被唸兩遍」那個坑。所以另開一個不帶內容的作廢訊號。
+        self.llm_stream_reset_pub = self.create_publisher(Empty, "llm_stream_reset", 10)
         self.speech_text_pub = self.create_publisher(String, "speech_text", 10)
         self.user_text_sub = self.create_subscription(
             String, "user_text", self.user_text_callback, 10, callback_group=self.cb_group
@@ -327,9 +355,17 @@ class LLMServiceNode(Node):
             ("list_waypoints", self.list_waypoints_client),
             ("switch_map", self.switch_map_client),
         ]
+        # ★★ 2026-08-17：`global_localization` 移出這張「非等到不可」的清單 ★★
+        #
+        # 工具已下架（見 tools_map 上方的說明），LLM 節點再也不會呼叫它，
+        # 但它原本留在這裡 -> 那個 action server 沒起來，**整個 LLM 節點就卡在
+        # 初始化、連「你好」都不會回**。這是一個純粹多餘的啟動硬相依：
+        # 對話功能完全不需要它，而它屬於導航堆疊（常常晚啟動或根本沒啟動）。
+        #
+        # client 本身**保留**（`self.global_localization_client`），HMI 的手動
+        # 「全域定位」按鈕走的是 HMI 自己的 ActionClient，兩邊都不受影響。
         actions = [
             ("create_map", self.create_map_client),
-            ("global_localization", self.global_localization_client),
             ("navigate", self.navigate_client),
         ]
         for service_name, client in services:
@@ -453,32 +489,23 @@ class LLMServiceNode(Node):
             except Exception as e:
                 return f"執行結果: 失敗, 詳細信息: {str(e)}"
 
-        @tool
-        def global_localization_tool() -> str:
-            """進行全域定位，獲取當前座標"""
-            goal = GlobalLocalization.Goal()
-            future = self.global_localization_client.send_goal_async(goal)
-            try:
-                goal_handle = self._wait_for_future(future, timeout_sec=5.0)
-
-                if goal_handle is None or not goal_handle.accepted:
-                    return f"執行結果: 失敗, 詳細信息: 全域定位請求未被接受"
-
-                result_future = goal_handle.get_result_async()
-                action_result = self._wait_for_future(result_future, timeout_sec=300.0)
-                self.get_logger().info(f"[Debug] 收到原始 Result 物件: {action_result.result}")
-                self.get_logger().info(f"[Debug] 原始 message 內容: '{action_result.result.message}'")
-
-                if action_result.status == GoalStatus.STATUS_SUCCEEDED:
-                    return f"執行結果: 成功, 詳細信息: {action_result.result.message}"
-                elif action_result.status == GoalStatus.STATUS_CANCELED:
-                    return "執行結果: 取消, 詳細信息: 全域定位請求被系統或使用者取消"
-                elif action_result.status == GoalStatus.STATUS_ABORTED:
-                    return f"執行結果: 失敗, 詳細信息: 全域定位過程中發生錯誤"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {action_result.result.message}"
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
+        # ★★ 2026-08-17：global_localization_tool 已下架，不再暴露給 LLM ★★
+        #
+        # 這裡原本有一個 @tool global_localization_tool。拿掉的理由是安全：
+        # 全域定位的實作會讓車子繞一個約 0.9 m 半徑的圓弧，而我們的走廊只有
+        # 0.99 m 寬 —— 也就是「一被呼叫就會擦牆」。
+        #
+        # 8/17 實機事故（log: ~/.ros/log/python3_5596_1786954243007.log）：
+        # 客人只是對著平板說「大門口」，模型就自己叫了這個工具，車子開始繞圈；
+        # 第一次跑了 129 秒，模型接著又叫了第二次，那次卡到 300 秒逾時才回來。
+        # ★ 客人的任何一句話都不該能讓車子動起來做這件事。
+        #
+        # 下架的是「LLM 的入口」而已：
+        #   - /global_localization action 本身完全沒動，
+        #   - self.global_localization_client 也保留（啟動時仍會等它就緒），
+        #   - HMI 的「全域定位」按鈕走的是 hmi_server_node 自己的 action client
+        #     （POST /api/localize -> _start_action），與這裡無關，照常可用。
+        # 走廊裡真正該用的是 HMI 的 /api/localize/here（不需移動的掃描對齊）。
 
         @tool
         def navigate_tool(waypoint_id: str) -> str:
@@ -561,7 +588,9 @@ class LLMServiceNode(Node):
             "create_waypoint_tool": create_waypoint_tool,
             "list_waypoints_tool": list_waypoints_tool,
             "navigate_tool": navigate_tool,
-            "global_localization_tool": global_localization_tool,
+            # ★ global_localization_tool 蓄意不列在這裡（2026-08-17，見上方說明）。
+            #   bind_tools() 只綁 tools_map 裡的東西，所以不在這張表上 = 模型看不到、
+            #   也叫不到。要恢復請先解決 0.9 m 圓弧 vs 0.99 m 走廊的問題。
         }
 
         # ★ 2026-08-14：知識庫工具與銀行 FAQ 工具**不可以同時掛上**。
@@ -704,8 +733,10 @@ class LLMServiceNode(Node):
 
         try:
             for iteration in range(max_iterations):
-                # 第 0 輪先扣著（旁白只可能出現在這一輪），之後即時串流
-                self.stream_handler.begin_turn(hold=(iteration == 0))
+                # ★ 2026-08-17：每一輪都扣。8/17 log 證實 iteration 1 也會
+                #   「先講一段旁白、再去呼叫工具」（見 begin_turn 的 docstring）。
+                self.stream_handler.begin_turn(
+                    hold=(self.hold_all_iterations or iteration == 0))
 
                 response = self.agent_chain.invoke(
                     {
@@ -737,6 +768,11 @@ class LLMServiceNode(Node):
                         f"{self.stream_handler.held[0][:40]}..."
                     )
                 self.stream_handler.drop_held()
+
+                # ★ 旁白丟掉的同時，也要把 HMI 上那段灰字作廢。
+                #   drop_held() 只擋住 /speech_text（不唸），但 /llm_stream 的
+                #   逐字內容早就送出去了，不清的話會一直灰在畫面上。
+                self.llm_stream_reset_pub.publish(Empty())
 
                 # 記錄 LLM 的工具調用請求
                 agent_scratchpad.append(response)

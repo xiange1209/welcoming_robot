@@ -82,9 +82,10 @@ class SpeechRecognizerNode(Node):
         # 這個擔心是對的，而且**有一個具體的無界成長點**：
         #
         #   `is_final` 是由 voice_trigger 的 VAD 決定的，**不是** sherpa 自己判斷的。
-        #   （`enable_endpoint_detection=True` 有設，但程式從來沒呼叫 `is_endpoint()`
-        #     去問它 —— 那三條 rule 目前是死設定，見 _init_sherpa_onnx_asr。）
-        #   所以只要 VAD 一直判定「還在講話」（持續噪音、冷氣、人聲背景），
+        #   （2026-08-17 起 `is_endpoint()` 已接上，多了一條獨立的斷句路徑，
+        #     但它需要**尾隨靜音**才會觸發 —— 持續噪音下一樣不會收句，
+        #     所以下面這個時間上限仍然是最後一道防線，不能因為接了端點偵測就拿掉。）
+        #   只要 VAD 一直判定「還在講話」（持續噪音、冷氣、人聲背景），
         #   同一個 stream 會一直被餵音訊，**永遠不會 reset**：
         #     - stream 內部的特徵緩衝隨時間線性成長
         #     - modified_beam_search 的假設集合也跟著長
@@ -101,6 +102,39 @@ class SpeechRecognizerNode(Node):
         self.declare_parameter(
             "queue_warn_depth", 20,
             ParameterDescriptor(description="音訊佇列積壓超過這個數就警告（上限 50）"))
+
+        # ── ★★ 2026-08-17（筆電端）：接上 sherpa 自己的端點偵測 ★★ ─────────
+        #
+        # 在此之前，`enable_endpoint_detection=True` 與那三條 rule 全是**死設定**
+        # ——程式從來沒有呼叫過 `recognizer.is_endpoint(stream)`。斷句 100% 由
+        # voice_trigger 的 VAD 決定，於是兩個方向都會壞：
+        #
+        #   VAD 太早收   -> 句子被切一半，漏字
+        #   VAD 一直不收 -> 好幾句累積在同一個 stream，解碼結果黏在一起且重複
+        #                   （8/17 實機症狀：「你是誰**你誰你好你好**喂」）
+        #
+        # 現在多一個**獨立**的斷句來源：模型自己聽到足夠的尾隨靜音就收句。
+        # 兩者是 **OR**：VAD 說結束仍然算結束，所以這是純粹的增益，不會讓
+        # 原本會斷的地方變得不斷。
+        #
+        # ★ 為什麼 sherpa 這條真的會先觸發：VAD 的 silence_timeout 是 500 ms，
+        #   照理說永遠比 rule2 的 1.2 s 早。但實機黏句正好證明**噪音讓 VAD 卡在
+        #   「還在講話」**——那正是 sherpa 這條當備援的時機。它看的是自己解碼出
+        #   的 blank 幀，不受 VAD 的能量門檻影響。
+        self.declare_parameter(
+            "use_sherpa_endpoint", True,
+            ParameterDescriptor(description="除了 VAD 之外，也讓 sherpa 自己判斷句尾（OR 關係）"))
+        # ★ 這三個值在接上 is_endpoint() 之後**才開始真的有作用**。
+        #   （舊註解寫「調這幾個數字會白調」——那在 2026-08-17 之前是對的，現在不是了。）
+        self.declare_parameter(
+            "rule1_min_trailing_silence", 2.4,
+            ParameterDescriptor(description="還沒解出任何字時，靜音多久算句尾（秒）"))
+        self.declare_parameter(
+            "rule2_min_trailing_silence", 1.2,
+            ParameterDescriptor(description="★ 已經解出字之後，靜音多久算句尾（秒）—— 這條最常觸發"))
+        self.declare_parameter(
+            "rule3_min_utterance_length", 20.0,
+            ParameterDescriptor(description="單句長度上限（秒），與 max_utterance_sec 對齊"))
 
         # ── 熱詞（contextual biasing）：專治同音錯字，見 _init_sherpa_onnx_asr ──
         self.declare_parameter(
@@ -119,6 +153,20 @@ class SpeechRecognizerNode(Node):
         self.queue_warn_depth = self.get_parameter("queue_warn_depth").get_parameter_value().integer_value
         self._stream_samples = 0          # 目前這個 stream 已經吃進多少取樣點
         self._queue_warned = False
+
+        # 端點偵測（2026-08-17）。★ `_sherpa_endpoint_ok` 是**執行期**的能力旗標：
+        # 舊版 sherpa-onnx 沒有 `is_endpoint()`，第一次呼叫失敗就永久退回純 VAD 斷句，
+        # 只警告一次。絕對不能讓「多一個斷句來源」這種增益功能害整個辨識掛掉。
+        self.use_sherpa_endpoint = self.get_parameter(
+            "use_sherpa_endpoint").get_parameter_value().bool_value
+        self.rule1_min_trailing_silence = self.get_parameter(
+            "rule1_min_trailing_silence").get_parameter_value().double_value
+        self.rule2_min_trailing_silence = self.get_parameter(
+            "rule2_min_trailing_silence").get_parameter_value().double_value
+        self.rule3_min_utterance_length = self.get_parameter(
+            "rule3_min_utterance_length").get_parameter_value().double_value
+        self._sherpa_endpoint_ok = self.use_sherpa_endpoint
+        self._endpoint_hits = 0           # sherpa 斷了幾句（VAD 沒斷的那些）
 
         self.min_text_length = self.get_parameter("min_text_length").get_parameter_value().integer_value
         self.drop_uniform_text = self.get_parameter("drop_uniform_text").get_parameter_value().bool_value
@@ -267,17 +315,58 @@ class SpeechRecognizerNode(Node):
                     decoding_method="modified_beam_search",
                     max_active_paths=self.get_parameter(
                         "max_active_paths").get_parameter_value().integer_value,
-                    # ★ 這三條 rule 目前**不會生效** —— 程式從來沒有呼叫
-                    #   `recognizer.is_endpoint(stream)` 去問它。斷句是由
-                    #   voice_trigger 的 VAD 透過 AudioData.is_final 決定的。
-                    #   保留設定是為了日後若改用 sherpa 自己的端點偵測，
-                    #   但**不要以為調這幾個數字會改變斷句延遲**（會白調）。
-                    #   真正影響延遲的是 voice_trigger 的 silence_timeout（預設 500 ms）。
+                    # ★ 2026-08-17 起這三條 rule **會真的生效**了 —— `recognize_audio()`
+                    #   已接上 `recognizer.is_endpoint(stream)`。在那之前它們是死設定，
+                    #   斷句 100% 由 voice_trigger 的 VAD（silence_timeout 500 ms）決定。
+                    #   現在兩個來源是 OR：誰先判定句尾就誰收句。
+                    #   ⚠ 調小 rule2 會讓 sherpa 變成主要斷句者、回應更快但更容易切斷
+                    #     講話中間的停頓；調大則退回幾乎全由 VAD 決定。
                     enable_endpoint_detection=True,
-                    rule1_min_trailing_silence=2.4,
-                    rule2_min_trailing_silence=1.2,
-                    rule3_min_utterance_length=20.0,
+                    rule1_min_trailing_silence=self.rule1_min_trailing_silence,
+                    rule2_min_trailing_silence=self.rule2_min_trailing_silence,
+                    rule3_min_utterance_length=self.rule3_min_utterance_length,
                 )
+
+                # ★★ 2026-08-17：sherpa-onnx **不會**忽略 `#` 註解行 ★★
+                #
+                # hotwords.txt 原本的檔頭註解寫「以 # 開頭的行與空行會被 sherpa-onnx
+                # 忽略」，**那是錯的**。它逐行解析，而說明格式用的範例
+                # 「詞尾可加 `:分數`，例如 `貴 賓 室 :2.5`」本身就在註解裡，
+                # 於是解析器拿 `:2.5` 去 std::stof 而丟出例外：
+                #
+                #     熱詞載入失敗（沿用無熱詞模式，辨識仍可用）: stof
+                #
+                # 因為有 try/except 退回無熱詞模式，**辨識照常運作、只是熱詞從沒生效**
+                # —— 8/17 實機把「櫃檯」認成「貴」「貴臺」，正是熱詞要治的病。
+                # ★ 這種「功能靜默失效但系統看起來正常」是這個專案最常見的失敗型態。
+                #
+                # 解法：餵給 sherpa 之前先濾掉註解與空行，寫成暫存檔。
+                # 這樣原檔可以保留給人看的說明，又不會炸。
+                if hot_file:
+                    try:
+                        import tempfile
+                        clean = []
+                        # ★ 這個檔案沒有 import pathlib，用內建 open 就好
+                        with open(hot_file, "r", encoding="utf-8") as _hf:
+                            _lines = _hf.read().splitlines()
+                        for raw in _lines:
+                            line = raw.strip()
+                            if line and not line.startswith("#"):
+                                clean.append(line)
+                        if clean:
+                            tf = tempfile.NamedTemporaryFile(
+                                mode="w", suffix=".txt", delete=False, encoding="utf-8")
+                            tf.write("\n".join(clean) + "\n")
+                            tf.close()
+                            self._hotwords_clean = tf.name      # 保留參考，避免被 GC
+                            self.get_logger().info(
+                                f"熱詞檔已濾除註解：{len(clean)} 個詞（原檔 {hot_file}）")
+                            hot_file = tf.name
+                        else:
+                            self.get_logger().warning(f"熱詞檔濾除註解後是空的：{hot_file}")
+                            hot_file = ""
+                    except Exception as e:  # noqa: BLE001
+                        self.get_logger().warning(f"熱詞檔前處理失敗，改用原檔: {e}")
 
                 recognizer = None
                 if hot_file:
@@ -437,12 +526,29 @@ class SpeechRecognizerNode(Node):
 
                 self.recognizer.decode_stream(self.stream)
 
+            # ★★ 2026-08-17：問 sherpa 自己「這裡是不是句尾」★★
+            #
+            # 必須在 get_result() **之前**問、在 reset() **之後**才失效 ——
+            # 端點狀態是解碼器內部的尾隨靜音計數，reset 會把它清掉。
+            # 只在 VAD 還沒收句時才問（is_final 已經是句尾，不用再問一次）。
+            endpoint = False
+            if not is_final and self._sherpa_endpoint_ok:
+                try:
+                    endpoint = bool(self.recognizer.is_endpoint(self.stream))
+                except Exception as exc:
+                    # 舊版 sherpa-onnx 可能沒有這個方法 -> 永久退回純 VAD 斷句。
+                    # 只警告一次，之後完全靜默（否則每 512 取樣就洗一行）。
+                    self._sherpa_endpoint_ok = False
+                    self.get_logger().warning(
+                        f"sherpa 端點偵測不可用，改由 VAD 單獨斷句（辨識不受影響）: {exc}")
+
             result = self.recognizer.get_result(self.stream)
             if result and result.strip():
                 converted_text = self._convert_simplified_to_traditional(result)
                 if converted_text:
-                    if is_final:
-                        self.get_logger().info(f"✓ 最終結果: '{converted_text}'")
+                    if is_final or endpoint:
+                        src = "VAD" if is_final else "sherpa 端點"
+                        self.get_logger().info(f"✓ 最終結果（{src} 斷句）: '{converted_text}'")
                         # ★ 2026-08-14：發出去之前先清洗。回傳 None 代表這句是雜訊，
                         #   直接不發 —— 這就是使用者要的「自動刪除」。
                         #   ⚠ 丟棄要 log，否則現場會變成「我明明有講話卻沒反應」，
@@ -463,10 +569,37 @@ class SpeechRecognizerNode(Node):
                 # 立即重置流，準備下一句識別
                 self.stream = self.recognizer.create_stream()
                 self._stream_samples = 0   # ★ 重建 stream 一定要歸零，否則計時器會一路累加
+            elif endpoint:
+                # ★ sherpa 斷句用 `reset()` 而**不是** `create_stream()`：
+                #   VAD 還在說「人在講話」，音訊會繼續進來。reset 只清掉解碼假設與
+                #   端點計數、保留同一個 stream 物件，下一段音訊接得上；
+                #   create_stream 則會把 accept_waveform 之後尚未消化的內部緩衝丟掉，
+                #   造成句與句交界處漏字 —— 這正是我們想修的症狀。
+                self._reset_stream_for_endpoint()
         except Exception as e:
             self.get_logger().error(f"✗ 語音辨識失敗: {e}")
             # 重置流
             self.stream = self.recognizer.create_stream()
+
+    def _reset_stream_for_endpoint(self) -> None:
+        """sherpa 判定句尾後，把解碼器狀態清乾淨但**保留同一個 stream**。
+
+        `OnlineRecognizer.reset(stream)` 是官方端點偵測範例的用法。舊版若沒有這個
+        方法，退回 `create_stream()` —— 會在交界處漏一點音訊，但總比整個節點掛掉好。
+        """
+        try:
+            self.recognizer.reset(self.stream)
+        except Exception as exc:
+            self.get_logger().warning(f"reset(stream) 不可用，改用重建 stream: {exc}")
+            self.stream = self.recognizer.create_stream()
+        self._stream_samples = 0
+        self.last_partial_result = None
+        self._endpoint_hits += 1
+        # ★ 每 10 句印一次。這個數字是判斷「VAD 是不是根本沒在斷句」的關鍵指標：
+        #   若它跟總句數差不多，代表 VAD 幾乎從不收句（被噪音卡住），
+        #   該回頭調 voice_trigger 的門檻，而不是繼續在 ASR 這端加工。
+        if self._endpoint_hits % 10 == 0:
+            self.get_logger().info(f"（sherpa 端點已接手斷句 {self._endpoint_hits} 句）")
 
     # ── 後處理 ────────────────────────────────────────────────
     #

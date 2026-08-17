@@ -28,6 +28,8 @@ class AudioRecorder:
         queue_size: int = 50,
         audio_callback: Optional[Callable] = None,
         logger: Optional[Any] = None,
+        channels: int = 1,
+        mono_mixer: Optional[Callable] = None,
     ):
         """初始化麥克風錄製器
 
@@ -39,12 +41,20 @@ class AudioRecorder:
             queue_size: 佇列最大容量
             audio_callback: 音訊回調函數，每個塊調用一次
             logger: 日誌記錄器，若無則使用預設記錄器
+            channels: 開幾個聲道錄音。Astra S 有兩顆實體麥克風，
+                channels=2 才拿得到右聲道；channels=1 時 PortAudio
+                給的是左聲道（2026-08-17 實測與 ch0 差 0.18 dB）。
+            mono_mixer: channels>1 時，把 (frames, channels) 縮成
+                (frames,) 的處理函式。在背景執行緒呼叫，不在音訊
+                回呼裡，所以不會拖累即時性。
         """
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.device = device if device >= 0 else None
         self.dtype = dtype
         self.audio_callback = audio_callback
+        self.channels = max(1, int(channels))
+        self.mono_mixer = mono_mixer
         self.logger = logger or get_default_logger(__name__)
 
         self._recording = False
@@ -67,11 +77,11 @@ class AudioRecorder:
                 # 清空舊佇列
                 self._clear_queue()
 
-                # 建立音訊輸入串流 (單聲道，用於模型識別)
+                # 建立音訊輸入串流（雙聲道時由 mono_mixer 縮成單聲道再往下送）
                 self._stream = sd.InputStream(
                     device=self.device,
                     samplerate=self.sample_rate,
-                    channels=1,
+                    channels=self.channels,
                     blocksize=self.chunk_size,
                     dtype=self.dtype,
                     callback=self._audio_callback,
@@ -143,8 +153,12 @@ class AudioRecorder:
             self.logger.warning(f"音訊流狀態異常: {status}")
 
         try:
-            # 複製並扁平化音訊數據
-            audio_data = indata.flatten().copy()
+            # 單聲道就地扁平化；多聲道保留 (frames, channels) 形狀，
+            # 留到背景執行緒再混音 —— 音訊回呼要越輕越好。
+            if self.channels == 1:
+                audio_data = indata.flatten().copy()
+            else:
+                audio_data = indata.copy()
             # 將音訊數據放入佇列，由執行緒消耗
             self._queue.put_nowait(audio_data)
         except queue.Full:
@@ -166,6 +180,17 @@ class AudioRecorder:
                     # 若收到 None 信號則結束
                     if audio_data is None:
                         break
+
+                    # 多聲道 -> 單聲道（雙麥克風處理就發生在這裡）
+                    if audio_data.ndim == 2:
+                        if self.mono_mixer is not None:
+                            try:
+                                audio_data = self.mono_mixer(audio_data)
+                            except Exception as mix_error:
+                                self.logger.error(f"雙麥克風混音失敗，退回左聲道: {mix_error}")
+                                audio_data = audio_data[:, 0].copy()
+                        else:
+                            audio_data = audio_data[:, 0].copy()
 
                     # 呼叫回調函數處理音訊數據
                     if self.audio_callback:

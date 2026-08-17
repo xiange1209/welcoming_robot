@@ -79,6 +79,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPo
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
 
 from smartnav_msgs.action import FollowTaughtPath
@@ -157,7 +158,10 @@ class PathTeachNode(Node):
         # ★ 不是關掉 collision_monitor —— 正常循跡、繞障、等待全部照舊走它。
         self.declare_parameter("escape_bypass_enabled", True)
         self.declare_parameter("escape_bypass_topic", "cmd_vel")
-        self.declare_parameter("escape_bypass_speed", 0.05)
+        # ★ 2026-08-17：0.05 -> 0.10。實測底盤死區在 0.085 m/s，
+        #   舊值等於「脫困時下一個馬達不會轉的速度」——脫困因此形同無效。
+        #   詳細量測見 min_move_speed 的說明。
+        self.declare_parameter("escape_bypass_speed", 0.10)
         self.declare_parameter("scan_topic", "scan")
         # 錄製時要「聽」哪個話題判斷行進方向。
         # 這跟 cmd_topic 是**不同的東西**：cmd_topic 是重播時本節點自己
@@ -199,6 +203,28 @@ class PathTeachNode(Node):
         # 重播
         self.declare_parameter("follow_speed", 0.15)
         self.declare_parameter("reverse_speed", 0.10)
+        # ★★ 2026-08-17：底盤有低速死區，實測值 ★★
+        #
+        # 逐段掃描（tools_0817/odom_feedback_check.py，電池 23.7 V、車子平放走廊）：
+        #     指令 0.05 m/s -> 位置變化 0.000 m   馬達不轉
+        #     指令 0.07 m/s -> 位置變化 0.000 m   馬達不轉
+        #     指令 0.08 m/s -> 位置變化 0.000 m   馬達不轉
+        #     指令 0.09 m/s -> 走了 0.152 m       ✓
+        # 也就是**臨界值在 0.085 附近**。低於它下指令等於下 0
+        #   —— 但 stuck_detector_cc 記的是「最後一筆指令值」，
+        #      所以它會報「指令 0.050 但實測 0.000」，看起來像車子被東西卡住。
+        #
+        # 這正是 8/17 導航到大廳失敗的整條因果鏈：
+        #     障礙減速 0.15 x 0.30 = 0.045 -> 車不動 -> 判定卡住 ->
+        #     脫困（escape_bypass_speed 也是 0.05，一樣不動）-> 越弄越歪 ->
+        #     偏離路徑 60 cm 中止 -> AMCL 跟丟 -> 重新規劃以為自己在牆裡 -> 失敗
+        #
+        # 取 0.10 留 15% 餘裕：電量低時死區會往上跑（這次量的時候是 23.7 V），
+        # 而且 0.10 正好等於 reverse_speed，那個值長期實測是動得了的。
+        #
+        # ★ 它不是「最低速度」而是「死區地板」：真正要停車時仍然送 0，
+        #   只有**非零但低於死區**的指令才會被抬上來。
+        self.declare_parameter("min_move_speed", 0.10)
         self.declare_parameter("lookahead_min_m", 0.30)
         self.declare_parameter("lookahead_max_m", 0.80)
         self.declare_parameter("lookahead_k", 1.2)      # L_d = k*|v| + min
@@ -410,6 +436,8 @@ class PathTeachNode(Node):
         self.max_points = int(p("max_points").value)
         self.follow_speed = float(p("follow_speed").value)
         self.reverse_speed = float(p("reverse_speed").value)
+        self.min_move_speed = abs(float(p("min_move_speed").value))
+        self._deadband_hits = 0
         self.la_min = float(p("lookahead_min_m").value)
         self.la_max = float(p("lookahead_max_m").value)
         self.la_k = float(p("lookahead_k").value)
@@ -578,6 +606,9 @@ class PathTeachNode(Node):
                             callback_group=cb)
         self.create_service(PlanTaughtPath, "plan_taught_path", self._plan_cb,
                             callback_group=cb)
+        # ★★ 2026-08-17：把車子從「規劃器不肯出手」的位置推開 ★★
+        # 見 _unwedge_cb 的長註解。這是當天實測發現的系統性死結的唯一解。
+        self.create_service(Trigger, "unwedge", self._unwedge_cb, callback_group=cb)
 
         # 地圖點選模式借用 nav2 的規劃器。規劃器（SmacPlannerHybrid + REEDS_SHEPP）
         # 本來就會產生符合最小轉彎半徑、含折返點的阿克曼可行路徑 —— 出問題的是
@@ -1536,7 +1567,33 @@ class PathTeachNode(Node):
         cap = 1.0 / max(0.05, self.min_radius_left if left else self.min_radius_right)
         return max(-cap, min(cap, curvature))
 
+    def _lift_deadband(self, lin: float, ang: float) -> Tuple[float, float]:
+        """把非零但低於底盤死區的線速度抬到 min_move_speed，角速度按同比例縮放。
+
+        為什麼要縮 ω：阿克曼是 ω = v·κ。只把 v 抬高而讓 ω 不動，等於要求
+        **更小的轉彎半徑**；韌體照 R = Vx/Vz 換算舵角，會打得比 min_turning_radius
+        還緊，前輪刮地 —— 那正是教導路徑產生「車子做不到」那些段落的現象。
+        按比例縮才能保住原本的曲率。（同樣的道理見 _publish_cmd 的脫困旁路。）
+
+        ★ 送 0 仍然是送 0：要停車就該停，這裡只處理「想動卻動不了」的區間。
+        """
+        if lin == 0.0 or self.min_move_speed <= 0.0:
+            return lin, ang
+        if abs(lin) >= self.min_move_speed:
+            return lin, ang
+        scale = self.min_move_speed / abs(lin)
+        self._deadband_hits += 1
+        # 每 20 次報一次：頻繁觸發代表規劃出來的速度整段都在死區裡，
+        # 那是規劃/減速策略的問題，不該只靠這裡硬抬。
+        if self._deadband_hits % 20 == 1:
+            self.get_logger().warn(
+                f"指令 {lin:+.3f} m/s 低於底盤死區，抬到 "
+                f"{math.copysign(self.min_move_speed, lin):+.3f}（累計 {self._deadband_hits} 次）"
+            )
+        return math.copysign(self.min_move_speed, lin), ang * scale
+
     def _publish_cmd(self, lin: float, ang: float) -> None:
+        lin, ang = self._lift_deadband(lin, ang)
         # 卡住判定要比對「指令 vs 實際」，所以指令值必須留下來（見 _follow_loop）
         self._cmd_v_last = lin
         t = Twist()
@@ -2057,6 +2114,138 @@ class PathTeachNode(Node):
             self._escape_bypass = False
             if self.bypass_pub is not None:
                 self.bypass_pub.publish(Twist())
+
+    # ── 楔住脫困（不需要路徑，也不需要規劃器） ──────────────────────────
+    #
+    # ★★ 2026-08-17：為什麼非要有這支不可 ★★
+    #
+    # 當天實測到一個**系統性死結**：車子跑完一趟後停在牆邊，
+    # 車體壓在成本地圖的內切格（99）上，於是 `planner_server` 對**每一個目標**都回
+    #
+    #     GridBased plugin failed to plan from (4.01, 1.50) to (...): "Start occupied"
+    #
+    # 而所有能救它的東西都需要先規劃：
+    #     - 教導-重現路線：規劃失敗，起不了跑
+    #     - 退回 nav2/MPPI：同一個規劃器、同一張成本地圖，一起失敗
+    #     - nav2 內建復原行為：實測 `backup failed`、`drive_on_heading failed`
+    #       （它們一樣要做碰撞檢查，而車子就在碰撞狀態裡）
+    #     - `_do_escape`：只在**導航進行中**才會被呼叫，導航起不來就永遠不會執行
+    #
+    # 結果是車子把自己開進一個出不來的狀態，只能人去搬。8/17 使用者手動救了三次。
+    # 清空成本地圖沒有用 —— 擋住的是靜態層的牆，不是障礙層的殘影。
+    #
+    # 這支繞過規劃器，直接發「往比較空的那側打舵」的小段指令。
+    # 阿克曼不能橫移，唯一能增加側向距離的方法就是邊走邊轉。
+    #
+    # ★ 一定要走防撞旁路：車子楔住時 collision_monitor 會停止輸出
+    #   （見 collision-monitor-escape-deadlock），指令根本到不了底盤。
+    #   用 try/finally 保證旁路一定關掉 —— 漏關的後果是正常循跡也在繞過防撞。
+    def _unwedge_cb(self, _request, response):
+        self._escape_bypass = True
+        try:
+            ok, msg = self._unwedge_run()
+            response.success = ok
+            response.message = msg
+        except Exception as e:  # noqa: BLE001
+            response.success = False
+            response.message = f"脫困異常：{e}"
+            self.get_logger().error(response.message)
+        finally:
+            self._escape_bypass = False
+            self._stop()
+            if self.bypass_pub is not None:
+                self.bypass_pub.publish(Twist())
+        return response
+
+    # 一段推多遠、最多推幾段、推到兩側各有多少就算成功
+    UNWEDGE_LEG_M = 0.12
+    UNWEDGE_MAX_LEGS = 8
+    UNWEDGE_TARGET_M = 0.20
+    UNWEDGE_SAFE_M = 0.35          # 行進方向要留的裕度
+
+    def _unwedge_run(self) -> Tuple[bool, str]:
+        left, right = self._side_clearance()
+        if left >= self.UNWEDGE_TARGET_M and right >= self.UNWEDGE_TARGET_M:
+            return True, f"兩側已有裕度（左 {left:.2f} / 右 {right:.2f} m），不需要脫困"
+
+        moved_total = 0.0
+        for leg in range(1, self.UNWEDGE_MAX_LEGS + 1):
+            left, right = self._side_clearance()
+            if left >= self.UNWEDGE_TARGET_M and right >= self.UNWEDGE_TARGET_M:
+                return True, (f"脫困完成：{leg - 1} 段、共 {moved_total:.2f} m，"
+                              f"兩側 左 {left:.2f} / 右 {right:.2f} m")
+
+            # 往比較空的那一側打。曲率為正 = 往左（前進時）；
+            # _clamp_curv 會依行進方向把它箝到該側做得到的極限。
+            to_left = left > right
+            sign = 1.0 if to_left else -1.0
+            need = self.UNWEDGE_LEG_M + self.UNWEDGE_SAFE_M
+
+            # ★★ 2026-08-17：要**由彎到直**逐級試，不能只試打滿舵 ★★
+            #
+            # 第一版只算「打滿舵的弧線」，實測在門口角落回報
+            #     前後都沒有空間（前 0.05 / 後 0.05 m，需要 0.47 m）
+            # 但同一時間直直往前明明有 0.51 m —— 打滿舵時弧線立刻掃到側邊的牆，
+            # 而**直著走是有路的**。只試一種曲率等於自己把出路排除掉。
+            #
+            # 順序是「彎 -> 直」而不是相反：彎的那些同時能增加側向距離，
+            # 直的只能離開角落。先試效果好的，不行才退而求其次。
+            direction = curv = None
+            for scale in (1.0, 0.6, 0.3, 0.0):
+                f_curv = self._clamp_curv(sign * scale, 1) if scale else 0.0
+                r_curv = self._clamp_curv(sign * scale, -1) if scale else 0.0
+                # ★ 用 _arc_clearance 而不是 _forward_clearance —— 打了舵之後
+                #   車子走的是弧線，直帶檢查會把「側前方明明有空間」誤判成
+                #   沒空間（2026-08-03 踩過）。scale=0 時兩者等價。
+                fwd = self._arc_clearance(1, f_curv, max_dist=1.2)
+                if fwd >= need:
+                    direction, curv = 1, f_curv
+                    break
+                rev = self._arc_clearance(-1, r_curv, max_dist=1.2)
+                if rev >= need:
+                    direction, curv = -1, r_curv
+                    break
+            if direction is None:
+                return False, (f"四種曲率（滿舵到直行）前後都沒有 {need:.2f} m 的空間，"
+                               f"第 {leg} 段放棄。要人工介入")
+
+            speed = self.reverse_speed if direction < 0 else self.follow_speed
+            moved = self._unwedge_leg(direction, curv, speed)
+            moved_total += moved
+            self.get_logger().info(
+                f"脫困第 {leg} 段：{'前進' if direction > 0 else '後退'}、"
+                f"往{'左' if to_left else '右'}打，移動 {moved:.3f} m"
+                f"（側向 左 {left:.2f} / 右 {right:.2f} m）")
+            if moved < 0.02:
+                return False, f"第 {leg} 段只移動 {moved:.3f} m —— 車子推不動，要人工介入"
+
+        left, right = self._side_clearance()
+        ok = left >= self.UNWEDGE_TARGET_M and right >= self.UNWEDGE_TARGET_M
+        return ok, (f"做滿 {self.UNWEDGE_MAX_LEGS} 段、共 {moved_total:.2f} m，"
+                    f"兩側 左 {left:.2f} / 右 {right:.2f} m")
+
+    def _unwedge_leg(self, direction: int, curvature: float, speed: float) -> float:
+        """推一小段，回傳實際位移。速度交給 _publish_cmd 的死區地板處理。"""
+        start = self._robot_pose()
+        v = speed if direction >= 0 else -speed
+        w = abs(v) * curvature
+        t0 = time.time()
+        limit = self.UNWEDGE_LEG_M / max(speed, 1e-3) + 3.0
+        moved = 0.0
+        while time.time() - t0 < limit:
+            cur = self._robot_pose()
+            if start and cur:
+                moved = math.hypot(cur[0] - start[0], cur[1] - start[1])
+                if moved >= self.UNWEDGE_LEG_M:
+                    break
+            self._publish_cmd(v, w)
+            time.sleep(0.05)
+        self._stop()
+        time.sleep(0.3)      # 等雷射與 tf 追上，否則下一段讀到的是舊淨空
+        cur = self._robot_pose()
+        if start and cur:
+            moved = math.hypot(cur[0] - start[0], cur[1] - start[1])
+        return moved
 
     def _escape_legs(self, pts, idx, cur_dir, goal_handle, attempt: int) -> bool:
         """★ 2026-08-10：一次呼叫做**連續多段**三點轉向，中間不還給純追蹤。

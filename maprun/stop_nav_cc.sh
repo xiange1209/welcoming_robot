@@ -12,7 +12,13 @@
 #   呼叫隨機落到其中一個。當天的症狀是「plan_taught_path 回傳失敗，
 #   log 卻顯示路徑存檔成功」，看起來像程式自相矛盾，實際是在跟兩個節點講話。
 #   ★ 做任何 A/B 對照之前，先確認節點只有一個。
-PATTERNS='nav2_|map_service_cc|waypoint_service_cc|navigation_action_cc|path_teach_cc|steering_trim_cc|async_slam_toolbox|frontier_explorer|smartnav_navigation_cc nav_bringup'
+# ★ 2026-08-17 再補 stuck_detector_cc 與 scan_filter_cc。
+#   實測後果：一天之內重啟幾次導航之後，機器上同時有
+#   **四份 stuck_detector_cc、三份 scan_filter_cc**（cpu_report.py 抓到的）。
+#   除了白吃約 26% CPU、365 MB 記憶體，更嚴重的是
+#   **多份 scan_filter_cc 會同時發布過濾後的雷達**，下游收到交錯的訊息，
+#   定位吻合度掉到 88% 且車頭淨空對不上很可能就是這個造成的。
+PATTERNS='nav2_|map_service_cc|waypoint_service_cc|navigation_action_cc|path_teach_cc|steering_trim_cc|stuck_detector_cc|scan_filter_cc|async_slam_toolbox|frontier_explorer|smartnav_navigation_cc nav_bringup'
 
 MYPID=$$
 MYPPID=$PPID

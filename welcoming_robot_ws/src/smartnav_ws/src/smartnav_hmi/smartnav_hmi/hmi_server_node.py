@@ -23,6 +23,7 @@ import numpy as np
 import rclpy
 import uvicorn
 from action_msgs.msg import GoalStatus
+from action_msgs.srv import CancelGoal
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -808,6 +809,38 @@ class HmiServerNode(Node):
         self.declare_parameter(
             "service_timeout", 8.0, ParameterDescriptor(description="呼叫 ROS 服務的等待秒數")
         )
+        # ── 用戶端在場偵測（2026-08-17）──────────────────────
+        # 「最後一次 HTTP 請求」之後還要把節點當成「有人在看」多久。
+        # WebSocket 活著時這個值用不到（活連線本身就是在場證明），它是給
+        # 「ws 剛斷、正在重連」那個空窗用的，所以要比前端的重連退避上限
+        # （index.html: Math.min(8000, ...) = 8 秒）寬。
+        self.declare_parameter(
+            "client_idle_ttl",
+            25.0,
+            ParameterDescriptor(description="沒有 WebSocket 時，最後一次 HTTP 請求後仍視為有人在看的秒數"),
+        )
+        # MJPEG 串流結束後仍保留影像訂閱的秒數。純粹是防抖：切分頁、重新整理
+        # 都會讓串流斷一下再接回來，沒有這個緩衝就會一直建立／銷毀訂閱，
+        # 每次都要重跑一輪 DDS 探索，反而更貴。
+        self.declare_parameter(
+            "video_idle_ttl",
+            10.0,
+            ParameterDescriptor(description="沒有人看影像多久後就取消影像訂閱（秒）"),
+        )
+        # WebSocket 存活探測。★ 用的是 **協定層** 的 ping/pong，不是自己寫的
+        # 心跳：瀏覽器的網路層會自動回 pong，就算分頁在背景、JS 計時器被節流
+        # 甚至整個暫停也照回不誤。所以「平板放著沒操作」不會被誤踢，
+        # 而「平板走出 WiFi 範圍」會在 interval+timeout 內被判定並關閉。
+        self.declare_parameter(
+            "ws_ping_interval",
+            25.0,
+            ParameterDescriptor(description="WebSocket 協定層 ping 間隔（秒），<=0 關閉"),
+        )
+        self.declare_parameter(
+            "ws_ping_timeout",
+            20.0,
+            ParameterDescriptor(description="WebSocket pong 逾時（秒），逾時即關閉該連線"),
+        )
         self.declare_parameter(
             "image_transport",
             "auto",
@@ -845,12 +878,18 @@ class HmiServerNode(Node):
         self.video_quality = self.get_parameter("video_quality").get_parameter_value().integer_value
         self.video_width = self.get_parameter("video_width").get_parameter_value().integer_value
         self.service_timeout = self.get_parameter("service_timeout").get_parameter_value().double_value
+        self.client_idle_ttl = self.get_parameter("client_idle_ttl").get_parameter_value().double_value
+        self.video_idle_ttl = self.get_parameter("video_idle_ttl").get_parameter_value().double_value
+        self.ws_ping_interval = self.get_parameter("ws_ping_interval").get_parameter_value().double_value
+        self.ws_ping_timeout = self.get_parameter("ws_ping_timeout").get_parameter_value().double_value
 
         transport = self.get_parameter("image_transport").get_parameter_value().string_value.strip().lower()
         if transport == "auto":
             self.image_compressed = image_topic.endswith("/compressed")
         else:
             self.image_compressed = transport == "compressed"
+        # 影像訂閱改成按需建立（見 _client_tick），所以話題名要留著
+        self.image_topic = image_topic
 
         # ── 狀態與緩衝 ─────────────────────────────────────
         self.state = HmiState()
@@ -896,6 +935,37 @@ class HmiServerNode(Node):
         # 根本沒有人打開地圖分頁。訊息只存參考，不複製，成本接近零。
         self._pending_grid: Optional[OccupancyGrid] = None
 
+        # ── 用戶端在場追蹤（2026-08-17）────────────────────
+        #
+        # 起因：使用者說「HMI 已連接設備如果沒在連線的話可以踢掉連線 省 CPU」。
+        #
+        # ★ 實測（py-spy 取樣 hmi_server 主執行緒，20 秒、100 Hz）發現 CPU
+        #   **不是**花在用戶端身上，而是花在 rclpy 的執行器上：
+        #     99.0%  _spin_once_impl → wait_for_ready_callbacks
+        #     77.6%  wait_set.wait()（DDS 等待本身）
+        #      0.7%  executors.py:592 handler ← 我們自己的回呼只有這麼多
+        #   也就是說幾乎全部的 CPU 都在「每次被喚醒就重建一次 wait set」。
+        #   成本 ≈ 喚醒次數 × wait set 內的實體數，跟連了幾台平板無關。
+        #
+        # ★ 對照實驗（獨立小節點，同一台機器）：
+        #     訂閱數 0、閒置服務客戶端 0  → 1.10%
+        #     訂閱 /odom（22 Hz）        → 6.45%
+        #     /odom + 20 個閒置客戶端     → 10.30%
+        #     只有 40 個閒置客戶端、無訂閱 → 0.50%
+        #   結論：**閒著的實體幾乎不要錢，被高頻話題叫醒才要錢。**
+        #
+        # 所以「省 CPU」的正解不是踢連線本身，而是「沒人在看就不要訂高頻話題」。
+        # 這裡追蹤用戶端在場與否，讓 /odom（20 Hz，只為了顯示車速）與影像
+        # 訂閱都掛在這個訊號上——跟既有的地圖／位姿按需訂閱同一個套路。
+        self._client_lock = threading.Lock()
+        self._ws_clients = 0           # 活著的 WebSocket 連線數
+        self._video_viewers = 0        # 進行中的 /video MJPEG 串流數
+        self._last_http_at = 0.0       # 最後一次 HTTP 請求（monotonic）
+        self._last_frame_req_at = 0.0  # 最後一次 /api/frame.jpg（拍照用）
+        self._clients_seen = False     # 上一輪的判定，只在變化時記 log
+        self._odom_sub = None          # 按需建立，見 _client_tick
+        self._image_sub = None         # 同上
+
         # ── 位姿來源（按需開啟）──────────────────────────
         # 有人在看地圖的期限（time.monotonic()）。0 = 沒人在看。
         self._pose_watch_until = 0.0
@@ -931,13 +1001,13 @@ class HmiServerNode(Node):
             depth=1,
         )
 
+        # 影像 QoS 留著給按需訂閱用（見 _acquire_image_sub）
+        self._sensor_qos = sensor_qos
+
         # ── 訂閱 ──────────────────────────────────────────
-        if self.image_compressed:
-            self.create_subscription(
-                CompressedImage, image_topic, self._compressed_image_cb, sensor_qos, callback_group=cb
-            )
-        else:
-            self.create_subscription(Image, image_topic, self._image_cb, sensor_qos, callback_group=cb)
+        # ★ 影像不在這裡訂。相機開著時它是全節點最高頻的話題（30 Hz），
+        #   而且不管有沒有人在看 /video 都照收、照 JPEG 編碼。改成
+        #   「有 MJPEG 串流在跑時才訂」，見 _client_tick / _acquire_image_sub。
         self.create_subscription(UserIdentity, identity_topic, self._identity_cb, 10, callback_group=cb)
         self.create_subscription(
             RegistrationProgress, "registration_progress", self._registration_progress_cb, 10,
@@ -947,6 +1017,12 @@ class HmiServerNode(Node):
         self.create_subscription(String, "partial_text", self._partial_text_cb, 10, callback_group=cb)
         self.create_subscription(String, "llm_response", self._llm_response_cb, 10, callback_group=cb)
         self.create_subscription(String, "llm_stream", self._llm_stream_cb, 10, callback_group=cb)
+        # ★ 2026-08-17：串流作廢訊號。llm_service_node 在「這一輪要去呼叫工具」時發，
+        #   用來丟掉已經串到畫面上、但永遠不會成為正式回覆的那段旁白。
+        #   不用 llm_response 代替：那會多出一則已完成訊息，前端會把它唸出來。
+        self.create_subscription(
+            Empty, "llm_stream_reset", self._llm_stream_reset_cb, 10, callback_group=cb
+        )
         # 模型名稱是 latched，HMI 比 LLM 晚啟動也收得到
         self.create_subscription(String, "llm_model", self._llm_model_cb, latched_qos, callback_group=cb)
         self.create_subscription(String, "speech_text", self._speech_text_cb, 10, callback_group=cb)
@@ -966,7 +1042,15 @@ class HmiServerNode(Node):
         self.create_subscription(Float32, "robot_charging_current", self._charge_current_cb, sensor_qos, callback_group=cb)
         # 車速取自 odom。上方列要回答的是「車子現在到底有沒有在動」——
         # 這在脫困、防撞死鎖那類問題上是第一個要看的量（發了指令但車不動）。
-        self.create_subscription(Odometry, "odom", self._odom_speed_cb, sensor_qos, callback_group=cb)
+        #
+        # ★ 2026-08-17：**改成按需訂閱**（見 _client_tick）。
+        #   /odom 是底盤以 20 Hz 發的，而畫面上只需要 1 Hz 的一個數字——
+        #   回呼裡本來就節流到 1 Hz 了，但**節流省不到重點**：訊息照樣抵達、
+        #   照樣把執行器叫醒、照樣讓 rclpy 在 Python 端重建整個 wait set。
+        #   實測這一條訂閱在本機要價約 6% 的一顆核心（見上面的對照實驗），
+        #   而迎賓展示時九成的時間根本沒有平板連著。
+        #   ★ 安全性不受影響：遙控看門狗用的是時間，不是 odom；
+        #     緊急停止、防撞、導航都不經過 HMI 的這條訂閱。
 
         # 資源監看：★ 獨立計時器，不掛在任何話題上。
         # 掛話題的話「沒開底盤就沒有 CPU 資訊」，而最需要看的時候
@@ -1127,6 +1211,9 @@ class HmiServerNode(Node):
             self.service_clients["plan_taught_path"] = self.create_client(
                 PlanTaughtPath, "plan_taught_path", callback_group=cb
             )
+        # ★ 2026-08-17：緊急停止用的「取消全部」服務客戶端，延遲建立（見 _cancel_all_action_goals）
+        self._cancel_srv_clients: Dict[str, Any] = {}
+        self._cancel_cb_group = cb
         self.action_clients: Dict[str, ActionClient] = {
             "create_map": ActionClient(self, CreateMap, "create_map", callback_group=cb),
             "navigate": ActionClient(self, Navigate, "navigate", callback_group=cb),
@@ -1166,6 +1253,9 @@ class HmiServerNode(Node):
 
         # 看門狗：等不到 llm_response 時把扣住的 speech_text 放出來
         self.create_timer(1.0, lambda: self._flush_pending_speech(), callback_group=cb)
+
+        # 用戶端在場 → 高頻訂閱的開關（2026-08-17）
+        self.create_timer(1.0, self._client_tick, callback_group=cb)
 
         # ── FastAPI ───────────────────────────────────────
         self.app = self._build_app()
@@ -1372,6 +1462,121 @@ class HmiServerNode(Node):
         except Exception as e:
             self.get_logger().warn(f"地圖渲染失敗: {e}", throttle_duration_sec=10.0)
 
+    # ── 用戶端在場 → 高頻訂閱的開關 ───────────────────────
+
+    def note_client(self) -> None:
+        """記下「剛剛有用戶端來過」。由 HTTP middleware 與 WebSocket 呼叫。"""
+        with self._client_lock:
+            self._last_http_at = time.monotonic()
+
+    def note_video_interest(self) -> None:
+        """記下「剛剛有人要影格」（/api/frame.jpg 拍照用）"""
+        with self._client_lock:
+            self._last_frame_req_at = time.monotonic()
+
+    def clients_present(self) -> bool:
+        """現在有沒有用戶端
+
+        判定順序刻意是「先看活連線，再看時間」：
+          ・有 WebSocket 活著 → 一定算在場。★ 這是不誤踢平板的關鍵：
+            連線活不活由**協定層 pong** 決定（uvicorn 的 ws_ping_interval），
+            瀏覽器網路層自動回覆，分頁在背景、JS 被節流都照回。
+            「平板放著沒人操作」在這個判準下是「在場」。
+          ・沒有 WebSocket 時退回看最後一次 HTTP。這是給「ws 斷了正在重連」
+            的空窗用的，TTL 設得比前端重連退避上限（8 秒）寬很多。
+        """
+        with self._client_lock:
+            if self._ws_clients > 0:
+                return True
+            return (time.monotonic() - self._last_http_at) < self.client_idle_ttl
+
+    def _video_wanted(self) -> bool:
+        """要不要維持影像訂閱
+
+        兩個條件要**同時**成立：
+          ・有 /video 串流在跑，或剛剛有人抓過影格
+          ・而且確實有用戶端在場
+        第二個條件不能省。MJPEG 是一條長連線，對端如果是「悄悄消失」
+        （平板走出 WiFi 範圍、直接斷電），TCP 只會把資料塞進送出緩衝區，
+        伺服器這邊要很久才會發現，_video_viewers 就一直掛著不歸零 ——
+        一條這樣的殭屍串流就足以讓相機訂閱永遠關不掉。
+        用 clients_present() 交叉驗證：那台平板的 WebSocket 會先被 pong 逾時
+        判死，在場訊號跟著消失，串流再怎麼賴著也留不住訂閱。
+        """
+        if not self.clients_present():
+            return False
+        with self._client_lock:
+            if self._video_viewers > 0:
+                return True
+            return (time.monotonic() - self._last_frame_req_at) < self.video_idle_ttl
+
+    def _acquire_image_sub(self) -> None:
+        if self._image_sub is not None:
+            return
+        if self.image_compressed:
+            self._image_sub = self.create_subscription(
+                CompressedImage, self.image_topic, self._compressed_image_cb,
+                self._sensor_qos, callback_group=self._cb,
+            )
+        else:
+            self._image_sub = self.create_subscription(
+                Image, self.image_topic, self._image_cb, self._sensor_qos, callback_group=self._cb,
+            )
+
+    def _release_image_sub(self) -> None:
+        if self._image_sub is None:
+            return
+        self.destroy_subscription(self._image_sub)
+        self._image_sub = None
+        # ★ 一定要把快取的影格丟掉。留著的話 /api/frame.jpg 會回一張
+        #   不知道多久以前的照片 —— 人臉註冊拿它當樣本就會註冊到錯的人。
+        with self._frame_lock:
+            self._latest_jpeg = None
+        self._frame_times = []
+        self.state.set_system(camera_fps=0.0)
+
+    def _acquire_odom_sub(self) -> None:
+        if self._odom_sub is not None:
+            return
+        self._odom_sub = self.create_subscription(
+            Odometry, "odom", self._odom_speed_cb, self._sensor_qos, callback_group=self._cb
+        )
+
+    def _release_odom_sub(self) -> None:
+        if self._odom_sub is None:
+            return
+        self.destroy_subscription(self._odom_sub)
+        self._odom_sub = None
+        # 訂閱沒了就不會有新車速，明確清成 None，免得畫面停在一個舊數字
+        self.state.set_system(speed=None)
+
+    def _client_tick(self) -> None:
+        """1 Hz：依用戶端在場與否開關高頻訂閱
+
+        ★ 一定要在執行器執行緒上做（也就是 ROS timer 裡），不能在 HTTP
+          執行緒上做：create_subscription / destroy_subscription 會動到執行器
+          正在走訪的實體集合。
+        1 Hz 是刻意的——它自己就是一個喚醒源，太快就把省下來的又吃回去。
+        """
+        present = self.clients_present()
+        if present != self._clients_seen:
+            self._clients_seen = present
+            self.get_logger().info(
+                "偵測到用戶端，恢復 /odom（車速）訂閱" if present
+                else f"沒有任何用戶端連線（閒置 {self.client_idle_ttl:.0f} 秒），"
+                     "停用 /odom 與影像訂閱以節省 CPU"
+            )
+
+        if present:
+            self._acquire_odom_sub()
+        else:
+            self._release_odom_sub()
+
+        if self._video_wanted():
+            self._acquire_image_sub()
+        else:
+            self._release_image_sub()
+
     def note_map_interest(self) -> None:
         """記下「現在有人在看地圖」
 
@@ -1576,6 +1781,16 @@ class HmiServerNode(Node):
             self._last_token_at = now
         self.state.append_stream(msg.data)
 
+    def _llm_stream_reset_cb(self, msg: Empty) -> None:
+        """作廢目前串流中的灰字（這一輪只是去呼叫工具，不是要講給客戶聽的答案）
+
+        只清畫面緩衝，**不**動 _turn_started / _first_token_at ——
+        那兩個是整輪（含工具執行時間）的計時起點，清掉的話最終回覆的
+        think/generate/cps 統計就沒了。也不碰 _pending_speech，
+        那條線本來就由 llm_response 或看門狗負責。
+        """
+        self.state.set_stream("")
+
     def _speech_text_cb(self, msg: String) -> None:
         """語音輸出也記進對話流——但要濾掉 LLM 回覆的回音
 
@@ -1754,12 +1969,34 @@ class HmiServerNode(Node):
 
         # ── 門檻警告 ────────────────────────────────────────
         # throttle_duration_sec 讓它最多每分鐘唸一次，不會洗版。
+        # ★★ 2026-08-17：load average **不能**單獨拿來判斷「現在忙不忙」★★
+        #
+        # 實測：load average 顯示 36.6 的同一時刻，vmstat 的 r（真正可執行的
+        # 執行緒數）只有 0~1、CPU 閒置 48~55%、IO 等待 0%。**系統根本沒在排隊。**
+        # 原因是 load average 是 1/5/15 分鐘的指數加權移動平均，**它落後現實好幾分鐘**：
+        # 當時反映的是稍早那段有四份 stuck_detector_cc、三份 scan_filter_cc
+        # 殘留的狀況（stop_nav_cc.sh 收不乾淨造成，已修）。
+        #
+        # 照舊邏輯，操作者會被叫去「關掉深度相機或導航堆疊」——
+        # 而真正該做的是把重複的節點收掉。**錯的警告比沒有警告更糟。**
+        #
+        # 改法：load 高**只是候選條件**，要再看一個即時指標才報。
+        # 這裡用 /proc/stat 兩次取樣算出的 CPU 忙碌率（非 idle 佔比）。
         load = fields.get("cpu_load")
         if load is not None and load >= self.LOAD_WARN:
-            self.get_logger().warn(
-                f"⚠ 系統負載 {load:.1f}（四核心，>{self.LOAD_WARN:.0f} 就已經在排隊）"
-                "——考慮關掉深度相機或導航堆疊",
-                throttle_duration_sec=60.0)
+            busy = self._cpu_busy_ratio()
+            if busy is None or busy >= 0.85:
+                self.get_logger().warn(
+                    f"⚠ 系統負載 {load:.1f}"
+                    + (f"、CPU 忙碌 {busy*100:.0f}%" if busy is not None else "")
+                    + "——考慮關掉深度相機或導航堆疊",
+                    throttle_duration_sec=60.0)
+            else:
+                # 這種情形通常代表「剛剛很忙、現在已經好了」，或有殘留節點被收掉了。
+                self.get_logger().info(
+                    f"系統負載 {load:.1f} 偏高，但 CPU 忙碌只有 {busy*100:.0f}%"
+                    "——是移動平均的殘影，現在沒有在排隊",
+                    throttle_duration_sec=300.0)
         mem = fields.get("mem_avail_mb")
         if mem is not None and mem <= self.MEM_WARN_MB:
             self.get_logger().error(
@@ -1771,6 +2008,30 @@ class HmiServerNode(Node):
             self.get_logger().warn(
                 f"⚠ CPU {temp:.1f}°C（>{self.TEMP_WARN:.0f} 會開始降頻，症狀是全部變慢）",
                 throttle_duration_sec=60.0)
+
+    def _cpu_busy_ratio(self) -> Optional[float]:
+        """CPU 忙碌率（0~1）—— 兩次 /proc/stat 取樣的差值，是**即時**指標。
+
+        ★ 跟 load average 的差別：load 是 1/5/15 分鐘的移動平均，會把幾分鐘前的
+        尖峰一直帶著；這個看的是「上次呼叫到現在」這段區間真的用掉多少 CPU。
+        第一次呼叫沒有前一筆可以比，回 None（呼叫端會退回只看 load）。
+        """
+        try:
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            vals = [int(x) for x in parts[1:11]]
+            total = sum(vals)
+            idle = vals[3] + vals[4]            # idle + iowait
+        except Exception:
+            return None
+        prev = getattr(self, "_cpu_stat_prev", None)
+        self._cpu_stat_prev = (total, idle)
+        if prev is None:
+            return None
+        dt, di = total - prev[0], idle - prev[1]
+        if dt <= 0:
+            return None
+        return max(0.0, min(1.0, 1.0 - di / dt))
 
     def access_urls(self) -> List[str]:
         """平板可以打開的網址清單
@@ -2173,6 +2434,49 @@ class HmiServerNode(Node):
         finally:
             with self._job_handles_lock:
                 self._job_handles.pop(job_id, None)
+
+    # ★★ 2026-08-17：緊急停止原本停不住「不是 HMI 發起的」導航 ★★
+    #
+    # 實機發生過：使用者用語音叫車子做全域定位，車子開始繞 0.9 m 圓弧，
+    # 按平板的緊急停止，log 回「已送零速，取消 **0 個**作業」而車子照走。
+    #
+    # 原因：`cancel_job()` 只能取消 `_job_handles` 裡的 goal handle，
+    # 那是 HMI 自己送出去才會登記的。LLM 的工具是
+    # `llm_service_node` -> `/navigate` 直接送，HMI 從頭到尾不知道有這件事。
+    # 而 `apply_teleop(0,0)` 送的零速會跟控制器 10~20 Hz 的真指令交錯，
+    # 車子只會頓一下，**不會停**（那條「遙控看門狗 0.6 秒」的註解，
+    # 前提是沒有別人在發指令，有控制器在跑時不成立）。
+    #
+    # ★ 客人只要開口就能讓車子動，而平板上的紅色大按鈕停不住它 —— 這是安全問題。
+    #
+    # 解法：直接對 action 的 cancel 服務送「取消全部」。
+    # ROS 2 action 規格：goal_id 全零 + stamp 全零 = 取消該伺服器上**所有**目標，
+    # 與是誰送出的無關。這條路不需要 goal handle，所以繞得過登記簿。
+    ACTION_CANCEL_ALL = ("navigate", "follow_taught_path", "global_localization", "create_map")
+
+    def _cancel_all_action_goals(self) -> List[str]:
+        """對所有會讓車子移動的 action 送『取消全部』。回傳成功送出的動作名。"""
+        sent: List[str] = []
+        for name in self.ACTION_CANCEL_ALL:
+            client = self.action_clients.get(name)
+            if client is None:
+                continue
+            try:
+                srv = self._cancel_srv_clients.get(name)
+                if srv is None:
+                    # action 的取消服務固定是 <action_name>/_action/cancel_goal
+                    srv = self.create_client(
+                        CancelGoal, f"{client._action_name}/_action/cancel_goal",
+                        callback_group=self._cancel_cb_group)
+                    self._cancel_srv_clients[name] = srv
+                if not srv.service_is_ready():
+                    continue
+                # 全零 goal_id + 全零 stamp = 取消全部
+                srv.call_async(CancelGoal.Request())
+                sent.append(name)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warning(f"送出 {name} 的取消全部失敗: {e}")
+        return sent
 
     def cancel_job(self, job_id: str) -> bool:
         """要求取消進行中的動作"""
@@ -2850,6 +3154,18 @@ class HmiServerNode(Node):
         if (web_dir / "static").is_dir():
             app.mount("/static", StaticFiles(directory=str(web_dir / "static")), name="static")
 
+        @app.middleware("http")
+        async def track_client(request: Request, call_next):
+            """任何一個 HTTP 請求都算「有用戶端在」
+
+            放在 middleware 而不是逐一在端點裡呼叫：漏掉一個端點的代價是
+            節點在有人操作時把訂閱收掉，那種 bug 很難查。
+            對 StreamingResponse（/video）不會造成阻塞——call_next 在送出
+            表頭時就回來了，串流本體是之後才逐段產生的。
+            """
+            self.note_client()
+            return await call_next(request)
+
         @app.exception_handler(StarletteHTTPException)
         async def http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
             """前端只認 success/message 兩個欄位，別讓 FastAPI 丟原生的 detail"""
@@ -2914,6 +3230,11 @@ class HmiServerNode(Node):
         async def api_health() -> JSONResponse:
             with self._frame_lock:
                 has_frame = self._latest_jpeg is not None
+            # 影像訂閱按需建立之後，「手上沒有影格」不再等於「相機沒影像」——
+            # 沒人在看的時候本來就沒有。改問話題上有沒有發布者，這其實比
+            # 原本的判斷更準：它回答的是「相機節點在不在發」。
+            if not has_frame:
+                has_frame = self.count_publishers(self.image_topic) > 0
             with self._map_lock:
                 has_map = self._map_png is not None
             services = {name: c.service_is_ready() for name, c in self.service_clients.items()}
@@ -2936,11 +3257,41 @@ class HmiServerNode(Node):
 
         @app.websocket("/ws")
         async def ws_endpoint(websocket: WebSocket) -> None:
+            """狀態推播
+
+            ★ 2026-08-17：加上「斷線就收掉」。原本這個迴圈只有在 send 失敗時
+              才會結束，而 send 只在狀態版本變動時才發生——狀態不動的期間
+              （迎賓機閒置時的常態）連線已經死了也沒人知道，迴圈就以 10 Hz
+              空轉下去，而且沒有上限：平板每重新整理一次就多留一條。
+
+              兩道防線：
+              1. **協定層 ping/pong**（uvicorn 的 ws_ping_interval/timeout，
+                 見 _run_server）。沒有 pong 就由伺服器主動關閉連線。
+              2. 這裡的 receive 監看任務。連線一被關閉（不論是對方關的、
+                 還是第 1 條判死的），它馬上收到 websocket.disconnect，
+                 推播迴圈下一輪就結束——不必等到有東西要送。
+            """
             await websocket.accept()
+            self.note_client()
+            with self._client_lock:
+                self._ws_clients += 1
             last_version = -1
             last_messages_version = None  # None 代表第一次，會帶上完整對話
-            try:
+
+            async def watch_disconnect() -> None:
+                """只為了偵測斷線而收訊息。前端目前不送任何東西，這是刻意的：
+                能不能活由協定層的 pong 決定，不依賴前端要記得送心跳
+                （JS 計時器在背景分頁會被節流，拿它當存活判準會誤踢）。"""
                 while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        return
+                    # 收到什麼都算一次「還活著」，以後前端要加心跳也不必改這裡
+                    self.note_client()
+
+            watcher = asyncio.ensure_future(watch_disconnect())
+            try:
+                while not watcher.done():
                     current = self.state.version
                     if current != last_version:
                         last_version = current
@@ -2952,13 +3303,17 @@ class HmiServerNode(Node):
                 pass
             except Exception as e:
                 self.get_logger().debug(f"WebSocket 結束: {e}")
+            finally:
+                watcher.cancel()
+                with self._client_lock:
+                    self._ws_clients = max(0, self._ws_clients - 1)
 
         # ── 影像與地圖 ────────────────────────────────────
 
         @app.get("/video")
-        async def video() -> StreamingResponse:
+        async def video(request: Request) -> StreamingResponse:
             return StreamingResponse(
-                self._mjpeg_generator(),
+                self._mjpeg_generator(request),
                 media_type="multipart/x-mixed-replace; boundary=frame",
             )
 
@@ -3340,8 +3695,12 @@ class HmiServerNode(Node):
                         job.get("label") or jid
                     )
 
+            # ★ 2026-08-17：登記簿之外的目標也要停（語音發起的導航就在這裡）
+            broadcast = self._cancel_all_action_goals()
+
             self.get_logger().warn(
                 f"緊急停止：已送零速，取消 {len(cancelled)} 個作業"
+                + (f"，另對 {len(broadcast)} 個動作送出取消全部（{'、'.join(broadcast)}）" if broadcast else "")
                 + (f"，{len(failed)} 個取消失敗" if failed else "")
             )
             if cancelled:
@@ -3589,9 +3948,20 @@ class HmiServerNode(Node):
 
         @app.get("/api/frame.jpg")
         async def api_frame() -> Response:
-            """抓當下這一張影格。前端「從畫面拍照」用這支"""
-            with self._frame_lock:
-                jpeg = self._latest_jpeg
+            """抓當下這一張影格。前端「從畫面拍照」用這支
+
+            影像訂閱是按需建立的（見 _client_tick），所以這裡要先舉手說
+            「我要影格」，再給它一點時間把訂閱建起來、收到第一張。
+            正常情況下拍照時 /video 已經開著，這段等待會直接跳過。
+            """
+            self.note_video_interest()
+            deadline = time.monotonic() + 2.0
+            while True:
+                with self._frame_lock:
+                    jpeg = self._latest_jpeg
+                if jpeg is not None or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.1)
             if jpeg is None:
                 return JSONResponse({"success": False, "message": "目前沒有相機影像"}, status_code=404)
             return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -3714,26 +4084,40 @@ class HmiServerNode(Node):
     # 沒有相機影像時，佔位圖的重送間隔（秒）
     PLACEHOLDER_INTERVAL_SEC = 1.0
 
-    async def _mjpeg_generator(self):
+    async def _mjpeg_generator(self, request: Optional[Request] = None):
         """產生 multipart MJPEG 串流
 
         相機關掉時（迎賓機目前的常態）原本照樣以 video_fps=12 一直重送同一張
         「NO CAMERA SIGNAL」佔位圖——每秒 12 次穿過 starlette 的 chunked 編碼，
         內容還完全一樣。這裡改成沒有真影格時降到 1 fps：畫面上看不出差別
         （本來就是靜態圖），HTTP 執行緒的工作量降到十二分之一。
+
+        ★ 2026-08-17：串流的存在本身現在是一個訊號——它開著，影像訂閱才會
+          建立（見 _client_tick）。所以進出都要記帳，而且要用 try/finally，
+          不然對方一斷線就永遠漏掉一次減量，計數只增不減。
+          乾淨的斷線不必自己偵測：starlette 的 StreamingResponse 內部就有一條
+          listen_for_disconnect，收到 http.disconnect 會把產生器取消掉，
+          finally 照樣會執行。（自己再輪詢一次 is_disconnected() 反而會跟它
+          搶同一個 receive 通道。）
         """
         interval = 1.0 / max(self.video_fps, 1.0)
         placeholder = self._placeholder_jpeg()
-        while True:
-            with self._frame_lock:
-                frame = self._latest_jpeg
-            payload = frame if frame is not None else placeholder
-            yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-            yield str(len(payload)).encode()
-            yield b"\r\n\r\n"
-            yield payload
-            yield b"\r\n"
-            await asyncio.sleep(interval if frame is not None else self.PLACEHOLDER_INTERVAL_SEC)
+        with self._client_lock:
+            self._video_viewers += 1
+        try:
+            while True:
+                with self._frame_lock:
+                    frame = self._latest_jpeg
+                payload = frame if frame is not None else placeholder
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                yield str(len(payload)).encode()
+                yield b"\r\n\r\n"
+                yield payload
+                yield b"\r\n"
+                await asyncio.sleep(interval if frame is not None else self.PLACEHOLDER_INTERVAL_SEC)
+        finally:
+            with self._client_lock:
+                self._video_viewers = max(0, self._video_viewers - 1)
 
     @staticmethod
     def _placeholder_jpeg() -> bytes:
@@ -3744,7 +4128,33 @@ class HmiServerNode(Node):
         return buf.tobytes() if ok else b""
 
     def _run_server(self) -> None:
-        config = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="warning")
+        """啟動 uvicorn
+
+        ★ ws_ping_interval / ws_ping_timeout（2026-08-17）
+          這是「踢掉斷線用戶端」真正的判準。伺服器每 interval 秒送一個
+          **WebSocket 協定層** 的 ping，對方要在 timeout 秒內回 pong，
+          否則連線關閉。
+
+          為什麼用協定層而不是自己在 JS 裡寫心跳：pong 是瀏覽器網路層自動
+          回的，**不經過 JavaScript**。平板螢幕關掉、分頁切到背景、JS 計時器
+          被節流甚至凍結，pong 照樣會回 —— 也就是「平板只是放著沒操作」
+          絕對不會被誤踢。真正收不到 pong 的只有「連線實際上已經沒了」：
+          走出 WiFi 範圍、平板關機、瀏覽器行程被系統回收。
+          （這正是舊寫法抓不到的那一類：TCP 送出去不會失敗，只會塞在
+          緩衝區裡，所以 send 永遠不丟例外，迴圈就一直空轉。）
+
+          誤判的代價也很低：前端 ws.onclose 會自動重連（退避上限 8 秒），
+          畫面上就是右上角那顆點閃一下。
+
+        timeout_keep_alive：閒置的 HTTP keep-alive 連線多久後關掉。
+          平板一直開著頁面時 /api/* 是零星打的，連線留著只是佔 socket。
+        """
+        config = uvicorn.Config(
+            self.app, host=self.host, port=self.port, log_level="warning",
+            ws_ping_interval=self.ws_ping_interval if self.ws_ping_interval > 0 else None,
+            ws_ping_timeout=self.ws_ping_timeout if self.ws_ping_timeout > 0 else None,
+            timeout_keep_alive=15,
+        )
         server = uvicorn.Server(config)
         try:
             server.run()
