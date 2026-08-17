@@ -121,6 +121,13 @@ class SpeechRecognizerNode(Node):
         #   照理說永遠比 rule2 的 1.2 s 早。但實機黏句正好證明**噪音讓 VAD 卡在
         #   「還在講話」**——那正是 sherpa 這條當備援的時機。它看的是自己解碼出
         #   的 blank 幀，不受 VAD 的能量門檻影響。
+        # ★ 2026-08-17：模型檔精度。原本寫死 encoder/decoder 用 fp32、只有 joiner 用 int8
+        #   —— 把最不影響效能的那塊量化了，最重的 encoder（315 MB fp32）反而沒有。
+        #   詳見 _init_sherpa_onnx_asr 的長註解。false = 退回舊行為。
+        self.declare_parameter(
+            "prefer_int8_model", True,
+            ParameterDescriptor(description="模型檔有 .int8 版就優先載入（RPi4 上明顯較快，準確率同級）"))
+
         self.declare_parameter(
             "use_sherpa_endpoint", True,
             ParameterDescriptor(description="除了 VAD 之外，也讓 sherpa 自己判斷句尾（OR 關係）"))
@@ -157,6 +164,8 @@ class SpeechRecognizerNode(Node):
         # 端點偵測（2026-08-17）。★ `_sherpa_endpoint_ok` 是**執行期**的能力旗標：
         # 舊版 sherpa-onnx 沒有 `is_endpoint()`，第一次呼叫失敗就永久退回純 VAD 斷句，
         # 只警告一次。絕對不能讓「多一個斷句來源」這種增益功能害整個辨識掛掉。
+        self.prefer_int8_model = self.get_parameter(
+            "prefer_int8_model").get_parameter_value().bool_value
         self.use_sherpa_endpoint = self.get_parameter(
             "use_sherpa_endpoint").get_parameter_value().bool_value
         self.rule1_min_trailing_silence = self.get_parameter(
@@ -259,10 +268,42 @@ class SpeechRecognizerNode(Node):
             # 使用本地 ASR 模型
             asr_model_dir = get_model_path("asr")
             if asr_model_dir:
-                # 查找 ONNX 模型文件
-                encoder_file = asr_model_dir / "encoder-epoch-99-avg-1.onnx"
-                decoder_file = asr_model_dir / "decoder-epoch-99-avg-1.onnx"
-                joiner_file = asr_model_dir / "joiner-epoch-99-avg-1.int8.onnx"
+                # ★★ 2026-08-17：優先載入 int8 版本 ★★
+                #
+                # 原本寫死成 encoder/decoder 用 fp32、**只有 joiner 用 int8**：
+                #
+                #     encoder-epoch-99-avg-1.onnx        fp32  315 MB   ← 幾乎全部的運算量
+                #     decoder-epoch-99-avg-1.onnx        fp32   14 MB
+                #     joiner-epoch-99-avg-1.int8.onnx    int8  3.1 MB   ← 最小、最不影響效能的那塊
+                #
+                # 這個組合看起來是意外：**把最不重要的那塊量化了，最重的那塊留在全精度**。
+                # sherpa-onnx 官方對資源受限裝置的建議就是全部用 int8
+                # （encoder int8 版是 174 MB，比 fp32 小 45%）。
+                #
+                # 為什麼這件事重要：實測 RTF **0.76**、餘裕只剩 24%，
+                # 相機一開就把佇列塞爆（「音訊處理佇列已滿」1405 筆）。
+                # encoder 量化是**不換模型、不掉準確率等級**就能拿到的效能，
+                # 在 Cortex-A72 上 int8 走 NEON dot-product 路徑，
+                # 【推論】約 1.5~2 倍——這比換任何模型都便宜。
+                #
+                # ⚠ 仍然是【推論】，上機要用 8/18 驗證清單段九實測 RTF 對照。
+                # 想退回舊行為（例如懷疑準確率掉了）：`-p prefer_int8_model:=false`
+                def _pick(stem):
+                    """同一個 stem 有 int8 就用 int8，沒有就退回 fp32。
+
+                    ★ 刻意不加 `-> Path` 型別標註：這個檔沒有 `from pathlib import Path`
+                      （`asr_model_dir` 是 `get_model_path()` 回傳的），
+                      標註會在 def 當下就 NameError。
+                    """
+                    if self.prefer_int8_model:
+                        cand = asr_model_dir / f"{stem}.int8.onnx"
+                        if cand.exists():
+                            return cand
+                    return asr_model_dir / f"{stem}.onnx"
+
+                encoder_file = _pick("encoder-epoch-99-avg-1")
+                decoder_file = _pick("decoder-epoch-99-avg-1")
+                joiner_file = _pick("joiner-epoch-99-avg-1")
                 tokens_file = asr_model_dir / "tokens.txt"
 
                 if not all(f.exists() for f in [encoder_file, decoder_file, joiner_file, tokens_file]):
@@ -270,6 +311,13 @@ class SpeechRecognizerNode(Node):
                     return
 
                 self.get_logger().info(f"載入 ASR 模型: {asr_model_dir}")
+                # ★ 逐檔印出精度與大小。這是唯一能證明「int8 真的生效」的憑據——
+                #   `ros2 param get` 只會告訴你參數是 true，不會告訴你檔案存不存在。
+                for label, f in (("encoder", encoder_file), ("decoder", decoder_file),
+                                 ("joiner", joiner_file)):
+                    prec = "int8" if ".int8." in f.name else "fp32"
+                    self.get_logger().info(
+                        f"    {label}: {prec}  {f.stat().st_size / 1024 / 1024:.0f} MB  ({f.name})")
 
                 # ★★ 2026-08-14：啟用熱詞（contextual biasing）★★
                 #
