@@ -153,6 +153,21 @@ class VoiceTriggerNode(Node):
 
         # 三階段狀態機
         self._state = TriggerState.IDLE
+        # ★★ 2026-08-19：知道「機器人正在講話」★★
+        #
+        # 平板固定在車上，所以麥克風**一定**會收到 TTS 的聲音，而且又近又大聲。
+        # 後果不是「多辨識一句」那麼單純：
+        #   VAD 會被持續的 TTS 聲音一路判成「還在講話」-> COMMAND 狀態不結束
+        #   -> 同一個 ASR stream 被餵好幾句 -> 黏句、重複、記憶體成長。
+        #
+        # ★ 但**不能**直接把音訊丟掉：使用者指出「VIP 或訪客不一定可以觸發語音輸入」。
+        #   客人常在機器人講到一半時插話，丟掉音訊等於聽不到他們。
+        #
+        # 折衷：TTS 開始與結束時**強制切句**（把目前累積的送出去、回到 IDLE），
+        # 音訊照收。這樣 TTS 那一段會變成一句獨立的（由 ASR 的文字層回音過濾丟掉），
+        # 客人插話的部分則是另一句，不會黏在一起。
+        self._tts_active = False
+        self.create_subscription(Bool, "playback_status", self._playback_cb, 10)
         self._lock = threading.Lock()
 
         # Idle 階段：連續 VAD 正幀計數，用於檢測語音起點
@@ -319,6 +334,27 @@ class VoiceTriggerNode(Node):
                 self.get_logger().info("✓ 麥克風錄製已停止")
             except Exception as e:
                 self.get_logger().error(f"✗ 停止麥克風錄製失敗: {e}")
+
+    def _playback_cb(self, msg: Bool) -> None:
+        """機器人開始／結束講話。★ 在**邊界**強制切句，不丟音訊。"""
+        active = bool(msg.data)
+        if active == self._tts_active:
+            return
+        self._tts_active = active
+        with self._lock:
+            in_command = self._state == TriggerState.COMMAND
+        if in_command:
+            # 邊界切句：讓 ASR 收到 is_final，把目前這段收乾淨，
+            # 否則 TTS 的聲音會跟客人的話黏在同一個 stream 裡。
+            #
+            # ★ `_set_state(IDLE)` 本身**不會**送 is_final（只是重置計數器），
+            #   所以要自己補一個帶 is_final 的音訊塊。
+            # ★ 不能送空陣列 —— 辨識端 `if len(audio) == 0: return`
+            #   會直接丟掉，連 is_final 都不會處理。送一小段靜音。
+            self.get_logger().info(
+                f"🔀 TTS {'開始' if active else '結束'}，強制切句（音訊照收，客人仍可插話）")
+            self._publish_audio(np.zeros(512, dtype=np.float32), is_final=True)
+            self._set_state(TriggerState.IDLE)
 
     def _set_state(self, new_state: TriggerState) -> None:
         """轉移到新狀態
