@@ -310,6 +310,10 @@ class PathTeachNode(Node):
         self.declare_parameter("max_yaw_error_deg", 40.0)
         self.declare_parameter("warn_yaw_error_deg", 25.0)
         self.declare_parameter("yaw_error_strikes", 8)
+        # 折返（三點轉向）之後的姿態判別寬限。三點轉向就是「刻意與路徑成大角度」，
+        # 不給寬限的話 14 個折返的路徑會在每一個轉角被中止。
+        # 8.0 秒 = 停穩(cusp_pause) + 轉出來的時間，實測三點轉向約 5~7 秒。
+        self.declare_parameter("cusp_yaw_grace_sec", 8.0)
         # ★★ 2026-08-10：最小轉彎半徑分左右，不是一個數字 ★★
         #
         # 這台車左右轉的能力差 26%，而且是**設計必然、不是故障**。
@@ -547,6 +551,7 @@ class PathTeachNode(Node):
         self.max_yaw_err = math.radians(abs(float(p("max_yaw_error_deg").value)))
         self.warn_yaw_err = math.radians(abs(float(p("warn_yaw_error_deg").value)))
         self.yaw_strikes_max = max(1, int(p("yaw_error_strikes").value))
+        self.cusp_yaw_grace = abs(float(p("cusp_yaw_grace_sec").value))
         self.min_radius = float(p("min_turning_radius").value)
         # 左右分開的最小轉彎半徑（見宣告處的長註解）。
         # 韌體是原廠的、不動它——不對稱在 ROS 2 端補償。
@@ -1856,6 +1861,7 @@ class PathTeachNode(Node):
         last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
         yaw_strikes = 0            # 朝向誤差連續超標次數（姿態判別）
         yaw_warned = False
+        last_cusp_t = 0.0          # 上次折返換向的時刻（姿態判別寬限期用）
         prog_t = time.monotonic()
         # 每個路徑點的累計弧長，給進度檢查用（見迴圈裡的說明）
         path_s = [0.0] * len(pts)
@@ -1910,8 +1916,17 @@ class PathTeachNode(Node):
             #   所以重播時**不分方向，一律直接比 yaw**。
             #   加 π 會讓倒車段每一個週期都報 180 度誤差、立刻中止。
             _yaw_err = abs(norm_angle(yaw - pts[idx].yaw))
-            _yaw_grace = (self.escape_grace > 0.0 and last_escape_t > 0.0
-                          and time.monotonic() - last_escape_t < self.escape_grace)
+            # ★★ 寬限期要涵蓋**兩種**刻意偏離朝向的動作，缺一個就會誤中止 ★★
+            #   (a) 脫困：車子被推開，朝向本來就會亂
+            #   (b) 折返（三點轉向）：**車子刻意與路徑成大角度**，這正是三點轉向
+            #       的定義。而折返點的處理在本檔更下面（約 2117 行），
+            #       姿態判別跑在它**之前** —— 只給脫困寬限的話，
+            #       14 個折返的路徑會被反覆中止在每一個轉角。
+            _now = time.monotonic()
+            _yaw_grace = (
+                (self.escape_grace > 0.0 and last_escape_t > 0.0
+                 and _now - last_escape_t < self.escape_grace)
+                or (last_cusp_t > 0.0 and _now - last_cusp_t < self.cusp_yaw_grace))
             if _yaw_err > self.max_yaw_err and not _yaw_grace:
                 yaw_strikes += 1
                 if yaw_strikes >= self.yaw_strikes_max:
@@ -2122,6 +2137,7 @@ class PathTeachNode(Node):
                 self.get_logger().info(f"折返點：{was} -> {now_dir}")
                 time.sleep(self.cusp_pause)
                 cur_dir = pts[idx].direction
+                last_cusp_t = time.monotonic()   # 開始姿態判別寬限期（三點轉向會刻意歪）
                 move_hist.clear()   # 折返是刻意停車，不是卡住
                 sig_hist.clear()
                 continue

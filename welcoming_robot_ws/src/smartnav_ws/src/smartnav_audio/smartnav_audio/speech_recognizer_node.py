@@ -160,7 +160,6 @@ class SpeechRecognizerNode(Node):
         self.max_utterance_sec = self.get_parameter("max_utterance_sec").get_parameter_value().double_value
         self.queue_warn_depth = self.get_parameter("queue_warn_depth").get_parameter_value().integer_value
         self._stream_samples = 0          # 目前這個 stream 已經吃進多少取樣點
-        self.create_subscription(String, "speech_text", self._tts_cb, 10)
         self._queue_warned = False
 
         # 端點偵測（2026-08-17）。★ `_sherpa_endpoint_ok` 是**執行期**的能力旗標：
@@ -230,6 +229,13 @@ class SpeechRecognizerNode(Node):
         self.is_playing = False
         self._playing_until = 0.0
         self._playing_lock = threading.Lock()
+        # ★ 這個訂閱一定要**在 `_playing_lock` 建立之後**才註冊。
+        #   原本寫在參數區（第 163 行附近），而 lock 在這裡才建立。
+        #   今天不會炸是因為 rclpy 要 spin 起來才會派送回呼，而 spin 在
+        #   __init__ 之後；但只要有人把節點改成建構期就 spin（例如加進
+        #   已在跑的 executor），`_tts_cb` 就會 AttributeError。
+        #   這種順序相依是隱形的，順手排掉。
+        self.create_subscription(String, "speech_text", self._tts_cb, 10)
 
         self.callback_group = ReentrantCallbackGroup()
 
