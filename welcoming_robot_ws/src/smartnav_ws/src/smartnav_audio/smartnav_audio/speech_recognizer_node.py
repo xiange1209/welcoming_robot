@@ -5,6 +5,7 @@
 訂閱音訊話題，將音訊轉換為文字
 """
 
+import time
 import queue
 import threading
 from typing import Optional
@@ -159,6 +160,7 @@ class SpeechRecognizerNode(Node):
         self.max_utterance_sec = self.get_parameter("max_utterance_sec").get_parameter_value().double_value
         self.queue_warn_depth = self.get_parameter("queue_warn_depth").get_parameter_value().integer_value
         self._stream_samples = 0          # 目前這個 stream 已經吃進多少取樣點
+        self.create_subscription(String, "speech_text", self._tts_cb, 10)
         self._queue_warned = False
 
         # 端點偵測（2026-08-17）。★ `_sherpa_endpoint_ok` 是**執行期**的能力旗標：
@@ -214,7 +216,19 @@ class SpeechRecognizerNode(Node):
         self.worker_thread = threading.Thread(target=self._process_audio_queue, daemon=True)
         self.worker_thread.start()
 
+        # ★★ 2026-08-19：接上 TTS 靜音 —— 這個旗標原本是死碼 ★★
+        #
+        # `is_playing` 只在這裡被設成 False，**全檔沒有任何地方設成 True**，
+        # 所以第 470/507 行那兩道防護從來沒生效過。實機症狀：
+        # 機器人講完迎賓詞，自己的聲音被麥克風收回去、被辨識成使用者輸入，
+        # 於是對話變得很亂（使用者原話：「他會辨識到自己朗讀的話導致會很亂」）。
+        #
+        # 訂 /speech_text（TTS 的入口）當作「開始講話」的訊號，
+        # 依字數估播放時間再自動解除。★ 用估計而不是等 TTS 回報結束，
+        # 是因為 TTS 端沒有發布「講完了」的話題 —— 加一個新話題要動兩個包，
+        # 而估計已經夠用（寧可多靜音一點，也不要把自己的聲音當成使用者輸入）。
         self.is_playing = False
+        self._playing_until = 0.0
         self._playing_lock = threading.Lock()
 
         self.callback_group = ReentrantCallbackGroup()
@@ -407,6 +421,26 @@ class SpeechRecognizerNode(Node):
                             tf.write("\n".join(clean) + "\n")
                             tf.close()
                             self._hotwords_clean = tf.name      # 保留參考，避免被 GC
+                            # ★★ 2026-08-19：另存一份「繁體、去空白」的熱詞供後處理用 ★★
+                            # 熱詞檔是**簡體且字間有空白**（sherpa 要求的格式），
+                            # 而 _postprocess 拿到的是 opencc 轉過的**繁體連續文字**。
+                            # 要用熱詞當「這個疊字是不是錯的」的判準，就得先對齊這兩點。
+                            _hw = set()
+                            for _w in clean:
+                                _t = _w.split(":")[0].replace(" ", "")
+                                if self.opencc is not None:
+                                    try:
+                                        _t = self.opencc.convert(_t)
+                                    except Exception:
+                                        pass
+                                if len(_t) >= 2:
+                                    _hw.add(_t)
+                            self._hotword_set = _hw
+                            # ★ 一定要印出來：這個集合是「疊字摺疊（熱詞變體）」的唯一依據，
+                            #   空的話那條規則會完全不作用**而且不報錯**。
+                            self.get_logger().info(
+                                f"  後處理用的熱詞集合：{len(_hw)} 個"
+                                f"（範例 {sorted(_hw)[:4]}）")
                             self.get_logger().info(
                                 f"熱詞檔已濾除註解：{len(clean)} 個詞（原檔 {hot_file}）")
                             hot_file = tf.name
@@ -484,6 +518,7 @@ class SpeechRecognizerNode(Node):
 
                 audio, is_final = queue_item
 
+                self._tts_expire()
                 with self._playing_lock:
                     if self.is_playing:
                         self.audio_queue.task_done()
@@ -568,6 +603,7 @@ class SpeechRecognizerNode(Node):
 
             # 檢查流是否已準備好進行解碼
             while self.recognizer.is_ready(self.stream):
+                self._tts_expire()
                 with self._playing_lock:
                     if self.is_playing:
                         return
@@ -665,6 +701,37 @@ class SpeechRecognizerNode(Node):
         "型員": "行員",
     }
 
+    # 中文 TTS 大約每字 0.22 秒；尾巴多留 1.2 秒給播放啟動延遲
+    TTS_SEC_PER_CHAR = 0.22
+    TTS_TAIL_SEC = 1.2
+    # ★ 2026-08-19（筆電端）：靜音的絕對上限。
+    #   平板現在會用 /api/tts_state 回報真實的 onstart/onend，
+    #   但它可能在唸到一半離線、關分頁、瀏覽器被系統回收 —— onend 就永遠不來。
+    #   沒有這個上限，ASR 會永久靜音，而且症狀跟麥克風壞掉完全一樣（最難查的那種）。
+    TTS_MAX_MUTE_SEC = 30.0
+
+    def _tts_cb(self, msg: String) -> None:
+        """收到 /speech_text -> 先按字數估一段靜音時間。
+
+        ★ 這是**後備**：平板連著時 `/api/tts_state` 會送來真實的 onstart/onend，
+          真訊號一到就覆蓋這裡的估計（onend 會直接解除，不必等估計時間到）。
+          平板沒連線時就靠這個估計 —— 但那種情況其實**根本沒出聲**，
+          靜音是白靜的，所以估計值不要調大。
+        """
+        secs = min(len(msg.data) * self.TTS_SEC_PER_CHAR + self.TTS_TAIL_SEC,
+                   self.TTS_MAX_MUTE_SEC)
+        with self._playing_lock:
+            self.is_playing = True
+            self._playing_until = time.time() + secs
+        self.get_logger().info(f"🔇 TTS 播放中，辨識靜音 {secs:.1f} 秒（{len(msg.data)} 字）")
+
+    def _tts_expire(self) -> None:
+        """靜音到期就解除。由音訊回呼順手呼叫，不另外開計時器。"""
+        with self._playing_lock:
+            if self.is_playing and time.time() >= self._playing_until:
+                self.is_playing = False
+                self.get_logger().info("🔊 TTS 播放結束，恢復辨識")
+
     def _postprocess(self, text: str) -> Optional[str]:
         """清洗最終辨識結果。回傳 None 代表這句該丟掉。
 
@@ -708,6 +775,67 @@ class SpeechRecognizerNode(Node):
                 self.get_logger().info(f"✎ 摺疊重複字: '{out}' -> '{collapsed}'")
                 out = collapsed
 
+        # (3b) ★★ 2026-08-19：摺疊連續重複的**詞組**（長度 >= 2）★★
+        #
+        # (3) 只處理單字重複，而且門檻是 3 —— 那個設計是對的（要保護「謝謝」
+        # 「好好」「慢慢」這種正常疊字）。但 8/19 量 CER 時發現**主要的錯誤來源
+        # 是重複，而且是雙字詞組的重複**：
+        #
+        #     「今天的匯率是多少」 -> 「今天的匯匯率是多少多少啊」
+        #                                    ↑↑        ↑↑↑↑
+        #     每一個字都認對了，50% 的 CER 全部來自重複。
+        #
+        # 中文**極少**把一個雙字詞連續講兩次（「多少多少」「開戶開戶」都不是正常說法），
+        # 所以摺疊長度 >= 2 的重複詞組是安全的，而且不會動到單字疊詞。
+        # ★ 刻意**不**降低 (3) 的門檻到 2 —— 那會把「謝謝」變成「謝」。
+        #
+        # 只摺疊「緊鄰的一次重複」（ABAB -> AB），不做更激進的多次摺疊：
+        # 重複三次以上通常代表音訊真的有問題，那種句子本來就不該當成有效輸入。
+        if len(out) >= 4:
+            _before = out
+            for _n in (4, 3, 2):                 # 先長後短，避免長詞被短詞拆散
+                _i = 0
+                _buf = []
+                while _i < len(out):
+                    if (_i + 2 * _n <= len(out)
+                            and out[_i:_i + _n] == out[_i + _n:_i + 2 * _n]):
+                        _buf.append(out[_i:_i + _n])
+                        _i += 2 * _n
+                    else:
+                        _buf.append(out[_i])
+                        _i += 1
+                out = "".join(_buf)
+            if out != _before:
+                self.get_logger().info(f"✎ 摺疊重複詞組: '{_before}' -> '{out}'")
+
+        # (3c) ★★ 2026-08-19：用熱詞把「疊字變體」換回正確的詞 ★★
+        #
+        # (3) 的門檻是 3，刻意不碰兩個字的疊字 —— 中文有「謝謝」「好好」「慢慢」。
+        # 但實測真人講話產生的錯誤**大量正是兩個字的疊字**（`匯匯率`），
+        # 而單靠字形永遠分不出「匯匯（錯）」與「謝謝（對）」。
+        #
+        # ★ 第一版的判準寫錯了：我寫成「摺疊之後如果冒出新熱詞就摺疊」，
+        #   但「匯匯率」**本來就包含**「匯率」這個子字串，所以條件永遠不成立、
+        #   規則一次都沒觸發。
+        #
+        # 正確的做法是反過來：**對每個熱詞產生它的疊字變體，在文字裡找到就換回去**。
+        #     熱詞 匯率 -> 變體 匯匯率 / 匯率率
+        #     文字含「匯匯率」-> 換成「匯率」
+        # 這樣只會動到「已知正確詞的疊字版本」，不會碰任何其他疊字。
+        #
+        # ★ 涵蓋範圍 = 熱詞表的涵蓋範圍。治不了熱詞以外的疊字（例如「今天天」），
+        #   那是刻意的：沒有依據就不要改使用者說的話。
+        _hw = getattr(self, "_hotword_set", None)
+        if _hw:
+            _before = out
+            for _w in _hw:
+                for _k in range(len(_w)):
+                    _var = _w[:_k + 1] + _w[_k] + _w[_k + 1:]
+                    if _var in out:
+                        out = out.replace(_var, _w)
+            if out != _before:
+                self.get_logger().info(f"✎ 疊字摺疊（熱詞變體）: '{_before}' -> '{out}'")
+
         # (4) 同音修正表（保守，只有幾條）
         if self.enable_corrections:
             for wrong, right in self.ASR_CORRECTIONS.items():
@@ -725,9 +853,25 @@ class SpeechRecognizerNode(Node):
         return out
 
     def _playback_status_callback(self, msg: Bool) -> None:
-        """說話狀態回呼函數"""
+        """說話狀態回呼。★ 這是**真實**訊號（平板 speechSynthesis 的 onstart/onend），
+        優先權高於 `_tts_cb` 的字數估計。
+
+        ★★ 這裡有一個一定要處理的互動：`_tts_expire()` 是拿 `_playing_until`
+        跟現在時間比。真實訊號說「開始講」時若不同步把 `_playing_until` 推遠，
+        它還停在上一次的舊值（甚至 0.0），下一個音訊區塊進來就會
+        **立刻解除靜音** —— 真訊號等於沒作用。所以 True 時要一併設定天花板。
+
+        天花板存在的理由：平板可能在唸到一半就離線／關分頁，onend 永遠不來。
+        沒有天花板的話 ASR 會**永久靜音**，而且外觀跟麥克風壞掉一模一樣。
+        """
         with self._playing_lock:
-            self.is_playing = msg.data
+            self.is_playing = bool(msg.data)
+            if self.is_playing:
+                self._playing_until = time.time() + self.TTS_MAX_MUTE_SEC
+            else:
+                self._playing_until = 0.0
+        self.get_logger().info(
+            "🔇 平板回報開始朗讀，辨識靜音" if msg.data else "🔊 平板回報朗讀結束，恢復辨識")
 
         if self.is_playing:
             while not self.audio_queue.empty():

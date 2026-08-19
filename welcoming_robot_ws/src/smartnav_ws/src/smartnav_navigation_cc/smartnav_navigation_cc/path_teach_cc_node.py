@@ -225,9 +225,70 @@ class PathTeachNode(Node):
         # ★ 它不是「最低速度」而是「死區地板」：真正要停車時仍然送 0，
         #   只有**非零但低於死區**的指令才會被抬上來。
         self.declare_parameter("min_move_speed", 0.10)
+        # ★★ 2026-08-19：死區地板要分「想慢慢走」與「想停下來」★★
+        #
+        # 只有地板的第一版有副作用，8/19 實測抓到：一條 15 個折返點的路徑上，
+        # 折返前的煞停指令是 -0.030 m/s，被抬到 -0.100 —— **快了 3.3 倍**，
+        # 於是每個折返點都衝過頭。log 的時序很清楚：
+        #     397.2 折返點：前進 -> 後退
+        #     397~403 連續倒車（0.10 m/s × 5 秒 = 0.5 m，而計畫段可能只有 0.2 m）
+        #     403.7 偏離路徑 61 cm 超過上限 60 cm，中止
+        #
+        # 指令值本身就帶著意圖：
+        #     0.045（障礙減速）  = 想慢慢走 -> 抬到 0.10 只是小失真，可接受
+        #     0.030（折返煞停）  = 想停下來 -> 抬到 0.10 是反向操作，必須送 0
+        #
+        # 低於 min_move_speed × 這個比例就判定為「想停」，直接送 0。
+        # 0.5 的意思是：要求速度不到地板的一半，那它的意圖比較接近停車。
+        # ★ 送 0 不會誤觸發卡住偵測 —— 那個判定要求指令 > 0.05。
+        # ★ 2026-08-19 實測調整：0.5 -> 0.3
+        #   0.5（低於 0.05 就停）在一條 14 折返的路上判定煞停 137 次，
+        #   車子大半時間停著、300 秒逾時。0.3（低於 0.03 才停）讓
+        #   障礙減速的 0.045 仍然被抬起來走，只有真正的「爬到停」才送 0。
+        self.declare_parameter("deadband_stop_ratio", 0.3)
         self.declare_parameter("lookahead_min_m", 0.30)
         self.declare_parameter("lookahead_max_m", 0.80)
         self.declare_parameter("lookahead_k", 1.2)      # L_d = k*|v| + min
+        # ★★ 2026-08-19：倒車時把前視距離放大 ★★
+        #
+        # 使用者實機觀察：「**倒退的部分 超級不準 一直亂撞**」——那是振盪的描述，
+        # 而它有明確的物理原因：**前輪轉向的車子倒車時，等效於用後輪轉向前進**，
+        # 那是非最小相位系統，用跟前進一樣的增益必然振盪。
+        # 純追蹤的阻尼直接由前視距離 L_d 決定（曲率 k = 2y/L_d^2），
+        # L_d 太短 = 增益太高 = 振盪。
+        #
+        # 而現況的數字正好是**反的**：
+        #     前進 L_d = 1.2 x 0.15 + 0.30 = 0.48 m
+        #     倒車 L_d = 1.2 x 0.10 + 0.30 = 0.42 m   <- 倒車更需要長前視，卻更短
+        # 因為 L_d 只跟速度有關，而 reverse_speed(0.10) < follow_speed(0.15)。
+        #
+        # 1.8 讓倒車的 L_d 變成 0.42 x 1.8 = 0.76 m（仍在 lookahead_max 0.80 之內）。
+        # ⚠ 代價：前視越長越「抄近路」，折返點附近的貼合度會變差。
+        #   設 1.0 就回到 2026-08-19 之前的行為。
+        # ★★ 2026-08-19（筆電端）：倒車改以「前軸」為追蹤參考點 ★★
+        #
+        # 使用者需求：**倒退要依照軌跡來導航**。
+        #
+        # 純追蹤在倒車時之所以會飄，不是視距不夠，是**參考點選錯**：
+        # 這台車的 `base_footprint` 就是**後軸**（HMI 車輛圖示那份報告已確認）。
+        # 前進時後軸是「非轉向軸」，純追蹤在數學上穩定；
+        # 倒車時運動學等價於一台「以前軸為非轉向軸」的車，
+        # 繼續拿後軸當參考點就是純追蹤的**不穩定組態** —— 會左右擺。
+        #
+        # 先前用 `lookahead_reverse_scale = 1.8`（視距拉長 1.8 倍）壓住擺動，
+        # 但那是拿**軌跡精度**去換穩定：視距愈長，轉彎切得愈內、離錄製軌跡愈遠。
+        # 正好跟「倒退要依照軌跡」相反。
+        #
+        # 改成倒車時把追蹤參考點沿車頭方向平移一個軸距（0.322 m，廠商值），
+        # 短視距就穩定了，於是 scale 可以收回 1.0 → 貼著軌跡走。
+        # ⚠ 兩者要一起調：把 `reverse_track_front_axle` 關掉時，
+        #   `lookahead_reverse_scale` 要自己調回 1.8，否則倒車會開始擺。
+        self.declare_parameter("reverse_track_front_axle", True)
+        self.declare_parameter("axle_spacing_m", 0.322)
+        self.declare_parameter("lookahead_reverse_scale", 1.0)
+        # 偏離檢查的搜尋視窗（點數）。0 = 整條路徑（2026-08-19 早上的行為）。
+        # 60 點 ≈ 9 m 路徑（每段約 3 點 0.45 m），已遠超任何合理的定位漂移。
+        self.declare_parameter("xte_window_pts", 60)
         # ★★ 2026-08-10：最小轉彎半徑分左右，不是一個數字 ★★
         #
         # 這台車左右轉的能力差 26%，而且是**設計必然、不是故障**。
@@ -303,6 +364,21 @@ class PathTeachNode(Node):
         # 偏離路徑超過這個距離就中止：代表定位跑掉或被推走了，
         # 硬追回去反而危險（純追蹤在大偏差下會畫出很大的弧）
         self.declare_parameter("max_cross_track_m", 0.60)
+        # ★★ 2026-08-19：脫困之後的偏離寬限期 ★★
+        #
+        # 偏離檢查的用途是抓「定位跳掉」或「有人把車推走」。但**脫困動作的本質
+        # 就是刻意離開路徑** —— 8/19 實測一次連續脫困「累計轉了 68 度、每段移動
+        # 0.35 m」，結束時離路徑 78 cm，於是自己觸發了自己的中止條件，
+        # 訊息還寫「可能是定位跑掉」（那時掃描吻合度是 100%）。
+        # 今天三份 log 統計：偏離事件前 60 行內有脫困的是 4/4、4/4、1/4
+        # —— **脫困是主要成因但不是唯一成因**，所以是給寬限期而不是拿掉檢查。
+        #
+        # 寬限期內不做偏離檢查，讓純追蹤有機會把路追回來；
+        # 真的追不回來時，「有下指令但沒推進」那條判定會接手（它不受這裡影響）。
+        # ★ 2026-08-19 實測調整：15.0 -> 25.0。一次三段脫困（累計轉 65 度）之後，
+        #   偏離在**第 15.08 秒**觸發 —— 寬限期有生效，只是差 0.08 秒。
+        #   車子花了 15 秒想追回路徑沒追到，給它更多時間是最小的介入。
+        self.declare_parameter("escape_grace_sec", 25.0)
         self.declare_parameter("cusp_pause_sec", 0.6)
 
         # 障礙
@@ -437,10 +513,16 @@ class PathTeachNode(Node):
         self.follow_speed = float(p("follow_speed").value)
         self.reverse_speed = float(p("reverse_speed").value)
         self.min_move_speed = abs(float(p("min_move_speed").value))
+        self.deadband_stop_ratio = abs(float(p("deadband_stop_ratio").value))
+        self._deadband_stops = 0
         self._deadband_hits = 0
         self.la_min = float(p("lookahead_min_m").value)
         self.la_max = float(p("lookahead_max_m").value)
         self.la_k = float(p("lookahead_k").value)
+        self.la_rev_scale = float(p("lookahead_reverse_scale").value)
+        self.rev_front_axle = bool(p("reverse_track_front_axle").value)
+        self.axle_spacing = abs(float(p("axle_spacing_m").value))
+        self.xte_window = int(p("xte_window_pts").value)
         self.min_radius = float(p("min_turning_radius").value)
         # 左右分開的最小轉彎半徑（見宣告處的長註解）。
         # 韌體是原廠的、不動它——不對稱在 ROS 2 端補償。
@@ -456,6 +538,7 @@ class PathTeachNode(Node):
         self.goal_tol = float(p("goal_tolerance_m").value)
         self.control_dt = 1.0 / max(1.0, float(p("control_rate").value))
         self.max_xte = float(p("max_cross_track_m").value)
+        self.escape_grace = float(p("escape_grace_sec").value)
         self.cusp_pause = float(p("cusp_pause_sec").value)
         self.obs_slow = float(p("obstacle_slow_m").value)
         self.obs_stop = float(p("obstacle_stop_m").value)
@@ -1502,10 +1585,29 @@ class PathTeachNode(Node):
             i += 1
         return len(pts) - 1, pts[-1]
 
+    def _track_ref(self, pose, direction: int) -> Tuple[float, float]:
+        """回傳這個行進方向下的**追蹤參考點**（世界座標）。
+
+        前進 -> 後軸（= base_footprint，原點本身）
+        倒車 -> 前軸（沿車頭方向平移一個軸距）
+
+        ★ 視距點搜尋與純追蹤**必須用同一個點**，否則 `lookahead_reverse_scale`
+          就不等於它字面上的意思（差一個軸距 0.322 m），A/B 會量到假的結果。
+        """
+        x, y, yaw = pose
+        if direction < 0 and self.rev_front_axle:
+            return x + self.axle_spacing * math.cos(yaw), y + self.axle_spacing * math.sin(yaw)
+        return x, y
+
     def _pure_pursuit(self, pose, target: PathPoint, direction: int,
                       speed: float, lateral_offset: float) -> Tuple[float, float]:
         """回傳 (linear, angular)"""
         x, y, yaw = pose
+        # ★ 倒車時把追蹤參考點從後軸移到前軸（見 __init__ 的長註解）。
+        #   前進時不動 —— 前進的參考點本來就該是後軸。
+        if direction < 0 and self.rev_front_axle:
+            x += self.axle_spacing * math.cos(yaw)
+            y += self.axle_spacing * math.sin(yaw)
         # 目標點轉到車體座標
         dx, dy = target.x - x, target.y - y
         c, s = math.cos(-yaw), math.sin(-yaw)
@@ -1581,6 +1683,14 @@ class PathTeachNode(Node):
             return lin, ang
         if abs(lin) >= self.min_move_speed:
             return lin, ang
+        # 要求速度低到「意圖是停車」-> 送 0，不要硬抬（見 deadband_stop_ratio 的說明）
+        if abs(lin) < self.min_move_speed * self.deadband_stop_ratio:
+            self._deadband_stops += 1
+            if self._deadband_stops % 20 == 1:
+                self.get_logger().info(
+                    f"指令 {lin:+.3f} m/s 低於死區一半，判定為煞停，送 0"
+                    f"（累計 {self._deadband_stops} 次）")
+            return 0.0, 0.0
         scale = self.min_move_speed / abs(lin)
         self._deadband_hits += 1
         # 每 20 次報一次：頻繁觸發代表規劃出來的速度整段都在死區裡，
@@ -1719,6 +1829,7 @@ class PathTeachNode(Node):
         escapes = 0
         sig_hist: List[Tuple[float, List[float]]] = []   # 打滑偵測用的掃描簽章歷史
         prog_idx = -1
+        last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
         prog_t = time.monotonic()
         # 每個路徑點的累計弧長，給進度檢查用（見迴圈裡的說明）
         path_s = [0.0] * len(pts)
@@ -1764,14 +1875,55 @@ class PathTeachNode(Node):
                 return result
 
             # ── 偏離檢查 ──
-            xte = math.hypot(pts[idx].x - x, pts[idx].y - y)
-            if xte > self.max_xte:
+            #
+            # ★★ 2026-08-19：不能用 pts[idx] 算，要對**整條路徑**算 ★★
+            #
+            # `_closest_index` 刻意只在「目前行進方向的路段」裡找最近點
+            # （見它的 docstring —— 那個限制本身是對的，折返路徑會自我交叉，
+            # 純 argmin 會讓索引跳過折返動作）。但把同一個 idx 拿來當偏離量
+            # 就錯了：折返點多的路徑每段很短，
+            #
+            #     42 點 ÷ 14 個折返 ≈ 每段 3 個點 ≈ 0.45 m
+            #
+            # 車子在 0.45 m 的路段裡做調姿動作，離「那一段的三個點」很容易就
+            # 超過 0.60 m —— 即使它其實正貼著下一段的路徑。
+            # 8/19 實測：14 折返的路徑連續四趟都在 60~61 cm 中止，
+            # 而同時 costmap 顯示車子中心成本只有 38、兩側各有 0.5 m。
+            #
+            # 所以拆成兩件事：**追蹤**仍用受限的 idx（維持折返偵測正確），
+            # **「我是不是迷路了」**對整條路徑取最小距離。
+            # 後者才是這個檢查真正想問的問題（訊息本身寫的就是「定位跑掉或車子被推動」）。
+            # ★ 2026-08-19（筆電端）在上面那個修正之上再加兩件事：
+            #   (a) 只在 idx 附近的視窗裡找，不掃整條路徑。
+            #       整條路徑取 min 有一個安全漏洞：走廊是來回的，
+            #       車子跑到**對向那條腿**上時離「某個點」仍然很近，
+            #       於是「我是不是迷路了」這個檢查會靜默通過。
+            #       視窗 60 點 ≈ 9 m，足以涵蓋十幾個折返段，
+            #       但擋得住「整條路徑對折」那種誤判。
+            #   (b) 先比平方距離、最後才開一次根號。
+            #       這段每個控制週期都跑，624 點的教導路徑原本是
+            #       每秒上萬次 hypot()，而 ASR 的 RTF 餘裕只有 24%。
+            if self.xte_window > 0:
+                _lo = max(0, idx - self.xte_window)
+                _hi = min(len(pts), idx + self.xte_window + 1)
+                _seg = pts[_lo:_hi]
+            else:
+                _seg = pts
+            xte = math.sqrt(min((p.x - x) ** 2 + (p.y - y) ** 2 for p in _seg))
+            in_grace = (self.escape_grace > 0.0 and last_escape_t > 0.0
+                        and time.monotonic() - last_escape_t < self.escape_grace)
+            if xte > self.max_xte and not in_grace:
                 self._stop()
                 goal_handle.abort()
                 result.success = False
+                # ★ 剛脫困過就別把帳算到定位頭上 —— 那時候車子是被**我們自己**
+                #   移開的。訊息講錯會讓現場往「重新定位」的方向排查，白花時間。
+                recent_escape = (last_escape_t > 0.0
+                                 and time.monotonic() - last_escape_t < self.escape_grace * 2.0)
+                why = ("脫困把車子移開後追不回原路徑，需要重新規劃"
+                       if recent_escape else "可能是定位跑掉或車子被推動")
                 result.message = (f"偏離路徑 {xte * 100:.0f} cm 超過上限 "
-                                  f"{self.max_xte * 100:.0f} cm，已停車。"
-                                  f"可能是定位跑掉或車子被推動")
+                                  f"{self.max_xte * 100:.0f} cm，已停車。{why}")
                 self.get_logger().warn(result.message)
                 return result
 
@@ -1880,6 +2032,7 @@ class PathTeachNode(Node):
                         f"嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
                     self._stop(3)
                     if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
+                        last_escape_t = time.monotonic()   # 開始偏離寬限期
                         prog_t = time.monotonic()
                         avoid_offset = 0.0
                         wait_started = 0.0
@@ -1930,9 +2083,11 @@ class PathTeachNode(Node):
             #
             # 先算一次純追蹤的曲率當預覽（下面真正下指令時會用當時的速度
             # 重算，兩者的曲率一致——曲率只跟目標點幾何有關，與速度無關）。
-            _pv_ld = max(self.la_min, min(self.la_max, self.la_k * abs(
-                self.follow_speed if cur_dir > 0 else self.reverse_speed) + self.la_min))
-            _pv_i, _pv_tgt = self._lookahead_point(pts, idx, x, y, _pv_ld)
+            _pv_ld = max(self.la_min, min(self.la_max,
+                (self.la_k * abs(self.follow_speed if cur_dir > 0 else self.reverse_speed)
+                 + self.la_min) * (self.la_rev_scale if cur_dir < 0 else 1.0)))
+            _rx, _ry = self._track_ref(pose, cur_dir)
+            _pv_i, _pv_tgt = self._lookahead_point(pts, idx, _rx, _ry, _pv_ld)
             _pv_v, _pv_w = self._pure_pursuit(pose, _pv_tgt, cur_dir, 1.0, avoid_offset)
             preview_curv = (_pv_w / abs(_pv_v)) if abs(_pv_v) > 1e-6 else 0.0
             # ★ 往前看的距離必須**大於**拿來比的門檻 ★
@@ -1982,6 +2137,7 @@ class PathTeachNode(Node):
                             f"等了 {waited:.0f} 秒仍不通，嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
                         _t_esc = time.monotonic()
                         if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
+                            last_escape_t = time.monotonic()   # 開始偏離寬限期
                             wait_started = 0.0
                             avoid_offset = 0.0
                             state = "following"
@@ -2057,8 +2213,13 @@ class PathTeachNode(Node):
                         f"目標往{'左' if wall_push > 0 else '右'}推 {abs(wall_push)*100:.0f} cm")
 
             # ── 純追蹤 ──
-            ld = max(self.la_min, min(self.la_max, self.la_k * abs(speed) + self.la_min))
-            _tgt_i, target = self._lookahead_point(pts, idx, x, y, ld)
+            # 倒車放大前視以阻尼振盪（見 lookahead_reverse_scale 的說明）
+            _la_scale = self.la_rev_scale if cur_dir < 0 else 1.0
+            ld = max(self.la_min,
+                     min(self.la_max,
+                         (self.la_k * abs(speed) + self.la_min) * _la_scale))
+            _rx, _ry = self._track_ref(pose, cur_dir)
+            _tgt_i, target = self._lookahead_point(pts, idx, _rx, _ry, ld)
             total_off = avoid_offset + wall_push
             lin, ang = self._pure_pursuit(pose, target, cur_dir, abs(speed), total_off)
 

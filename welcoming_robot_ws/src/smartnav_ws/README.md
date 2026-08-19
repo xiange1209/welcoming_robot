@@ -7,6 +7,24 @@
 
 **SmartNav** 是一個基於 ROS 2 Jazzy 的智慧導航機器人系統，整合了視覺辨識、語音介面與自主導航功能，實現高度智能化的人機互動與環境感知能力。
 
+> ## ⚠️ 這份文件描述的是 2026-07 的架構，部分內容已經作廢
+>
+> 2026-07-29 的 vision 重構把辨識拆成「vision 只抽向量、brain 負責比對」，
+> 以下名稱**已經不存在**，本文件中提到它們的地方一律作廢：
+>
+> | 已刪除 | 現在是 |
+> |---|---|
+> | `face_recognition_node` / `face_registration_node` | `face_embedding_node`（vision）＋ `user_auth_node`（brain） |
+> | `recognition_text_bridge_node` | 已移除——人臉事件不再經過 LLM，直接進 `bank_reception_node` 的劇本 |
+> | `smartnav_vision/database_manager.py` | `smartnav_brain/user_manager.py` |
+> | `RecognitionResult.msg`、`/face_recognition/result` | `UserIdentity.msg`、`/user_identity` |
+> | 欄位 `person_name` / `person_type` / `gender` / `confidence` | `user_name` / `user_type` / （已移除）/ `similarity` |
+>
+> ★ 特別注意：`ros2 topic echo /face_recognition/result` **不會報錯**，
+> 它只是**永遠沒有輸出**——這是這個專案最常見的失敗型態。
+>
+> **現行架構、實測數據與操作方式請看 [儲存庫根目錄的 README](../../../README.md)。**
+
 ## 📋 目錄
 
 - [主要功能](#-主要功能)
@@ -90,7 +108,7 @@ SmartNav System Architecture
 **核心模組**：
 
 - [`face_engine.py`](src/smartnav_vision/smartnav_vision/face_engine.py)：InsightFace 引擎封裝
-- [`database_manager.py`](src/smartnav_vision/smartnav_vision/database_manager.py)：人臉特徵向量資料庫管理
+- ~~`database_manager.py`：人臉特徵向量資料庫管理~~ → **已刪除**，改為 `smartnav_brain/user_manager.py`
 - [`face_utils.py`](src/smartnav_vision/smartnav_vision/face_utils.py)：通用人臉處理工具函數
 
 **依賴**：
@@ -399,7 +417,7 @@ smartnav_ws/
 │   ├── smartnav_vision/            # 視覺模組（Python）
 │   │   ├── smartnav_vision/        # 套件代碼
 │   │   │   ├── face_engine.py      # InsightFace 引擎
-│   │   │   ├── database_manager.py # 特徵向量資料庫管理
+│   │   │   ├── (database_manager.py 已刪除，見文件開頭的對照表)
 │   │   │   ├── face_recognition_node.py
 │   │   │   ├── face_registration_node.py
 │   │   │   └── __init__.py

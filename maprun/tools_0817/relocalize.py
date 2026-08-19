@@ -34,6 +34,17 @@ import tf2_ros
 LX_OFF, LY_OFF = 0.08874, 0.00067      # 雷射相對 base_footprint（robot_model.yaml）
 
 DO_SET = "--set" in sys.argv
+# ★★ 2026-08-19：預設只搜「目前朝向 ±90 度」，不再盲搜完整 360 度 ★★
+#
+# 走廊 180 度對稱害這支工具連續三次回報「分不出來」（100.0% vs 99.3%、
+# 兩個解剛好差 180 度）。但那個歧義**只存在於雷射資料裡** ——
+# 里程計完全知道車頭朝哪：車子沒有被人抬起來轉半圈，
+# 而輪子轉了半圈的話 odom 一定會看到。搜完整 360 度等於主動把這個先驗丟掉。
+#
+# 所以預設信任目前 tf 的朝向到 ±90 度，只用掃描匹配做細修。
+# ★ 什麼時候要用 `--free360`：**車子被人搬動過或抬起來過**（odom 沒看到那段位移），
+#   例如開機時、或使用者說「我把它搬回原點了」。那時先驗才是不可信的。
+FREE360 = "--free360" in sys.argv
 _spans = [a for a in sys.argv[1:] if not a.startswith("--")]
 SPAN = float(_spans[0]) if _spans else 2.0
 
@@ -126,7 +137,11 @@ def main():
     cands = []
     nxy = int(SPAN / 0.10)
     t0 = time.time()
-    for iy in range(72):                                  # 5 度一格，完整 360
+    # 5 度一格。預設 ±90 度（37 格），--free360 才掃完整 360 度（72 格）
+    yaw_range = range(72) if FREE360 else range(-18, 19)
+    print(f"  朝向搜尋範圍：{'完整 360 度（--free360）' if FREE360 else '目前朝向 ±90 度'}"
+          f"　—— 里程計知道車頭朝哪，盲搜 360 度會自己製造 180 度歧義")
+    for iy in yaw_range:
         yaw = cur[2] + math.radians(iy * 5.0)
         for ix in range(-nxy, nxy + 1):
             x = cur[0] + ix * 0.10

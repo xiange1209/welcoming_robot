@@ -167,6 +167,25 @@ class BankReceptionNode(Node):
             import yaml
             with open(self.SECRETS_PATH, "r", encoding="utf-8") as fh:
                 data = yaml.safe_load(fh) or {}
+            # ★★ 2026-08-19：ROS 參數檔格式也要吃 ★★
+            #
+            # 實機踩到：密鑰檔是用 **ROS 參數檔格式**寫的
+            #     /**:
+            #       ros__parameters:
+            #         notify_backend: telegram
+            # 而這裡原本只讀扁平鍵，於是 `data.get("notify_backend")` 讀到 None，
+            # **安靜地退回 dry-run** —— log 印「✓ 已從密鑰檔載入」但 backend=none、
+            # token=無，看起來像「檔案裡沒東西」而不是「格式沒對上」。
+            #
+            # 兩種格式都合理（ROS 格式還能直接餵 `--params-file`），所以接受兩種，
+            # 不要求使用者改檔案 —— 改檔案的那一刻權杖就有可能被複製到別的地方。
+            for _k in ("/**", "/*", "**"):
+                if isinstance(data.get(_k), dict) and "ros__parameters" in data[_k]:
+                    data = data[_k]["ros__parameters"] or {}
+                    break
+            else:
+                if "ros__parameters" in data and isinstance(data["ros__parameters"], dict):
+                    data = data["ros__parameters"] or {}
             backend = str(data.get("notify_backend", "") or "")
             token = str(data.get("telegram_bot_token", "") or "")
             chat = str(data.get("telegram_chat_id", "") or "")

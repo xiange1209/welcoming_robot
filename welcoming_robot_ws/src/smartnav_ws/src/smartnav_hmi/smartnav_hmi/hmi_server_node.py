@@ -1027,6 +1027,20 @@ class HmiServerNode(Node):
         self.create_subscription(String, "llm_model", self._llm_model_cb, latched_qos, callback_group=cb)
         self.create_subscription(String, "speech_text", self._speech_text_cb, 10, callback_group=cb)
         self.create_subscription(Bool, "playback_status", self._playback_cb, 10, callback_group=cb)
+        # ★★ 2026-08-19：平板瀏覽器回報真實的 TTS 起訖 ★★
+        #
+        # 車上沒有喇叭，出聲是平板的 `speechSynthesis`，所以
+        # `playback_status` 這個話題**從來沒有人發布過** ——
+        # ASR 那端訂了它（speech_recognizer_node.py:262）卻永遠收不到，
+        # 於是「機器人聽到自己講話」只能靠字數估時間（0.22 秒/字）擋。
+        #
+        # 估計有兩個真實的壞處：
+        #   1. 100 字的回覆 -> 靜音 23 秒，這段期間客人講什麼都聽不到
+        #   2. **平板沒連線時 TTS 根本沒響，卻照樣靜音** —— 白聾一場
+        #
+        # 瀏覽器的 SpeechSynthesisUtterance 有 onstart/onend，那是真訊號。
+        # 讓它回報，這裡轉發成 ROS 話題，估計值降級成「收不到 onend 時的天花板」。
+        self.playback_pub = self.create_publisher(Bool, "playback_status", 10)
         if self.enable_map:
             self.create_subscription(OccupancyGrid, map_topic, self._map_cb, latched_qos, callback_group=cb)
         # map_service_node 發布的是 std_msgs/String（內容為 map_id），不是 MapInfo
@@ -4040,6 +4054,22 @@ class HmiServerNode(Node):
                 return JSONResponse({"success": False, "message": "內容不可為空"}, status_code=400)
             self.user_text_pub.publish(String(data=text))
             return JSONResponse({"success": True, "message": "已送出"})
+
+        @app.post("/api/tts_state")
+        async def api_tts_state(req: Request) -> JSONResponse:
+            """平板回報 speechSynthesis 的起訖。★ 蓄意不需要登入：
+
+            它不會讓車子動、不改任何狀態，只是把「我正在唸」告訴 ASR。
+            要求登入反而會讓未登入的展示平板變成「機器人聽自己講話」。
+            """
+            try:
+                body = await req.json()
+            except Exception:
+                body = {}
+            active = bool(body.get("active"))
+            self.playback_pub.publish(Bool(data=active))
+            self.state.set_system(speaking=active)
+            return JSONResponse({"ok": True, "active": active})
 
         @app.post("/api/speak")
         async def api_speak(req: SayRequest) -> JSONResponse:

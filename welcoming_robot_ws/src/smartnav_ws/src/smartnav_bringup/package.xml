@@ -3,13 +3,19 @@
 <package format="3">
   <name>smartnav_bringup</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>統一啟動（★ 2026-08 現況：只有套件骨架，尚無 launch 檔）</description>
   <maintainer email="swient@todo.todo">swient</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclpy</depend>
+  <!-- ★ 2026-08-19 補上：CMakeLists.txt 有 find_package(nav2_bringup REQUIRED)，
+       但這裡一直沒宣告。後果只在**乾淨機器**上才會顯現 ——
+       rosdep 抓不到它，colcon 直接炸在 CMake 找不到套件，
+       而錯誤訊息不會告訴你「是 package.xml 漏了」。
+       專案有 Pi4重灌重建指南，重灌是真的會發生的事。 -->
+  <depend>nav2_bringup</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

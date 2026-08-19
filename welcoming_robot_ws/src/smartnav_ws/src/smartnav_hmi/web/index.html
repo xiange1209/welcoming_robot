@@ -1730,8 +1730,24 @@ function ttsSay(text) {
   if (tts.voice) u.voice = tts.voice;
   u.lang = (tts.voice && tts.voice.lang) || "zh-TW";
   u.rate = tts.rate;
+  // ★ 2026-08-19：把真實的起訖回報給機器人，讓 ASR 在這段期間靜音。
+  //   在此之前 ASR 只能用字數估播放時間（0.22 秒/字），兩個壞處：
+  //   100 字的回覆會讓它聾 23 秒；平板沒連線時根本沒出聲卻照樣靜音。
+  //   onend 與 onerror 都要回報 —— 只綁 onend 的話，唸到一半失敗就會卡在「播放中」。
+  u.onstart = () => ttsReport(true);
+  u.onend   = () => ttsReport(false);
+  u.onerror = () => ttsReport(false);
   speechSynthesis.cancel();   // 上一句還沒唸完就被新回覆蓋過時不要排隊，直接換
   speechSynthesis.speak(u);
+}
+
+/** 回報 TTS 起訖。失敗就算了 —— ASR 端還有字數估計當後備，不要因此擋住播報 */
+function ttsReport(active) {
+  fetch("/api/tts_state", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({active}),
+  }).catch(() => {});
 }
 
 /** 只唸「新出現的、已完成的」機器人訊息；串流中的 ghost 不唸，否則會逐字重唸 */
