@@ -1448,6 +1448,45 @@ class PathTeachNode(Node):
         except Exception as exc:
             self.get_logger().warning(f"切換車尾遮蔽失敗: {exc}")
 
+    def _arc_clearance_robust(self, direction: int, curv_cmd: float,
+                              curv_meas, max_dist: float,
+                              lateral_offset: float = 0.0) -> float:
+        """對「車子可能實際走出來」的一組曲率取**最保守**的淨空。
+
+        ★★ 為什麼不能只用指令曲率 ★★
+
+        `_arc_clearance` 的運動學是對的，但它是**理想模型**，隱含兩個假設，
+        而本專案已經實測到兩個都不成立：
+
+          1. **舵角瞬間到位** —— 實際上舵機有響應延遲。折返點打滿舵的瞬間
+             車子已經開始動，但舵還沒到位，那一段實際走的接近**上一個曲率**
+             （常常是直線）。
+          2. **實際曲率 = 指令曲率** —— 實測是**欠轉**：
+             `minimum_turning_radius` 設 0.80 時「指令看起來對、車子卻一路往右漂」，
+             因為舵機根本轉不到那麼多（左極限 0.944 / 右極限 0.751）。
+
+        ★ 兩種偏差**方向一致**：都讓車子比預測**更直**，也就是更貼外側的牆。
+          所以取「指令 / 實測 / 直線」三者的最小淨空，剛好涵蓋這個誤差方向。
+
+        ★ 只在真的在轉彎時才做（|κ| > 0.1，約 R < 10 m）。
+          直線行駛時三個候選都一樣，白算三次會吃掉 Pi 的 CPU
+          （這段每個控制週期都跑，而 ASR 的 RTF 餘裕只有 24%）。
+        """
+        base = self._arc_clearance(direction, curv_cmd, max_dist=max_dist,
+                                   lateral_offset=lateral_offset)
+        if abs(curv_cmd) <= 0.1:
+            return base
+        worst = base
+        cands = [0.0]                       # 舵機還沒到位 = 直線
+        if curv_meas is not None and abs(curv_meas - curv_cmd) > 0.05:
+            cands.append(curv_meas)         # 車子實際在做的
+        for c in cands:
+            d = self._arc_clearance(direction, c, max_dist=max_dist,
+                                    lateral_offset=lateral_offset)
+            if d < worst:
+                worst = d
+        return worst
+
     def _body_margin(self, direction: int) -> Tuple[float, float]:
         """車身矩形到最近障礙的**真實距離**，回傳 (行進方向側, 全方位最小)。
 
@@ -1948,6 +1987,10 @@ class PathTeachNode(Node):
         last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
         # ★ 自主重播 = 沒有人跟在車後 -> 全 360 度偵測（見 _set_scan_mask）
         self._set_scan_mask(False)
+        # 實際走出來的曲率（Δyaw / Δs）。用來對照指令曲率，
+        # 涵蓋舵機延遲與欠轉 —— 見 _arc_clearance_robust。
+        prev_pose_for_curv = None
+        curv_meas = None
         yaw_strikes = 0            # 朝向誤差連續超標次數（姿態判別）
         yaw_warned = False
         last_cusp_t = 0.0          # 上次折返換向的時刻（姿態判別寬限期用）
@@ -2272,6 +2315,17 @@ class PathTeachNode(Node):
             # ★ 倒車時特別重要：車尾只在原點後 0.09 m、車頭有 0.40 m，
             #   同樣的預測誤差倒車會先撞。而且阿克曼打方向時車頭會外甩，
             #   `any_margin` 就是為了抓「轉彎時前角刮到側牆」這種側向接觸。
+            # 實際走出來的曲率 = Δyaw / Δs（不必訂 odom，位姿每個週期都有）。
+            # ★ 只在真的有移動時更新：靜止時 Δs≈0，除下去會爆出巨大的假曲率。
+            if prev_pose_for_curv is not None:
+                _px, _py, _pyaw = prev_pose_for_curv
+                _ds = math.hypot(x - _px, y - _py)
+                if _ds > 0.01:
+                    curv_meas = norm_angle(yaw - _pyaw) / _ds
+                    prev_pose_for_curv = (x, y, yaw)
+            else:
+                prev_pose_for_curv = (x, y, yaw)
+
             dir_margin, any_margin = self._body_margin(cur_dir)
             if min(dir_margin, any_margin) <= self.body_margin_stop:
                 self._stop()
@@ -2292,8 +2346,9 @@ class PathTeachNode(Node):
                 time.sleep(self.control_dt)
                 continue
 
-            clearance = self._arc_clearance(cur_dir, preview_curv,
-                                            max_dist=self.obs_slow + 0.30)
+            # ★ 用穩健版：涵蓋舵機延遲與欠轉（見 _arc_clearance_robust 的長註解）
+            clearance = self._arc_clearance_robust(cur_dir, preview_curv, curv_meas,
+                                                   max_dist=self.obs_slow + 0.30)
             speed = (self.follow_speed if cur_dir > 0 else self.reverse_speed) * scale
 
             # ★ 換算門檻的單位 ★

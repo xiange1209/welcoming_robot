@@ -125,6 +125,28 @@ class SpeechRecognizerNode(Node):
         # ★ 2026-08-17：模型檔精度。原本寫死 encoder/decoder 用 fp32、只有 joiner 用 int8
         #   —— 把最不影響效能的那塊量化了，最重的 encoder（315 MB fp32）反而沒有。
         #   詳見 _init_sherpa_onnx_asr 的長註解。false = 退回舊行為。
+        # ★★ 2026-08-19：機器人「聽到自己講話」的兩種擋法 ★★
+        #
+        # (A) 硬靜音：TTS 播放期間丟掉所有音訊。有效，但**代價很大** ——
+        #     使用者指出的：「VIP 或訪客不一定可以觸發語音輸入」。
+        #     機器人講一句 100 字的回覆時客人完全講不了話，體驗很差，
+        #     而迎賓場景客人本來就常在機器人講到一半時插話。
+        #
+        # (B) 文字層回音過濾：照常聽，但辨識出來的字**如果和機器人剛講的話高度重疊
+        #     就丟掉**。客人隨時能講話，而機器人自己的聲音進不了 /user_text。
+        #
+        # 預設走 (B)。(A) 保留成參數 `mute_during_tts`，若實機發現回音過濾
+        # 擋不住（例如客人與機器人同時講話產生的混合亂碼），再打開它。
+        self.declare_parameter(
+            "mute_during_tts", False,
+            ParameterDescriptor(description="TTS 播放期間丟棄音訊。★ 會讓客人無法插話，預設關"))
+        self.declare_parameter(
+            "echo_filter_sec", 25.0,
+            ParameterDescriptor(description="辨識結果與這麼多秒內機器人講過的話比對，重疊就丟掉；0 = 關閉"))
+        self.declare_parameter(
+            "echo_overlap_ratio", 0.6,
+            ParameterDescriptor(description="重疊比例門檻。太低會把客人複述的話也丟掉"))
+
         self.declare_parameter(
             "prefer_int8_model", True,
             ParameterDescriptor(description="模型檔有 .int8 版就優先載入（RPi4 上明顯較快，準確率同級）"))
@@ -165,6 +187,14 @@ class SpeechRecognizerNode(Node):
         # 端點偵測（2026-08-17）。★ `_sherpa_endpoint_ok` 是**執行期**的能力旗標：
         # 舊版 sherpa-onnx 沒有 `is_endpoint()`，第一次呼叫失敗就永久退回純 VAD 斷句，
         # 只警告一次。絕對不能讓「多一個斷句來源」這種增益功能害整個辨識掛掉。
+        self.mute_during_tts = self.get_parameter(
+            "mute_during_tts").get_parameter_value().bool_value
+        self.echo_filter_sec = self.get_parameter(
+            "echo_filter_sec").get_parameter_value().double_value
+        self.echo_overlap = self.get_parameter(
+            "echo_overlap_ratio").get_parameter_value().double_value
+        self._robot_said = []      # [(時刻, 正規化後的字串)]
+        self._echo_drops = 0
         self.prefer_int8_model = self.get_parameter(
             "prefer_int8_model").get_parameter_value().bool_value
         self.use_sherpa_endpoint = self.get_parameter(
@@ -644,6 +674,14 @@ class SpeechRecognizerNode(Node):
                         #   ⚠ 丟棄要 log，否則現場會變成「我明明有講話卻沒反應」，
                         #     而那跟麥克風壞掉、VAD 沒觸發長得一模一樣。
                         cleaned = self._postprocess(converted_text)
+                        # ★ 回音過濾放在**發布之前**、清洗之後：
+                        #   要比對的是最終會送進 LLM 的那個字串。
+                        if cleaned and self._is_echo(cleaned):
+                            self._echo_drops += 1
+                            self.get_logger().info(
+                                f"🔁 丟棄回音（機器人自己講的）: '{cleaned}'"
+                                f"（累計 {self._echo_drops} 次）")
+                            cleaned = None
                         if cleaned:
                             self.user_text_pub.publish(String(data=cleaned))
                         # 重置上一次部分結果
@@ -670,6 +708,42 @@ class SpeechRecognizerNode(Node):
             self.get_logger().error(f"✗ 語音辨識失敗: {e}")
             # 重置流
             self.stream = self.recognizer.create_stream()
+
+    @staticmethod
+    def _norm_for_echo(text: str) -> str:
+        """比對回音前先正規化：只留中文字與英數，去掉標點與空白。
+
+        ★ 不能直接比原字串：ASR 出來的沒有標點，而 TTS 收到的有。
+        """
+        return "".join(ch for ch in text if ch.isalnum())
+
+    def _is_echo(self, text: str) -> bool:
+        """這句是不是機器人自己剛講的話。
+
+        ★ 用「字元集合重疊比例」而不是子字串比對：ASR 幾乎一定會漏字或錯字，
+          嚴格比對會全部漏掉。重疊比例對「聽到自己講話」很敏感
+          （內容本來就一樣），對客人的新句子則不敏感。
+
+        ⚠ 門檻不能太低：客人**複述**機器人的話（「你說櫃檯在左邊？」）
+          是合法輸入。0.6 是在「擋住回音」與「不要吃掉複述」之間取的值，
+          而且還要求長度相近（回音的長度會跟原句差不多）。
+        """
+        if self.echo_filter_sec <= 0 or not self._robot_said:
+            return False
+        got = self._norm_for_echo(text)
+        if len(got) < 3:
+            return False                # 太短的句子字元重疊沒有鑑別力
+        now = time.time()
+        for said_t, said in self._robot_said:
+            if now - said_t > self.echo_filter_sec or not said:
+                continue
+            common = len(set(got) & set(said))
+            ratio = common / max(1, len(set(got)))
+            # 長度相近才算回音：客人的短問句碰巧用到機器人講過的字不算
+            len_ok = len(got) >= 0.5 * len(said)
+            if ratio >= self.echo_overlap and len_ok:
+                return True
+        return False
 
     def _reset_stream_for_endpoint(self) -> None:
         """sherpa 判定句尾後，把解碼器狀態清乾淨但**保留同一個 stream**。
@@ -724,6 +798,14 @@ class SpeechRecognizerNode(Node):
           平板沒連線時就靠這個估計 —— 但那種情況其實**根本沒出聲**，
           靜音是白靜的，所以估計值不要調大。
         """
+        # ★ 不論有沒有硬靜音，都要記下「機器人講了什麼」給回音過濾用
+        if self.echo_filter_sec > 0 and msg.data:
+            now = time.time()
+            self._robot_said.append((now, self._norm_for_echo(msg.data)))
+            self._robot_said = [(t, x) for (t, x) in self._robot_said
+                                if now - t <= self.echo_filter_sec]
+        if not self.mute_during_tts:
+            return                      # 走文字層過濾，不丟音訊（客人隨時能插話）
         secs = min(len(msg.data) * self.TTS_SEC_PER_CHAR + self.TTS_TAIL_SEC,
                    self.TTS_MAX_MUTE_SEC)
         with self._playing_lock:
