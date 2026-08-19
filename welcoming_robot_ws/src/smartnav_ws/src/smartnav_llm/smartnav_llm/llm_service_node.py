@@ -184,6 +184,25 @@ class LLMServiceNode(Node):
         # 第 4 週驗收要端到端 < 6 秒，只有 3b 這條線達得到。
         self.model_name = self.declare_parameter("model_name", "qwen2.5:3b").get_parameter_value().string_value
         self.temperature = self.declare_parameter("temperature", 0.0).get_parameter_value().double_value
+        # ★★ 2026-08-19：限制回覆長度 ★★
+        #
+        # 使用者回報「LLM 回覆太多字」。查下來**不是 RAG 太多** ——
+        # `config/bank_faq.txt` 只有 1147 bytes / 26 行，塞不爆任何上下文。
+        # 真因是兩個都沒設限：
+        #   1. ChatOllama 沒有給 `num_predict`，生成長度**完全沒有上限**
+        #   2. 系統提示詞 79 行裡**沒有任何一條講回覆長度**
+        #
+        # 為什麼長回覆在這個專案特別糟（不只是囉唆）：
+        #   - 出聲端是平板 TTS。120 字 = 唸 26 秒，客人站在那裡等
+        #   - 平板固定在車上，唸愈久麥克風收自己的聲音就愈久
+        #   - `hold_all_iterations` 之後最終答案要整輪生成完才開口，
+        #     生成愈長，開口愈慢
+        #
+        # 120 token 對中文約 80~100 字，夠講完「營業時間 + 一句補充」。
+        # ★ 這是**硬上限**，會直接截斷。真正該讓它短的是提示詞裡的規則，
+        #   這個只是保險 —— 所以留得比期望長度寬一點。
+        self.num_predict = self.declare_parameter(
+            "num_predict", 120).get_parameter_value().integer_value
 
         # ── 簡體轉繁體 ───────────────────────────────────
         # 系統提示詞早就寫了「回覆一律使用繁體中文」，但小模型會忽略它：
@@ -640,6 +659,7 @@ class LLMServiceNode(Node):
             base_url=self.ollama_base_url,
             model=self.model_name,
             temperature=self.temperature,
+            num_predict=self.num_predict,   # ★ 生成長度硬上限，見宣告處
             callbacks=[stream_handler],
         )
         self.llm_with_tools = raw_llm.bind_tools(list(self.tools_map.values()))
