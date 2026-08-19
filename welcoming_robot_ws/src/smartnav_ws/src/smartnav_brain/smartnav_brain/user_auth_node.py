@@ -100,6 +100,26 @@ class UserAuthNode(Node):
             2.0,
             ParameterDescriptor(description="身份辨識結果發布的最小間隔秒數"),
         )
+        # ★★ 2026-08-19：人離開之後把身份清掉 ★★
+        #
+        # 使用者實測：「遮住鏡頭還是有信心值，或是原本辨識的 VIP 沒消掉」。
+        #
+        # 機制：`face_embedding_node` **只在偵測到臉時才發布**
+        # （face_embedding_node.py:135 `if face is not None:`）。
+        # 沒有臉 = 沒有訊息 = 這個節點永遠不會被叫醒 =
+        # `/user_identity` 上最後一則永遠留著。平板顯示的是**上一個人**，
+        # 而 `bank_reception` 也會以為那個 VIP 還站在前面。
+        #
+        # ★ 這是「沒有訊息」與「訊息說沒人」的差別 —— ROS 裡這兩件事完全不同，
+        #   而下游沒辦法區分。所以要由這裡主動發一則「現在沒人」。
+        #
+        # 2.0 秒的理由：相機 15+ FPS，正常情況每 66 ms 就有一幀；
+        # 2 秒等於連續 30 幀都沒臉，不會被偶發的偵測漏失誤觸發。
+        self.declare_parameter(
+            "identity_timeout_sec",
+            2.0,
+            ParameterDescriptor(description="超過這麼久沒收到人臉向量就發布『無人』身份；0 = 關閉"),
+        )
 
         # 讀取與驗證參數
         face_embedding_topic = self.get_parameter("face_embedding_topic").get_parameter_value().string_value
@@ -154,6 +174,15 @@ class UserAuthNode(Node):
         self.user_identity_pub = self.create_publisher(UserIdentity, user_identity_topic, 10)
         self._last_identity_key: Optional[str] = None
         self._last_identity_time: float = 0.0
+        # 身份逾時（見 identity_timeout_sec 的長註解）
+        self.identity_timeout = float(
+            self.get_parameter("identity_timeout_sec").get_parameter_value().double_value)
+        self._last_face_time: float = 0.0     # 最後一次收到人臉向量的時刻
+        self._identity_cleared: bool = True   # 目前是不是已經處於「無人」狀態
+        if self.identity_timeout > 0.0:
+            # ★ 用獨立計時器而不是掛在影像回呼上：影像回呼在**沒有臉**的時候
+            #   一樣會跑，但相機整個掉線時它就不跑了 —— 那正是最需要清掉身份的時候。
+            self._identity_timer = self.create_timer(0.5, self._identity_timeout_tick)
 
         # 訂閱人臉向量話題
         self.face_embedding_sub = message_filters.Subscriber(
@@ -590,11 +619,45 @@ class UserAuthNode(Node):
 
         self._publish_identity(user_uuid, user_info, face_msg, similarity)
 
+    def _identity_timeout_tick(self) -> None:
+        """超過 identity_timeout 沒看到人臉 -> 發一則「現在沒人」。
+
+        ★ 只在狀態**改變**時發一次（`_identity_cleared` 旗標），不是每 0.5 秒洗一則。
+        ★ 清掉的身份 similarity 一定要是 0.0、recognized 一定要是 False ——
+          使用者看到的「遮住鏡頭還是有信心值」就是因為舊訊息的 similarity 留在畫面上。
+        """
+        if self.identity_timeout <= 0.0 or self._identity_cleared:
+            return
+        now = self.get_clock().now().nanoseconds / 1e9
+        if self._last_face_time <= 0.0 or (now - self._last_face_time) < self.identity_timeout:
+            return
+
+        msg = UserIdentity()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.user_uuid = ""
+        msg.user_name = "Unknown"
+        msg.description = ""
+        msg.user_type.type = UserType.GUEST.value
+        msg.recognized = False
+        msg.similarity = 0.0
+        msg.bbox = [0.0, 0.0, 0.0, 0.0]
+        self.user_identity_pub.publish(msg)
+
+        self._identity_cleared = True
+        # 一併清掉去重狀態，否則同一個人再走回來時會被
+        # `key == self._last_identity_key` 擋掉，迎賓詞不會再觸發。
+        self._last_identity_key = None
+        self.get_logger().info(
+            f"👤 已連續 {self.identity_timeout:.1f} 秒沒偵測到人臉，身份清除為『無人』")
+
     def _publish_identity(self, user_uuid, user_info, face_msg: FaceEmbedding,
                           similarity: float = 0.0) -> None:
         """發布身份辨識結果"""
         key = user_uuid if user_info else "__unknown__"
         now = self.get_clock().now().nanoseconds / 1e9
+        # 看到臉了 -> 記時間、解除「無人」狀態（讓下一次離開能再清一次）
+        self._last_face_time = now
+        self._identity_cleared = False
         if key == self._last_identity_key and (now - self._last_identity_time) < self.identity_publish_interval:
             return
         self._last_identity_key = key

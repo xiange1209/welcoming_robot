@@ -1587,17 +1587,34 @@ function connectWS() {
 function render(s) {
   // 身分橫幅
   const id = s.identity || {};
-  $("banner").className = id.recognized ? (id.user_type || "").toLowerCase() : "";
-  $("who").firstChild.nodeValue = id.recognized ? id.user_name : (id.user_name ? "訪客" : "等待辨識…");
-  $("tag").textContent = id.recognized ? id.user_type : "—";
-  $("sub").textContent = id.recognized
-    ? `${id.description || "已認證"}　相似度 ${id.similarity}`
-    : (id.user_name ? `未在資料庫中（相似度 ${id.similarity}）` : "尚未偵測到人臉");
 
-  lastIdentity = id;
-  // updated_at 為 0 代表從沒收過辨識結果，維持 Infinity 讓它判定為「沒人」
+  // ★★ 2026-08-19：先更新新鮮度，再決定要不要顯示 ★★
+  //
+  // 使用者實測：「遮住鏡頭還是有信心值，或是原本辨識的 VIP 沒消掉」。
+  // 上面 FACE_FRESH_SEC 那段註解已經把原因寫得很清楚
+  // （沒有人臉時後端不發任何訊息，狀態會留著上一個人），
+  // 但**這裡渲染時根本沒用到那個判斷** —— 寫了防護卻沒接上。
+  //
+  // 順序很重要：`facePresent()` 讀的是 identityAgeAtRecv，
+  // 所以要先用這一則快照更新它，再拿來判斷。原本這兩行在最後面，
+  // 等於永遠用上一則快照的年齡在判斷，慢一拍。
   identityAgeAtRecv = (id.updated_at && s.now) ? Math.max(0, s.now - id.updated_at) : Infinity;
   identityRecvAt = Date.now();
+
+  // 後端（user_auth_node）現在也會在 2 秒沒人時主動發一則「無人」，
+  // 這裡是**第二道防線** —— 後端節點整個掛掉時，前端仍然會自己讓橫幅退回等待狀態。
+  const fresh = facePresent();
+  const shown = fresh ? id : {};
+  $("banner").className = shown.recognized ? (shown.user_type || "").toLowerCase() : "";
+  $("who").firstChild.nodeValue = shown.recognized ? shown.user_name
+    : (shown.user_name ? "訪客" : "等待辨識…");
+  $("tag").textContent = shown.recognized ? shown.user_type : "—";
+  $("sub").textContent = shown.recognized
+    ? `${shown.description || "已認證"}　相似度 ${shown.similarity}`
+    : (shown.user_name ? `未在資料庫中（相似度 ${shown.similarity}）`
+       : (isFinite(faceAge()) ? "鏡頭前沒有人" : "尚未偵測到人臉"));
+
+  lastIdentity = id;
 
   applyRegistration(s.registration || null);
 

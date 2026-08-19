@@ -289,6 +289,27 @@ class PathTeachNode(Node):
         # 偏離檢查的搜尋視窗（點數）。0 = 整條路徑（2026-08-19 早上的行為）。
         # 60 點 ≈ 9 m 路徑（每段約 3 點 0.45 m），已遠超任何合理的定位漂移。
         self.declare_parameter("xte_window_pts", 60)
+        # ★★ 2026-08-19：姿態判別（行進中的朝向誤差）★★
+        #
+        # 使用者原話：「需要姿態判別跟位置判別與猜測，不然它會一直亂撞、
+        # 不會停止，然後就卡住了」。這個缺口是真的：
+        # **朝向誤差在此之前只在終點檢查**（final_yaw_error_deg），
+        # 行進中完全沒有人看。位置對、車頭歪 40 度也照跑。
+        #
+        # 為什麼位置檢查擋不住：純追蹤是拿「目標點在車體座標的側向分量」算曲率。
+        # 車頭一歪，正前方的目標會被算成「在側邊」，於是它打舵去修；
+        # 但阿克曼有最小迴轉半徑 0.95 m，而走廊只有 0.99 m 寬
+        # —— **修不回來，只會愈修愈歪，直到貼牆**。位置偏移是這個過程的
+        # **結果**，等它超過 0.60 m 時車子早就在刮牆了。
+        #
+        # 門檻怎麼來的：本檔開頭那句「朝向誤差就是 17 公分側向偏移」，
+        # 以視距 0.5 m 反推 asin(0.17/0.5) ≈ 20 度。所以 25 度警告、40 度中止。
+        #
+        # ★ 折返、脫困之後車頭本來就會歪，所以沿用 escape_grace 的寬限期，
+        #   而且要**連續** N 個週期都超標才中止（單一週期的定位跳動不算）。
+        self.declare_parameter("max_yaw_error_deg", 40.0)
+        self.declare_parameter("warn_yaw_error_deg", 25.0)
+        self.declare_parameter("yaw_error_strikes", 8)
         # ★★ 2026-08-10：最小轉彎半徑分左右，不是一個數字 ★★
         #
         # 這台車左右轉的能力差 26%，而且是**設計必然、不是故障**。
@@ -523,6 +544,9 @@ class PathTeachNode(Node):
         self.rev_front_axle = bool(p("reverse_track_front_axle").value)
         self.axle_spacing = abs(float(p("axle_spacing_m").value))
         self.xte_window = int(p("xte_window_pts").value)
+        self.max_yaw_err = math.radians(abs(float(p("max_yaw_error_deg").value)))
+        self.warn_yaw_err = math.radians(abs(float(p("warn_yaw_error_deg").value)))
+        self.yaw_strikes_max = max(1, int(p("yaw_error_strikes").value))
         self.min_radius = float(p("min_turning_radius").value)
         # 左右分開的最小轉彎半徑（見宣告處的長註解）。
         # 韌體是原廠的、不動它——不對稱在 ROS 2 端補償。
@@ -1830,6 +1854,8 @@ class PathTeachNode(Node):
         sig_hist: List[Tuple[float, List[float]]] = []   # 打滑偵測用的掃描簽章歷史
         prog_idx = -1
         last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
+        yaw_strikes = 0            # 朝向誤差連續超標次數（姿態判別）
+        yaw_warned = False
         prog_t = time.monotonic()
         # 每個路徑點的累計弧長，給進度檢查用（見迴圈裡的說明）
         path_s = [0.0] * len(pts)
@@ -1873,6 +1899,42 @@ class PathTeachNode(Node):
                                   f"朝向誤差 {result.final_yaw_error_deg:.0f} 度")
                 self.get_logger().info(result.message)
                 return result
+
+            # ── ★★ 姿態判別（2026-08-19 新增）★★ ──
+            #
+            # 位置對、車頭歪，純追蹤只會愈修愈歪 —— 詳見 __init__ 的長註解。
+            #
+            # ★★ 一個一定要講清楚的陷阱：**倒車時不要把路徑朝向加 π**。
+            #   錄製時存的 `pts[i].yaw` 就是「當下車頭朝哪」，倒車那段錄的也是車頭朝向
+            #   （車頭朝前、車子往後走，方向資訊存在 `pts[i].direction`）。
+            #   所以重播時**不分方向，一律直接比 yaw**。
+            #   加 π 會讓倒車段每一個週期都報 180 度誤差、立刻中止。
+            _yaw_err = abs(norm_angle(yaw - pts[idx].yaw))
+            _yaw_grace = (self.escape_grace > 0.0 and last_escape_t > 0.0
+                          and time.monotonic() - last_escape_t < self.escape_grace)
+            if _yaw_err > self.max_yaw_err and not _yaw_grace:
+                yaw_strikes += 1
+                if yaw_strikes >= self.yaw_strikes_max:
+                    self._stop()
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = (
+                        f"車頭偏離路徑朝向 {math.degrees(_yaw_err):.0f} 度"
+                        f"（上限 {math.degrees(self.max_yaw_err):.0f} 度，連續 {yaw_strikes} 次），已停車。"
+                        f"最小迴轉半徑 {self.min_radius_left:.2f} m 大於走廊寬度，"
+                        f"純追蹤修不回來，硬跑會刮牆")
+                    self.get_logger().error(result.message)
+                    return result
+            else:
+                if _yaw_err <= self.warn_yaw_err:
+                    yaw_strikes = 0
+                    yaw_warned = False
+                elif not yaw_warned and not _yaw_grace:
+                    yaw_warned = True
+                    self.get_logger().warning(
+                        f"⚠ 車頭已偏離路徑朝向 {math.degrees(_yaw_err):.0f} 度"
+                        f"（{math.degrees(self.warn_yaw_err):.0f} 度警告 / "
+                        f"{math.degrees(self.max_yaw_err):.0f} 度中止）")
 
             # ── 偏離檢查 ──
             #
