@@ -33,6 +33,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
+from std_srvs.srv import SetBool
 
 
 class ScanFilterCcNode(Node):
@@ -46,8 +47,25 @@ class ScanFilterCcNode(Node):
         self.declare_parameter("mask_min_deg", 140.0)
         self.declare_parameter("mask_max_deg", 220.0)
 
+        # ★★ 2026-08-19：遮蔽改成可即時開關 ★★
+        #
+        # 使用者指出的（正確）：**遮蔽只有建圖／錄製時需要**——那時操作者跟在車後。
+        # **自主運行時沒有人在後面**，繼續遮掉 80 度等於：
+        #   - AMCL 少掉 22% 的光束（240 根中約 53 根），窄走廊裡特徵本來就少
+        #   - 全域成本地圖的障礙層看不到車後 —— 倒車規劃是瞎的
+        #
+        # 所以預設仍然是「開」（保持既有建圖行為不變），
+        # 但 `path_teach_cc` 在**重播開始時關掉、結束時打開**，
+        # 於是自主運行全程是 360 度。
+        #
+        # ★ 為什麼用服務而不是參數：`ros2 param set` 對這種要即時生效的
+        #   開關可以用，但沒有回應可以確認「對方真的收到了」。
+        #   服務會回 success，呼叫端才能在失敗時決定要不要繼續。
+        self.declare_parameter("mask_enabled", True)
+        self.mask_enabled = bool(self.get_parameter("mask_enabled").value)
         self.mask_min = math.radians(self.get_parameter("mask_min_deg").value)
         self.mask_max = math.radians(self.get_parameter("mask_max_deg").value)
+        self.create_service(SetBool, "set_scan_mask", self._set_mask_cb)
 
         self.pub = self.create_publisher(
             LaserScan, self.get_parameter("output_topic").value, qos_profile_sensor_data
@@ -63,6 +81,17 @@ class ScanFilterCcNode(Node):
             f"{self.get_parameter('output_topic').value}，"
             f"遮蔽 {math.degrees(self.mask_min):.0f}~{math.degrees(self.mask_max):.0f} 度（車尾扇區）"
         )
+
+    def _set_mask_cb(self, request, response):
+        """開關車尾遮蔽。data=True 遮（建圖／錄製），False 全 360 度（自主運行）。"""
+        was = self.mask_enabled
+        self.mask_enabled = bool(request.data)
+        if was != self.mask_enabled:
+            self.get_logger().info(
+                f"車尾遮蔽 {'啟用（建圖／錄製，擋掉跟車的人）' if self.mask_enabled else '★ 關閉 —— 全 360 度（自主運行）'}")
+        response.success = True
+        response.message = "masked" if self.mask_enabled else "full_360"
+        return response
 
     def _cb(self, msg: LaserScan):
         out = LaserScan()
@@ -80,7 +109,7 @@ class ScanFilterCcNode(Node):
         for i in range(len(ranges)):
             # 這顆雷達的 angle_min 是 -180 度，先轉成 0~360 再比
             a = math.degrees(msg.angle_min + i * msg.angle_increment) % 360.0
-            if math.degrees(self.mask_min) <= a <= math.degrees(self.mask_max):
+            if self.mask_enabled and math.degrees(self.mask_min) <= a <= math.degrees(self.mask_max):
                 # inf = 「這個方向沒有回波」。slam_toolbox 會直接忽略，
                 # 不會把它當成 range_max 處有一面牆。
                 ranges[i] = float("inf")
@@ -91,7 +120,7 @@ class ScanFilterCcNode(Node):
             ints = list(msg.intensities)
             for i in range(len(ints)):
                 a = math.degrees(msg.angle_min + i * msg.angle_increment) % 360.0
-                if math.degrees(self.mask_min) <= a <= math.degrees(self.mask_max):
+                if self.mask_enabled and math.degrees(self.mask_min) <= a <= math.degrees(self.mask_max):
                     ints[i] = 0.0
             out.intensities = ints
 

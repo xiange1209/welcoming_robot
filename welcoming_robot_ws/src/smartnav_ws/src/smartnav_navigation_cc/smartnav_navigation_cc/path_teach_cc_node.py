@@ -79,7 +79,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPo
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformListener
 
 from smartnav_msgs.action import FollowTaughtPath
@@ -432,6 +432,12 @@ class PathTeachNode(Node):
         # 這裡的檢查只該攔「錄製時不存在的東西」（人、臨時障礙），
         # 不該比實際車身寬那麼多而把門框當障礙。
         self.declare_parameter("obstacle_half_width_m", 0.22)
+        # ★ 車身外緣硬停距離（不做弧線預測，見 _body_margin）。
+        #   0.12 m 的理由：N10 光達 std dev 約 1.3 mm，但車身矩形本身
+        #   （前 0.40 / 後 0.09）是標稱值，加上定位與舵機延遲，留 12 cm。
+        #   ⚠ 不要調到比 0.08 小 —— 那會小於單次控制週期的移動量
+        #   （0.15 m/s ÷ 10 Hz = 1.5 cm，但脫困速度 0.10 m/s 加上反應延遲會更多）。
+        self.declare_parameter("body_margin_stop_m", 0.12)
         self.declare_parameter("avoid_max_offset_m", 0.25)
         self.declare_parameter("avoid_step_m", 0.05)
         self.declare_parameter("avoid_clearance_m", 0.10)
@@ -573,6 +579,8 @@ class PathTeachNode(Node):
         self.obs_stop = float(p("obstacle_stop_m").value)
         self.obs_stop_rev = float(p("obstacle_stop_reverse_m").value)
         self.obs_half_w = float(p("obstacle_half_width_m").value)
+        self.body_margin_stop = float(p("body_margin_stop_m").value)
+        self._margin_stops = 0
         self.avoid_max = float(p("avoid_max_offset_m").value)
         self.avoid_step = float(p("avoid_step_m").value)
         self.avoid_clear = float(p("avoid_clearance_m").value)
@@ -721,6 +729,10 @@ class PathTeachNode(Node):
         # ★★ 2026-08-17：把車子從「規劃器不肯出手」的位置推開 ★★
         # 見 _unwedge_cb 的長註解。這是當天實測發現的系統性死結的唯一解。
         self.create_service(Trigger, "unwedge", self._unwedge_cb, callback_group=cb)
+        # ★ 2026-08-19：自主重播期間把車尾遮蔽關掉，換回全 360 度偵測。
+        #   遮蔽只有「操作者跟在車後」時才需要（建圖／錄製）。
+        self.scan_mask_client = self.create_client(SetBool, "/set_scan_mask",
+                                                   callback_group=cb)
 
         # 地圖點選模式借用 nav2 的規劃器。規劃器（SmacPlannerHybrid + REEDS_SHEPP）
         # 本來就會產生符合最小轉彎半徑、含折返點的阿克曼可行路徑 —— 出問題的是
@@ -1213,6 +1225,9 @@ class PathTeachNode(Node):
                 resp.success = False
                 resp.message = "重播進行中，不能同時錄製"
                 return resp
+            # ★ 錄製 = 操作者跟在車後遙控 -> 打開車尾遮蔽，
+            #   否則那個人會被建進地圖／干擾 AMCL（2026-07-31 實測 map->odom 一步跳 22 m）。
+            self._set_scan_mask(True)
             if self._robot_pose() is None:
                 resp.success = False
                 resp.message = f"取不到 {self.map_frame} -> {self.robot_frame} 的 TF，請先確認定位已就緒"
@@ -1415,6 +1430,78 @@ class PathTeachNode(Node):
             if longitudinal < best:
                 best = longitudinal
         return best
+
+    def _set_scan_mask(self, enabled: bool) -> None:
+        """開關車尾遮蔽。★ 失敗只警告不中斷 —— 遮蔽開著也只是視野小一點，
+        不值得為它讓一趟導航失敗。"""
+        if not self.scan_mask_client.service_is_ready():
+            self.get_logger().warning(
+                "/set_scan_mask 服務不在，車尾遮蔽維持原狀"
+                "（自主運行時車後會有 80 度盲區，請確認 scan_filter_cc 有起來）")
+            return
+        try:
+            req = SetBool.Request()
+            req.data = enabled
+            self.scan_mask_client.call_async(req)
+            self.get_logger().info(
+                f"車尾遮蔽 -> {'開（錄製／建圖）' if enabled else '關（自主運行，全 360 度）'}")
+        except Exception as exc:
+            self.get_logger().warning(f"切換車尾遮蔽失敗: {exc}")
+
+    def _body_margin(self, direction: int) -> Tuple[float, float]:
+        """車身矩形到最近障礙的**真實距離**，回傳 (行進方向側, 全方位最小)。
+
+        ★★ 為什麼要有這個，而 `_arc_clearance` 不夠 ★★
+
+        `_arc_clearance` 是**預測**：假設車子會照 `preview_curv` 那條弧線走。
+        預測有三個會失準的地方 —— 曲率是純追蹤算的（倒車時參考點還換過）、
+        舵機有響應延遲、車子可能正被推動。預測一失準，
+        掃過的區域就跟實際不同，於是**明明在刮牆卻回報還有空間**。
+
+        這個方法完全不預測，只問「**現在**車身外緣離最近的障礙多遠」。
+
+        ★★ 用「點到矩形距離」而不是「縱向帶」的理由（使用者指出的）：
+        阿克曼打方向時**車頭會外甩** —— 前保險桿在 base_footprint 前方 0.40 m，
+        轉彎時它掃過的半徑比車身中心大，會先碰到**側牆**。
+        只量縱向（正前／正後）的檢查對這種刮擦完全看不見。
+        點到矩形距離把前、後、左、右四個方向一次涵蓋。
+
+        回傳兩個值：
+          - `dir_margin`：行進方向那一側的餘裕（負 = 已經進到車身裡）
+          - `any_margin`：**任何方向**的最小餘裕，用來抓轉彎外甩的側向刮擦
+        """
+        with self._scan_lock:
+            scan = self._scan
+        if scan is None:
+            return 0.0, 0.0                 # 沒資料當作貼牆，寧可保守
+        # 車身矩形（雷達座標系；雷達在 base_footprint 前方 laser_x）
+        front = 0.40 - self.laser_x
+        rear = -(0.09 + self.laser_x)
+        half_w = 0.185
+        dir_best = float("inf")
+        any_best = float("inf")
+        ang = scan.angle_min
+        for r in scan.ranges:
+            a = ang
+            ang += scan.angle_increment
+            if not (scan.range_min <= r <= scan.range_max) or r != r:
+                continue
+            if r > 2.0:
+                continue                    # 遠處的牆現在刮不到
+            x = r * math.cos(a)
+            y = r * math.sin(a)
+            # 點到矩形的距離：各軸超出量的歐氏長度，都在裡面就是 0（已侵入）
+            ox = max(rear - x, x - front, 0.0)
+            oy = max(abs(y) - half_w, 0.0)
+            d = math.hypot(ox, oy)
+            if d < any_best:
+                any_best = d
+            # 行進方向那一側：只看落在車身寬度內、且在行進方向前方的點
+            if abs(y) <= half_w:
+                dv = (x - front) if direction >= 0 else (rear - x)
+                if dv < dir_best:
+                    dir_best = dv
+        return dir_best, any_best
 
     def _side_clearance(self) -> Tuple[float, float]:
         """車身**兩側**的橫向空隙 (左,右)，單位公尺。沒看到牆就回 inf。
@@ -1859,6 +1946,8 @@ class PathTeachNode(Node):
         sig_hist: List[Tuple[float, List[float]]] = []   # 打滑偵測用的掃描簽章歷史
         prog_idx = -1
         last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
+        # ★ 自主重播 = 沒有人跟在車後 -> 全 360 度偵測（見 _set_scan_mask）
+        self._set_scan_mask(False)
         yaw_strikes = 0            # 朝向誤差連續超標次數（姿態判別）
         yaw_warned = False
         last_cusp_t = 0.0          # 上次折返換向的時刻（姿態判別寬限期用）
@@ -2174,6 +2263,35 @@ class PathTeachNode(Node):
             # 「算清空」要 > 1.11，可用區間只有 9 公分，於是幾乎永遠 slowing。
             # 實測（path_07068062ebc0）686 筆裡 following 只有 1 筆。
             # 多看 0.30 m，讓「真的清空」有機會成立。
+            # ★★ 2026-08-19：先做「不預測」的車身外緣檢查 ★★
+            #
+            # 這一段要在 _arc_clearance 之前，因為它擋的是不同的失效模式：
+            #   _arc_clearance  預測「照這條弧線走會不會撞」 -> 會因預測失準而漏
+            #   _body_margin    量「現在車身離障礙多遠」     -> 已經貼上去就一定抓到
+            #
+            # ★ 倒車時特別重要：車尾只在原點後 0.09 m、車頭有 0.40 m，
+            #   同樣的預測誤差倒車會先撞。而且阿克曼打方向時車頭會外甩，
+            #   `any_margin` 就是為了抓「轉彎時前角刮到側牆」這種側向接觸。
+            dir_margin, any_margin = self._body_margin(cur_dir)
+            if min(dir_margin, any_margin) <= self.body_margin_stop:
+                self._stop()
+                self._margin_stops += 1
+                which = "行進方向" if dir_margin <= any_margin else "車身側面（轉彎外甩）"
+                if self._margin_stops % 20 == 1:
+                    self.get_logger().warning(
+                        f"⚠ 車身外緣只剩 {min(dir_margin, any_margin) * 100:.0f} cm"
+                        f"（{which}，門檻 {self.body_margin_stop * 100:.0f} cm），"
+                        f"已煞停（累計 {self._margin_stops} 次）")
+                # ★ 不 abort、不脫困 —— 只是不再往那個方向送速度。
+                #   障礙移開（人走掉）就會自己恢復；真的是牆的話，
+                #   下面既有的卡住偵測會在 stuck_timeout 之後接手處理。
+                #   ★ 這裡刻意不呼叫脫困：倒車貼牆時脫困可能繼續往後推。
+                self._send_feedback(goal_handle, idx, len(pts),
+                                    min(dir_margin, any_margin), "blocked",
+                                    f"車身外緣 {min(dir_margin, any_margin) * 100:.0f} cm")
+                time.sleep(self.control_dt)
+                continue
+
             clearance = self._arc_clearance(cur_dir, preview_curv,
                                             max_dist=self.obs_slow + 0.30)
             speed = (self.follow_speed if cur_dir > 0 else self.reverse_speed) * scale
