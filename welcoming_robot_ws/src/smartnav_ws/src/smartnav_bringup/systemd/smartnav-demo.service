@@ -1,0 +1,40 @@
+# 迎賓機器人開機自動啟動（★ 發表當天的保險）
+#
+# 安裝：
+#   sudo cp smartnav-demo.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now smartnav-demo
+#
+# ★ 刻意**不**預設啟用：開發時自動啟動會跟手動啟動的節點打架，
+#   產生重複節點（實測會同時有四份 stuck_detector_cc、三份 scan_filter_cc，
+#   多份 scan_filter 同時發布過濾雷達會讓定位吻合度掉到 88%）。
+#   發表前一天再 enable。
+#
+# 停用：sudo systemctl disable --now smartnav-demo
+
+[Unit]
+Description=SmartNav 迎賓機器人（統一啟動）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+# ★ 這三個環境變數缺一不可：
+#   systemd 不會 source 任何 shell profile，所以 ROS 的 setup.bash 要自己來。
+#   RMW 不設會退回預設實作，跟手動啟動的節點看不到彼此（最難查的那種）。
+Environment="RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+Environment="CYCLONEDDS_URI=file:///home/user/cyclonedds.xml"
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/user/welcoming_robot_ws/install/setup.bash && exec ros2 launch smartnav_bringup demo.launch.py'
+# 啟動要 21 秒（分階段），給足 90 秒再判定失敗
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=10
+# ★ 不要用 KillMode=mixed：launch 底下有十幾個節點，
+#   只殺主行程會留下孤兒（就是重複節點的來源）。control-group 會整棵殺掉。
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -10,6 +10,10 @@ find_package(ament_cmake REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(nav2_bringup REQUIRED)
 
+# ★ 2026-08-19：launch 檔要裝進 share，否則 `ros2 launch smartnav_bringup ...`
+#   會回「package not found」而不是「launch file not found」—— 訊息會誤導。
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

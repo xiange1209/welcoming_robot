@@ -312,6 +312,69 @@
     #banner { flex-wrap: wrap; gap: 10px; }
     #stats { margin-left: 0; width: 100%; flex-wrap: wrap; }
   }
+
+  /* ══════════════════════════════════════════════════════════════
+     ★★ 2026-08-19：把版面調到 iPad Air 11" 與桌機瀏覽器都不跑版 ★★
+
+     在此之前只有一個斷點 `max-width: 900px`，而目標裝置是：
+
+       iPad Air 11" 橫向   1180 × 820  ← 落在 900px **之上**，走桌機版面，
+                                          但高度只有 820，flex 面板會被
+                                          `.page { overflow: hidden }` 切掉，
+                                          按鈕跑到畫面外**再也點不到**
+       iPad Air 11" 直向    820 × 1180  ← 走堆疊版面，這個本來就沒問題
+       桌機瀏覽器          通常 ≥ 1080 高，也可能被縮成小視窗
+
+     所以補三件事：矮螢幕橫向、觸控目標放大、超寬螢幕限寬。
+     ══════════════════════════════════════════════════════════════ */
+
+  /* ── (1) 矮螢幕橫向：iPad Air 橫放、筆電 13" 視窗化 ────────────
+     判準用**高度**而不是寬度 —— 會被切掉的是垂直方向。
+     1180×820 的問題是「寬度夠但高度不夠」，用 max-width 永遠抓不到。 */
+  @media (orientation: landscape) and (max-height: 900px) {
+    #banner { padding: 6px 14px; }
+    #who    { font-size: 18px; }
+    .page   { padding: 8px; gap: 8px; }
+    .card   { padding: 10px; }
+    #tabs button { padding: 9px 14px; }
+    /* ★ 最重要的一行：矮螢幕上內容一定會超出，
+       允許卡片內部自己捲，而不是被外層裁掉。 */
+    .page.active > .card { min-height: 0; overflow-y: auto; }
+    .videobox, .regpreview { min-height: 120px; }
+  }
+
+  /* ── (2) 觸控裝置：把可點區域放大 ───────────────────────
+     `pointer: coarse` 只有觸控螢幕會命中，桌機滑鼠不受影響。
+     Apple 的人機介面指南建議可點目標 ≥ 44 pt；原本的
+     `padding: 12px 15px` + 14px 字約 40 px 高，站著用平板時容易點歪。 */
+  @media (pointer: coarse) {
+    button, .seg > *, #tabs button, select, input[type="text"], input[type="password"] {
+      min-height: 44px;
+    }
+    #tabs button { font-size: 15px; }
+    /* 站在機器人前面操作時手會抖，把相鄰按鈕的間距拉開 */
+    .row, .btns { gap: 10px; }
+  }
+
+  /* ── (3) 超寬螢幕：限制內容寬度 ─────────────────────────
+     桌機全螢幕 2560px 時，兩欄會被拉到很難掃視（眼睛要橫向掃 1 公尺）。
+     限寬並置中，跟一般網頁的可讀寬度慣例一致。 */
+  @media (min-width: 1600px) {
+    .page { max-width: 1500px; width: 100%; margin: 0 auto; }
+  }
+
+  /* ── (4) 最後的保險：任何情況下都不要讓內容變成點不到 ──────
+     `.page { overflow: hidden }` 是刻意的（讓內部面板自己捲），
+     但只要有一個子元素算錯高度，按鈕就會消失在畫面外而且**無法捲到**。
+     `user-scalable=no` 又讓使用者不能縮小來找它。
+     這條規則在內容真的超出時把捲動還給使用者 —— 寧可醜，不要點不到。 */
+  @media (max-height: 620px) {
+    .page.active { display: block; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .page.active > .card { margin-bottom: 10px; }
+    #mapwrap { height: 60vh; min-height: 200px; }
+    #chat    { height: 50vh; min-height: 160px; }
+  }
+
 /* 系統開關頁「啟動中」的呼吸燈：導航堆疊要 60 秒，
    要讓人一眼看出「有在動，只是還沒好」 */
 @keyframes syspulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
