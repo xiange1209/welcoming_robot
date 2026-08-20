@@ -309,7 +309,10 @@ class PathTeachNode(Node):
         #   而且要**連續** N 個週期都超標才中止（單一週期的定位跳動不算）。
         self.declare_parameter("max_yaw_error_deg", 40.0)
         self.declare_parameter("warn_yaw_error_deg", 25.0)
-        self.declare_parameter("yaw_error_strikes", 8)
+        # ★★ 2026-08-20：8 -> 40 ★★
+        #   這是**控制週期數**不是秒數。control_rate = 20 Hz，8 次只有 0.4 秒 ——
+        #   比 AMCL 一次位姿跳動還短，等於沒有濾波。40 次 = 2 秒。
+        self.declare_parameter("yaw_error_strikes", 40)
         # 折返（三點轉向）之後的姿態判別寬限。三點轉向就是「刻意與路徑成大角度」，
         # 不給寬限的話 14 個折返的路徑會在每一個轉角被中止。
         # 8.0 秒 = 停穩(cusp_pause) + 轉出來的時間，實測三點轉向約 5~7 秒。
@@ -438,6 +441,10 @@ class PathTeachNode(Node):
         #   ⚠ 不要調到比 0.08 小 —— 那會小於單次控制週期的移動量
         #   （0.15 m/s ÷ 10 Hz = 1.5 cm，但脫困速度 0.10 m/s 加上反應延遲會更多）。
         self.declare_parameter("body_margin_stop_m", 0.12)
+        # ★ 2026-08-20：重播時是否關閉車尾遮罩。預設 false（**不要關**）。
+        #   理由見 _execute_follow 裡的長註解 —— 本節點避障本來就吃原始
+        #   /scan，關遮罩對避障零幫助，卻會讓 AMCL 看到跟在車後的人。
+        self.declare_parameter("disable_mask_on_replay", False)
         self.declare_parameter("avoid_max_offset_m", 0.25)
         self.declare_parameter("avoid_step_m", 0.05)
         self.declare_parameter("avoid_clearance_m", 0.10)
@@ -580,6 +587,7 @@ class PathTeachNode(Node):
         self.obs_stop_rev = float(p("obstacle_stop_reverse_m").value)
         self.obs_half_w = float(p("obstacle_half_width_m").value)
         self.body_margin_stop = float(p("body_margin_stop_m").value)
+        self.disable_mask_on_replay = bool(p("disable_mask_on_replay").value)
         self._margin_stops = 0
         self.avoid_max = float(p("avoid_max_offset_m").value)
         self.avoid_step = float(p("avoid_step_m").value)
@@ -1537,9 +1545,26 @@ class PathTeachNode(Node):
                 any_best = d
             # 行進方向那一側：只看落在車身寬度內、且在行進方向前方的點
             if abs(y) <= half_w:
-                dv = (x - front) if direction >= 0 else (rear - x)
-                if dv < dir_best:
-                    dir_best = dv
+                # ★★ 2026-08-20：補上「在身後就不管」的守衛 ★★
+                #
+                # 上面那行註解一直寫著「且在行進方向前方」，但**程式碼裡沒有
+                # 這個檢查**（`_forward_clearance` 有：`if longitudinal <= 0.0:
+                # continue  # 在身後，不管`，這裡漏了）。
+                #
+                # 少了它，行進方向**反側**的點也會進來取 min，而那些點的 dv
+                # 必為負、絕對值還很大：
+                #   前進中車後 0.8 m 有牆 -> dv = -0.8 - 0.311 = -1.11
+                #   -> dir_margin = -1.11 -> 每個控制週期都硬停
+                # 倒車段更慘：正前方所有點都變成負的，0.99 m 走廊裡
+                # 前方兩公尺內必有牆，等於整段倒車從第一個週期起全程硬停。
+                # 14 個折返點每一個折返後車子都剛從牆邊退出來，牆就在身後 0.3~1 m。
+                #
+                # ★ log 印出**負的公分數**就是這條 bug 的指紋。
+                longitudinal = x if direction >= 0 else -x
+                if longitudinal > 0.0:
+                    dv = (x - front) if direction >= 0 else (rear - x)
+                    if dv < dir_best:
+                        dir_best = dv
         return dir_best, any_best
 
     def _side_clearance(self) -> Tuple[float, float]:
@@ -1973,6 +1998,11 @@ class PathTeachNode(Node):
             self._following = False
             self._active_path_id = ""
             self._stop(5)
+            # ★ 2026-08-20：遮罩一定要復原。8/19 版本關掉之後沒有任何
+            #   地方打開，於是重播結束後 AMCL 一直看得到車後的人，
+            #   直到下一次按錄製為止 —— 而那可能是好幾趟之後的事。
+            if self.disable_mask_on_replay:
+                self._set_scan_mask(True)
 
     def _follow_loop(self, goal_handle, pts, scale, result):
         idx = 0
@@ -1985,15 +2015,49 @@ class PathTeachNode(Node):
         sig_hist: List[Tuple[float, List[float]]] = []   # 打滑偵測用的掃描簽章歷史
         prog_idx = -1
         last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
-        # ★ 自主重播 = 沒有人跟在車後 -> 全 360 度偵測（見 _set_scan_mask）
-        self._set_scan_mask(False)
+        # ★★ 2026-08-20 撤回 8/19 的 `_set_scan_mask(False)` ★★
+        #
+        # 原本這裡寫「自主重播 = 沒有人跟在車後 -> 全 360 度偵測」。
+        # **前提是錯的，而且改動有害無益：**
+        #
+        #   1. 本節點的避障一直訂**原始 `/scan`**（scan_topic 預設 "scan"，
+        #      nav_bringup_cc.launch.py:336 也明寫 "scan"，註解說
+        #      「避障要看得到人，所以訂原始的 /scan」）。
+        #      -> `_body_margin` / `_forward_clearance` / `_arc_clearance` /
+        #         `_side_clearance` **本來就是 360 度**，關遮罩一點好處都沒有。
+        #
+        #   2. 遮罩實際影響的是吃 `/scan_slam` 的 AMCL（nav2 yaml:66）與
+        #      global_costmap 的 obstacle 層（:734）。那是 8/03 為了
+        #      「操作者跟在車後」做的修正，地圖吻合度 71% -> 90%。
+        #      關掉 = 把那個已驗證的改善默默推翻。
+        #
+        #   3. 重播時人**仍然會跟在車後**（SOP 要求隨時能按急停），
+        #      所以 8/03 的理由在重播時完全成立。
+        #
+        #   4. 而且 `finally` 沒有復原，關掉會一直關到下次錄製為止。
+        #
+        # 服務 `/set_scan_mask` 保留（手動除錯時有用），但重播不再自動關。
+        # 真要關的話帶 `disable_mask_on_replay:=true`，並且知道自己在做什麼。
+        if self.disable_mask_on_replay:
+            self.get_logger().warning(
+                "⚠ disable_mask_on_replay=true：重播期間關閉車尾遮罩。"
+                "AMCL 會看到跟在車後的人，定位可能變差（8/03 實測差別 71% vs 90%）")
+            self._set_scan_mask(False)
         # 實際走出來的曲率（Δyaw / Δs）。用來對照指令曲率，
         # 涵蓋舵機延遲與欠轉 —— 見 _arc_clearance_robust。
         prev_pose_for_curv = None
         curv_meas = None
         yaw_strikes = 0            # 朝向誤差連續超標次數（姿態判別）
         yaw_warned = False
-        last_cusp_t = 0.0          # 上次折返換向的時刻（姿態判別寬限期用）
+        # ★★ 2026-08-20：起點要有寬限期，不能從 0.0 開始 ★★
+        #   0.0 表示「從來沒折返過」-> `_yaw_grace` 在重播的**第一個週期**
+        #   就是 False。而起點常常接在折返段之後，人把車推到起點時車頭
+        #   差 40 度以上很常見 -> 8 次 strike（20 Hz 下只有 0.4 秒）
+        #   -> 車子**一步都還沒動就 abort**，訊息卻說「純追蹤修不回來」。
+        #   起步視為「剛折返完」，給一樣的寬限。
+        last_cusp_t = time.monotonic()
+        # 車身外緣硬停的起始時刻（0 = 現在沒有在硬停）。見硬停分支的說明。
+        margin_stop_t = 0.0
         prog_t = time.monotonic()
         # 每個路徑點的累計弧長，給進度檢查用（見迴圈裡的說明）
         path_s = [0.0] * len(pts)
@@ -2059,7 +2123,11 @@ class PathTeachNode(Node):
                 (self.escape_grace > 0.0 and last_escape_t > 0.0
                  and _now - last_escape_t < self.escape_grace)
                 or (last_cusp_t > 0.0 and _now - last_cusp_t < self.cusp_yaw_grace))
-            if _yaw_err > self.max_yaw_err and not _yaw_grace:
+            # ★★ 2026-08-20：車子沒在動時不要累計 ★★
+            #   停著歪頭不會刮到任何東西。而硬停／等障礙時 _cmd_v_last = 0，
+            #   卻可能維持一個大偏航好幾秒 -> 20 Hz 下 0.4 秒就湊滿 8 次 -> 誤中止。
+            _yaw_moving = abs(self._cmd_v_last) > 1e-6
+            if _yaw_err > self.max_yaw_err and not _yaw_grace and _yaw_moving:
                 yaw_strikes += 1
                 if yaw_strikes >= self.yaw_strikes_max:
                     self._stop()
@@ -2073,6 +2141,11 @@ class PathTeachNode(Node):
                     self.get_logger().error(result.message)
                     return result
             else:
+                # ★★ 2026-08-20：25~40 度之間要**衰減**，不是原地不動 ★★
+                #   原本只在 <= warn(25 度) 才歸零，25~40 度之間既不加也不減。
+                #   yaw 在 45/30 度之間振盪時 strikes 只增不減，最後照樣中止，
+                #   而訊息會謊稱「連續 N 次」—— 現場拿那個數字反推會反推錯。
+                yaw_strikes = max(0, yaw_strikes - 1)
                 if _yaw_err <= self.warn_yaw_err:
                     yaw_strikes = 0
                     yaw_warned = False
@@ -2227,8 +2300,15 @@ class PathTeachNode(Node):
 
             if not stuck_now:
                 prog_idx = idx
-                prog_s = path_s[idx]
-                prog_t = now_t
+                # ★★ 2026-08-20：只有真的有推進才重設計時 ★★
+                #   原本無條件 `prog_t = now_t`，但「沒推進、但還沒滿
+                #   no_progress 秒」時 stuck_now 仍是 False -> 也會走到這裡
+                #   -> prog_t 每個週期歸零 -> `now_t - prog_t` 永遠只有一個
+                #   控制週期 -> 上面那條「有在動但沒推進」的判準**永遠不成立**。
+                #   那條判準從 8/10 加進來到現在一次都沒觸發過。
+                if self.stall_progress <= 0 or path_s[idx] - prog_s >= self.stall_progress:
+                    prog_s = path_s[idx]
+                    prog_t = now_t
                 self._escape_steer = None      # 真的在動，下次卡住重新判斷轉向
             elif time.monotonic() - prog_t > self.no_progress:
                 if escapes < self.max_escapes:
@@ -2317,34 +2397,92 @@ class PathTeachNode(Node):
             #   `any_margin` 就是為了抓「轉彎時前角刮到側牆」這種側向接觸。
             # 實際走出來的曲率 = Δyaw / Δs（不必訂 odom，位姿每個週期都有）。
             # ★ 只在真的有移動時更新：靜止時 Δs≈0，除下去會爆出巨大的假曲率。
+            # ★★ 2026-08-20：實測曲率要有基線下限、物理箝制與時效 ★★
+            #
+            # 原本基線只要 1 cm。但本檔 feasibility_window_m 的註解自己寫過：
+            # 「教導路徑點距 5 cm，單點對的朝向差被 AMCL 的 yaw 抖動主導，
+            #   會把雜訊誤判成緊彎」——1 cm 比那個還小 5 倍，同一個病。
+            #
+            # 更糟的是 prev_pose_for_curv 只在 _ds > 門檻時更新，也從不
+            # 因折返／脫困而重置。脫困三點轉向累計轉 68 度、淨位移可能只有
+            # 5 cm -> curv_meas = 1.19/0.05 = 23.8 /m（R = 4 cm），
+            # 而物理極限只有 1.33 /m（R = 0.75 m）。
+            # _arc_clearance_robust 取三者**最小**，垃圾值一定勝出 ->
+            # 沿 R=4 cm 的假弧掃描 -> 立刻誤判前方阻擋 -> 等 4 秒 -> 脫困
+            # -> 又轉一次 -> 迴圈。這與 8/03「78% 時間在脫困」是同型症狀。
+            _CURV_MAX = 1.0 / 0.75          # 廠商韌體最小迴轉半徑 0.750 m
             if prev_pose_for_curv is not None:
-                _px, _py, _pyaw = prev_pose_for_curv
+                _px, _py, _pyaw, _pt_t = prev_pose_for_curv
                 _ds = math.hypot(x - _px, y - _py)
-                if _ds > 0.01:
-                    curv_meas = norm_angle(yaw - _pyaw) / _ds
-                    prev_pose_for_curv = (x, y, yaw)
+                if time.monotonic() - _pt_t > 2.0:
+                    # 太久沒更新（停著等障礙、硬停）-> 分子會是整段時間的
+                    # yaw 漂移，整個丟掉重來
+                    curv_meas = None
+                    prev_pose_for_curv = (x, y, yaw, time.monotonic())
+                elif _ds > 0.10:            # 與 feasibility_window_m 對齊
+                    _k = norm_angle(yaw - _pyaw) / _ds
+                    curv_meas = max(-_CURV_MAX, min(_CURV_MAX, _k))
+                    prev_pose_for_curv = (x, y, yaw, time.monotonic())
             else:
-                prev_pose_for_curv = (x, y, yaw)
+                prev_pose_for_curv = (x, y, yaw, time.monotonic())
 
             dir_margin, any_margin = self._body_margin(cur_dir)
-            if min(dir_margin, any_margin) <= self.body_margin_stop:
+            # ★★ 2026-08-20：只有「行進方向」那一側可以煞停 ★★
+            #
+            # 原本是 min(dir_margin, any_margin)，但 `any_margin` 是點到車身
+            # 矩形的距離，在走廊裡就等於**側向空隙** —— 而本專案自己記錄的
+            # 實測側向空隙是 0.03 / 0.07 / 0.20 m（見 _pick_avoid_offset 與
+            # wall_keepout_m 的註解），三筆有兩筆低於門檻 0.12。
+            # `wall_keepout_m = 0.25` 的存在本身就宣告「設計上預期在
+            # 0~0.25 m 側向空隙下運行」，門口三點轉向更是貼到幾公分。
+            # 拿它當煞停條件 = 一進走廊就永久停住。
+            #
+            # 側向的風險（轉彎外甩刮擦）真實存在，但那是**警告**該做的事，
+            # 不是煞停 —— 側向貼牆時繼續前進是安全的，往牆的方向轉才不是，
+            # 而「往哪個方向轉」已經由 _arc_clearance_robust 掃過了。
+            if any_margin <= self.body_margin_stop and self._margin_stops % 40 == 0:
+                self.get_logger().warning(
+                    f"⚠ 車身側面只剩 {any_margin * 100:.0f} cm（轉彎外甩風險，僅警告不煞停）")
+            if dir_margin <= self.body_margin_stop:
                 self._stop()
                 self._margin_stops += 1
-                which = "行進方向" if dir_margin <= any_margin else "車身側面（轉彎外甩）"
+                if margin_stop_t <= 0.0:
+                    margin_stop_t = time.monotonic()
                 if self._margin_stops % 20 == 1:
                     self.get_logger().warning(
-                        f"⚠ 車身外緣只剩 {min(dir_margin, any_margin) * 100:.0f} cm"
-                        f"（{which}，門檻 {self.body_margin_stop * 100:.0f} cm），"
+                        f"⚠ 行進方向車身外緣只剩 {dir_margin * 100:.0f} cm"
+                        f"（門檻 {self.body_margin_stop * 100:.0f} cm），"
                         f"已煞停（累計 {self._margin_stops} 次）")
-                # ★ 不 abort、不脫困 —— 只是不再往那個方向送速度。
-                #   障礙移開（人走掉）就會自己恢復；真的是牆的話，
-                #   下面既有的卡住偵測會在 stuck_timeout 之後接手處理。
-                #   ★ 這裡刻意不呼叫脫困：倒車貼牆時脫困可能繼續往後推。
+                # ★★ 2026-08-20：硬停必須自己管逾時，不能指望卡住偵測 ★★
+                #
+                # 原本這裡寫「下面既有的卡住偵測會在 stuck_timeout 之後接手」。
+                # 那是錯的，而且錯得很貴：
+                #   1. 卡住偵測在**上面**（本函式較早的位置），`continue`
+                #      根本走不到「下面」
+                #   2. 三個判準全部要求 `want > 0.02`，而 `_stop()` 會把
+                #      `_cmd_v_last` 歸零 -> move_hist 全是 0 -> want = 0
+                #      -> 三個判準**全部失效**
+                #   3. 第三個判準（有在動但沒推進）本身是死碼：
+                #      `if not stuck_now:` 每個週期都把 prog_t 歸零（已一併修）
+                # 結果是硬停之後永遠不 abort、不脫困，一路掛到 HMI 端
+                # 300 秒 client timeout，訊息顯示「等待結果逾時」——
+                # 把現場指向動作伺服器，而真因在這裡。
+                if time.monotonic() - margin_stop_t > self.no_progress * 2.0:
+                    self._stop()
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = (
+                        f"車身外緣持續不足（行進方向只剩 {dir_margin * 100:.0f} cm，"
+                        f"已停 {time.monotonic() - margin_stop_t:.0f} 秒）。"
+                        f"障礙沒有移開，請人工介入。")
+                    self.get_logger().error("⛔ " + result.message)
+                    return result
                 self._send_feedback(goal_handle, idx, len(pts),
-                                    min(dir_margin, any_margin), "blocked",
-                                    f"車身外緣 {min(dir_margin, any_margin) * 100:.0f} cm")
+                                    dir_margin, "blocked",
+                                    f"車身外緣 {dir_margin * 100:.0f} cm")
                 time.sleep(self.control_dt)
                 continue
+            margin_stop_t = 0.0        # 恢復了，計時歸零
 
             # ★ 用穩健版：涵蓋舵機延遲與欠轉（見 _arc_clearance_robust 的長註解）
             clearance = self._arc_clearance_robust(cur_dir, preview_curv, curv_meas,
@@ -2469,6 +2607,22 @@ class PathTeachNode(Node):
             ld = max(self.la_min,
                      min(self.la_max,
                          (self.la_k * abs(speed) + self.la_min) * _la_scale))
+            # ★★ 2026-08-20：倒車走前軸時，前視距離必須補回一個軸距 ★★
+            #
+            # `_lookahead_point` 是從 `pts[idx]`（**後軸**最近點）往前找
+            # 「距離**前軸** >= ld」的點。倒車時行進方向是 -yaw，而前軸在
+            # +yaw 方向 0.322 m —— 也就是 pts[idx] 距前軸已經有 0.322 m。
+            # 於是有效前視 = ld - 0.322：
+            #     ld=0.42（倒車標稱）  -> 實際 0.10 m
+            #     ld=0.336（減速中）   -> 實際 0.014 m
+            #     ld<=0.322           -> 直接回 pts[idx]，前視 **0**
+            # 而 lookahead_min_m = 0.30 **小於** axle_spacing = 0.322，
+            # HMI 速度滑桿最低 30% + 走廊長期減速時一定會落到最後一列。
+            #
+            # 純追蹤增益是 2/ld²，前視縮到 0.1 m 等於增益放大 17 倍 ——
+            # 這正好是「倒車擺盪」的成因，而換前軸參考點本來是要消除它的。
+            if cur_dir < 0 and self.rev_front_axle:
+                ld += self.axle_spacing
             _rx, _ry = self._track_ref(pose, cur_dir)
             _tgt_i, target = self._lookahead_point(pts, idx, _rx, _ry, ld)
             total_off = avoid_offset + wall_push
