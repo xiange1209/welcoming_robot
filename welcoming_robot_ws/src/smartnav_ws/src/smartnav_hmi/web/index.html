@@ -348,8 +348,26 @@
      Apple 的人機介面指南建議可點目標 ≥ 44 pt；原本的
      `padding: 12px 15px` + 14px 字約 40 px 高，站著用平板時容易點歪。 */
   @media (pointer: coarse) {
-    button, .seg > *, #tabs button, select, input[type="text"], input[type="password"] {
+    /* ★★ 2026-08-20：`input[type="text"]` 匹配到**零個**元素 ★★
+       全檔 8 個文字輸入框**都省略了 type**（#sayinput、#regname、#tmapname、
+       #tpathname、#newmapname、#speakinput、#loginuser…），而 CSS 屬性選擇器
+       比對的是實際存在的 attribute，不是 IDL 預設值。
+       結果：同一列的 button 被撐到 44px、輸入框留在 38px，每一列都對不齊，
+       而最需要放大的主輸入框反而沒放大。唯一吃到的是有 type 的 #loginpass，
+       所以登入頁會出現「帳號 38 / 密碼 44」的不對稱。
+       `:not([type])` 才是關鍵。range/checkbox/file 刻意不列（撐高會破版）。 */
+    button, .seg > *, #tabs button, select,
+    input:not([type]), input[type="text"], input[type="password"], input[type="number"] {
       min-height: 44px;
+    }
+    /* ★ 縮圖上的移除鈕是**覆蓋層**，不能被 44px 撐開。
+       `#shots .rm` 的 specificity 再高也沒用 —— min-height 與 height 是兩個
+       不同的屬性，min-height 永遠 clamp 住 height。被撐成 18x44 的直立紅橢圓
+       後會蓋掉縮圖右側約 3/4，而 rm.onclick 沒有確認就直接 splice，
+       橫向撥動瀏覽 10 張照片時手指碰到右半邊 = 靜默刪掉那張。 */
+    #shots .rm {
+      min-height: 0; width: 26px; height: 26px; line-height: 26px;
+      top: -7px; right: -7px; font-size: 15px;
     }
     #tabs button { font-size: 15px; }
     /* 站在機器人前面操作時手會抖，把相鄰按鈕的間距拉開 */
@@ -1219,7 +1237,7 @@ async function refreshPaths() {
 
 async function followPath(p, reverse) {
   const word = reverse ? "反向重播" : "重播";
-  if (!confirm(`${word}「${p.name}」？\n\n車子會立刻開始移動（${p.length_m} 公尺）。\n右下角的「緊急停止」隨時可以中止。`)) return;
+  if (!confirm(`${word}「${p.name}」？\n\n車子會立刻開始移動（${p.length_m} 公尺）。\n上方列右邊的「緊急停止」隨時可以中止。`)) return;
   const r = await post("/api/paths/follow", {
     path_id: p.path_id, name: p.name, reverse: reverse,
     speed_scale: pathSpeed,
@@ -1558,6 +1576,8 @@ let lastIdentity = {};
 // 否則同一個人被節流不發布的空檔會被誤判成人走了。
 const FACE_FRESH_SEC = 3.5;
 let identityAgeAtRecv = Infinity;   // 收到快照當下，identity 已經多舊（秒）
+// ★ 2026-08-20：最後一則身份訊息裡有沒有真的人臉框（見 render 的 bbox 判別）
+let faceBoxed = false;
 let identityRecvAt = 0;             // 收到快照的本地時間
 
 function faceAge() {
@@ -1623,7 +1643,10 @@ function updateFaceStatus() {
     return;
   }
 
-  const seen = facePresent();
+  // ★ 2026-08-20：同樣要看 bbox。否則收到「無人」訊息後的數秒內會顯示
+  //   「偵測到人臉（未在資料庫中）——可以開始註冊」並把虛線框轉成綠色，
+  //   對著空無一人的鏡頭給註冊者「已經對好位」的錯誤訊號。
+  const seen = facePresent() && faceBoxed;
   el.textContent = seen
     ? (lastIdentity.recognized
         ? `偵測到人臉：${lastIdentity.user_name}`
@@ -1666,8 +1689,23 @@ function render(s) {
 
   // 後端（user_auth_node）現在也會在 2 秒沒人時主動發一則「無人」，
   // 這裡是**第二道防線** —— 後端節點整個掛掉時，前端仍然會自己讓橫幅退回等待狀態。
+  // ★★ 2026-08-20：加上 bbox 面積判別 ★★
+  //
+  //   8/19 的兩個修正互相打架：後端改成「2 秒沒人就主動發一則說沒人」，
+  //   而那則訊息剛好是**新鮮的**，於是 `fresh` 這道防線整個被繞過。
+  //   那則訊息是 user_name="Unknown"（truthy）、similarity=0.0，
+  //   所以畫面會顯示「訪客／未在資料庫中（相似度 0）」約 3.5 秒 ——
+  //   遮住鏡頭後憑空多出一位不存在的訪客，段四的驗收條件當場失敗。
+  //
+  //   判別依據與 bank_reception_node.identity_callback（同日修正）**完全一致**：
+  //     真的有人臉 -> bbox = face_msg.bbox，一定有面積
+  //     沒人      -> user_auth_node 明確寫死 [0,0,0,0]
+  //   bbox 是唯一能區分兩者的欄位，而且不必動 .msg 介面。
+  const _bb = id.bbox || [];
+  const noFace = _bb.length < 4 || ((_bb[2] - _bb[0]) <= 0 && (_bb[3] - _bb[1]) <= 0);
+  faceBoxed = !noFace;
   const fresh = facePresent();
-  const shown = fresh ? id : {};
+  const shown = (fresh && !noFace) ? id : {};
   $("banner").className = shown.recognized ? (shown.user_type || "").toLowerCase() : "";
   $("who").firstChild.nodeValue = shown.recognized ? shown.user_name
     : (shown.user_name ? "訪客" : "等待辨識…");
@@ -1814,9 +1852,9 @@ function ttsSay(text) {
   //   在此之前 ASR 只能用字數估播放時間（0.22 秒/字），兩個壞處：
   //   100 字的回覆會讓它聾 23 秒；平板沒連線時根本沒出聲卻照樣靜音。
   //   onend 與 onerror 都要回報 —— 只綁 onend 的話，唸到一半失敗就會卡在「播放中」。
-  u.onstart = () => ttsReport(true);
-  u.onend   = () => ttsReport(false);
-  u.onerror = () => ttsReport(false);
+  u.onstart = () => { ttsReport(true);  ttsMark("speaking"); };
+  u.onend   = () => { ttsReport(false); ttsMark("idle"); };
+  u.onerror = (e) => { ttsReport(false); ttsMark("error", e && e.error); };
   speechSynthesis.cancel();   // 上一句還沒唸完就被新回覆蓋過時不要排隊，直接換
   speechSynthesis.speak(u);
 }
@@ -1873,6 +1911,32 @@ function ttsSyncBtn() {
   const r = $("ttsrate"), rv = $("ttsratev");
   if (r) r.value = tts.rate;
   if (rv) rv.textContent = tts.rate.toFixed(2) + "×";
+}
+
+/** 把朗讀狀態顯示在按鈕上。
+ *
+ * ★★ 2026-08-20：沒有這個的話，「沒聲音」有三種原因而畫面完全分不出來 ★★
+ *   (1) TTS 根本沒被觸發（LLM 沒回、話題沒通）
+ *   (2) 觸發了但合成失敗（這台裝置沒有中文語音包 —— iPad 上很常見）
+ *   (3) 裝置音量鍵靜音
+ * 原本 onerror 只送 HTTP 回報、畫面一點反應都沒有，明天驗語音輸出時
+ * 會被誤判成 (1) 然後跑去查 LLM，而真因是 (2)。
+ */
+function ttsMark(state, why) {
+  const b = $("ttsbtn");
+  if (!b || !tts.on) return;
+  if (state === "speaking") {
+    b.textContent = "🔊 唸讀中…";
+    b.classList.remove("danger");
+  } else if (state === "error") {
+    b.textContent = "⚠ 朗讀失敗";
+    b.classList.add("danger");
+    toast("語音合成失敗" + (why ? "：" + why : "") +
+          "（這台裝置可能沒有中文語音包）", true);
+  } else {
+    b.classList.remove("danger");
+    ttsSyncBtn();
+  }
 }
 
 function renderChat(s) {
@@ -1994,13 +2058,24 @@ if (ttsOK) ttsFillVoices();
 if (ttsOK && tts.on) {
   const b = $("ttsbtn");
   if (b) b.textContent = "🔇 點一下啟用朗讀";
-  const unlock = () => {
+  const unlock = (ev) => {
+    // ★★ 2026-08-20：點的就是朗讀鈕本身時不要搶 ★★
+    //   按鈕文案寫著「點一下啟用朗讀」，操作者最自然的動作就是點它。
+    //   但 ttsbtn.onclick 是**無條件 toggle**，於是：
+    //     pointerdown -> 這裡解鎖成功、把文字改回「🔊 朗讀中」
+    //     click       -> tts.on = false、localStorage 記成關、cancel()
+    //   淨結果是「解鎖成功但朗讀被關掉」，要再點第二下才真的開。
+    //   明天的動線是「開頁 -> 按朗讀 -> 打一句話 -> 平板安靜」，
+    //   會被誤判成 LLM 沒回或 TTS 壞掉。
+    //   讓按鈕走它自己的 onclick 就好（那一下的 ttsSay 本來就在手勢堆疊裡）。
+    if (ev && ev.target && ev.target.closest && ev.target.closest("#ttsbtn")) return;
+    document.removeEventListener("pointerdown", unlock);
     // 唸一個空白就夠了：目的只是在使用者手勢裡呼叫過一次 speak()
     try { speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); } catch (e) {}
     ttsFillVoices();
     ttsSyncBtn();
   };
-  document.addEventListener("pointerdown", unlock, { once: true });
+  document.addEventListener("pointerdown", unlock);   // ★ 不用 once，自己移除
 }
 
 $("clearchatbtn").onclick = () => {

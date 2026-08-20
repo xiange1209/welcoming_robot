@@ -3234,7 +3234,18 @@ class HmiServerNode(Node):
             index_path = web_dir / "index.html"
             if not index_path.exists():
                 return HTMLResponse("<h1>找不到 index.html</h1>", status_code=500)
-            return HTMLResponse(index_path.read_text(encoding="utf-8"))
+            # ★ 2026-08-20：補禁快取標頭。
+            #   Starlette 的 HTMLResponse 只設 content-type 與 content-length，
+            #   **沒有 Cache-Control、沒有 ETag、也沒有 Last-Modified** ——
+            #   連條件式請求都發不出來，瀏覽器只能重抓或直接吃自己那份。
+            #   同一支檔案的地圖 PNG 與 frame.jpg 都明確帶了 no-store，就這裡漏了。
+            #   而整個前端只有 index.html 一個檔（見 setup.py 的 data_files），
+            #   **一次快取失手 = 整個前端是舊版**，包含所有修正。
+            #   iOS Safari 在「加入主畫面」模式下對 HTML 的重用特別積極。
+            return HTMLResponse(
+                index_path.read_text(encoding="utf-8"),
+                headers={"Cache-Control": "no-store, must-revalidate"},
+            )
 
         @app.get("/api/state")
         async def api_state() -> JSONResponse:

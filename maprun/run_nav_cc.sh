@@ -33,7 +33,20 @@ fi
 #     ★ 這是「導航忽然變準／忽然變爛」最可能的隱形變因，做 A/B 前必須排除。
 #     偵測用 pgrep -x（比對執行檔名，不是命令列字串）—— 專案禁用 `pgrep -f`，
 #     因為字串比對誤殺過七次。
-if pgrep -x controller_server > /dev/null 2>&1 || pgrep -x amcl > /dev/null 2>&1; then
+# ★★ 2026-08-20：pgrep -x 對這兩個名字其實**永遠比不中** ★★
+#
+#   pgrep -x 比對的是 /proc/<pid>/comm，而 Linux 的 TASK_COMM_LEN = 16（含 NUL），
+#   也就是**只有 15 個可用字元**。逐一數：
+#       controller_server  17 -> comm = "controller_serv"  比不中
+#       stuck_detector_cc  17 -> comm = "stuck_detector_"  比不中
+#       amcl                4 -> 可用，但**建圖模式下 amcl 根本不跑**
+#   所以這道防護等於完全失效，而本檔上面自己記著
+#   「實測同時有四份 stuck_detector_cc、三份 scan_filter_cc，吻合度掉到 88%」。
+#
+#   改用 ros2 node list —— ROS 圖是這件事唯一可靠的事實來源，
+#   而且不違反專案禁用 `pgrep -f` 的鐵則（那是字串比對誤殺的來源）。
+_dupes=$(ros2 node list 2>/dev/null | grep -cE "controller_server|amcl|scan_filter_cc|stuck_detector_cc|path_teach_cc")
+if [ "${_dupes:-0}" -gt 0 ]; then
   echo "[run_nav_cc] ✗ 偵測到導航堆疊已經在跑（controller_server / amcl）。" >&2
   echo "[run_nav_cc]   再啟動一次會產生重複節點，雷達與定位會開始互相干擾。" >&2
   echo "[run_nav_cc]   請先執行：~/maprun/stop_nav_cc.sh" >&2

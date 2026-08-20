@@ -6,7 +6,7 @@
 用法：
     ros2 launch smartnav_hmi hmi.launch.py
     ros2 launch smartnav_hmi hmi.launch.py \\
-        image_capture_topic:=/camera/color/image_raw robot_frame:=base_footprint
+        image_capture_topic:=/camera/color/image_raw/compressed robot_frame:=base_footprint
 """
 
 from launch import LaunchDescription
@@ -20,7 +20,19 @@ from launch_ros.parameter_descriptions import ParameterValue
 ARGS = [
     ("port", "8080", int, "HTTP 連接埠"),
     ("host", "0.0.0.0", str, "HTTP 綁定位址"),
-    ("image_capture_topic", "image_raw", str, "相機影像話題。實車 astra 相機請設 /camera/color/image_raw"),
+    # ★★ 2026-08-20：預設從 "image_raw" 改成實際存在的話題 ★★
+    #   本檔的 ARGS 是**無條件**展開成參數傳給 Node 的（見下方 Node(parameters=...)），
+    #   所以不帶參數啟動時一定會蓋掉節點自己正確的預設值
+    #   （hmi_server_node.py:766 = /camera/color/image_raw/compressed）。
+    #   而全 workspace **沒有任何節點發布 /image_raw** ——
+    #   astra 發的是 /camera/color/image_raw，compressed 那條由廠商
+    #   wheeltec_camera.launch.py 的 image_transport/republish 發。
+    #   後果：平板顯示「NO CAMERA SIGNAL」佔位圖，迎賓頁、註冊預覽、
+    #   「從畫面拍照」全掛，段一起手就停住。
+    #   ★ 選 compressed 而非 raw：Pi4 上原始幀 640x480x3 = 900 KB，
+    #     壓縮那條省非常多，而 HMI 只是要顯示。
+    ("image_capture_topic", "/camera/color/image_raw/compressed", str,
+     "相機影像話題（壓縮那條由廠商 republish 發，Pi4 上比 raw 省很多）"),
     ("image_transport", "auto", str, "auto／raw／compressed。auto 依話題是否以 /compressed 結尾判斷"),
     ("user_identity_topic", "user_identity", str, "身份辨識結果話題（由 user_auth_node 發布）"),
     ("map_topic", "map", str, "佔據柵格地圖話題（slam_toolbox 或 map_server 發布）"),
