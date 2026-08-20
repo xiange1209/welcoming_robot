@@ -28,7 +28,8 @@
 """
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess, GroupAction,
-                            IncludeLaunchDescription, LogInfo, TimerAction)
+                            IncludeLaunchDescription, LogInfo, OpaqueFunction,
+                            TimerAction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -43,6 +44,47 @@ def _inc(pkg, rel, args=None, cond=None):
         launch_arguments=list((args or {}).items()),
         condition=cond,
     )
+
+
+def _guard_duplicate_stack(context, *args, **kwargs):
+    """★★ 2026-08-20：起飛前先確認沒有另一份堆疊在跑 ★★
+
+    `~/maprun/run_nav_cc.sh` 有這個防護（`pgrep -x` + `FORCE_NAV=1` 覆寫），
+    這支統一 launch 一直沒有。而它同時起十幾個節點，跟手動啟動的併存時
+    症狀是**定位數據被汙染但不會報錯** —— 實測曾同時有四份 stuck_detector_cc、
+    三份 scan_filter_cc，多份 scan_filter 同時發布過濾雷達讓吻合度掉到 88%。
+
+    ★ 用 `ros2 node list` 而不是 pgrep：
+      (a) 專案硬性規則禁用 `pgrep -f` / `pkill -f`（字串比對誤殺過七次）
+      (b) `pgrep -x` 比對的是 comm 欄位，**Linux 上限 15 字元** ——
+          `stuck_detector_cc`(17) / `controller_server`(17) 這類永遠比不中，
+          等於檢查了個寂寞
+      ROS 圖是這件事唯一可靠的事實來源。
+
+    帶 `force:=true` 可以跳過（知道自己在做什麼的時候）。
+    """
+    if LaunchConfiguration("force").perform(context).lower() in ("true", "1"):
+        return [LogInfo(msg="[bringup] ⚠ force:=true，跳過重複堆疊檢查")]
+
+    import subprocess
+    try:
+        out = subprocess.run(["ros2", "node", "list"], capture_output=True,
+                             text=True, timeout=8).stdout
+    except Exception as exc:
+        # 查不到就放行 —— 這是保護不是門禁，不該因為自己壞掉就擋住啟動
+        return [LogInfo(msg=f"[bringup] 重複堆疊檢查跳過（{exc}）")]
+
+    names = [n.strip() for n in out.splitlines() if n.strip()]
+    watch = ("scan_filter_cc", "stuck_detector_cc", "path_teach_cc",
+             "controller_server", "amcl", "hmi_server", "llm_service")
+    dup = sorted({w for w in watch if sum(w in n for n in names) > 0})
+    if dup:
+        raise RuntimeError(
+            "偵測到已經有節點在跑：" + "、".join(dup) + "。" +
+            "統一 launch 會再起一份，兩份併存會汙染定位數據而且不會報錯。" + "\n" +
+            "  先停乾淨：~/maprun/stop_nav_cc.sh、~/maprun/kill_sensors_cc.sh" + "\n" +
+            "  或確定要併存：ros2 launch smartnav_bringup demo.launch.py force:=true")
+    return [LogInfo(msg="[bringup] ✓ 沒有既有節點，可以啟動")]
 
 
 def generate_launch_description():
@@ -68,6 +110,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "start_mode", default_value="auto",
             description="auto / mapping / localization"),
+        DeclareLaunchArgument(
+            "force", default_value="false",
+            description="跳過重複堆疊檢查（★ 只在確定要併存時用）"),
         DeclareLaunchArgument(
             "use_exploration", default_value="false",
             description="★ 兩個探索參數在下游要一起設，這裡只暴露一個避免設出矛盾組合"),
@@ -165,5 +210,6 @@ def generate_launch_description():
                     "並用 ros2 node list 檢查有沒有重複節點。"),
     ])
 
-    return LaunchDescription(args + [stage_sensors, stage_nav,
+    return LaunchDescription(args + [OpaqueFunction(function=_guard_duplicate_stack),
+                                     stage_sensors, stage_nav,
                                      stage_brain, stage_audio, stage_top])

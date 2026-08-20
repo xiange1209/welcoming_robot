@@ -108,10 +108,24 @@ if [ "$MIC_MODE" = "cancel" ]; then
 else
     echo "[run_asr] 雙麥克風模式 $MIC_MODE"
 fi
-# 補回 cancel 壓掉的人聲位準（倍率）。1.0 = 不補。預設由節點決定（x1.86）。
-if [ -n "$ASR_MIC_GAIN" ]; then
-    MIC_ARGS="$MIC_ARGS -p mic_output_gain:=$ASR_MIC_GAIN"
-    echo "[run_asr] 輸出補回增益覆寫為 $ASR_MIC_GAIN"
+# 補回 cancel 壓掉的人聲位準（**倍率**）。1.0 = 不補。預設由節點決定（x1.86）。
+#
+# ★★ 2026-08-20：這裡原本讀 $ASR_MIC_GAIN —— 與上面 amixer 用的是同一個變數 ★★
+#
+#   上面 :63 的 $ASR_MIC_GAIN 是 amixer 的**音量檔位（0~120）**，預設 66。
+#   這裡的 mic_output_gain 是**倍率**，預設 1.86。
+#   兩者尺度完全不同，卻共用一個環境變數。
+#
+#   後果：照本腳本註解去調校的人（「換場地或距離要重量」）設
+#   `ASR_MIC_GAIN=70` -> amixer 檔位 70（合理）＋ 輸出倍率 **70 倍**
+#   -> 音訊整段削爆 -> ASR 完全失效，而症狀看起來像麥克風壞掉。
+#   ★ 平常不會發作，因為不設環境變數時走的是「不加參數」那條路 ——
+#     愈是照文件調校的人愈會踩到。
+#
+#   改用獨立變數 ASR_OUT_GAIN。
+if [ -n "$ASR_OUT_GAIN" ]; then
+    MIC_ARGS="$MIC_ARGS -p mic_output_gain:=$ASR_OUT_GAIN"
+    echo "[run_asr] 輸出補回增益（倍率）覆寫為 $ASR_OUT_GAIN"
 fi
 
 nohup ros2 run smartnav_audio voice_trigger \

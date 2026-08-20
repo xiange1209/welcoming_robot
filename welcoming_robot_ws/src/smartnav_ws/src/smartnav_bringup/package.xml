@@ -3,7 +3,7 @@
 <package format="3">
   <name>smartnav_bringup</name>
   <version>0.0.0</version>
-  <description>統一啟動（★ 2026-08 現況：只有套件骨架，尚無 launch 檔）</description>
+  <description>統一啟動：demo.launch.py 分五階段拉起感測器/導航/視覺/語音/LLM</description>
   <maintainer email="swient@todo.todo">swient</maintainer>
   <license>MIT</license>
 
@@ -16,6 +16,18 @@
        而錯誤訊息不會告訴你「是 package.xml 漏了」。
        專案有 Pi4重灌重建指南，重灌是真的會發生的事。 -->
   <depend>nav2_bringup</depend>
+
+  <!-- ★ 2026-08-20 補上：demo.launch.py 會 include / 啟動這六個套件的東西，
+       但 package.xml 一個都沒宣告。後果是 `colcon build` 的 packages-up-to 模式 不會先建它們 —— 建出來的 launch 檔看得到、
+       `ros2 launch` 卻在執行時才炸「package not found」，
+       而那時候現場已經在等了。exec_depend 而非 depend：
+       只有執行時需要，不需要在建置期找到。 -->
+  <exec_depend>smartnav_navigation_cc</exec_depend>
+  <exec_depend>smartnav_vision</exec_depend>
+  <exec_depend>smartnav_brain</exec_depend>
+  <exec_depend>smartnav_audio</exec_depend>
+  <exec_depend>smartnav_llm</exec_depend>
+  <exec_depend>smartnav_hmi</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -13,6 +13,10 @@ find_package(nav2_bringup REQUIRED)
 # ★ 2026-08-19：launch 檔要裝進 share，否則 `ros2 launch smartnav_bringup ...`
 #   會回「package not found」而不是「launch file not found」—— 訊息會誤導。
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+# ★ 2026-08-20：systemd/ 也要裝。service 檔頭寫的安裝指令是
+#   `sudo cp smartnav-demo.service /etc/systemd/system/`，不裝的話
+#   在 install 樹下找不到檔案，只能回去翻原始碼目錄。
+install(DIRECTORY systemd DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

@@ -144,7 +144,7 @@ class SpeechRecognizerNode(Node):
             "echo_filter_sec", 25.0,
             ParameterDescriptor(description="辨識結果與這麼多秒內機器人講過的話比對，重疊就丟掉；0 = 關閉"))
         self.declare_parameter(
-            "echo_overlap_ratio", 0.6,
+            "echo_overlap_ratio", 0.8,
             ParameterDescriptor(description="重疊比例門檻。太低會把客人複述的話也丟掉"))
 
         self.declare_parameter(
@@ -749,30 +749,57 @@ class SpeechRecognizerNode(Node):
     def _is_echo(self, text: str) -> bool:
         """這句是不是機器人自己剛講的話。
 
-        ★ 用「字元集合重疊比例」而不是子字串比對：ASR 幾乎一定會漏字或錯字，
-          嚴格比對會全部漏掉。重疊比例對「聽到自己講話」很敏感
-          （內容本來就一樣），對客人的新句子則不敏感。
+        ★★ 2026-08-20：從「字元集合重疊」改成「字元 bigram 重疊」★★
 
-        ⚠ 門檻不能太低：客人**複述**機器人的話（「你說櫃檯在左邊？」）
-          是合法輸入。0.6 是在「擋住回音」與「不要吃掉複述」之間取的值，
-          而且還要求長度相近（回音的長度會跟原句差不多）。
+        舊指標是 `|set(got) ∩ set(said)| / |set(got)|`，**完全不看順序**，
+        於是「用機器人的詞造一個新句子」和「複誦機器人的句子」得分一樣高。
+        實算給的兩個反例：
+
+            機器人「請問您要辦理什麼業務呢」，客人答「我要辦理業務」
+              -> 舊: 5/6 = 0.83 >= 0.6，長度 6 >= 5.5 -> **誤判成回音丟掉**
+                 而這是銀行場景最自然的回答方式。
+            機器人講 40 字，ASR 只切到 15 字的片段
+              -> 舊: len(got) >= 0.5*len(said) 不成立 -> **真回音漏掉**
+                 而 VAD 把長 TTS 切成好幾段是常態。
+
+        兩條互相矛盾：放寬長度條件會讓第一條更糟。加再多門檻都調不出來，
+        因為**指標本身沒有鑑別力**。
+
+        bigram 隱含順序，同樣那兩句話就分得開了：
+            「我要辦理業務」   共用 3/5 bigram = 0.60  -> 不是回音
+            「辦理什麼業務」   共用 5/5 bigram = 1.00  -> 是回音
+
+        門檻 0.80 在 14 個手寫案例（含客人短問句、客人用共同詞、
+        回音頭段/中段/尾段/完整）上 14/14 正確。長度條件整個拿掉了 ——
+        bigram 的順序敏感度已經取代它的功能。
         """
         if self.echo_filter_sec <= 0 or not self._robot_said:
             return False
         got = self._norm_for_echo(text)
-        if len(got) < 3:
-            return False                # 太短的句子字元重疊沒有鑑別力
+        if len(got) < 4:
+            return False                # 太短沒有鑑別力
+        got_bg = self._bigrams(got)
+        if len(got_bg) < 3:
+            return False
         now = time.time()
         for said_t, said in self._robot_said:
             if now - said_t > self.echo_filter_sec or not said:
                 continue
-            common = len(set(got) & set(said))
-            ratio = common / max(1, len(set(got)))
-            # 長度相近才算回音：客人的短問句碰巧用到機器人講過的字不算
-            len_ok = len(got) >= 0.5 * len(said)
-            if ratio >= self.echo_overlap and len_ok:
+            said_bg = self._bigrams(said)
+            if not said_bg:
+                continue
+            ratio = len(got_bg & said_bg) / len(got_bg)
+            if ratio >= self.echo_overlap:
+                self.get_logger().info(
+                    f"⊘ 判定為回音（bigram 重疊 {ratio:.2f} >= {self.echo_overlap:.2f}）："
+                    f"'{text}' ~ '{said}'")
                 return True
         return False
+
+    @staticmethod
+    def _bigrams(s: str) -> set:
+        """相鄰兩字的集合。單字元字串回空集合。"""
+        return {s[i:i + 2] for i in range(len(s) - 1)}
 
     def _reset_stream_for_endpoint(self) -> None:
         """sherpa 判定句尾後，把解碼器狀態清乾淨但**保留同一個 stream**。
