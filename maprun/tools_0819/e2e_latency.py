@@ -35,6 +35,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 
@@ -49,10 +50,28 @@ class E2ELatency(Node):
         self.t = {}          # 這一輪各站的時刻
         self.round = 0
 
-        # 相機話題可能是壓縮或未壓縮，兩個都訂，先到先算
-        self.create_subscription(CompressedImage, "/image_raw/compressed",
-                                 lambda m: self._mark("image"), 1)
-        self.create_subscription(Image, "/image_raw", lambda m: self._mark("image"), 1)
+        # ★★ 2026-08-20 修正：話題名與 QoS 都是錯的，image 這站永遠不會被標記 ★★
+        #
+        # 錯誤一：話題名。車上相機發的是 `/camera/color/image_raw/compressed`
+        #   （見 face_embedding_node.py 的 image_capture_topic 預設值）。
+        #   `/image_raw` 與 `/image_raw/compressed` **都不存在** ——
+        #   `ros2 topic echo` 打這兩個名字不會報錯，只是永遠沒有輸出。
+        #
+        # 錯誤二：QoS。相機那條是 **BEST_EFFORT**，這裡用 depth 數字等於
+        #   預設的 RELIABLE。訂閱端要求 RELIABLE 而發布端只提供 BEST_EFFORT
+        #   是**不相容**的，一樣一則都收不到。只改話題名還是量不到。
+        #
+        # 兩個錯疊在一起的後果：image 沒有時刻 -> total 恆為 0 或分段值變負數。
+        cam_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
+        cam_topic = self.declare_parameter(
+            "image_topic", "/camera/color/image_raw/compressed"
+        ).get_parameter_value().string_value
+        self.create_subscription(CompressedImage, cam_topic,
+                                 lambda m: self._mark("image"), cam_qos)
+        # 未壓縮那條保留成備援（有些啟動組合只發原始影像），同樣用 BEST_EFFORT
+        self.create_subscription(Image, cam_topic.replace("/compressed", ""),
+                                 lambda m: self._mark("image"), cam_qos)
         self.create_subscription(FaceEmbedding, "/face_embedding",
                                  lambda m: self._mark("embedding"), 10)
         self.create_subscription(UserIdentity, "/user_identity", self._identity_cb, 10)

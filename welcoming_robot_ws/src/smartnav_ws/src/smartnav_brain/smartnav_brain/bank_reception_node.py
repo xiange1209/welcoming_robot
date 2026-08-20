@@ -206,6 +206,29 @@ class BankReceptionNode(Node):
 
     # ==================================================================
     def identity_callback(self, msg: UserIdentity) -> None:
+        # ★★ 2026-08-20：先擋掉「現在沒人」那一則 ★★
+        #
+        # user_auth_node 從 8/19 起會在連續 identity_timeout 秒沒看到人臉時
+        # 補發一則「無人」（`_identity_timeout_tick`），讓平板把相似度與 VIP
+        # 名字清掉。那一則長這樣：recognized=False、similarity=0.0、
+        # user_name="Unknown"、**bbox=[0,0,0,0]**。
+        #
+        # 但下面第一條規則是「未通過辨識門檻的一律當一般訪客」，
+        # 於是這則「沒人」會被當成**一位真訪客**：冷卻一過就
+        # 對著空無一人的鏡頭播迎賓詞，還寫一筆假的來訪紀錄。
+        # （明天段四驗「遮住鏡頭 -> 身份消失」時會當場發作，
+        #   看起來會像人臉系統壞了，其實是這裡沒分辨。）
+        #
+        # 判別依據用 bbox 面積，因為它是唯一能區分兩種情況的欄位：
+        #   真的有人臉  -> msg.bbox = face_msg.bbox，一定有面積
+        #   沒人        -> user_auth 明確寫死 [0,0,0,0]
+        # ★ 刻意**不**改 UserIdentity.msg 加欄位 —— 改介面要全 workspace
+        #   重建，type hash 對不上時症狀是「節點照跑但收不到訊息且沒有錯誤」，
+        #   上機前一天不值得冒這個險。
+        if len(msg.bbox) >= 4 and (msg.bbox[2] - msg.bbox[0]) <= 0.0                 and (msg.bbox[3] - msg.bbox[1]) <= 0.0:
+            self._state = "IDLE"
+            return
+
         name = msg.user_name or "Unknown"
         try:
             ptype = UserType(msg.user_type.type).name

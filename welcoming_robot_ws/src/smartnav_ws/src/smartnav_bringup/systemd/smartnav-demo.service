@@ -16,16 +16,34 @@
 Description=SmartNav 迎賓機器人（統一啟動）
 After=network-online.target
 Wants=network-online.target
+# ★ 環境腳本不在就直接不要啟動（下面的 ExecStart 完全依賴它）
+AssertPathExists=/home/user/maprun/env.sh
 
 [Service]
 Type=simple
 User=user
-# ★ 這三個環境變數缺一不可：
-#   systemd 不會 source 任何 shell profile，所以 ROS 的 setup.bash 要自己來。
-#   RMW 不設會退回預設實作，跟手動啟動的節點看不到彼此（最難查的那種）。
-Environment="RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
-Environment="CYCLONEDDS_URI=file:///home/user/cyclonedds.xml"
-ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/user/welcoming_robot_ws/install/setup.bash && exec ros2 launch smartnav_bringup demo.launch.py'
+
+# ★★ 2026-08-20：改成直接 source ~/maprun/env.sh，不要在這裡重列環境變數 ★★
+#
+# 原本這裡只寫了 RMW_IMPLEMENTATION 與 CYCLONEDDS_URI 兩個，
+# 漏掉了 env.sh 裡另外兩個而且**兩個都會出事**：
+#
+#   ROS_DOMAIN_ID=0
+#   ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+#       ← env.sh 的註解寫得很清楚：這個子網路上還有別台機器在跑同一套 stack，
+#         「曾經看到 3 個 /waypoint_service_node、3 個 /navigation_service_node」。
+#         不隔離的話 map_service 會呼叫到**別台機器**的 /control_exploration。
+#         開機自動啟動最容易撞到這個 —— 同學的機器也開著的時候。
+#
+# 環境設定只該有一份事實來源。maprun 的腳本全都 source env.sh，
+# 這裡再抄一份就一定會漂移（已經漂移過一次了）。
+#
+# ★ ExecStartPre 檢查 cyclonedds.xml 存在：三支 maprun 腳本都有這個檢查，
+#   檔案不見時 CycloneDDS 會安靜地退回內建預設值，participant 索引照樣耗盡。
+ExecStartPre=/usr/bin/test -f /home/user/cyclonedds.xml
+# 等底盤序列埠出現（udev 規則建的 symlink；名稱依實機為準，沒有就註解掉這行）
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do ls /dev/wheeltec_controller /dev/ttyUSB* >/dev/null 2>&1 && exit 0; sleep 1; done; echo "chassis serial port not found within 30s" >&2; exit 1'
+ExecStart=/bin/bash -lc 'source /home/user/maprun/env.sh && exec ros2 launch smartnav_bringup demo.launch.py'
 # 啟動要 21 秒（分階段），給足 90 秒再判定失敗
 TimeoutStartSec=90
 Restart=on-failure

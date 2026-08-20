@@ -275,9 +275,23 @@ class SpeechRecognizerNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
+        # ★★ 2026-08-20：durability 從 TRANSIENT_LOCAL 改回 VOLATILE ★★
+        #
+        # 這裡原本要 TRANSIENT_LOCAL，而 playback_status 有兩個發布端：
+        #   voice_playback_node:81   TRANSIENT_LOCAL（車上喇叭；車上沒喇叭，不會跑）
+        #   hmi_server_node:1043     VOLATILE（★ 平板 TTS 真訊號，唯一會跑的那個）
+        #
+        # DDS 規則是「發布端提供的必須 >= 訂閱端要求的」，所以
+        # VOLATILE 發布端配 TRANSIENT_LOCAL 訂閱端 -> **完全不連線**，
+        # 而且不會報錯，只是永遠收不到 —— 8/19 加的整套「平板 TTS 真訊號」
+        # 其實一則都沒送到過。
+        #
+        # 改成 VOLATILE 對兩個發布端都相容（TRANSIENT_LOCAL 發布端 > VOLATILE 訂閱端）。
+        # ★ 而且 VOLATILE 才是對的語意：這是**狀態訊號**，晚加入的訂閱者
+        #   不該收到一則歷史的 True 然後當場靜音。
         status_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -302,6 +316,21 @@ class SpeechRecognizerNode(Node):
             status_qos,
             callback_group=self.callback_group,
         )
+
+        # ★★ 2026-08-20：靜音到期必須由計時器解除，不能靠音訊佇列 ★★
+        #
+        # `_tts_expire()` 原本只在 `_process_audio_queue` 從佇列取到東西之後才呼叫。
+        # 但 `_audio_callback` 在 `is_playing` 為真時**直接 return，不入佇列**，
+        # 於是佇列很快見底 -> `get(timeout=0.5)` 丟 queue.Empty -> `continue`
+        # -> **永遠走不到 `_tts_expire()`**。
+        #
+        # 後果：只要 is_playing 曾經為真而解除訊號沒來（平板中途關分頁、
+        # onend 沒送出），ASR 就**永久聾**，而且外觀跟麥克風壞掉一模一樣。
+        # 天花板 TTS_MAX_MUTE_SEC 形同虛設 —— 它要有人去比對才會生效。
+        #
+        # 現在多一條獨立計時器，不管佇列有沒有東西都會到期解除。
+        self._tts_expire_timer = self.create_timer(
+            0.2, self._tts_expire, callback_group=self.callback_group)
 
         self.get_logger().info("✓ 語音辨識節點已初始化")
         self.get_logger().info(f"  訂閱話題: {audio_topic}")
@@ -952,6 +981,23 @@ class SpeechRecognizerNode(Node):
         天花板存在的理由：平板可能在唸到一半就離線／關分頁，onend 永遠不來。
         沒有天花板的話 ASR 會**永久靜音**，而且外觀跟麥克風壞掉一模一樣。
         """
+        # ★★ 2026-08-20：這裡原本無條件硬靜音，繞過了 `mute_during_tts` ★★
+        #
+        # `mute_during_tts` 預設是 **False**，那是刻意的決定：
+        # VIP／訪客不一定能觸發語音輸入，客人必須隨時能插話，
+        # 所以防回音走**文字層**（`_is_echo`），不丟音訊。
+        #
+        # 舊版收到平板的 onstart 就 is_playing=True + 清空佇列 + 重建 stream，
+        # 等於把那個決定整個推翻。之所以現場沒發作，只是因為
+        # QoS 不相容讓這個回呼從來沒被呼叫過（同日一併修好）——
+        # 兩個 bug 互相抵銷，最惡劣的那種，因為修好其中一個就會爆。
+        if not self.mute_during_tts:
+            # 不靜音，但要留下 log：這行是「QoS 修好了、平板真訊號有進來」的唯一證據。
+            self.get_logger().info(
+                f"🔈 平板回報{'開始' if msg.data else '結束'}朗讀"
+                f"（mute_during_tts=False，不靜音，回音走文字層過濾）")
+            return
+
         with self._playing_lock:
             self.is_playing = bool(msg.data)
             if self.is_playing:

@@ -201,8 +201,28 @@ class LLMServiceNode(Node):
         # 120 token 對中文約 80~100 字，夠講完「營業時間 + 一句補充」。
         # ★ 這是**硬上限**，會直接截斷。真正該讓它短的是提示詞裡的規則，
         #   這個只是保險 —— 所以留得比期望長度寬一點。
+        #
+        # ★★ 2026-08-20 修正：120 -> 256 ★★
+        #
+        # 120 是照「最終答案該多長」訂的，但這個上限**套在每一輪**上，
+        # 包含「決定要呼叫哪個工具」的那幾輪（`agent_chain` 只建一次，
+        # 見 :665 的 bind_tools，迴圈每輪都用同一個）。
+        #
+        # 那幾輪的輸出是「旁白 + 工具呼叫 JSON」。qwen2.5:3b 很愛先講
+        # 一段旁白（這正是 hold_all_iterations 要擋的東西），旁白 50~80
+        # token 之後才輪到 JSON —— 120 一到就從 JSON 中間切斷。
+        #
+        # 被切斷的後果**不是報錯，是靜默降級**：
+        #   JSON 不完整 -> Ollama 解不出 tool_calls -> response.tool_calls 是空的
+        #   -> 迴圈 :771 判定「沒有工具呼叫 = 這是最終答案」
+        #   -> **把那段旁白當成答案唸給客人聽，工具永遠不會執行**
+        # 症狀會是「它嘴上說要幫我查，然後就沒有然後了」。
+        #
+        # 256 對中文約 170~200 字，旁白加 JSON 放得下。真正讓回覆變短的是
+        # 系統提示詞裡那條「40 字 / 最多兩句」的規則，這個只是保險。
+        # ★ 下面迴圈裡加了截斷偵測，真的撞到上限會 WARN，不會再靜默。
         self.num_predict = self.declare_parameter(
-            "num_predict", 120).get_parameter_value().integer_value
+            "num_predict", 256).get_parameter_value().integer_value
 
         # ── 簡體轉繁體 ───────────────────────────────────
         # 系統提示詞早就寫了「回覆一律使用繁體中文」，但小模型會忽略它：
@@ -766,6 +786,20 @@ class LLMServiceNode(Node):
                         "agent_scratchpad": agent_scratchpad,
                     }
                 )
+
+                # ★ 2026-08-20：撞到 num_predict 上限要吼出來。
+                #   撞上限而且沒有 tool_calls，極可能是工具呼叫 JSON 被切斷
+                #   （見 num_predict 宣告處）。不 log 的話這個失敗完全隱形：
+                #   客人只會覺得「它答應要查，然後就沒下文了」。
+                try:
+                    _done = (response.response_metadata or {}).get("done_reason")
+                except Exception:
+                    _done = None
+                if _done == "length":
+                    self.get_logger().warning(
+                        f"⚠️ 第 {iteration} 輪生成撞到 num_predict={self.num_predict} 上限"
+                        + ("（且沒解出 tool_calls -> 工具呼叫很可能被截斷，"
+                           "請調高 num_predict）" if not response.tool_calls else ""))
 
                 # 檢查 LLM 是否需要叫工具
                 if not response.tool_calls:
