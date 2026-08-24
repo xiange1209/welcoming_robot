@@ -260,6 +260,15 @@ def yaw_to_quaternion(yaw: float) -> Dict[str, float]:
     return {"x": 0.0, "y": 0.0, "z": math.sin(yaw / 2.0), "w": math.cos(yaw / 2.0)}
 
 
+def normalize_angle(a: float) -> float:
+    """把角度收斂到 (-pi, pi]。
+
+    ★ 2026-08-24：位姿外推用。不加這個的話 yaw 相減會在 ±pi 交界處
+      跳出 2pi 的假位移 —— 車子在地圖上會瞬間轉半圈。
+    """
+    return math.atan2(math.sin(a), math.cos(a))
+
+
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
     """從四元數取出平面角度（只看 Z 軸分量）"""
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
@@ -972,6 +981,22 @@ class HmiServerNode(Node):
         # amcl_pose 訂閱與最近一次收到的位姿。None 代表還沒收到過。
         self._amcl_sub = None
         self._amcl_pose: Optional[Dict[str, float]] = None
+        # ★★ 2026-08-24：里程計外推，修「HMI 顯示的位置落後現實」★★
+        #
+        # 使用者回報「HMI 顯示的車輛有時候不是實際位置」。根因是 amcl_pose
+        # 是**上一次雷射更新時**的估計，而 AMCL 的更新門檻是
+        # update_min_d 0.10 m / update_min_a 0.10 rad（nav2 yaml），
+        # 也就是車子要移動 10 cm 或轉 5.7 度才會發下一則
+        # -> 顯示最多落後 10 cm、5.7 度，0.15 m/s 時約 0.67 秒。
+        #
+        # 正解是 map→base_footprint 的 TF，但 rclpy 的 TF 訂閱在 Pi 4 上
+        # 吃 19.4% CPU，本節點當初就是為此才改用 amcl_pose 的。
+        #
+        # 折衷：amcl_pose 當「map→odom 的修正」、/odom 做外推。
+        # /odom 本來就已經訂了（_odom_speed_cb 拿它算車速），
+        # 這裡只是在節流**之前**多存三個浮點數，成本可以忽略。
+        self._odom_pose: Optional[Dict[str, float]] = None
+        self._odom_at_amcl: Optional[Dict[str, float]] = None
         # 這一輪觀看是否已經拿到過初始位置（見 _pose_timer_cb）
         self._pose_seeded = False
         self._pose_lock = threading.Lock()
@@ -1613,6 +1638,52 @@ class HmiServerNode(Node):
                 "y": float(p.y),
                 "yaw": quaternion_to_yaw(q.x, q.y, q.z, q.w),
             }
+            # ★ 記下「這一則 amcl 對應到哪個里程計位置」。之後的外推
+            #   就是拿現在的里程計減掉這個基準。
+            self._odom_at_amcl = dict(self._odom_pose) if self._odom_pose else None
+
+    # 外推的上限。超過就代表里程計或 amcl 有一邊不對勁（打滑、重定位、
+    # 里程計重置），寧可顯示「舊但正確」也不要顯示「新但編出來」的位置。
+    EXTRAP_MAX_M = 1.0
+    EXTRAP_MAX_RAD = 1.0
+
+    def _extrapolate(self, amcl, odom_ref, odom_now) -> Dict[str, float]:
+        """用里程計把 amcl 位姿外推到「現在」。
+
+        ★ 為什麼需要（2026-08-24）
+        `amcl_pose` 是**上一次雷射更新時**的估計。AMCL 的更新門檻是
+        `update_min_d: 0.10` / `update_min_a: 0.10 rad`，也就是車子要移動
+        10 cm 或轉 5.7 度才會發下一則 —— 顯示最多落後 10 cm、5.7 度，
+        0.15 m/s 時約 0.67 秒，再加上雷射→濾波→發布的處理延遲。
+
+        ★ 數學
+        amcl 給的是 map→base，odom 給的是 odom→base。兩則 amcl 之間，
+        map→odom 這個修正量是**固定的**（amcl 沒發新的就沒有新的修正），
+        所以「現在的 map→base」＝「上次的 map→base」⊕「這段期間的 odom 位移」，
+        而位移要先從 odom 座標系轉到 map 座標系（差一個 yaw）。
+
+        ★ 使用者提過「粒子重採樣調快一點」—— **那個方向是錯的**：
+          調快只是增加 CPU 與位姿抖動，而且**避障根本不看 AMCL**
+          （`_body_margin` / `_forward_clearance` / `_arc_clearance`
+          讀的都是即時 `/scan`）。顯示落後與避障安全是兩件事。
+        """
+        if not odom_ref or not odom_now:
+            return dict(amcl)          # 沒有里程計就照舊，不要編
+        dx = odom_now["x"] - odom_ref["x"]
+        dy = odom_now["y"] - odom_ref["y"]
+        dyaw = normalize_angle(odom_now["yaw"] - odom_ref["yaw"])
+        if math.hypot(dx, dy) > self.EXTRAP_MAX_M or abs(dyaw) > self.EXTRAP_MAX_RAD:
+            # 位移大到不合理：打滑、重定位、或里程計被重置過。
+            # 這種時候 amcl 馬上就會發新的，等它就好。
+            return dict(amcl)
+        # 把 odom 座標系的位移轉進 map 座標系（兩者差 amcl.yaw - odom_ref.yaw）
+        th = amcl["yaw"] - odom_ref["yaw"]
+        c, sn = math.cos(th), math.sin(th)
+        return {
+            "x": amcl["x"] + c * dx - sn * dy,
+            "y": amcl["y"] + sn * dx + c * dy,
+            "yaw": normalize_angle(amcl["yaw"] + dyaw),
+        }
 
     def _acquire_pose_sources(self) -> None:
         """開始觀看時建立 amcl_pose 訂閱（TF 留到真的需要才建）"""
@@ -1697,11 +1768,13 @@ class HmiServerNode(Node):
 
         with self._pose_lock:
             pose = self._amcl_pose
+            odom_now = dict(self._odom_pose) if self._odom_pose else None
+            odom_ref = dict(self._odom_at_amcl) if self._odom_at_amcl else None
         if pose is not None:
             # amcl 有資料就絕不碰 TF——這是整個改動的重點
             self._drop_tf_listener()
             self._pose_seeded = True
-            self.state.set_robot_pose(dict(pose))
+            self.state.set_robot_pose(self._extrapolate(pose, odom_ref, odom_now))
             return
 
         if amcl_alive and self._pose_seeded:
@@ -1925,6 +1998,17 @@ class HmiServerNode(Node):
           而 8/14 把整台機器跑到 load 51、SSH 被擠掉的那次，正好是
           相機＋人臉＋LLM 全開而底盤沒開。最需要看的時候剛好看不到。
         """
+        # ★ 位姿要在節流**之前**存：外推需要最新的里程計，
+        #   而車速 1 Hz 就夠看。存三個浮點數的成本可以忽略。
+        _p = msg.pose.pose.position
+        _q = msg.pose.pose.orientation
+        with self._pose_lock:
+            self._odom_pose = {
+                "x": float(_p.x),
+                "y": float(_p.y),
+                "yaw": quaternion_to_yaw(_q.x, _q.y, _q.z, _q.w),
+            }
+
         now = time.monotonic()
         if now - self._last_speed_at < 1.0:
             return

@@ -302,6 +302,27 @@ def generate_launch_description():
         parameters=[{"use_sim_time": use_sim_time}],
     )
 
+    # ★★ 2026-08-24：速度下限守門員，插在 collision_monitor 與底盤之間 ★★
+    #
+    # 底盤韌體線速度死區 0.085 m/s，而鏈上有三個機制會壓低速度且互不知情：
+    #   path_teach `_lift_deadband()` 抬到 0.10   ← 唯一知道死區的
+    #   collision_monitor PolygonSlow  × 0.85     ← 8/24 從 0.5 改上來
+    #   collision_monitor FootprintApproach 連續縮放、**沒有下限**  ← 這個擋不住
+    #
+    # 8/24 逐筆 1583 筆：前進平均指令 +0.080 m/s、**平均實速 −0.001 m/s**。
+    # 馬達不轉 -> 判定「有指令沒動」-> 脫困 -> 把 AMCL 轉丟。
+    #
+    # ★ 停止指令（linear.x == 0）永遠原樣通過，該停還是會停。
+    #   抬速度時 angular.z 等比例放大，曲率 κ = ω/v 保持不變
+    #   （阿克曼的舵角由 κ 決定，只抬 v 會走出比指令更直的線）。
+    cmd_vel_floor = Node(
+        package=PKG,
+        executable="cmd_vel_floor_cc",
+        name="cmd_vel_floor_cc_node",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
+    )
+
     # 卡住偵測：雷達裝在 0.11 m 高，比它矮的雜物 (電線、地毯邊、椅腳橫桿)
     # 完全掃不到，輪子卡住了 costmap 上還是一片空白。
     # 這裡用純運動學推論 —— 指令要求在動但里程計顯示沒動，就是卡住了，
@@ -443,5 +464,5 @@ def generate_launch_description():
 
     return LaunchDescription(
         declare_args + nav2_nodes + map_source_nodes + smartnav_nodes
-        + [steering_trim, stuck_detector, path_teach, explorer_node, rviz]
+        + [steering_trim, cmd_vel_floor, stuck_detector, path_teach, explorer_node, rviz]
     )

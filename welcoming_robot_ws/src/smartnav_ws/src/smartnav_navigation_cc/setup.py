@@ -39,6 +39,7 @@ setup(
             "teleop_keyboard_cc = smartnav_navigation_cc.teleop_keyboard_cc_node:main",
             "scan_filter_cc = smartnav_navigation_cc.scan_filter_cc_node:main",
             "path_teach_cc = smartnav_navigation_cc.path_teach_cc_node:main",
+            "cmd_vel_floor_cc = smartnav_navigation_cc.cmd_vel_floor_cc_node:main",
         ],
     },
 )

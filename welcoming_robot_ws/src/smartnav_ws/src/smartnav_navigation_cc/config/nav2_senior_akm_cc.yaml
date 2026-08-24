@@ -1095,7 +1095,20 @@ collision_monitor:
     # 鏈路：velocity_smoother -> steering_trim_cc -> collision_monitor -> 底盤
     # 補償刻意放在碰撞檢查「之前」，補償量設錯也不會繞過安全層。
     cmd_vel_in_topic: "cmd_vel_trimmed"
-    cmd_vel_out_topic: "cmd_vel"
+    # ★★ 2026-08-24：輸出改名，後面插一個速度下限守門員 ★★
+    #   鏈路變成：velocity_smoother -> steering_trim_cc -> collision_monitor
+    #             -> **cmd_vel_floor_cc** -> 底盤
+    #
+    #   理由：本節點的 FootprintApproach（action_type: "approach"）按碰撞
+    #   剩餘時間**連續縮放且沒有下限**，會把速度壓到底盤死區 0.085 以下，
+    #   結果馬達根本不轉 -> path_teach 判定「有指令沒動」-> 脫困
+    #   -> 脫困轉向把 AMCL 轉丟。8/24 實測死區以下的比例：
+    #   順利那趟 1.1%、窄空間那趟 26.3%、倒車失敗那趟 18.0%。
+    #
+    #   把 slowdown_ratio 改成 0.85 只解決了 PolygonSlow 那一個來源；
+    #   守門員放在最後才能一次擋住**所有**下游來源（含以後才加的）。
+    #   ★ 停止指令（linear.x == 0）永遠原樣通過，該停還是會停。
+    cmd_vel_out_topic: "cmd_vel_prefloor"
     state_topic: "collision_monitor_state"
     transform_tolerance: 1.0
     source_timeout: 2.0
