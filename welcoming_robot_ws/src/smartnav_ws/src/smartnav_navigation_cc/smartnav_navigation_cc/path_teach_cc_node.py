@@ -3144,6 +3144,16 @@ class PathTeachNode(Node):
                 moved = math.hypot(cur[0] - start[0], cur[1] - start[1])
                 if moved >= self.UNWEDGE_LEG_M:
                     break
+            # ★★ 2026-08-25：楔住脫困也要看車身外緣 ★★
+            #   這支原本一個淨空檢查都沒有，而它與 _do_escape 一樣走
+            #   `_escape_bypass` 繞過 collision_monitor。
+            #   「已經楔住了還往牆裡推」正是使用者回報的現象。
+            _bm, _ = self._body_margin(direction)
+            if _bm <= self.body_margin_stop:
+                self.get_logger().warn(
+                    f"楔住脫困：{'前方' if direction >= 0 else '後方'}"
+                    f"車身外緣只剩 {_bm * 100:.0f} cm，這一段收手")
+                break
             self._publish_cmd(v, w)
             time.sleep(0.05)
         self._stop()
@@ -3445,6 +3455,19 @@ class PathTeachNode(Node):
                 if self._arc_clearance(back_dir, 0.0) <= 0.12:
                     self.get_logger().warn("直線方向也被擋住，無法拉開距離")
                     break
+                # ★★ 2026-08-25：脫困也要看車身外緣 ★★
+                #   脫困會 `_escape_bypass = True` **繞過 collision_monitor**，
+                #   而 collision_monitor 的 PolygonStop 已經停用、
+                #   PolygonSlow 只乘 0.85 永遠不到 0、FootprintApproach 只縮放 ——
+                #   所以脫困期間**整台車沒有任何「停車」機制**。
+                #   使用者回報的「倒車一直撞牆然後還繼續移動沒有停」就是這個。
+                _bm, _ = self._body_margin(back_dir)
+                if _bm <= self.body_margin_stop:
+                    self._stop(3)
+                    self.get_logger().warn(
+                        f"脫困：{'前方' if back_dir > 0 else '後方'}車身外緣只剩 "
+                        f"{_bm * 100:.0f} cm，中止這一段")
+                    break
                 v0 = (self.follow_speed if back_dir > 0 else self.reverse_speed) * 0.5
                 self._publish_cmd(v0 if back_dir > 0 else -v0, 0.0)
                 self._send_feedback(goal_handle, idx, len(pts), 0.0, "escaping",
@@ -3501,6 +3524,13 @@ class PathTeachNode(Node):
                         if min(l3, r3) < 0.02:          # 真的要碰到了
                             self.get_logger().warn(
                                 f"橫移置中：側向剩 {min(l3, r3):.2f} m，中止")
+                            break
+                        # ★ 2026-08-25：這一段一律往前，所以查前方車身外緣
+                        _bm3, _ = self._body_margin(+1)
+                        if _bm3 <= self.body_margin_stop:
+                            self._stop(3)
+                            self.get_logger().warn(
+                                f"橫移置中：前方車身外緣只剩 {_bm3 * 100:.0f} cm，中止")
                             break
                         self._publish_cmd(v_c, sgn * w_c)
                         self._send_feedback(
@@ -3570,6 +3600,22 @@ class PathTeachNode(Node):
                     goal_handle, idx, len(pts), 0.0, "escaping",
                     f"脫困第 {attempt} 次：移動 {moved:.2f} m 但只轉了 "
                     f"{math.degrees(dyaw):.0f} 度，放棄這次")
+                return dyaw > math.radians(5.0)
+
+            # ★★ 2026-08-25：這是三點轉向的主迴圈，倒車撞牆最常發生在這裡 ★★
+            #   `_arc_clearance` 掃的是**沿弧線的前方**，而車身外緣是另一件事：
+            #   打舵時車尾會外甩，弧線上乾淨不代表車角不會刮到。
+            #   加上脫困繞過 collision_monitor，這裡是最後一道防線。
+            _bm2, _ = self._body_margin(back_dir)
+            if _bm2 <= self.body_margin_stop:
+                self._stop(3)
+                self.get_logger().warn(
+                    f"脫困：{'前方' if back_dir > 0 else '後方'}車身外緣只剩 "
+                    f"{_bm2 * 100:.0f} cm，停止這一段"
+                    f"（已轉 {math.degrees(dyaw_signed):+.0f} 度）")
+                self._send_feedback(
+                    goal_handle, idx, len(pts), 0.0, "escaping",
+                    f"脫困第 {attempt} 次：車身外緣 {_bm2 * 100:.0f} cm，停止")
                 return dyaw > math.radians(5.0)
 
             v = speed if back_dir > 0 else -speed
