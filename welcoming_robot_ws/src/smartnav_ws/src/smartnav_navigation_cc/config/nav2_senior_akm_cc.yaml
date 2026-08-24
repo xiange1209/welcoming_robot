@@ -1164,7 +1164,34 @@ collision_monitor:
       points: "[[0.75, 0.22], [0.75, -0.22], [-0.25, -0.22], [-0.25, 0.22]]"
       action_type: "slowdown"
       min_points: 4
-      slowdown_ratio: 0.5
+      # ★★ 2026-08-24：0.5 -> 0.85 ★★
+      #
+      # 0.5 會把速度砍到**底盤死區以下**，結果是馬達根本不轉。
+      # 完整的鏈（8/24 逐筆分析 1583 筆 /cmd_vel 查出來的）：
+      #
+      #   path_teach `_lift_deadband()`  把非零速度抬到 min_move_speed 0.10
+      #   steering_trim_cc               不動 linear.x（只改 angular.z）
+      #   collision_monitor PolygonSlow  0.10 x 0.5 = 0.050   <- 這裡
+      #   底盤韌體                        死區 0.085 -> **不轉**
+      #
+      # 實測佐證：前進 463 筆平均指令 +0.080 m/s、平均實速 -0.001 m/s；
+      # 另有 442 筆落在 0.050~0.070，其中 31.4% 輪速為 0。
+      #
+      # ★ 後果不是報錯，是**誤診**：馬達不轉 -> path_teach 判定
+      #   「有下速度指令但車子沒動」-> 脫困 -> 脫困轉向把 AMCL 也轉丟
+      #   （8/24 實測事後吻合度剩 23.4%、yaw 差約 250 度）。
+      #   現場看起來像定位壞掉或控制器沒調好，真因在**兩個安全機制的算術**。
+      #
+      # 為什麼是 0.85 而不是提高 min_move_speed：
+      #   要讓 min_move_speed x 0.5 >= 0.085 得把 min_move_speed 拉到 0.17，
+      #   在 0.99 m 走廊配 0.95 m 迴轉半徑太快。
+      #   0.10 x 0.85 = 0.085 剛好落在死區上緣，減速仍然有作用（-15%），
+      #   只是不再減到「保護變成癱瘓」。
+      #
+      # ★ 保護沒有變少：FootprintApproach（沿指令方向投影 footprint、1.5 秒預測）、
+      #   path_teach 的 _body_margin 硬停（★ 2026-08-24 起是 6 cm 不是 12）、
+      #   三層都還在。這裡減的只是「慢慢接近」那一段的幅度。
+      slowdown_ratio: 0.85
       visualize: true
       polygon_pub_topic: "polygon_slowdown"
       enabled: true

@@ -283,9 +283,47 @@ class PathTeachNode(Node):
         # 短視距就穩定了，於是 scale 可以收回 1.0 → 貼著軌跡走。
         # ⚠ 兩者要一起調：把 `reverse_track_front_axle` 關掉時，
         #   `lookahead_reverse_scale` 要自己調回 1.8，否則倒車會開始擺。
-        self.declare_parameter("reverse_track_front_axle", True)
+        # ★★ 2026-08-24：True -> False（退回 8/03 驗證過的組態）★★
+        #
+        # 前軸追蹤是 8/19 加的，理論正確（倒車時運動學等價於「以前軸為
+        # 非轉向軸」的車，拿後軸當參考點是純追蹤的不穩定組態），
+        # 但**它從來沒有在路上成功過**：
+        #     8/19 加入 -> 沒上機
+        #     8/20 筆電端又改（補軸距）-> 沒上機
+        #     8/24 實機三趟：倒車 12 秒就偏 36 度、26 秒偏 44 度，
+        #          使用者回報「完全偏離、沒有照著路線跑」
+        # 而專案唯一量到循跡精度 3.42 cm 的那次（8/03，624 筆、最大 8.60 cm）
+        # 用的是**後軸追蹤**——那時這個參數還不存在。
+        #
+        # ★ 這不是說前軸追蹤的理論錯了，是說它需要一次乾淨的 A/B 才能上線，
+        #   而不該在發表前用沒驗過的組態。要重新試就帶
+        #   `-p reverse_track_front_axle:=true -p lookahead_reverse_ahead_m:=0.24`
+        #   並且**兩趟都存 nav_trace CSV** 才有對照價值。
+        self.declare_parameter("reverse_track_front_axle", False)
         self.declare_parameter("axle_spacing_m", 0.322)
-        self.declare_parameter("lookahead_reverse_scale", 1.0)
+        # ★ 2026-08-24：配合退回後軸追蹤，這個要一起回到 1.8。
+        #   清單 3-3 寫得很清楚：「這兩個要一起改。只關前軸追蹤而 scale 留在
+        #   1.0，倒車會開始擺——等於回到『不穩定組態 + 短視距』這個最糟的組合。」
+        self.declare_parameter("lookahead_reverse_scale", 1.8)
+        # ★★ 2026-08-24：倒車要「瞄多遠」，獨立於前進 ★★
+        #
+        # 補軸距（`ld += axle_spacing`）讓**目標點**的幾何正確了，但它同時
+        # 把純追蹤公式裡的 L_d 拉長，而增益是 2/L_d² —— 目標點對了，
+        # 反應卻變鈍了：
+        #     前進  L_d = 1.2x0.13 + 0.30 = 0.42   -> 增益 2/0.42² = 11.3
+        #     倒車  L_d = 0.42 + 0.322     = 0.742 -> 增益 2/0.742² =  3.6
+        # **倒車的轉向增益只有前進的三分之一**，使用者的回報是
+        # 「後面都撞到牆了才轉舵，太慢了」——正是這個。
+        #
+        # 所以把兩件事拆開：這個參數是「沿路徑往前瞄多少公尺」（純粹的意圖），
+        # 軸距補償另外加（純粹的幾何修正）。
+        #     ld = lookahead_reverse_ahead_m + axle_spacing
+        # 0.24 -> L_d = 0.562 -> 增益 6.3，約為原本的 1.7 倍。
+        #
+        # ★ 不要再調小：8/19 曾經因為有效前視只剩 0.098 m 而嚴重擺盪
+        #   （增益放大 17 倍），那次的補救就是把 scale 拉到 1.8。
+        #   這個參數的安全區間大約是 0.20 ~ 0.35。
+        self.declare_parameter("lookahead_reverse_ahead_m", 0.24)
         # 偏離檢查的搜尋視窗（點數）。0 = 整條路徑（2026-08-19 早上的行為）。
         # 60 點 ≈ 9 m 路徑（每段約 3 點 0.45 m），已遠超任何合理的定位漂移。
         self.declare_parameter("xte_window_pts", 60)
@@ -310,9 +348,15 @@ class PathTeachNode(Node):
         self.declare_parameter("max_yaw_error_deg", 40.0)
         self.declare_parameter("warn_yaw_error_deg", 25.0)
         # ★★ 2026-08-20：8 -> 40 ★★
-        #   這是**控制週期數**不是秒數。control_rate = 20 Hz，8 次只有 0.4 秒 ——
-        #   比 AMCL 一次位姿跳動還短，等於沒有濾波。40 次 = 2 秒。
+        #   這是**控制週期數**不是秒數。8 次只有 0.4 秒 ——
+        #   比 AMCL 一次位姿跳動還短，等於沒有濾波。
+        #   ★ 2026-08-24 起這個參數**已經不是判準**（實測迴圈是 15.4 Hz 不是
+        #     設定的 20，週期數這個單位本身就會隨負載漂移）。真正在用的是
+        #     `yaw_error_sec`，這個只留著相容舊腳本。
         self.declare_parameter("yaw_error_strikes", 40)
+        # ★ 2026-08-24：真正在用的是這個（秒）。yaw_error_strikes 留著只為相容，
+        #   實際判準見 yaw_error_secs 的長註解。
+        self.declare_parameter("yaw_error_sec", 2.0)
         # 折返（三點轉向）之後的姿態判別寬限。三點轉向就是「刻意與路徑成大角度」，
         # 不給寬限的話 14 個折返的路徑會在每一個轉角被中止。
         # 8.0 秒 = 停穩(cusp_pause) + 轉出來的時間，實測三點轉向約 5~7 秒。
@@ -387,7 +431,16 @@ class PathTeachNode(Node):
         # 檢查不過時是否拒絕重播。預設只警告 —— 一條路徑可能只有最後
         # 一小段做不到，而走完前面 90% 仍有價值（例如錄影、或人工接手）。
         self.declare_parameter("refuse_infeasible_path", False)
-        self.declare_parameter("goal_tolerance_m", 0.12)
+        # ★★ 2026-08-24：0.12 -> 0.20 ★★
+        # 0.12 太緊，車子會為了那幾公分在終點反覆脫困。8/24 實測：
+        # 起點->大廳 在最後一點做了 7 次脫困、累計轉 280 度以上，
+        # 最後停在 11 cm（剛好進 12 cm）而**朝向差 86 度**。
+        # 那 86 度直接害下一趟倒車從錯的姿態開始、10 次脫困全滅。
+        # 0.20 m 在 0.99 m 走廊裡仍然足夠精準（循跡精度實測 3.42 cm），
+        # 而且換掉的是「為了 9 公分把朝向轉爛」這個很糟的交易。
+        self.declare_parameter("goal_tolerance_m", 0.20)
+        # ★ 2026-08-24：實測是 15.4 Hz（102.8 秒 1583 筆），不是 20。
+        #   姿態判別的 yaw_error_strikes 40 次因此是 2.6 秒而不是 2 秒。
         self.declare_parameter("control_rate", 20.0)
         # 偏離路徑超過這個距離就中止：代表定位跑掉或被推走了，
         # 硬追回去反而危險（純追蹤在大偏差下會畫出很大的弧）
@@ -440,7 +493,25 @@ class PathTeachNode(Node):
         #   （前 0.40 / 後 0.09）是標稱值，加上定位與舵機延遲，留 12 cm。
         #   ⚠ 不要調到比 0.08 小 —— 那會小於單次控制週期的移動量
         #   （0.15 m/s ÷ 10 Hz = 1.5 cm，但脫困速度 0.10 m/s 加上反應延遲會更多）。
-        self.declare_parameter("body_margin_stop_m", 0.12)
+        # ★★ 2026-08-24：0.12 -> 0.06 ★★
+        #
+        # 0.12 對這條走廊在幾何上就太大了：
+        #     門口最窄處 0.967 m，車身寬 2 x 0.185 = 0.37 m
+        #     -> 完美置中時每側只有 (0.967 - 0.37) / 2 = 0.30 m
+        # 而阿克曼在窄走廊裡本來就會左右修正，偏個 0.18 m 就掉到門檻以下。
+        #
+        # 本專案自己記錄的實測側向空隙是 **右 0.03 / 右 0.07 / 左 0.20 m**
+        # —— 三筆有兩筆低於 0.12。也就是說這個門檻在正常通過門口時
+        # 就會觸發，而觸發的後果是硬停 -> 判定卡住 -> 脫困 -> 姿態轉歪，
+        # 使用者看到的就是「一進門口就亂撞」。
+        # `wall_keepout_m = 0.25` 的存在本身也宣告了「設計上預期在
+        # 0~0.25 m 側向空隙下運行」。
+        #
+        # 0.06 仍然守得住：0.10 m/s、控制迴圈實測 15.4 Hz ->
+        # 一個週期只走 6.5 mm，6 cm 有將近 10 個週期可以煞停。
+        # ★ 這是「能不能通過門口」與「留多少餘裕」的取捨，不是安全被拿掉：
+        #   FootprintApproach、collision_monitor、弧線預測三層都還在。
+        self.declare_parameter("body_margin_stop_m", 0.06)
         # ★ 2026-08-20：重播時是否關閉車尾遮罩。預設 false（**不要關**）。
         #   理由見 _execute_follow 裡的長註解 —— 本節點避障本來就吃原始
         #   /scan，關遮罩對避障零幫助，卻會讓 AMCL 看到跟在車後的人。
@@ -465,6 +536,32 @@ class PathTeachNode(Node):
         # 但三次前後退太少」。窄轉角的三點轉向本來就要來回好幾趟才轉得夠，
         # 每次只轉 20 度，要轉過 60~90 度的彎需要 4~6 次。
         self.declare_parameter("max_escapes", 10)
+        # 終點段推不動時，容差放寬幾倍才收下（見 _follow_loop 的「終點附近不要脫困」）。
+        # 2.0 表示 goal_tolerance_m 0.20 -> 最多收到 0.40 m。
+        self.declare_parameter("goal_tol_relax", 2.0)
+        # ★★ 2026-08-24：終點朝向對齊（三點調頭）★★
+        #
+        # 使用者要求「位置誤差 3 cm、朝向誤差 5 度以內」。單靠純追蹤做不到，
+        # 因為阿克曼車**不能原地轉**：純追蹤把車開到位置上時，朝向是路徑幾何
+        # 決定的副產品，沒有任何一段程式在管它。
+        #
+        # 對稱三點調頭可以：前進打左舵、後退打右舵，**兩段都把車頭往同一個
+        # 方向轉**。驗算（自行車模型 dθ/dt = v·tanδ/L）：
+        #     前進 v>0、δ>0(左)  ->  dθ > 0
+        #     後退 v<0、δ<0(右)  ->  dθ = (-v)(-tanδ)/L > 0   ← 同向再加一次
+        # 所以一個來回給 2s/R 的朝向，而位置的前後位移大部分互相抵銷。
+        #
+        # 空間需求比直覺小很多：修 19 度 = 0.33 rad，總弧長 0.95 x 0.33 = 0.31 m，
+        # 拆成一個來回就是**前後各 0.16 m** —— 走廊裡做得到。
+        self.declare_parameter("goal_align_enable", True)
+        self.declare_parameter("goal_align_yaw_tol_deg", 5.0)
+        self.declare_parameter("goal_align_max_cycles", 4)
+        self.declare_parameter("goal_align_leg_max_m", 0.25)
+        # 對齊時的速度。要**明顯高於死區 0.085**，否則整段動作等於沒下指令。
+        # ★ 死區會隨電壓上升（0.085 是 23.7 V 量的），所以留了餘裕。
+        self.declare_parameter("goal_align_speed", 0.13)
+        # 一段最少要有這麼多淨空才敢動
+        self.declare_parameter("goal_align_min_clear_m", 0.32)
         # ── 連續三點轉向（2026-08-10，依使用者現場示範）──────────────
         # 「方向打滿 -> 前後反向打 -> 多次 -> 需要開啟避障」。
         # 一次 _do_escape 裡連做幾段（而不是做一段就把控制權還給純追蹤，
@@ -558,12 +655,24 @@ class PathTeachNode(Node):
         self.la_max = float(p("lookahead_max_m").value)
         self.la_k = float(p("lookahead_k").value)
         self.la_rev_scale = float(p("lookahead_reverse_scale").value)
+        self.la_rev_ahead = abs(float(p("lookahead_reverse_ahead_m").value))
         self.rev_front_axle = bool(p("reverse_track_front_axle").value)
         self.axle_spacing = abs(float(p("axle_spacing_m").value))
         self.xte_window = int(p("xte_window_pts").value)
         self.max_yaw_err = math.radians(abs(float(p("max_yaw_error_deg").value)))
         self.warn_yaw_err = math.radians(abs(float(p("warn_yaw_error_deg").value)))
         self.yaw_strikes_max = max(1, int(p("yaw_error_strikes").value))
+        # ★★ 2026-08-24：改用「秒」而不是「週期數」★★
+        #
+        # 8/20 把 strikes 從 8 改成 40，理由是「40 次 = 2 秒 @ 20 Hz」。
+        # 但 8/24 實測**實際迴圈頻率是 15.4 Hz**（102.8 秒 1583 筆），
+        # 所以 40 次其實是 **2.6 秒**，而不是說好的 2 秒。
+        #
+        # 週期數這個單位本身就是錯的：它把「要歪多久才算真的歪了」這個
+        # **物理問題**綁在「這台機器現在跑多快」這個**負載問題**上。
+        # 相機一開、CPU 一忙，同一個 40 就變成 4 秒。
+        # 改成秒之後，頻率是多少都不影響判準。
+        self.yaw_error_secs = abs(float(p("yaw_error_sec").value))
         self.cusp_yaw_grace = abs(float(p("cusp_yaw_grace_sec").value))
         self.min_radius = float(p("min_turning_radius").value)
         # 左右分開的最小轉彎半徑（見宣告處的長註解）。
@@ -578,6 +687,13 @@ class PathTeachNode(Node):
         # merge_min_segment_m 刻意**不**在這裡快取（見宣告處）：它要能在
         # 錄製前用 `ros2 param set` 臨時調整，快取了就永遠讀不到新值。
         self.goal_tol = float(p("goal_tolerance_m").value)
+        self.goal_relax = abs(float(p("goal_tol_relax").value))
+        self.align_enable = bool(p("goal_align_enable").value)
+        self.align_yaw_tol = math.radians(abs(float(p("goal_align_yaw_tol_deg").value)))
+        self.align_max_cycles = int(p("goal_align_max_cycles").value)
+        self.align_leg_max = abs(float(p("goal_align_leg_max_m").value))
+        self.align_speed = abs(float(p("goal_align_speed").value))
+        self.align_min_clear = abs(float(p("goal_align_min_clear_m").value))
         self.control_dt = 1.0 / max(1.0, float(p("control_rate").value))
         self.max_xte = float(p("max_cross_track_m").value)
         self.escape_grace = float(p("escape_grace_sec").value)
@@ -589,6 +705,7 @@ class PathTeachNode(Node):
         self.body_margin_stop = float(p("body_margin_stop_m").value)
         self.disable_mask_on_replay = bool(p("disable_mask_on_replay").value)
         self._margin_stops = 0
+        self._side_warns = 0      # 側向警告節流用（★ 不要共用 _margin_stops）
         self.avoid_max = float(p("avoid_max_offset_m").value)
         self.avoid_step = float(p("avoid_step_m").value)
         self.avoid_clear = float(p("avoid_clearance_m").value)
@@ -1882,6 +1999,101 @@ class PathTeachNode(Node):
             )
         return math.copysign(self.min_move_speed, lin), ang * scale
 
+    # ==================================================================
+    # 終點朝向對齊（三點調頭）
+    # ==================================================================
+    def _align_leg(self, direction: int, kappa: float, dist: float) -> float:
+        """往 direction 走 dist 公尺、曲率 kappa，回傳實際走了多少。
+
+        每個週期都重新檢查該方向的車身外緣與淨空，不夠就提早收手 ——
+        對齊動作是「錦上添花」，絕不該為了幾度朝向去撞牆。
+        """
+        start = self._robot_pose()
+        if start is None:
+            return 0.0
+        v = math.copysign(self.align_speed, direction)
+        moved = 0.0
+        t0 = time.monotonic()
+        # 逾時：dist / 速度 再乘 3 倍餘裕（死區、加速都會拖慢）
+        deadline = t0 + max(3.0, dist / max(0.02, self.align_speed) * 3.0)
+        while rclpy.ok() and time.monotonic() < deadline:
+            pose = self._robot_pose()
+            if pose is None:
+                break
+            moved = math.hypot(pose[0] - start[0], pose[1] - start[1])
+            if moved >= dist:
+                break
+            dir_margin, _any_margin = self._body_margin(direction)
+            if dir_margin <= self.body_margin_stop:
+                self.get_logger().warn(
+                    f"　對齊：{'前方' if direction > 0 else '後方'}只剩 "
+                    f"{dir_margin * 100:.0f} cm，這一段提早收手")
+                break
+            # ω = v·κ。前進配左舵、後退配右舵時 kappa 已經帶好符號，
+            # 兩段算出來的 ω 同號 —— 那正是「兩段都往同一方向轉」的意思。
+            self._publish_cmd(v, v * kappa)
+            time.sleep(self.control_dt)
+        self._stop(3)
+        return moved
+
+    def _align_final_yaw(self, goal_yaw: float):
+        """抵達位置後把車頭轉到 goal_yaw。回傳 (朝向誤差弧度, 來回次數)。
+
+        ★ 為什麼需要這個（2026-08-24）
+        純追蹤只管「把車開到路徑上的位置」，朝向是幾何的副產品。8/24 實測
+        導航到門口：位置誤差 0.11 m 很好，**朝向差 23.9 度**。而來回路線裡
+        「上一段的結束朝向就是下一段的起始朝向」—— 那個誤差會複利。
+
+        ★ 為什麼不是「原地轉」
+        阿克曼車做不到。這裡用對稱三點調頭：前進打一邊、後退打另一邊，
+        兩段都把車頭往同一方向轉，而前後位移大部分抵銷。
+        """
+        if not self.align_enable:
+            return None
+        cycles = 0
+        while cycles < self.align_max_cycles:
+            pose = self._robot_pose()
+            if pose is None:
+                return None
+            err = norm_angle(goal_yaw - pose[2])
+            if abs(err) <= self.align_yaw_tol:
+                break
+
+            # 往左轉用左側的最小半徑，往右轉用右側的 —— 兩邊物理上不對稱
+            # （實測左 0.944 / 右 0.751），用錯邊會要求車子做不到的舵角。
+            radius = self.min_radius_left if err > 0 else self.min_radius_right
+            kappa = math.copysign(1.0 / radius, err)
+            # 一個來回給 2s/R，所以單段弧長是「還差的角度 x 半徑」的一半
+            leg = min(self.align_leg_max, abs(err) * radius / 2.0)
+            if leg < 0.03:
+                break
+
+            fwd_clear, _ = self._body_margin(+1)
+            rev_clear, _ = self._body_margin(-1)
+            if fwd_clear < self.align_min_clear and rev_clear < self.align_min_clear:
+                self.get_logger().warn(
+                    f"　對齊：前 {fwd_clear * 100:.0f} cm / 後 {rev_clear * 100:.0f} cm "
+                    f"都不足 {self.align_min_clear * 100:.0f} cm，這個地點做不了對齊")
+                break
+
+            # 空間多的那邊先走，另一邊補回來
+            order = ((+1, kappa), (-1, -kappa)) if fwd_clear >= rev_clear \
+                else ((-1, -kappa), (+1, kappa))
+            for direction, k in order:
+                self._align_leg(direction, k, leg)
+
+            cycles += 1
+            pose2 = self._robot_pose()
+            if pose2 is not None:
+                self.get_logger().info(
+                    f"　對齊第 {cycles} 個來回（每段 {leg * 100:.0f} cm）："
+                    f"朝向差 {math.degrees(abs(norm_angle(goal_yaw - pose2[2]))):.1f} 度")
+
+        pose = self._robot_pose()
+        if pose is None:
+            return None
+        return norm_angle(goal_yaw - pose[2]), cycles
+
     def _publish_cmd(self, lin: float, ang: float) -> None:
         lin, ang = self._lift_deadband(lin, ang)
         # 卡住判定要比對「指令 vs 實際」，所以指令值必須留下來（見 _follow_loop）
@@ -2047,7 +2259,8 @@ class PathTeachNode(Node):
         # 涵蓋舵機延遲與欠轉 —— 見 _arc_clearance_robust。
         prev_pose_for_curv = None
         curv_meas = None
-        yaw_strikes = 0            # 朝向誤差連續超標次數（姿態判別）
+        yaw_strikes = 0            # 朝向誤差超標次數（只拿來印，判準是下面那個）
+        yaw_over_sec = 0.0         # ★ 真正的判準：朝向超標累計了幾秒
         yaw_warned = False
         # ★★ 2026-08-20：起點要有寬限期，不能從 0.0 開始 ★★
         #   0.0 表示「從來沒折返過」-> `_yaw_grace` 在重播的**第一個週期**
@@ -2093,12 +2306,28 @@ class PathTeachNode(Node):
             # 一出發就會被判定成已抵達
             if idx >= len(pts) - 3 and dist_to_goal <= self.goal_tol:
                 self._stop(5)
+                yaw_err0 = abs(norm_angle(goal.yaw - yaw))
+                align_note = ""
+                # ★ 2026-08-24：位置到了之後再把車頭轉正（見 _align_final_yaw）
+                if self.align_enable and yaw_err0 > self.align_yaw_tol:
+                    self.get_logger().info(
+                        f"位置已到（{dist_to_goal * 100:.0f} cm），"
+                        f"朝向還差 {math.degrees(yaw_err0):.1f} 度，開始對齊…")
+                    outcome = self._align_final_yaw(goal.yaw)
+                    if outcome is not None:
+                        yaw_err_new, cyc = outcome
+                        align_note = f"（對齊 {cyc} 個來回：{math.degrees(yaw_err0):.0f}→"
+                        align_note += f"{math.degrees(abs(yaw_err_new)):.0f} 度）"
+                    pose2 = self._robot_pose()
+                    if pose2 is not None:
+                        x, y, yaw = pose2
+                        dist_to_goal = math.hypot(goal.x - x, goal.y - y)
                 goal_handle.succeed()
                 result.success = True
                 result.final_error_m = dist_to_goal
                 result.final_yaw_error_deg = math.degrees(abs(norm_angle(goal.yaw - yaw)))
                 result.message = (f"已抵達終點，位置誤差 {dist_to_goal * 100:.0f} cm、"
-                                  f"朝向誤差 {result.final_yaw_error_deg:.0f} 度")
+                                  f"朝向誤差 {result.final_yaw_error_deg:.0f} 度{align_note}")
                 self.get_logger().info(result.message)
                 return result
 
@@ -2128,14 +2357,17 @@ class PathTeachNode(Node):
             #   卻可能維持一個大偏航好幾秒 -> 20 Hz 下 0.4 秒就湊滿 8 次 -> 誤中止。
             _yaw_moving = abs(self._cmd_v_last) > 1e-6
             if _yaw_err > self.max_yaw_err and not _yaw_grace and _yaw_moving:
+                # 累計的是**時間**不是次數：加上這一個週期實際過了多久
+                yaw_over_sec += self.control_dt
                 yaw_strikes += 1
-                if yaw_strikes >= self.yaw_strikes_max:
+                if yaw_over_sec >= self.yaw_error_secs:
                     self._stop()
                     goal_handle.abort()
                     result.success = False
                     result.message = (
                         f"車頭偏離路徑朝向 {math.degrees(_yaw_err):.0f} 度"
-                        f"（上限 {math.degrees(self.max_yaw_err):.0f} 度，連續 {yaw_strikes} 次），已停車。"
+                        f"（上限 {math.degrees(self.max_yaw_err):.0f} 度，"
+                        f"持續 {yaw_over_sec:.1f} 秒），已停車。"
                         f"最小迴轉半徑 {self.min_radius_left:.2f} m 大於走廊寬度，"
                         f"純追蹤修不回來，硬跑會刮牆")
                     self.get_logger().error(result.message)
@@ -2146,8 +2378,10 @@ class PathTeachNode(Node):
                 #   yaw 在 45/30 度之間振盪時 strikes 只增不減，最後照樣中止，
                 #   而訊息會謊稱「連續 N 次」—— 現場拿那個數字反推會反推錯。
                 yaw_strikes = max(0, yaw_strikes - 1)
+                yaw_over_sec = max(0.0, yaw_over_sec - self.control_dt)
                 if _yaw_err <= self.warn_yaw_err:
                     yaw_strikes = 0
+                    yaw_over_sec = 0.0
                     yaw_warned = False
                 elif not yaw_warned and not _yaw_grace:
                     yaw_warned = True
@@ -2290,7 +2524,27 @@ class PathTeachNode(Node):
             # 點距差三倍），弧長與點距無關。門檻取 stall_progress_m，
             # 預設 0.10 m —— 比 no_progress_sec 內正常前進距離小一個量級
             # （0.03 m/s × 5 s = 0.15 m），慢慢開不會誤判。
-            if not stuck_now and self.stall_progress > 0:
+            # ★★ 2026-08-24：硬停期間不能讓這條判準把脫困叫起來 ★★
+            #
+            # 三個卡住判準裡，前兩個都有 `want > 0.02` 門檻，而硬停時
+            # `_stop()` 會把 `_cmd_v_last` 歸零 -> want = 0 -> 兩個都擋得住。
+            # **只有這一條沒有門檻**，而它偏偏是唯一在硬停狀態下仍會成立的
+            # （車子確實沒有推進，計時器確實會滿）。
+            #
+            # 後果有安全含意：硬停的意思是「行進方向 6 cm 內有東西」，
+            # 而 no_progress 秒之後系統決定**朝那個方向推** ——
+            # 脫困會 `_escape_bypass = True` **繞過 collision_monitor**，
+            # 而且 `_do_escape` / `_escape_legs` / `_do_escape_inner`
+            # 都不呼叫 `_body_margin`。8/24 實測「脫困了 4 次才 abort」。
+            #
+            # ★ 8/20 修好了這條判準的死碼（prog_t 每週期歸零），
+            #   等於同時把這條危險路徑打開了 —— 修好一個 bug 讓另一個變得可達。
+            #
+            # 硬停自己已經有逾時 -> abort（見下方硬停分支），那才是對的出口：
+            # 障礙移開就恢復，不移開就講清楚請人工介入，而不是硬推過去。
+            # `margin_stop_t` 在上一個週期的硬停分支設定，這裡讀到的是
+            # 「上一輪是不是還在硬停」，正是需要的資訊。
+            if not stuck_now and self.stall_progress > 0 and margin_stop_t <= 0.0:
                 if path_s[idx] - prog_s < self.stall_progress:
                     if now_t - prog_t > self.no_progress:
                         stuck_now = True        # 有在動，但這段時間幾乎沒往前
@@ -2311,6 +2565,58 @@ class PathTeachNode(Node):
                     prog_t = now_t
                 self._escape_steer = None      # 真的在動，下次卡住重新判斷轉向
             elif time.monotonic() - prog_t > self.no_progress:
+                # ★★ 2026-08-24：終點附近不要脫困 ★★
+                #
+                # 8/24 實測：起點->大廳 那趟在**最後一點（45/46）**卡住，
+                # 連做 7 次脫困、每次轉約 35 度，累計轉了 280 度以上，
+                # 最後因為某次脫困碰巧把位置甩進 12 cm 容差內而判定「成功」，
+                # 但 `final_yaw_error_deg` 是 **86 度**。
+                #
+                # 為什麼會卡在最後一點：那條路徑的最後一段要在 0.14 m 之內
+                # 把車頭從 -79 度轉到 -56 度（23 度）。最小迴轉半徑 0.95 m
+                # 轉 23 度需要走 0.95 x 0.40 = 0.38 m —— **路徑在它自己的終點
+                # 就是不可行的**，脫困再多次也做不到。
+                #
+                # ★ 而且代價是複利的：來回路線裡「上一段的結束朝向就是下一段的
+                #   起始朝向」。那 86 度直接害下一趟（大廳->起點，48/50 都是
+                #   倒車點）從一個差 60~110 度的姿態開始，脫困每次都「轉了
+                #   +0 度就停」，10 次全滅。
+                #
+                # 所以在最後幾點只有兩條路：位置夠近就收下，不夠近就講清楚為什麼
+                # 失敗 —— 就是不要用脫困把朝向愈轉愈歪。
+                if idx >= len(pts) - 3:
+                    self._stop(5)
+                    if dist_to_goal <= self.goal_tol * self.goal_relax:
+                        # 推不動也一樣值得把車頭轉正 —— 下一段路要從這個朝向開始
+                        if self.align_enable:
+                            self._align_final_yaw(pts[-1].yaw)
+                            pose2 = self._robot_pose()
+                            if pose2 is not None:
+                                x, y, yaw = pose2
+                                dist_to_goal = math.hypot(
+                                    pts[-1].x - x, pts[-1].y - y)
+                        goal_handle.succeed()
+                        result.success = True
+                        result.final_error_m = dist_to_goal
+                        result.final_yaw_error_deg = math.degrees(
+                            abs(norm_angle(pts[-1].yaw - yaw)))
+                        result.message = (
+                            f"已抵達終點（終點段推不動，以放寬容差收下）："
+                            f"位置誤差 {dist_to_goal * 100:.0f} cm、"
+                            f"朝向誤差 {result.final_yaw_error_deg:.0f} 度")
+                        self.get_logger().info(result.message)
+                        return result
+                    goal_handle.abort()
+                    result.success = False
+                    result.final_error_m = dist_to_goal
+                    result.message = (
+                        f"停在終點前 {dist_to_goal * 100:.0f} cm 推不動"
+                        f"（放寬容差 {self.goal_tol * self.goal_relax * 100:.0f} cm 仍不夠）。"
+                        f"★ 終點段很可能超出最小迴轉半徑做得到的範圍，"
+                        f"不是控制器沒調好 —— 請重錄這條路徑的最後一段。")
+                    self.get_logger().warn(result.message)
+                    return result
+
                 if escapes < self.max_escapes:
                     escapes += 1
                     self.get_logger().warn(
@@ -2372,10 +2678,32 @@ class PathTeachNode(Node):
             # 車子斜著走時檢查的就是斜著的那條路。它本來只用在脫困裡。
             #
             # 先算一次純追蹤的曲率當預覽（下面真正下指令時會用當時的速度
-            # 重算，兩者的曲率一致——曲率只跟目標點幾何有關，與速度無關）。
+            # 重算）。
+            #
+            # ★★ 2026-08-24：這裡也要補軸距，否則預覽與指令是**兩個不同的
+            #    目標點** ★★
+            #
+            # 8/20 只在下面「真正下指令」那處補了 `ld += axle_spacing`，
+            # 這裡漏掉了 —— 但兩處都用 `_track_ref()`，而它在倒車時回傳的是
+            # **前軸**。於是倒車時：
+            #     指令端  ld = 0.42 + 0.322 = 0.742  -> 有效前視 0.42
+            #     預覽端  ld = 0.42              -> 有效前視 **0.098**
+            # 純追蹤增益是 2/ld²，0.098 對 0.42 等於增益差 **18 倍**。
+            #
+            # 後果：`preview_curv` 送進 `_arc_clearance_robust` 之後，
+            # 掃的是一條半徑小很多的假弧 —— 車子實際會走的是大彎，
+            # 系統卻拿小彎去比對障礙，於是**一直誤判前方被擋** ->
+            # 減速/停 -> 判定卡住 -> 脫困 -> 姿態愈轉愈歪 -> 撞牆。
+            # 使用者回報的「倒車不準、一直跑掉姿態、回原點每次都撞牆」
+            # 就是這個。
+            #
+            # ★ 舊註解說「兩者的曲率一致——曲率只跟目標點幾何有關」：
+            #   那句話只在兩邊用**同一個 ld** 時才成立。補上之後才真的一致。
             _pv_ld = max(self.la_min, min(self.la_max,
                 (self.la_k * abs(self.follow_speed if cur_dir > 0 else self.reverse_speed)
                  + self.la_min) * (self.la_rev_scale if cur_dir < 0 else 1.0)))
+            if cur_dir < 0 and self.rev_front_axle:
+                _pv_ld = self.la_rev_ahead + self.axle_spacing
             _rx, _ry = self._track_ref(pose, cur_dir)
             _pv_i, _pv_tgt = self._lookahead_point(pts, idx, _rx, _ry, _pv_ld)
             _pv_v, _pv_w = self._pure_pursuit(pose, _pv_tgt, cur_dir, 1.0, avoid_offset)
@@ -2440,9 +2768,20 @@ class PathTeachNode(Node):
             # 側向的風險（轉彎外甩刮擦）真實存在，但那是**警告**該做的事，
             # 不是煞停 —— 側向貼牆時繼續前進是安全的，往牆的方向轉才不是，
             # 而「往哪個方向轉」已經由 _arc_clearance_robust 掃過了。
-            if any_margin <= self.body_margin_stop and self._margin_stops % 40 == 0:
-                self.get_logger().warning(
-                    f"⚠ 車身側面只剩 {any_margin * 100:.0f} cm（轉彎外甩風險，僅警告不煞停）")
+            # ★★ 2026-08-24：節流用自己的計數器 ★★
+            #   原本寫 `self._margin_stops % 40 == 0`，但 `_margin_stops`
+            #   **只在下面的硬停分支才 +1**。正常貼牆時（側向不足、行進方向沒事）
+            #   它一直停在 0 -> `0 % 40 == 0` 恆真 -> 以實測 15.4 Hz 洗 log，
+            #   而洗掉的正是同一趟裡真正該看的訊息。
+            #   ★ 這是一個 bug class：拿「別的路徑才會遞增的計數器」做節流。
+            if any_margin <= self.body_margin_stop:
+                self._side_warns += 1
+                if self._side_warns % 40 == 1:
+                    self.get_logger().warning(
+                        f"⚠ 車身側面只剩 {any_margin * 100:.0f} cm"
+                        f"（轉彎外甩風險，僅警告不煞停；第 {self._side_warns} 次）")
+            else:
+                self._side_warns = 0
             if dir_margin <= self.body_margin_stop:
                 self._stop()
                 self._margin_stops += 1
@@ -2622,7 +2961,8 @@ class PathTeachNode(Node):
             # 純追蹤增益是 2/ld²，前視縮到 0.1 m 等於增益放大 17 倍 ——
             # 這正好是「倒車擺盪」的成因，而換前軸參考點本來是要消除它的。
             if cur_dir < 0 and self.rev_front_axle:
-                ld += self.axle_spacing
+                # 「往前瞄多遠」用倒車自己的值，再加軸距做幾何修正
+                ld = self.la_rev_ahead + self.axle_spacing
             _rx, _ry = self._track_ref(pose, cur_dir)
             _tgt_i, target = self._lookahead_point(pts, idx, _rx, _ry, ld)
             total_off = avoid_offset + wall_push

@@ -60,6 +60,21 @@ class FaceEmbeddingNode(Node):
             True,
             ParameterDescriptor(description="啟用 GPU 加速"),
         )
+        # ★★ 2026-08-24：這兩個一定要明確給，見 face_engine._init_model ★★
+        self.declare_parameter(
+            "det_size",
+            640,
+            ParameterDescriptor(
+                description="偵測輸入邊長。不給的話 InsightFace 會跑 "
+                            "[(128,128),(640,640)] 串聯，等於每幀偵測兩次"),
+        )
+        self.declare_parameter(
+            "cpu_cores",
+            2,
+            ParameterDescriptor(
+                description="人臉推論最多用幾顆核心（0 = 不限）。"
+                            "Pi 4 只有 4 顆，不限的話會搶走導航控制迴圈"),
+        )
 
         # 讀取與驗證參數
         image_capture_topic = self.get_parameter("image_capture_topic").get_parameter_value().string_value
@@ -67,6 +82,8 @@ class FaceEmbeddingNode(Node):
         model_name = self.get_parameter("model_name").get_parameter_value().string_value
         detect_threshold = self.get_parameter("detect_threshold").get_parameter_value().double_value
         enable_gpu = self.get_parameter("enable_gpu").get_parameter_value().bool_value
+        det_size = self.get_parameter("det_size").get_parameter_value().integer_value
+        cpu_cores = self.get_parameter("cpu_cores").get_parameter_value().integer_value
 
         # 初始化臉部引擎
         try:
@@ -75,6 +92,8 @@ class FaceEmbeddingNode(Node):
                 det_thresh=detect_threshold,
                 enable_gpu=enable_gpu,
                 logger=self.get_logger(),
+                det_size=det_size,
+                cpu_cores=cpu_cores,
             )
         except Exception as e:
             self.get_logger().error(f"臉部引擎初始化失敗: {e}")

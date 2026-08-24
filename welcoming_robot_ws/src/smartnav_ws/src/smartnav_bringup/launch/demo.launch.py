@@ -32,7 +32,8 @@ from launch.actions import (DeclareLaunchArgument, ExecuteProcess, GroupAction,
                             TimerAction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (LaunchConfiguration, PathJoinSubstitution,
+                                  PythonExpression)
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -107,6 +108,13 @@ def generate_launch_description():
         #   CPU 尖峰上，是用失敗換來的教訓被一個預設值推翻。
         #   要人臉辨識時由 camera_manager_cc 按階段開，或明確帶 with_camera:=true。
         DeclareLaunchArgument("with_camera", default_value="false"),
+        # ★★ 2026-08-24：把 camera_manager_cc 真的接進來 ★★
+        #   在此之前它只出現在上面那行註解裡 —— 註解承諾了一個沒有被啟動的機制。
+        #   實測(8/24)：車子靜止、沒開人臉沒開 ASR，CPU 已經是 382~398% / 400%，
+        #   而人臉單項還要 ~190%。相機與導航**必須互斥**，這個節點就是做那件事的。
+        DeclareLaunchArgument(
+            "camera_manager", default_value="true",
+            description="依 /navigation_active 自動開關相機（導航中關、待機開）"),
         DeclareLaunchArgument(
             "start_mode", default_value="auto",
             description="auto / mapping / localization"),
@@ -125,7 +133,7 @@ def generate_launch_description():
 
     # ── 0 s：感測器（底盤、光達、相機、TF）──
     stage_sensors = GroupAction([
-        LogInfo(msg="[bringup] 1/5 感測器啟動中…（導航要等它 8 秒）"),
+        LogInfo(msg="[bringup] 1/6 感測器啟動中…（導航要等它 8 秒）"),
         _inc("smartnav_navigation_cc", "launch/sensors_cc.launch.py",
              {"with_camera": LaunchConfiguration("with_camera")},
              IfCondition(sensors)),
@@ -133,7 +141,7 @@ def generate_launch_description():
 
     # ── 8 s：導航堆疊 ──
     stage_nav = TimerAction(period=8.0, actions=[
-        LogInfo(msg="[bringup] 2/5 導航堆疊啟動中…"),
+        LogInfo(msg="[bringup] 2/6 導航堆疊啟動中…"),
         _inc("smartnav_navigation_cc", "launch/nav_bringup_cc.launch.py",
              {"use_sim_time": "false", "use_rviz": "false",
               "start_mode": start_mode,
@@ -147,7 +155,7 @@ def generate_launch_description():
 
     # ── 14 s：視覺 + 大腦 ──
     stage_brain = TimerAction(period=14.0, actions=[
-        LogInfo(msg="[bringup] 3/5 人臉辨識與迎賓劇本…"),
+        LogInfo(msg="[bringup] 3/6 人臉辨識與迎賓劇本…"),
         # ★ enable_gpu 節點端預設是 True，但 RPi4 沒有 CUDA（專案硬性規則第 5 條）。
         #   不覆寫的話 InsightFace 會先試 CUDAExecutionProvider、噴一串誤導性的
         #   CUDA 警告才退回 CPU —— 現場看到那串會以為是相機壞了。
@@ -167,7 +175,7 @@ def generate_launch_description():
     # ★ voice_trigger 要先於 speech_recognizer：前者開麥克風，
     #   後者只是訂閱它發出來的音訊。反過來不會壞，只是 log 會先噴一堆等待。
     stage_audio = TimerAction(period=18.0, actions=[
-        LogInfo(msg="[bringup] 4/5 語音（雙麥克風 cancel 模式）…"),
+        LogInfo(msg="[bringup] 4/6 語音（雙麥克風 cancel 模式）…"),
         # ★★ 2026-08-20：改成呼叫 run_asr_cc.sh，不要直接起 Node ★★
         #
         # 直接起兩個 Node 看起來乾淨，但**啟動起來是啞的**，因為
@@ -195,7 +203,7 @@ def generate_launch_description():
 
     # ── 21 s：LLM + HMI ──
     stage_top = TimerAction(period=21.0, actions=[
-        LogInfo(msg="[bringup] 5/5 LLM 與平板介面…（HMI 在 :8080）"),
+        LogInfo(msg="[bringup] 5/6 LLM 與平板介面…（HMI 在 :8080）"),
         Node(package="smartnav_llm", executable="llm_service",
              name="llm_service_node", output="screen",
              condition=IfCondition(LaunchConfiguration("llm"))),
@@ -205,11 +213,45 @@ def generate_launch_description():
         #   到 21 秒就無條件印出的定時訊息 —— 底盤沒接、光達沒轉、
         #   ASR 啞掉，它一樣照印。8/20 的驗收若拿它當「啟動成功」，
         #   會產生假 PASS，而假 PASS 比失敗更貴。
-        LogInfo(msg="[bringup] 五個階段都已送出啟動指令（★ 這不代表成功）。"),
+    ])
+
+    # ── 26 s：相機電源管理（★ 一定要排在最後）──
+    #
+    # 為什麼是 26 秒而不是跟著視覺階段(14 s)一起起：
+    # 相機相關行程實測吃掉約 110% CPU，而 14 秒正是 nav2 lifecycle 轉換的
+    # CPU 尖峰。把 `start_with_camera` 疊在那個尖峰上，等於用另一種方式
+    # 重演 `with_camera` 預設 true 那個已經被推翻的錯誤。
+    #
+    # ★★ camera_launch_cmd 一定要指向 camera_face_only.launch.py ★★
+    # 節點自己的預設是原廠的 `wheeltec_camera.launch.py`，那支會開
+    # 彩色+深度+IR+點雲+d2c viewer 外加兩個 republish，實測 astra_camera_node
+    # 吃到 135.9%、load average 衝到 51，人臉向量掉到 0.3 Hz
+    # （見 camera_face_only.launch.py 檔頭）。人臉辨識**完全不用深度**。
+    #
+    # 與 with_camera 互斥：兩邊都開會有兩份 astra_camera_node 搶同一支 USB。
+    stage_camera = TimerAction(period=26.0, actions=[
+        LogInfo(msg="[bringup] 6/6 相機電源管理（camera_manager:=false 時這階段不起任何節點）…"),
+        Node(package="smartnav_navigation_cc", executable="camera_manager_cc",
+             name="camera_manager_cc_node", output="screen",
+             parameters=[{
+                 "camera_launch_cmd":
+                     "ros2 launch /home/user/maprun/camera_face_only.launch.py",
+                 "start_with_camera": True,
+                 "auto_follow_navigation": True,
+                 "resume_delay_sec": 3.0,
+             }],
+             condition=IfCondition(PythonExpression([
+                 "'", LaunchConfiguration("camera_manager"), "'.lower() == 'true' and '",
+                 LaunchConfiguration("with_camera"), "'.lower() != 'true'"]))),
+        # ★ 2026-08-20 的教訓保留：這只是一個到時間就印的定時訊息，
+        #   底盤沒接、光達沒轉、ASR 啞掉，它一樣照印。拿它當「啟動成功」
+        #   會產生假 PASS，而假 PASS 比失敗更貴。
+        LogInfo(msg="[bringup] 六個階段都已送出啟動指令（★ 這不代表成功）。"),
         LogInfo(msg="[bringup] 請跑 ~/maprun/nav_cc_check.py 確認實際狀態，"
                     "並用 ros2 node list 檢查有沒有重複節點。"),
     ])
 
     return LaunchDescription(args + [OpaqueFunction(function=_guard_duplicate_stack),
                                      stage_sensors, stage_nav,
-                                     stage_brain, stage_audio, stage_top])
+                                     stage_brain, stage_audio, stage_top,
+                                     stage_camera])
