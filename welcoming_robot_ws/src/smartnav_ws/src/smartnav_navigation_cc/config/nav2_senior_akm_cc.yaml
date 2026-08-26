@@ -1116,7 +1116,22 @@ collision_monitor:
     stop_pub_timeout: 2.0
     enable_stamped_cmd_vel: false
     use_realtime_priority: false
+    # ★★★ 一鍵退路（2026-08-26）★★★
+    #
+    # "VelocityStop" 是 2026-08-26 新增、**從未上機跑過**的設定。
+    # `velocity_polygon` 型別在 Jazzy 的 nav2 已支援（上游 collision_monitor_params.yaml
+    # 就有 VelocityPolygonStop 範例），但若這台 Pi 上的 nav2 是較舊的修訂版，
+    # 解析失敗會讓 collision_monitor **configure 不起來**，
+    # 而它起不來 -> 沒有人讀 cmd_vel_trimmed -> **整條導航鏈都不動**。
+    #
+    # 症狀：啟動 log 出現 collision_monitor 的 configure 失敗／參數錯誤，
+    #       或 `ros2 lifecycle get /collision_monitor` 停在 unconfigured。
+    #
+    # 退路：把下面那行換成註解掉的那行（拿掉 "VelocityStop"），重新啟動即可。
+    #       ★ 注意：把 VelocityStop.enabled 設成 false **沒有用** ——
+    #         只要名字還在 polygons 清單裡，它就會被解析。要退必須從清單移除。
     polygons: ["PolygonStop", "PolygonSlow", "FootprintApproach", "VelocityStop"]
+    # polygons: ["PolygonStop", "PolygonSlow", "FootprintApproach"]   # ← 退路
     PolygonStop:
       type: "polygon"
       # === 2026-07-29 重畫：原本是照「錯的」車身尺寸畫的 ===

@@ -705,13 +705,32 @@ class WaypointServiceCcNode(Node):
         n_valid = 0
         for lo, hi in index_ranges:
             for r in msg.ranges[lo:hi]:
-                # inf/nan 的比較一律為 False，所以這個條件同時濾掉它們
-                if 0.0 < r < float("inf"):
-                    n_valid += 1
-                    if r < best:
-                        best = r
-        # 少於 3 點就當作沒資料：單一雜訊點不足以宣告「這個方向是安全的」。
-        return best if n_valid >= 3 else 0.0
+                # ★★ 2026-08-26 修正：inf 是**有效觀測**，不是無效值 ★★
+                #
+                # 我 8/25 把 inf 跟 nan 一起當成「沒資料」，那是錯的：
+                #   nan / 0.0  = 這一束**量不到**（玻璃、鏡面、太近、雷達重連）
+                #   inf        = 這一束**量到了，而且量程內沒東西** = 淨空
+                #
+                # 混在一起的後果是一個誤判：在空曠大廳裡，正前方 ±30 度
+                # 每一束都回 inf -> n_valid = 0 -> 回傳 0.0（當作貼牆）
+                # -> 判定前方不通 -> 倒車 -> 後方同樣空曠也回 0.0
+                # -> 立刻中止並印「後方只剩 0.00 m」。**越空曠越會誤判。**
+                if r != r:                       # nan
+                    continue
+                if r <= 0.0:                     # 0 = 量不到（多數驅動的慣例）
+                    continue
+                if r == float("inf") or r > msg.range_max:
+                    n_valid += 1                 # 量到了：量程內淨空
+                    continue                     # 不參與 min，它不是「最近的東西」
+                n_valid += 1
+                if r < best:
+                    best = r
+        if n_valid < 3:
+            # 少於 3 點才是真的沒資料 —— 單一雜訊點不足以宣告方向安全。
+            # 回 0.0（當作貼牆），寧可誤停也不要誤衝。
+            return 0.0
+        # 有資料但沒有任何一束打到東西 -> 整個扇區在量程內是空的。
+        return best if best != float("inf") else float(msg.range_max)
 
     @staticmethod
     def _compute_sector_index_ranges(msg: LaserScan, n: int, center: float,
