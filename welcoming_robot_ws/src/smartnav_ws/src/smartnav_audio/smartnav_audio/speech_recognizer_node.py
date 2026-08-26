@@ -781,7 +781,7 @@ class SpeechRecognizerNode(Node):
         got_bg = self._bigrams(got)
         if len(got_bg) < 3:
             return False
-        now = time.time()
+        now = time.monotonic()
         for said_t, said in self._robot_said:
             if now - said_t > self.echo_filter_sec or not said:
                 continue
@@ -856,7 +856,7 @@ class SpeechRecognizerNode(Node):
         """
         # ★ 不論有沒有硬靜音，都要記下「機器人講了什麼」給回音過濾用
         if self.echo_filter_sec > 0 and msg.data:
-            now = time.time()
+            now = time.monotonic()
             self._robot_said.append((now, self._norm_for_echo(msg.data)))
             self._robot_said = [(t, x) for (t, x) in self._robot_said
                                 if now - t <= self.echo_filter_sec]
@@ -864,15 +864,23 @@ class SpeechRecognizerNode(Node):
             return                      # 走文字層過濾，不丟音訊（客人隨時能插話）
         secs = min(len(msg.data) * self.TTS_SEC_PER_CHAR + self.TTS_TAIL_SEC,
                    self.TTS_MAX_MUTE_SEC)
+        # ★★ 2026-08-25：本檔五處計時全部從 time.time() 改成 time.monotonic() ★★
+        #   RPi4 沒有 RTC 電池，開機是 fake-hwclock 回填的舊時間，
+        #   連上熱點後 NTP 會把系統時間**階躍**校正。這五處（回音視窗 ×2、
+        #   靜音視窗 ×3）量的都是「經過多久」，牆鐘一跳就全錯：
+        #     往後跳 -> _playing_until 遠在未來 -> 麥克風靜音到跳幅結束，
+        #               現場看起來就是「語音壞了」，而且不會有任何錯誤訊息
+        #     往前跳 -> 靜音提早解除、回音視窗被清空 -> TTS 被自己聽回去
+        #   五處是互相比較的，一起換才一致。
         with self._playing_lock:
             self.is_playing = True
-            self._playing_until = time.time() + secs
+            self._playing_until = time.monotonic() + secs
         self.get_logger().info(f"🔇 TTS 播放中，辨識靜音 {secs:.1f} 秒（{len(msg.data)} 字）")
 
     def _tts_expire(self) -> None:
         """靜音到期就解除。由音訊回呼順手呼叫，不另外開計時器。"""
         with self._playing_lock:
-            if self.is_playing and time.time() >= self._playing_until:
+            if self.is_playing and time.monotonic() >= self._playing_until:
                 self.is_playing = False
                 self.get_logger().info("🔊 TTS 播放結束，恢復辨識")
 
@@ -1028,7 +1036,7 @@ class SpeechRecognizerNode(Node):
         with self._playing_lock:
             self.is_playing = bool(msg.data)
             if self.is_playing:
-                self._playing_until = time.time() + self.TTS_MAX_MUTE_SEC
+                self._playing_until = time.monotonic() + self.TTS_MAX_MUTE_SEC
             else:
                 self._playing_until = 0.0
         self.get_logger().info(

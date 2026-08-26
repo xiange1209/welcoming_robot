@@ -449,8 +449,12 @@ class SteeringTrimCcNode(Node):
         cmd = Twist()
         cmd.linear.x = speed
         # 量測時不套用補償，才量得到原始偏移
-        t0 = time.time()
-        while time.time() - t0 < duration and rclpy.ok():
+        # ★ 2026-08-25：牆鐘改單調鐘。這是一個**會讓車子直線衝出去**的迴圈，
+        #   而 RPi4 沒有 RTC 電池，NTP 在連上熱點後會把系統時間階躍校正。
+        #   往後跳的話 time.time() - t0 變負，這個迴圈**不會因逾時停下**，
+        #   而它全程沒有任何淨空檢查（只有上面那句「請確認前方淨空」的提醒）。
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < duration and rclpy.ok():
             self.pub.publish(cmd)
             time.sleep(0.05)
         self.pub.publish(Twist())

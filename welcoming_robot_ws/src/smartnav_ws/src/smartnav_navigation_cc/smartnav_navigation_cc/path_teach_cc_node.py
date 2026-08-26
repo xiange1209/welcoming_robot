@@ -2281,7 +2281,50 @@ class PathTeachNode(Node):
         self._escape_steer = None
         move_hist: List[Tuple[float, float, float, float]] = []   # (t, x, y, |指令v|)
 
+        # ★★ 2026-08-25：所有以「秒」為單位的判準改吃**實際量到的**週期 ★★
+        #
+        # 8/24 把姿態判別從「次數」改成「秒」，理由寫得完全正確：
+        #   「週期數這個單位本身就是錯的：它把『要歪多久才算真的歪了』這個
+        #     物理問題綁在『這台機器現在跑多快』這個負載問題上。
+        #     改成秒之後，頻率是多少都不影響判準。」
+        # 但實作寫的是 `yaw_over_sec += self.control_dt` —— control_dt 是
+        # **標稱值** 1/20，不是這一圈實際過了多久。所以那個累加器只是
+        # 穿著「秒」外衣的次數計數器，它要治的病一個都沒治到。
+        #
+        # 為什麼標稱值一定不對：這個迴圈是「做完事再 sleep(control_dt)」，
+        # 所以實際週期 = 工作時間 + control_dt，**永遠大於** control_dt。
+        # 8/24 實測 15.4 Hz -> 週期 0.0649 s -> 工作時間約 15 ms，對得起來。
+        # 而工作時間會隨 CPU 負載變動 -> 頻率是浮動的 -> 標稱值錯得也是浮動的。
+        _tick_t = time.monotonic()          # 上一圈的時間戳
+        _tick_dt = self.control_dt          # 這一圈實際過了多久（第一圈先用標稱值）
+        _tick_next = _tick_t + self.control_dt   # 定速迴圈的下一個目標時刻
+        _rate_t0, _rate_n, _rate_worst = _tick_t, 0, 0.0
+
         while rclpy.ok():
+            # 這一圈實際過了多久。★ 夾在 3 倍標稱值以內：暫停、等障礙、
+            #   折返靜止那些地方會 sleep 好幾秒，不夾的話一圈就把逾時累滿。
+            _tick_now = time.monotonic()
+            _tick_dt = min(_tick_now - _tick_t, 3.0 * self.control_dt)
+            _tick_t = _tick_now
+            _rate_n += 1
+            if _tick_dt > _rate_worst:
+                _rate_worst = _tick_dt
+            if _tick_now - _rate_t0 >= 10.0:
+                # ★ 把「實際頻率」印進 log。這個數字以前要事後撈 CSV 才算得出來，
+                #   而它是判讀所有「持續 N 秒」訊息的前提。
+                _hz = _rate_n / (_tick_now - _rate_t0)
+                if _hz < 0.85 * (1.0 / self.control_dt):
+                    self.get_logger().warning(
+                        f"⚠ 控制迴圈只跑到 {_hz:.1f} Hz（設定 "
+                        f"{1.0 / self.control_dt:.0f} Hz，最慢一圈 "
+                        f"{_rate_worst * 1000:.0f} ms）—— CPU 吃緊，"
+                        f"車身外緣硬停的檢查間隔也跟著變長")
+                else:
+                    self.get_logger().info(
+                        f"控制迴圈 {_hz:.1f} Hz（最慢一圈 "
+                        f"{_rate_worst * 1000:.0f} ms）")
+                _rate_t0, _rate_n, _rate_worst = _tick_now, 0, 0.0
+
             if goal_handle.is_cancel_requested:
                 self._stop()
                 goal_handle.canceled()
@@ -2357,8 +2400,10 @@ class PathTeachNode(Node):
             #   卻可能維持一個大偏航好幾秒 -> 20 Hz 下 0.4 秒就湊滿 8 次 -> 誤中止。
             _yaw_moving = abs(self._cmd_v_last) > 1e-6
             if _yaw_err > self.max_yaw_err and not _yaw_grace and _yaw_moving:
-                # 累計的是**時間**不是次數：加上這一個週期實際過了多久
-                yaw_over_sec += self.control_dt
+                # 累計的是**時間**不是次數：加上這一個週期實際過了多久。
+                # ★ 用 _tick_dt（量到的）不是 self.control_dt（標稱的）——
+                #   標稱值會讓這個「秒」退化成次數，見迴圈開頭的長註解。
+                yaw_over_sec += _tick_dt
                 yaw_strikes += 1
                 if yaw_over_sec >= self.yaw_error_secs:
                     self._stop()
@@ -2378,7 +2423,7 @@ class PathTeachNode(Node):
                 #   yaw 在 45/30 度之間振盪時 strikes 只增不減，最後照樣中止，
                 #   而訊息會謊稱「連續 N 次」—— 現場拿那個數字反推會反推錯。
                 yaw_strikes = max(0, yaw_strikes - 1)
-                yaw_over_sec = max(0.0, yaw_over_sec - self.control_dt)
+                yaw_over_sec = max(0.0, yaw_over_sec - _tick_dt)
                 if _yaw_err <= self.warn_yaw_err:
                     yaw_strikes = 0
                     yaw_over_sec = 0.0
@@ -2994,7 +3039,26 @@ class PathTeachNode(Node):
             if now - last_fb > 0.25:
                 last_fb = now
                 self._send_feedback(goal_handle, idx, len(pts), xte, state, "")
-            time.sleep(self.control_dt)
+
+            # ★★ 定速迴圈：睡到「下一個目標時刻」，不是固定睡 control_dt ★★
+            #
+            # 原本是 `time.sleep(self.control_dt)` 放在做完事之後，
+            # 所以實際週期 = 工作時間 + control_dt，**永遠慢於設定值**，
+            # 而且慢多少取決於當下 CPU 有多忙（8/24 實測 15.4 Hz / 設定 20）。
+            #
+            # 這件事有安全含意：車身外緣硬停 `_body_margin` 是**一圈檢查一次**，
+            # 兩次檢查之間車子是照著上一個指令在走的（底盤看門狗要 1 秒才切，
+            # 8/24 實測 1583 筆裡 ≥1.0 s 的空窗有 0 次，所以它不會來救）。
+            # 迴圈變慢 = 檢查變疏 = 撞上去之前多滑一段。
+            #
+            # 落後太多時直接把基準拉到現在，不要試圖補跑 —— 補跑會變成
+            # 一連串 sleep(0) 的空轉，在已經吃緊的 CPU 上只會更糟。
+            _tick_next += self.control_dt
+            _slack = _tick_next - time.monotonic()
+            if _slack > 0.0:
+                time.sleep(_slack)
+            elif _slack < -self.control_dt:
+                _tick_next = time.monotonic()
 
         self._stop()
         goal_handle.abort()
@@ -3135,10 +3199,26 @@ class PathTeachNode(Node):
         start = self._robot_pose()
         v = speed if direction >= 0 else -speed
         w = abs(v) * curvature
-        t0 = time.time()
+        # ★★ 2026-08-25：牆鐘改單調鐘 ★★
+        #
+        # 這裡原本是 time.time()（牆鐘），而全檔其他 41 處計時都是 monotonic。
+        # 牆鐘會**跳**，而這台車跳得特別兇：RPi4 沒有 RTC 電池，開機時是
+        # fake-hwclock 回填的舊時間，等連上手機熱點之後 NTP 才把它**階躍**校正。
+        # 也就是說「開機就出發、網路稍後才通」正好會讓時鐘在跑的當下跳。
+        #
+        #   往前跳 -> time.time() - t0 瞬間變超大 -> 迴圈立刻結束 ->
+        #             這一段等於沒推 -> moved≈0 -> 脫困回報失敗 -> 再脫困
+        #             -> 反覆脫困把 AMCL 轉丟。這就是「導航非常不穩定」。
+        #   往後跳 -> 差值變負 -> **永遠 < limit** -> 迴圈不會因逾時結束，
+        #             車子一直推。只剩 moved 判斷與下面的車身外緣硬停能救，
+        #             而外緣硬停是 fail-open 的（沒有回波 = 淨空）。
+        #             這就是「一直撞牆然後還繼續移動沒有停」。
+        #
+        # monotonic 不受系統時間調整影響，是計時唯一正確的選擇。
+        t0 = time.monotonic()
         limit = self.UNWEDGE_LEG_M / max(speed, 1e-3) + 3.0
         moved = 0.0
-        while time.time() - t0 < limit:
+        while time.monotonic() - t0 < limit:
             cur = self._robot_pose()
             if start and cur:
                 moved = math.hypot(cur[0] - start[0], cur[1] - start[1])

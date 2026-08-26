@@ -2268,8 +2268,10 @@ class HmiServerNode(Node):
             if client.service_is_ready():
                 pending[name] = client.call_async(GetState.Request())
 
-        deadline = time.time() + 1.5
-        while time.time() < deadline and not all(f.done() for f in pending.values()):
+        # ★ 2026-08-25：量「經過多久」一律用 monotonic。本檔其餘的 time.time()
+        #   是要送到瀏覽器顯示的**絕對**時間戳，那些正確、不要改。
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and not all(f.done() for f in pending.values()):
             time.sleep(0.05)
 
         # 用完就拆掉。這些 get_state 客戶端原本是「建了就永久留著」，導航跑起來
@@ -2445,8 +2447,11 @@ class HmiServerNode(Node):
 
         # 進度由 registration_progress 話題推送，這裡只當看門狗：
         # user_auth_node 若中途掛掉就不會再有任何訊息，狀態會永遠卡在 running。
-        deadline = time.time() + self.REG_TIMEOUT_SEC + 5.0
-        while time.time() < deadline:
+        # ★ 2026-08-25：牆鐘改單調鐘。這支是看門狗，用牆鐘等於把它自己也交給
+        #   一個會跳的東西 —— NTP 往後階躍時它永遠不會響，
+        #   而「永遠卡在 running」正是它存在要防的那件事。
+        deadline = time.monotonic() + self.REG_TIMEOUT_SEC + 5.0
+        while time.monotonic() < deadline:
             time.sleep(0.5)
             if not self.state.registration_active():
                 return
