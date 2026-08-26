@@ -1116,7 +1116,7 @@ collision_monitor:
     stop_pub_timeout: 2.0
     enable_stamped_cmd_vel: false
     use_realtime_priority: false
-    polygons: ["PolygonStop", "PolygonSlow", "FootprintApproach"]
+    polygons: ["PolygonStop", "PolygonSlow", "FootprintApproach", "VelocityStop"]
     PolygonStop:
       type: "polygon"
       # === 2026-07-29 重畫：原本是照「錯的」車身尺寸畫的 ===
@@ -1217,6 +1217,96 @@ collision_monitor:
       min_points: 6
       visualize: false
       enabled: true
+
+    # ==================================================================
+    # ★★★ VelocityStop —— 2026-08-25 新增，補回「停車」這個動作 ★★★
+    # ==================================================================
+    #
+    # 背景：`PolygonStop` 在 2026-07-29 被停用，理由完全正確 ——
+    # 它是一個**固定在車體上、不分方向**的方框，半寬 0.235 m，
+    # 而走廊淨寬 0.99 m、車寬 0.37 m，車子偏離中線 0.08 m 就觸發，
+    # 觸發後**所有方向**的指令一起歸零，連「往空曠處倒車脫困」都被鎖死。
+    #
+    # 但停用之後**沒有補替代品**，於是整條鏈只剩「減速」沒有「停止」：
+    #   PolygonSlow        乘 0.85，永遠不到 0
+    #   FootprintApproach  連續縮放，是斜坡不是停
+    # 這就是使用者回報「撞牆還繼續移動沒有停」的環境條件。
+    #
+    # --- 為什麼現在可以解 ---
+    #
+    # nav2 的 `velocity_polygon` 型別（Jazzy 已支援，見
+    # nav2_collision_monitor/params/collision_monitor_params.yaml 的
+    # VelocityPolygonStop 範例）會**依照當下的速度指令挑選**要用哪一個子多邊形。
+    # 倒車時只有後方那個生效、前進時只有前方那個生效 ——
+    # 2026-07-29 那個「不分方向、把脫困也一起鎖死」的問題從根本上不存在。
+    #
+    # --- 幾何設計：把框畫得比車身還窄 ---
+    #
+    # 車身 footprint = [-0.09, 0.40] x [±0.185]，base_footprint 在**後輪軸心**。
+    # 這裡所有子多邊形一律用 **半寬 0.16**（比車身半寬 0.185 還窄 2.5 cm）。
+    #
+    #   ★ 比車身窄的框，不可能被「車身本來就不會撞到」的側牆觸發。
+    #     走廊裡置中時每邊餘裕 (0.99-0.37)/2 = 0.31 m，
+    #     半寬 0.16 要偏離中線 0.15 m 才觸發（舊值 0.235 只要 0.08 m）。
+    #     這一條就把 2026-07-29 的反對理由整個化解掉了。
+    #
+    # 縱向只涵蓋「車身之外」的緩衝，不重疊車身本體：
+    #   前進  x 從 +0.40（車頭）往前到 +0.50    -> 正前方 10 cm 內有東西才停
+    #   倒車  x 從 -0.09（車尾）往後到 -0.20    -> 正後方 11 cm 內有東西才停
+    # 0.15 m/s 時 11 cm 約 0.7 秒，足夠這個底盤停下來。
+    #
+    # ★★ 前提：**雷達看得見車後**。雷達裝在 0.11 m 高、位於 base_footprint
+    #    前方 0.089 m，車尾可能被車身自己遮住。這個多邊形只有在後方
+    #    真的有回波時才有用 —— 上機前先跑
+    #        python3 ~/maprun/tools_0825/rear_blind_check.py 10
+    #    若判定後方是盲區，這個設定不會救到你，要先解決遮擋。
+    #
+    # ★ 若前進因此變得太容易停（使用者說前進目前是可以的，只是誤差大），
+    #   第一個要調的是 translation_forward 的 x 上限 0.50 -> 0.46，
+    #   不要去動半寬 —— 半寬是這個設計能成立的關鍵。
+    VelocityStop:
+      type: "velocity_polygon"
+      action_type: "stop"
+      # 3 點：夠濾掉單一雜訊點，又不會因為後方回波稀疏而漏掉牆。
+      # （PolygonStop 舊值是 4、上游範例是 6；後方視野可能本來就少，取 3。）
+      min_points: 3
+      visualize: true
+      enabled: true
+      polygon_pub_topic: "velocity_polygon_stop"
+      holonomic: false
+      velocity_polygons: ["rotation", "translation_forward",
+                          "translation_backward", "stopped"]
+      # 順序有意義：由上而下第一個「速度落在範圍內」的子多邊形生效。
+      #
+      # rotation / stopped 這兩個對阿克曼沒有實質意義（不能原地轉），
+      # 而 0~0.085 m/s 是底盤死區、馬達根本不轉。所以刻意畫成一個
+      # **完全位於車身內部**的小框 —— 雷射打不到車身內部，等於不會觸發。
+      # 不能直接省略：省略的話那段速度區間沒有子多邊形可選。
+      rotation:
+        points: "[[0.05, 0.05], [0.05, -0.05], [-0.05, -0.05], [-0.05, 0.05]]"
+        linear_min: 0.0
+        linear_max: 0.085
+        theta_min: -1.5
+        theta_max: 1.5
+      translation_forward:
+        points: "[[0.50, 0.16], [0.50, -0.16], [0.40, -0.16], [0.40, 0.16]]"
+        linear_min: 0.085
+        linear_max: 2.0
+        theta_min: -1.5
+        theta_max: 1.5
+      translation_backward:
+        points: "[[-0.09, 0.16], [-0.09, -0.16], [-0.20, -0.16], [-0.20, 0.16]]"
+        linear_min: -2.0
+        linear_max: 0.0
+        theta_min: -1.5
+        theta_max: 1.5
+      stopped:
+        points: "[[0.05, 0.05], [0.05, -0.05], [-0.05, -0.05], [-0.05, 0.05]]"
+        linear_min: -2.0
+        linear_max: 2.0
+        theta_min: -3.0
+        theta_max: 3.0
+
     # 停車判斷同樣要兩個來源。只看雷達的話，低於 0.11 m 的障礙
     # 進到 PolygonStop 框內也不會觸發停車。
     observation_sources: ["scan", "depth_cloud"]
