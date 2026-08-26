@@ -67,8 +67,29 @@ class RosStreamHandler(BaseCallbackHandler):
         # 「整句」送出去的時候轉——畫面上的串流字幕會短暫是簡體，
         # 但送進 TTS 與最終回覆的都是繁體。
         self.convert = convert or (lambda s: s)
-        self.split_pattern = re.compile(r"([,.\!?;:，。！？；：\n])")
-        self.clean_pattern = re.compile(r"[^\w\u4e00-\u9fa5\s]|[_-]")
+        # ★★ 2026-08-26：數字之間的 . : , 不是標點 ★★
+        #
+        # 舊版把半形句點、冒號、逗號一律當成斷句符，而銀行機器人講的話裡
+        # 這三個符號幾乎都夾在數字中間。實測（模擬逐 token 串流，
+        # 見 ~/maprun/tools_0826/tts_split_check.py）：
+        #
+        #   「營業時間是上午9:00到下午3:30」-> 唸成「上午9」「00到下午3」「30」
+        #   「年利率3.5%，匯率31.25」      -> 唸成「年利率3」「5」「匯率31」「25」
+        #   「餘額是1,250,000元」           -> 唸成「1」「250」「000元」
+        #
+        # 而 config/bank_faq.txt:4 的營業時間就寫成 09:00-15:30 ——
+        # 客人問「幾點開門」正好會踩到。
+        #
+        # ★ 這個 bug 特別難察覺：HMI 畫面顯示的是 /llm_response（完整正確的
+        #   final_reply），平板唸的是 /speech_text（被切碎的）。**畫面對、聲音錯**。
+        #
+        # 全形標點（，。！？；：）不加 lookaround —— 它們不會出現在數字中間。
+        self.split_pattern = re.compile(r"((?<!\d)[,.:;](?!\d)|[!?，。！？；：\n])")
+        # 千分位逗號先拿掉：1,250,000 -> 1250000，TTS 才唸得出「一百二十五萬」
+        self.thousands_pattern = re.compile(r"(?<=\d),(?=\d\d\d)")
+        # ★ . : % 要保留（小數、時刻、百分比），其餘符號照舊刪掉。
+        #   `-` 不在保留集合裡，仍會被第一個分支刪掉；`_` 屬於 \w，要另外列出。
+        self.clean_pattern = re.compile(r"[^\w一-龥\s.:%]|_")
         self.buffer = ""
         self.current_sentence = ""
         self.held: List[str] = []
@@ -115,6 +136,16 @@ class RosStreamHandler(BaseCallbackHandler):
         """這一輪只是去呼叫工具，旁白不要唸出來"""
         self.held = []
 
+    def _clean(self, text: str) -> str:
+        """把一句話整理成適合 TTS 唸的形式。
+
+        ★ 2026-08-26：順序很重要 —— 千分位逗號要**先**拿掉。
+          若先跑 clean_pattern，1,250,000 的逗號會被刪成 "1 250 000"（三個數），
+          TTS 就唸成「一、二百五十、零」。
+        """
+        return " ".join(
+            self.clean_pattern.sub("", self.thousands_pattern.sub("", text)).split())
+
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         if not token:
             return
@@ -125,12 +156,24 @@ class RosStreamHandler(BaseCallbackHandler):
         parts = self.split_pattern.split(self.buffer)
         self.buffer = parts.pop() if parts else ""
 
+        # ★★ 2026-08-26：buffer 剛好停在分隔符上時，退回去等下一個 token ★★
+        #
+        # split_pattern 用 (?!\d) 判斷「這個冒號是時刻還是標點」，而 lookahead
+        # 需要**下一個字元**才能判斷。但 token 是一個一個到的：
+        # buffer 是「...上午9:」時 0 還沒到，lookahead 看到的是字串結尾，
+        # 判定為標點 -> 照樣切錯。退回去等一個 token 就看得到 0。
+        #
+        # 若那個分隔符真的是句尾（後面沒有字了），on_llm_end 會把殘留 flush
+        # 出去，不會漏掉。代價只是最後一句晚一個 token 送出。
+        if parts and self.split_pattern.fullmatch(parts[-1]):
+            self.buffer = parts.pop() + self.buffer
+
         for item in parts:
             if not item:
                 continue
 
             if self.split_pattern.match(item):
-                speech_sentence = " ".join(self.clean_pattern.sub("", self.current_sentence).split())
+                speech_sentence = self._clean(self.current_sentence)
                 if speech_sentence:
                     self._emit(speech_sentence)
                 self.current_sentence = ""
@@ -138,7 +181,7 @@ class RosStreamHandler(BaseCallbackHandler):
                 self.current_sentence += item
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
-        remaining_text = " ".join(self.clean_pattern.sub("", self.current_sentence + self.buffer).split())
+        remaining_text = self._clean(self.current_sentence + self.buffer)
         if remaining_text:
             self._emit(remaining_text)
         self.buffer = ""

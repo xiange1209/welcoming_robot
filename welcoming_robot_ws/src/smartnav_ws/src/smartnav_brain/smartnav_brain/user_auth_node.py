@@ -137,6 +137,10 @@ class UserAuthNode(Node):
             self.get_logger().error(f"使用者管理器初始化失敗: {e}")
             raise
 
+        # ★★ 2026-08-26：人臉代表向量快取（理由見 _get_prototypes）★★
+        self._proto_cache = {}      # {uuid: 正規化後的平均向量}
+        self._proto_key = None      # (uuid, 樣本數) 快照，變了才重建
+
         # 建立註冊人臉服務
         self.register_face_service = self.create_service(
             RegisterFace,
@@ -684,6 +688,56 @@ class UserAuthNode(Node):
         msg.similarity = float(similarity)
         self.user_identity_pub.publish(msg)
 
+    def _get_prototypes(self) -> dict:
+        """取得每位使用者的代表向量（各樣本 L2 正規化後平均），只在註冊表變動時重建。
+
+        Returns:
+            dict: {user_uuid: 代表向量}
+
+        ★★ 2026-08-26：這裡原本每一幀都重算一次 ★★
+
+        原本 `_process_face_recognition` 每收到一則 /face_embedding 就呼叫
+        `get_all_embeddings()` -> 對每個樣本 `np.load()` -> 再 `np.mean()`。
+        全檔沒有任何快取。實測（3 使用者 × 10 樣本，Windows SSD、page cache 已熱）：
+
+            每幀 16.5 ms、檔案 I/O 450 次/秒 -> 15 FPS 下佔將近 1/4 顆核心
+
+        而 Pi 4 只有 4 顆核心、導航跑起來已經 382~398%，SD 卡又比 SSD 慢，
+        實際成本只會更高。成本還與**註冊人數成正比** —— E1/E2 實驗要註冊
+        多位受測者時會更明顯。
+
+        ★★ 同時修正平均方式：先正規化再平均 ★★
+
+        `face_engine.py` 存的是 InsightFace 的**原始** embedding
+        （不是 `normed_embedding`），而它的長度會隨臉的大小與亮度變動。
+        直接算算術平均等於**讓亮而大的樣本主導這個人的代表臉**。
+        改成各自 L2 正規化後再平均，每張樣本權重相同。
+
+        ★ 注意 `compute_similarity`（brain_utils.py）本來就有正規化，
+          所以「比對」那一步一直是對的。問題只在**平均之前**沒有先正規化。
+
+        ★ 快取鍵是 (uuid, 樣本數)，所以註冊新人或加樣本會自動重建。
+          ⚠ 樣本數不變但檔案內容被換掉時**不會**重建 —— 目前沒有這種操作，
+            若日後加了「重新註冊覆蓋樣本」的功能，要把註冊表 mtime 也放進鍵。
+        """
+        key = tuple(sorted(
+            (uuid, len(info.get("samples", [])))
+            for uuid, info in self.user_manager.user_registry.items()))
+        if key == self._proto_key:
+            return self._proto_cache
+
+        protos = {}
+        for user_uuid, embeddings in self.user_manager.get_all_embeddings().items():
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms[norms < 1e-6] = 1.0          # 全零向量不要製造 NaN
+            protos[user_uuid] = cast(
+                np.ndarray,
+                np.mean(embeddings / norms, axis=0, dtype=np.float32))
+
+        self._proto_cache, self._proto_key = protos, key
+        self.get_logger().info(f"人臉代表向量已重建：{len(protos)} 位使用者")
+        return protos
+
     def _process_face_recognition(self, embedding: np.ndarray):
         """處理人臉識別邏輯。
 
@@ -702,13 +756,12 @@ class UserAuthNode(Node):
         ★ 未認出時也要回實際的最高分（不是 0），E2 誤認率分析要的
         就是「未註冊者拿到多少分」的分布。
         """
-        all_embeddings = self.user_manager.get_all_embeddings()
-
         max_similarity = 0.0
         best_match_uuid = None
 
-        for user_uuid, embeddings in all_embeddings.items():
-            mean_embedding = cast(np.ndarray, np.mean(embeddings, axis=0, dtype=np.float32))
+        # ★ 2026-08-26：改走快取。原本每一幀都把所有樣本從磁碟重讀
+        #   並重算平均，實測 16.5 ms/幀。詳見 _get_prototypes 的 docstring。
+        for user_uuid, mean_embedding in self._get_prototypes().items():
             similarity = compute_similarity(embedding, mean_embedding)
 
             if similarity > max_similarity:
