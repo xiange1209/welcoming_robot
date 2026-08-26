@@ -205,6 +205,11 @@ class WaypointServiceCcNode(Node):
         self._localizing = False
         self._front_idx_n = -1
         self._front_ranges = []
+        # ★ 2026-08-25：後方扇形。初值 0.0 而不是 inf —— 還沒量到就當作
+        #   後面有東西，倒車要先拿到真的資料才准動。
+        self._rear_ranges = []
+        self.min_rear_distance = 0.0
+        self._scan_stamp = 0.0          # 最後一次收到雷射的單調鐘時刻
 
         self.get_logger().info("地點服務節點 (_cc) 已啟動")
 
@@ -429,6 +434,10 @@ class WaypointServiceCcNode(Node):
                 except Exception as exc:  # noqa: BLE001
                     self.get_logger().warn(f"request_nomotion_update 失敗: {exc}")
 
+            # ★ 2026-08-25：先清掉上一輪的雷射時戳，再打開 _localizing。
+            #   不清的話，上一次定位留下的 _scan_stamp 會被誤認成「這一輪的資料」。
+            #   _scan_callback 只在 _localizing 為 True 時才更新，所以順序不能反。
+            self._scan_stamp = 0.0
             self._localizing = True
             try:
                 outcome = self._drive_until_converged(goal_handle)
@@ -444,7 +453,17 @@ class WaypointServiceCcNode(Node):
                 return result
 
             if outcome != "converged":
-                return self._abort_localization(goal_handle, result, "全域定位超時失敗")
+                # ★ 2026-08-25：訊息要說出**真正的**失敗原因。
+                #   原本不論什麼結果都寫「超時失敗」，而 blocked 是「被障礙擋住」、
+                #   跟等了 240 秒是完全不同的兩件事 —— 現場拿錯誤訊息判斷
+                #   下一步要做什麼，講錯就會往錯的方向查。
+                why = {
+                    "blocked": "全域定位失敗：前後都有障礙或雷射沒有資料，"
+                               "車子已停下。請把車推到空一點的位置再試",
+                    "timeout": f"全域定位失敗：{self.global_localization_timeout_sec:.0f} "
+                               f"秒內 AMCL 沒有收斂",
+                }.get(outcome, f"全域定位失敗（{outcome}）")
+                return self._abort_localization(goal_handle, result, why)
 
             result.pose = copy.deepcopy(self.current_pose)
             result.success = True
@@ -465,6 +484,21 @@ class WaypointServiceCcNode(Node):
         策略：以 0.9 m 半徑的圓弧前進；前方太近就倒車並換邊，避免撞牆。
         每一圈換一次轉向，讓粒子有機會看到不同方向的特徵。
         """
+        # ★★ 2026-08-25：先等到第一幀雷射再動 ★★
+        #   下面每一圈都會檢查「雷射有沒有超過 1 秒沒更新」，但 _scan_stamp
+        #   在第一幀到達之前是 0，第一圈就會誤判成掉線。雷射是 10 Hz，
+        #   正常情況下這裡最多等 100 ms；等不到才是真的有問題。
+        _wait_until = time.monotonic() + 2.0
+        while self._scan_stamp <= 0.0 and time.monotonic() < _wait_until:
+            if goal_handle.is_cancel_requested:
+                return "cancel"
+            time.sleep(0.05)
+        if self._scan_stamp <= 0.0:
+            self.get_logger().error(
+                "全域定位中止：等了 2 秒還沒收到任何雷射掃描。"
+                "★ 先確認 sensors_cc 有起來、`ros2 topic hz /scan` 約 10 Hz")
+            return "blocked"
+
         deadline = time.monotonic() + self.global_localization_timeout_sec
         direction = 1.0  # 1 = 左轉, -1 = 右轉
         reversing = False
@@ -489,11 +523,43 @@ class WaypointServiceCcNode(Node):
                 reversing = False
                 phase_deadline = now + 8.0
 
+            # ★★★ 2026-08-25：雷射過期就停 ★★★
+            #   下面每一個判斷都建立在「掃描是新的」之上。雷射掉線時
+            #   min_front/rear_distance 會凍在最後一個值，而這個迴圈會拿著
+            #   那個舊值繼續開車。
+            if self._scan_stamp <= 0.0 or now - self._scan_stamp > 1.0:
+                self._stop_robot()
+                self.get_logger().error(
+                    "全域定位中止：超過 1 秒沒有收到雷射掃描，"
+                    "沒有感測就不移動")
+                return "blocked"
+
             twist = Twist()
             if not reversing and self.min_front_distance < self.front_clearance_m:
                 # 前方太近，改倒車並反向打方向盤 (阿克曼車倒車時轉向反向才會擺尾脫困)
                 reversing = True
                 phase_deadline = now + 4.0
+
+            # ★★★ 2026-08-25：倒車每一圈都要看後方 ★★★
+            #
+            # 這個迴圈原本**只有正前方 ±30° 一個感測輸入**（FRONT_HALF_ANGLE）。
+            # 進入倒車之後會連續 4 秒、每 0.1 秒發一次 -0.18 m/s，
+            # 中間**沒有任何一行檢查車後**。而車尾撞牆之後車子不動、
+            # 雷射畫面不變 -> AMCL 不會收斂 -> 8 秒換階段 -> 又判定前方太近
+            # -> 再倒 4 秒，一路重複到 global_localization_timeout_sec = 240 秒。
+            #
+            # ★ 這就是使用者回報的「倒車一直撞牆然後還繼續移動沒有停」，
+            #   而且它可以持續**四分鐘**。
+            #
+            # 鏈上也沒有東西會救：PolygonStop 是 enabled: false，
+            # PolygonSlow 只乘 0.85，FootprintApproach 只縮放。
+            if reversing and self.min_rear_distance < self.front_clearance_m:
+                self._stop_robot()
+                self.get_logger().warn(
+                    f"全域定位中止：後方只剩 {self.min_rear_distance:.2f} m"
+                    f"（門檻 {self.front_clearance_m:.2f} m），停止倒車。"
+                    f"★ 前後都不通，請把車推到空一點的位置再重新定位")
+                return "blocked"
 
             if reversing:
                 twist.linear.x = -self.relocalize_linear_speed
@@ -609,30 +675,61 @@ class WaypointServiceCcNode(Node):
 
         if self._front_idx_n != n:
             self._front_idx_n = n
-            self._front_ranges = self._compute_front_index_ranges(msg, n)
+            self._front_ranges = self._compute_sector_index_ranges(msg, n, 0.0)
+            # ★★ 2026-08-25：後方扇形。全域定位會倒車，而在這之前
+            #   這支節點**只看正前方 ±30°** —— 倒車那 4 秒完全沒有感測。
+            self._rear_ranges = self._compute_sector_index_ranges(msg, n, math.pi)
 
-        best = float("inf")
-        for lo, hi in self._front_ranges:
-            for r in msg.ranges[lo:hi]:
-                # inf/nan 的比較一律為 False，所以這個條件同時濾掉它們
-                if 0.0 < r < best:
-                    best = r
-
-        self.min_front_distance = best
+        self.min_front_distance = self._sector_min(msg, self._front_ranges)
+        self.min_rear_distance = self._sector_min(msg, self._rear_ranges)
+        self._scan_stamp = time.monotonic()
 
     @staticmethod
-    def _compute_front_index_ranges(msg: LaserScan, n: int):
-        """算出正前方 ±FRONT_HALF_ANGLE 對應的索引區間
+    def _sector_min(msg: LaserScan, index_ranges) -> float:
+        """扇形內最近的有效回波。**沒有有效回波時回 0.0，不是 inf。**
 
-        角度 0 不一定落在陣列中央 (取決於 angle_min)，而且前方扇形可能跨越
+        ★★ 這是 fail-open 改成 fail-safe ★★
+
+        原本的寫法是 `best = float("inf")`，掃完沒更新就把 inf 寫出去，
+        而下游判斷是 `min_front_distance < front_clearance_m` —— inf 永遠不小於
+        0.7，於是「量不到」與「很空曠」得到**完全一樣**的結果。
+
+        什麼時候會一個有效點都沒有：玻璃門、深色或鏡面的牆、貼得太近低於
+        range_min、雷達正在重連、被車身自己擋住。這些正好都是**危險**的情況，
+        卻會被判成安全。改成 0.0（當作貼著障礙），寧可誤停也不要誤衝。
+
+        ★ 這與 maprun/tools_0825/rear_blind_check.py 的立場一致：
+          「有沒有量到」與「量到多遠」是兩件事，必須分開。
+        """
+        best = float("inf")
+        n_valid = 0
+        for lo, hi in index_ranges:
+            for r in msg.ranges[lo:hi]:
+                # inf/nan 的比較一律為 False，所以這個條件同時濾掉它們
+                if 0.0 < r < float("inf"):
+                    n_valid += 1
+                    if r < best:
+                        best = r
+        # 少於 3 點就當作沒資料：單一雜訊點不足以宣告「這個方向是安全的」。
+        return best if n_valid >= 3 else 0.0
+
+    @staticmethod
+    def _compute_sector_index_ranges(msg: LaserScan, n: int, center: float,
+                                     half: float = FRONT_HALF_ANGLE):
+        """算出以 center 為中心、±half 的扇形對應的索引區間
+
+        角度不一定落在陣列中央 (取決於 angle_min)，而且扇形可能跨越
         陣列頭尾，所以回傳的是區間列表而不是單一區間。
+
+        ★ center 是參數而不是寫死 0：前方與後方用同一套邏輯，
+          後方傳 math.pi 即可（正後方跨頭尾，這個函式本來就處理得了）。
         """
         ranges = []
         lo = None
         for i in range(n):
-            a = msg.angle_min + i * msg.angle_increment
+            a = msg.angle_min + i * msg.angle_increment - center
             a = math.atan2(math.sin(a), math.cos(a))
-            inside = abs(a) < FRONT_HALF_ANGLE
+            inside = abs(a) < half
             if inside and lo is None:
                 lo = i
             elif not inside and lo is not None:
