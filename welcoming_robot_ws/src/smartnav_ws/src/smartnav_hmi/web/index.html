@@ -421,6 +421,7 @@
 
 <div id="tabs">
   <button class="active" data-page="p-greet">迎賓</button>
+  <button data-page="p-stats">到訪統計</button>
   <button data-page="p-map" data-admin>地圖與導航</button>
   <button data-page="p-teleop" data-admin>遙控建圖</button>
   <button data-page="p-system" data-admin>系統開關</button>
@@ -475,6 +476,43 @@
 
 <!-- ── 地圖 ───────────────────────────────────────── -->
 <!-- 系統開關：不用進終端機打 ros2 run -->
+<!-- ── 到訪統計 ───────────────────────────────────────
+     ★ 資料來自 bank_reception_node 寫的 visit_log.db，這一頁只讀不寫。
+     ★ 圖表刻意用純 div 畫，不引入 Chart.js —— HMI 是離線服務，
+       外部 CDN 在展示現場會直接失敗，而那時你沒有時間查。      -->
+<div class="page" id="p-stats">
+  <div class="card" style="flex:1; overflow-y:auto">
+    <h3>今日接待</h3>
+    <div id="statsbig" style="display:flex; gap:18px; flex-wrap:wrap; margin:10px 0 4px"></div>
+    <p class="meta" id="statsnote" style="margin:4px 0 16px"></p>
+
+    <h3 style="margin-top:6px">今日每小時分布</h3>
+    <div id="statshour" style="display:flex; align-items:flex-end; gap:3px;
+         height:110px; margin:12px 0 6px; padding-bottom:2px"></div>
+    <div id="statshourlab" style="display:flex; gap:3px; font-size:10px;
+         color:var(--muted); margin-bottom:16px"></div>
+
+    <h3>近 7 日</h3>
+    <div id="statsday" style="display:flex; align-items:flex-end; gap:6px;
+         height:90px; margin:12px 0 6px"></div>
+    <div id="statsdaylab" style="display:flex; gap:6px; font-size:11px;
+         color:var(--muted); margin-bottom:8px"></div>
+
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="statsrefresh">重新整理</button>
+    </div>
+  </div>
+
+  <div class="card" style="flex:1; overflow-y:auto">
+    <h3>最近到訪</h3>
+    <div class="list" id="statsrecent"></div>
+    <p class="meta" style="margin-top:10px">
+      ★ 相似度是人臉比對的餘弦相似度。實測同一人落在 0.671–0.875、
+      不同人的基線是 0.515 —— 兩者之間的距離就是這套辨識的安全邊際。
+    </p>
+  </div>
+</div>
+
 <div class="page" id="p-system">
   <div class="card" style="flex:1">
     <h3>節點開關</h3>
@@ -899,6 +937,7 @@ function selectTab(btn) {
   if (btn.dataset.page === "p-map")   { refreshMaps(); refreshWaypoints(); drawMap(); }
   if (btn.dataset.page === "p-users") refreshUsers();
   if (btn.dataset.page === "p-sys")   refreshHealth();
+  if (btn.dataset.page === "p-stats") refreshStats();
   // 離開遙控頁一定要停車：使用者可能按著方向鍵就切走了
   if (btn.dataset.page !== "p-teleop") teleopStop();
   else { drawTeleopMap(); refreshMapStatus(); refreshMapList(); refreshPaths(); }
@@ -2807,6 +2846,96 @@ async function refreshHardware() {
   });
 }
 
+// ── 到訪統計 ─────────────────────────────────────────────────
+//
+// 資料來自 bank_reception_node 寫的 visit_log.db，本頁只讀不寫。
+// 長條圖用純 div 畫：HMI 是離線服務，外部圖表函式庫在展示現場會直接失敗。
+const STATS_TYPE = {
+  VIP:       { label: "貴賓",   color: "#f0b429" },
+  GUEST:     { label: "訪客",   color: "#4f9cf0" },
+  ADMIN:     { label: "管理者", color: "#8b7bd8" },
+  BLACKLIST: { label: "黑名單", color: "#e06c62" },
+};
+
+function statsBars(host, labelHost, values, labels, color) {
+  host.innerHTML = "";
+  if (labelHost) labelHost.innerHTML = "";
+  // ★ 尺規至少為 1：全部是 0 時若用 max=0 會除以零，畫出 NaN% 高度的方塊。
+  const max = Math.max(1, ...values);
+  values.forEach((v, i) => {
+    const col = document.createElement("div");
+    col.style.cssText =
+      `flex:1; min-width:6px; display:flex; flex-direction:column; justify-content:flex-end;`;
+    const bar = document.createElement("div");
+    // 有資料時至少留 3px，否則「1 人次」跟「0 人次」在畫面上看起來一樣。
+    const h = v > 0 ? Math.max(3, Math.round((v / max) * 100)) : 0;
+    bar.style.cssText =
+      `height:${h}%; background:${color}; border-radius:2px 2px 0 0;` +
+      (v > 0 ? "" : "opacity:.25; height:2px; background:var(--line);");
+    bar.title = `${labels[i]}：${v} 人次`;
+    col.appendChild(bar);
+    host.appendChild(col);
+    if (labelHost) {
+      const lab = document.createElement("div");
+      lab.style.cssText = "flex:1; min-width:6px; text-align:center;";
+      lab.textContent = labels[i];
+      labelHost.appendChild(lab);
+    }
+  });
+}
+
+async function refreshStats() {
+  const s = await api("/api/stats?days=7");
+  const big = $("statsbig"), note = $("statsnote"), recent = $("statsrecent");
+  if (!s || !s.available) {
+    big.innerHTML = `<div style="font-size:15px; color:var(--muted)">尚無資料</div>`;
+    note.textContent = (s && s.reason) || "讀不到到訪記錄";
+    recent.innerHTML = "";
+    statsBars($("statshour"), $("statshourlab"), new Array(24).fill(0),
+              [...Array(24).keys()].map(String), "#4f9cf0");
+    statsBars($("statsday"), $("statsdaylab"), [], [], "#4f9cf0");
+    return;
+  }
+
+  const today = s.today || {};
+  const byType = today.by_type || {};
+  const cards = [
+    { n: today.count || 0, t: "今日人次", c: "var(--accent)" },
+    { n: byType.VIP || 0,  t: "其中貴賓", c: STATS_TYPE.VIP.color },
+    { n: s.unique_people || 0, t: "累計不重複人數", c: "var(--muted)" },
+    { n: s.total || 0,     t: "累計總人次", c: "var(--muted)" },
+  ];
+  big.innerHTML = cards.map((c) => `
+    <div style="min-width:96px">
+      <div style="font-size:34px; font-weight:700; line-height:1.1; color:${c.c};
+                  font-variant-numeric:tabular-nums">${c.n}</div>
+      <div class="meta">${escapeHtml(c.t)}</div>
+    </div>`).join("");
+
+  const parts = Object.entries(byType)
+    .map(([k, v]) => `${(STATS_TYPE[k] || {}).label || k} ${v}`).join("　");
+  note.textContent = parts
+    ? `今日分類：${parts}`
+    : "今天還沒有人來 —— 到迎賓頁讓相機看到一張已註冊的臉就會出現。";
+
+  statsBars($("statshour"), $("statshourlab"), s.by_hour || new Array(24).fill(0),
+            [...Array(24).keys()].map((h) => (h % 3 === 0 ? String(h) : "")),
+            "#4f9cf0");
+  const days = s.by_day || [];
+  statsBars($("statsday"), $("statsdaylab"), days.map((d) => d.count),
+            days.map((d) => d.date), "var(--accent)");
+
+  recent.innerHTML = (s.recent || []).map((r) => {
+    const ty = STATS_TYPE[r.type] || { label: r.type_label || "—", color: "var(--muted)" };
+    return `<div class="row" style="justify-content:space-between; gap:10px">
+      <span><b>${escapeHtml(r.name)}</b>
+        <span style="color:${ty.color}; font-size:12px">${escapeHtml(ty.label)}</span></span>
+      <span class="meta" style="font-variant-numeric:tabular-nums">
+        ${escapeHtml(r.time)}　${r.confidence.toFixed(3)}</span>
+    </div>`;
+  }).join("") || `<div class="meta">還沒有記錄</div>`;
+}
+
 async function refreshHealth() {
   refreshHardware();          // 硬體偵測與節點狀態一起更新
   const h = await api("/api/health");
@@ -2846,6 +2975,7 @@ async function refreshHealth() {
   }
 }
 $("healthrefresh").onclick = refreshHealth;
+$("statsrefresh").onclick = refreshStats;
 
 // ── 啟動 ───────────────────────────────────────────
 updateStreams("p-greet");   // 預設分頁是迎賓
