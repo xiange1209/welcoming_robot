@@ -612,6 +612,34 @@ class UserAuthNode(Node):
                     target=target,
                 )
 
+                # ★★ 2026-08-26：註冊中的中間幀不要再往下做身份比對 ★★
+                #
+                # 本函式第 567 行的註解寫著「註冊模式走的是另一條分支、不做比對」，
+                # 但程式碼其實只有「收滿最後一張」那個分支有 return（見上面），
+                # 中間的每一張樣本收完之後都會 fallthrough 到下面的
+                # _process_face_recognition + _publish_identity。
+                #
+                # 為什麼這件事比「多算幾次」嚴重得多：
+                # 上面第 581 行的 add_face_sample 會**當場**把新樣本 append 進
+                # user_manager.user_registry（user_manager.py:207，而且立刻存檔），
+                # 所以第 2 張樣本開始，這個人就是拿當幀的臉去跟**自己剛剛寫進去的
+                # 樣本**比對 —— 相似度必然逼近 1.0，遠高於 0.70 門檻。
+                #
+                # 結果是 /user_identity 會在「請保持正對鏡頭 3/10 張」的當下，
+                # 就把這個還沒註冊完的人當成「辨識成功」發布出去，而 user_type
+                # 是 register_face 呼叫時指定的那個：
+                #   - 註冊 VIP -> bank_reception 插播歡迎詞，時機完全錯亂
+                #   - 註冊 BLACKLIST 做測試 -> **對著正在幫忙建檔的人發 Telegram 假警報**
+                #
+                # ★ 一併更新 _last_face_time：那個欄位只在 _publish_identity 裡
+                #   更新（見該函式），提早 return 會讓 _identity_timeout_tick 以為
+                #   鏡頭前沒人，在使用者正對著鏡頭配合採樣時發一則「無人」。
+                #   目前取樣沒有間隔（每一幀都收），10 張約 0.67 秒 < 2 秒門檻，
+                #   實務上來不及觸發；但採樣張數調大或相機掉幀時就會，所以補上。
+                self._last_face_time = self.get_clock().now().nanoseconds / 1e9
+                self._identity_cleared = False
+                return
+
             user_uuid, similarity = self._process_face_recognition(face_embedding)
             user_info = self.user_manager.get_user_info(user_uuid) if user_uuid else None
             if user_info:
