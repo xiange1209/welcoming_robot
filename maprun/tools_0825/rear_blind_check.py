@@ -68,7 +68,20 @@ class BlindCheck(Node):
         self.frames = 0
         self.range_min = None
         self.range_max = None
-        # ★ 雷達是 BEST_EFFORT。用預設的 RELIABLE 會完全收不到而且不報錯。
+        # ★ 用 BEST_EFFORT 訂閱：它對 RELIABLE 與 BEST_EFFORT 兩種發布端都通。
+        #
+        # ★★ 2026-08-25 更正：本檔原本寫「雷達是 BEST_EFFORT，用 RELIABLE
+        #    會完全收不到」——**那句話是錯的**。查證過兩個發布端不一樣：
+        #
+        #      /scan       lslidar_x10_driver.cpp:171
+        #                  create_publisher<LaserScan>(san_topic_, 10)  -> RELIABLE
+        #      /scan_slam  scan_filter_cc_node.py:71
+        #                  qos_profile_sensor_data                      -> BEST_EFFORT
+        #
+        #    DDS 的規則是「發布端提供的必須 ≥ 訂閱端要求的」，所以
+        #    RELIABLE 訂閱 /scan 沒問題（8/24 的 tools_0824/sectors.py 就是
+        #    用預設 RELIABLE 收到 121 幀的，那是這件事的直接反證），
+        #    但 RELIABLE 訂閱 /scan_slam 會靜靜地一則都收不到。
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST, depth=5)
         self.create_subscription(LaserScan, "/scan", self._cb, qos)

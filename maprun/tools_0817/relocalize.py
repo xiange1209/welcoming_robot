@@ -24,7 +24,8 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                       QoSReliabilityPolicy, qos_profile_sensor_data)
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -58,8 +59,16 @@ class Relocalize(Node):
                          durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
                          history=QoSHistoryPolicy.KEEP_LAST)
         self.create_subscription(OccupancyGrid, "/map", self._map, qos)
-        self.create_subscription(LaserScan, "/scan_filtered", self._sc, 10)
-        self.create_subscription(LaserScan, "/scan", self._sc, 10)
+        # ★★ 2026-08-25：話題名錯了 —— `/scan_filtered` 全樹沒有發布端，
+        #   實際是 `/scan_slam`。在此之前這支必定印「✗ 收不到 /map 或雷射」
+        #   然後 return 1，看起來像雷達沒開。
+        #   ★ 而 /scan_slam 是 scan_filter_cc 用 qos_profile_sensor_data 發的
+        #     （BEST_EFFORT），所以訂閱端也必須是 BEST_EFFORT —— BEST_EFFORT
+        #     發布端無法滿足 RELIABLE 訂閱端，DDS 不連線也不噴錯。
+        #     （對照：/scan 是原廠 C++ 驅動用 create_publisher(..., 10) 發的
+        #       RELIABLE，那條用預設訂閱本來就收得到。）
+        self.create_subscription(LaserScan, "/scan_slam", self._sc, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan", self._sc, qos_profile_sensor_data)
         self.buf = tf2_ros.Buffer()
         self.tl = tf2_ros.TransformListener(self.buf, self)
 

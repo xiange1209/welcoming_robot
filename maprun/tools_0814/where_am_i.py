@@ -23,7 +23,8 @@ import sys
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                       QoSReliabilityPolicy, qos_profile_sensor_data)
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from smartnav_msgs.srv import ListWaypoints
@@ -46,8 +47,20 @@ class WhereAmI(Node):
         )
         self.create_subscription(OccupancyGrid, "/map", self._on_map, map_qos)
         # 用過濾後的雷射：跟導航實際吃的同一條，否則比出來的分數對不上
-        self.create_subscription(LaserScan, "/scan_filtered", self._on_scan, 10)
-        self.create_subscription(LaserScan, "/scan", self._on_scan, 10)
+        #
+        # ★★ 2026-08-25 修正兩件事，在此之前這支拿不到過濾後的雷射 ★★
+        #   1. 話題名是 `/scan_slam` 不是 `/scan_filtered`。
+        #      後者在全樹**沒有任何發布端**（scan_filter_cc 的 output_topic
+        #      預設就是 /scan_slam，nav2 設定檔也是對到 scan_slam）。
+        #   2. QoS 要 `qos_profile_sensor_data`（BEST_EFFORT）。
+        #      ★ 兩個發布端的 QoS **不一樣**，這點很容易搞錯：
+        #          /scan       lslidar_x10_driver.cpp:171 create_publisher(..., 10)  -> RELIABLE
+        #          /scan_slam  scan_filter_cc_node.py:71  qos_profile_sensor_data    -> BEST_EFFORT
+        #      BEST_EFFORT 發布端**無法滿足** RELIABLE 訂閱端，DDS 不建立連線
+        #      也不噴錯。所以訂 /scan 用 RELIABLE 沒事，訂 /scan_slam 就靜靜收不到。
+        #      訂閱端一律用 BEST_EFFORT 兩邊都通，是最省事的選擇。
+        self.create_subscription(LaserScan, "/scan_slam", self._on_scan, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan", self._on_scan, qos_profile_sensor_data)
 
     def _on_map(self, msg):
         if self.grid is None:

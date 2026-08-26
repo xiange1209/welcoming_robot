@@ -30,6 +30,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
@@ -48,7 +49,12 @@ class Check(Node):
         self.pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.create_subscription(Odometry, "/odom", self._raw, 20)
         self.create_subscription(Odometry, "/odom_combined", self._ekf, 20)
-        self.create_subscription(LaserScan, "/scan", self._scan, 5)
+        # ★ 2026-08-25：改用 qos_profile_sensor_data。
+        #   /scan 本身是 RELIABLE（lslidar_x10_driver.cpp:171 用
+        #   create_publisher(..., 10)），所以原本的整數 depth 其實收得到 ——
+        #   這一改是為了統一：BEST_EFFORT 訂閱端對 RELIABLE 與 BEST_EFFORT
+        #   兩種發布端都通，換成 /scan_slam 之類的話題也不用再改一次。
+        self.create_subscription(LaserScan, "/scan", self._scan, qos_profile_sensor_data)
         self.raw = []      # (t, vx)
         self.ekf = []      # (t, vx)
         self.raw_pose = None
