@@ -71,6 +71,13 @@ from geometry_msgs.msg import Pose, PoseStamped, Twist
 from nav_msgs.msg import Path
 from nav2_msgs.action import ComputePathToPose
 from nav2_msgs.srv import ClearEntireCostmap
+
+# ★ 用來知道「collision_monitor 現在有沒有在煞車」。匯入失敗不讓節點掛掉，
+#   但會在啟動時大聲說出來 —— 沒有這個訊號，卡住判定會把「被煞停」誤判成「卡住」。
+try:
+    from nav2_msgs.msg import CollisionMonitorState
+except ImportError:                                  # pragma: no cover
+    CollisionMonitorState = None
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -843,6 +850,38 @@ class PathTeachNode(Node):
                                  self._scan_cb, scan_qos, callback_group=cb)
         self.create_subscription(String, "current_map", self._map_cb, latched,
                                  callback_group=cb)
+
+        # ★★★ 2026-08-25：防撞煞車 ≠ 卡住 ★★★
+        #
+        # `_publish_cmd` 把 `_cmd_v_last` 記在**鏈路縮放之前**（本檔 :2100），
+        # 而卡住判定拿它跟里程計比。所以 collision_monitor 一煞車就會變成：
+        #
+        #     防撞判定要撞了 -> 把速度壓到馬達不轉（死區 0.085）
+        #       -> path_teach 記的是自己送出的 0.10
+        #       -> 「有下指令但車子沒動」-> 判定卡住
+        #       -> _do_escape -> _escape_bypass = True -> 直接發 /cmd_vel
+        #       -> ★ 繞過 collision_monitor，朝著它剛判定會撞的方向硬推
+        #
+        # **安全機制的動作，變成了推翻它自己的理由。**
+        #
+        # 既有的 `margin_stop_t` 只擋 path_teach **自己**的車身外緣硬停，
+        # 擋不到 collision_monitor 的煞車 —— 那是另一個節點做的決定，
+        # 本節點看不到，除非訂閱它的狀態。
+        self._cm_action = None
+        self._cm_action_t = 0.0
+        self._cm_polygon = ""
+        self._cm_warned = False
+        if CollisionMonitorState is not None:
+            self.create_subscription(
+                CollisionMonitorState, "collision_monitor_state", self._cm_cb,
+                QoSProfile(depth=1, reliability=_RP.RELIABLE,
+                           history=HistoryPolicy.KEEP_LAST),
+                callback_group=cb)
+        else:
+            self.get_logger().error(
+                "✗ 匯入 nav2_msgs/CollisionMonitorState 失敗 —— 無法分辨"
+                "「被防撞煞停」與「真的卡住」。防撞一煞車就會誤判卡住並脫困，"
+                "而脫困會繞過防撞。先修這個匯入。")
 
         self.create_service(RecordPath, "record_path", self._record_cb, callback_group=cb)
         self.create_service(ListTaughtPaths, "list_taught_paths", self._list_cb,
@@ -2119,6 +2158,30 @@ class PathTeachNode(Node):
                 b.angular.z = 0.0
             self.bypass_pub.publish(b)
 
+    def _cm_cb(self, msg) -> None:
+        """collision_monitor 現在在做什麼。"""
+        self._cm_action = int(getattr(msg, "action_type", 0))
+        self._cm_polygon = str(getattr(msg, "polygon_name", ""))
+        self._cm_action_t = time.monotonic()
+
+    def _safety_braking(self) -> bool:
+        """collision_monitor 現在是不是正在煞車（APPROACH 或 STOP）。
+
+        ★ 這個回傳值只用來**抑制**卡住判定，不用來啟動任何動作。
+          所以「不知道」時回 False（＝不抑制）是安全的方向：
+          最壞情況是回到 8/25 之前的行為，而不是讓車子多走一步。
+          這與 cmd_vel_floor 的取捨相反 —— 那裡「不知道」要保守成不抬速度，
+          因為那個回傳值會**放大**速度。方向不同，預設值就不同。
+        """
+        if CollisionMonitorState is None or self._cm_action is None:
+            return False
+        # 狀態是每個控制週期發一次的；超過 1 秒沒來就當作不知道。
+        if time.monotonic() - self._cm_action_t > 1.0:
+            return False
+        approach = getattr(CollisionMonitorState, "APPROACH", 3)
+        stop = getattr(CollisionMonitorState, "STOP", 1)
+        return self._cm_action in (approach, stop)
+
     def _stop(self, frames: int = 3) -> None:
         for _ in range(frames):
             self._publish_cmd(0.0, 0.0)
@@ -2522,7 +2585,35 @@ class PathTeachNode(Node):
             while move_hist and now_t - move_hist[0][0] > self.no_progress:
                 move_hist.pop(0)
             stuck_now = False
-            if len(move_hist) >= 2 and now_t - move_hist[0][0] >= self.no_progress * 0.8:
+
+            # ★★★ 2026-08-25：collision_monitor 正在煞車時，三個判準全部關掉 ★★★
+            #
+            # 被安全機制煞停**不是**卡住。而這裡的三個判準都會把它當成卡住：
+            #   判準一「有下指令卻沒動」—— _cmd_v_last 記的是鏈路縮放**之前**
+            #     的值（_publish_cmd :2100），縮放發生在下游，本節點看不到。
+            #     所以防撞把 0.10 壓到 0.03（低於死區 0.085）時，
+            #     這裡看到的仍是「指令 0.10、實際 0」。
+            #   判準二「掃描沒變」—— 車子確實沒動，掃描確實沒變。
+            #   判準三「索引沒推進」—— 同上。
+            # 三個一起成立，而且成立得**非常快**。
+            #
+            # 後果是一個閉合迴路：煞停 -> 誤判卡住 -> _do_escape ->
+            # _escape_bypass = True -> 直接發 /cmd_vel 繞過 collision_monitor
+            # -> 朝著它剛判定會撞的方向硬推。
+            #
+            # 正確的出口不是脫困，而是「等障礙移開」那條路徑（下方的 blocked
+            # 分支），它有逾時、有明確訊息、而且不會繞過任何東西。
+            _cm_braking = self._safety_braking()
+            if _cm_braking and not self._cm_warned:
+                self._cm_warned = True
+                self.get_logger().info(
+                    f"防撞正在煞車（{self._cm_polygon or '未具名多邊形'}），"
+                    f"暫停卡住判定 —— 被煞停不是卡住")
+            elif not _cm_braking:
+                self._cm_warned = False
+
+            if (not _cm_braking) and len(move_hist) >= 2 \
+                    and now_t - move_hist[0][0] >= self.no_progress * 0.8:
                 span = now_t - move_hist[0][0]
                 actual = math.hypot(x - move_hist[0][1], y - move_hist[0][2]) / max(1e-3, span)
                 want = sum(h[3] for h in move_hist) / len(move_hist)
@@ -2534,7 +2625,7 @@ class PathTeachNode(Node):
             # 前兩個判準都建立在位姿上，而走廊裡位姿會被打滑的里程計拖著跑
             # （AMCL 沿長軸沒有分辨力，擋不住這個謊）。詳見 _scan_signature。
             # 這一條完全不看位姿，只問「雷射看到的世界有沒有變」。
-            if not stuck_now and self.scan_still_m > 0:
+            if not stuck_now and not _cm_braking and self.scan_still_m > 0:
                 sig = self._scan_signature()
                 if sig is not None:
                     sig_hist.append((now_t, sig))
@@ -2589,7 +2680,8 @@ class PathTeachNode(Node):
             # 障礙移開就恢復，不移開就講清楚請人工介入，而不是硬推過去。
             # `margin_stop_t` 在上一個週期的硬停分支設定，這裡讀到的是
             # 「上一輪是不是還在硬停」，正是需要的資訊。
-            if not stuck_now and self.stall_progress > 0 and margin_stop_t <= 0.0:
+            if not stuck_now and not _cm_braking \
+                    and self.stall_progress > 0 and margin_stop_t <= 0.0:
                 if path_s[idx] - prog_s < self.stall_progress:
                     if now_t - prog_t > self.no_progress:
                         stuck_now = True        # 有在動，但這段時間幾乎沒往前
