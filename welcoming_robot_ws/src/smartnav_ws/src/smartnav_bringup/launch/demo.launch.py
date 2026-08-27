@@ -237,7 +237,21 @@ def generate_launch_description():
                  "camera_launch_cmd":
                      "ros2 launch /home/user/maprun/camera_face_only.launch.py",
                  "start_with_camera": True,
-                 "auto_follow_navigation": True,
+                 # ★★ 2026-08-27：True -> False ★★
+                 #
+                 # 使用者確認的需求：「導航中可能要開相機顯示在 HMI，
+                 # 但是可以不用辨識。」相機關掉的話平板就沒畫面了。
+                 #
+                 # 而省 CPU 的目的仍然達成，只是換個地方省：
+                 #     關相機（舊做法）      省 ~52%，但平板沒畫面
+                 #     關人臉推論（新做法）  省 ~190%，平板照樣有畫面
+                 # 貴的一直是推論不是相機。由 face_embedding_node 的
+                 # `skip_while_navigating`（預設 true）負責，它同樣訂
+                 # /navigation_active，政策集中在一個地方。
+                 #
+                 # ★ 要退回舊行為（例如 CPU 又不夠用）：把這個設回 True，
+                 #   兩邊會疊加（相機關 + 推論關），但平板會失去畫面。
+                 "auto_follow_navigation": False,
                  "resume_delay_sec": 3.0,
              }],
              condition=IfCondition(PythonExpression([

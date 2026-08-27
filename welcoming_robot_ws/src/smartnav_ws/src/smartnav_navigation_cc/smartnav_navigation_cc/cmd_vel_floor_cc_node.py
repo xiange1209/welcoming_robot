@@ -127,7 +127,29 @@ class CmdVelFloorNode(Node):
                 description="collision_monitor 的狀態話題（要與 nav2 設定檔的 "
                             "state_topic 一致）"))
         self.declare_parameter(
-            "state_stale_sec", 1.0,
+            # ★★ 2026-08-27：1.0 -> 10.0 ★★
+            #
+            # 1.0 秒對 `collision_monitor_state` 是**錯的單位**：那個話題是
+            # **狀態改變時才發**，不是週期性發布。2026-08-27 實測（20 秒視窗）：
+            #     訊息數 14 則 -> 平均 0.70 Hz
+            #     最大間隔 **3.20 秒**
+            #     **超過 1 秒的間隔佔 5/13 = 38%**
+            # 也就是守門員有 **38% 的時間**在印「不知道防撞狀態就不抬」而拒絕抬升
+            # —— 死區問題原樣回來（見 8/24 的 deadband vs slowdown 那條）。
+            #
+            # ★ 觀念錯在哪：on-change 的話題上，「沒有新訊息」代表
+            #   **狀態沒變**，不是「不知道」。把它當成「不知道」而 fail-safe，
+            #   等於讓保護機制在完全正常的狀況下持續誤動作。
+            #
+            # ★★ 而「collision_monitor 真的掛了」根本不需要靠這個逾時保護：
+            #   鏈路是 cmd_vel_trimmed -> collision_monitor -> cmd_vel_prefloor
+            #   -> 本節點 -> cmd_vel。它掛了就沒有 cmd_vel_prefloor，
+            #   本節點沒有輸入也就沒有輸出，底盤 1 秒逾時自己停車。
+            #   **那條路已經是安全的了**，這裡不必再擋一次。
+            #
+            # 留 10 秒是為了「發布端還在、但語意上真的失聯」這種極端情況，
+            # 而 3.2 秒的實測最大間隔離它還有三倍餘裕。
+            "state_stale_sec", 10.0,
             ParameterDescriptor(
                 description="狀態訊息多久沒來就當作不知道（不知道 = 不抬）"))
 
@@ -171,7 +193,8 @@ class CmdVelFloorNode(Node):
         self.get_logger().info(
             f"✓ 速度下限守門員：{self.in_topic} → {self.out_topic}，"
             f"下限 {self.min_speed:.3f} m/s（底盤死區實測 0.085）；"
-            f"防撞狀態看 {self.state_topic}，"
+            f"防撞狀態看 {self.state_topic}（視為過期 {self.state_stale:.0f} 秒；"
+            f"★ 那是 on-change 話題，沒有新訊息代表狀態沒變），"
             f"APPROACH/STOP 期間不抬")
         if self.min_speed <= 0.0:
             self.get_logger().warning(
@@ -195,9 +218,31 @@ class CmdVelFloorNode(Node):
         if CollisionMonitorState is None:
             return True, "沒有 CollisionMonitorState"
         if self._action is None:
-            return True, "還沒收到任何防撞狀態"
+            # ★★ 2026-08-27：「還沒收到任何狀態」要跟「發布端不在」分開 ★★
+            #
+            # collision_monitor 是 **on-change** 發布的（nav2 內部只在
+            # `robot_action_prev_` 改變時才 notify）。一趟乾淨的行駛裡動作
+            # 一直是 DO_NOTHING，**它可能一則都不發**。
+            #
+            # 今天的實測（logs/nav_cc_20260827_184308.log）：
+            #     18:43:42  ✓ 速度下限守門員…啟動
+            #     18:45:33  ⚠ 不抬：還沒收到任何防撞狀態   ← 整整 **111 秒**沒有任何一則
+            #     18:45:42  抬過死區：-0.0850 → -0.095      ← 9 秒後才等到第一則
+            # 也就是說**開機後那兩分鐘守門員完全沒作用**，死區問題原樣存在。
+            #
+            # ★ 分辨的方法：發布端**在不在**。
+            #   有發布端但還沒發過 = 狀態就是 DO_NOTHING（on-change 的語意）-> 可以抬
+            #   連發布端都沒有       = 真的不知道 -> fail-safe 不抬
+            try:
+                if self.count_publishers(self.state_topic) > 0:
+                    return False, ""
+            except Exception:  # noqa: BLE001
+                pass
+            return True, "防撞狀態話題上沒有任何發布端"
         if time.monotonic() - self._action_t > self.state_stale:
-            return True, f"防撞狀態超過 {self.state_stale:.1f} 秒沒更新"
+            return True, (f"防撞狀態超過 {self.state_stale:.1f} 秒沒更新"
+                          f"（★ 這個話題是狀態改變時才發，正常運作時本來就會"
+                          f"隔幾秒才有一則；會看到這行代表真的很久沒動靜）")
         # APPROACH = 按碰撞剩餘時間連續縮放（正在煞車，那個小值就是要的結果）
         # STOP     = 明確要停
         approach = getattr(CollisionMonitorState, "APPROACH", 3)

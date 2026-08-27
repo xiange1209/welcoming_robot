@@ -46,8 +46,8 @@ ARGS = [
     ("enable_map", "true", bool, "是否啟用地圖功能。純迎賓展示設 false 可省下 Pi 的 CPU"),
     ("map_render_interval", "2.0", float, "地圖最快多久重繪一次（秒）"),
     ("pose_update_rate", "2.0", float, "查詢機器人 TF 位姿的頻率（Hz）"),
-    ("video_fps", "12.0", float, "MJPEG 串流上限幀率"),
-    ("video_quality", "70", int, "JPEG 品質 1-100"),
+    ("video_fps", "6.0", float, "MJPEG 串流上限幀率"),
+    ("video_quality", "55", int, "JPEG 品質 1-100"),
     ("video_width", "640", int, "輸出寬度，0 為不縮放"),
     ("service_timeout", "8.0", float, "呼叫 ROS 服務的等待秒數"),
 ]

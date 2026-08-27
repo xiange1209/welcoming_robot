@@ -157,7 +157,11 @@ class PathTeachNode(Node):
         #
         # 已經楔住的時候「不准動」不是安全，是死鎖。所以開一條**窄通道**：
         #   - 只在 _do_escape 期間生效（_escape_bypass 旗標，try/finally 保證關閉）
-        #   - 速度硬上限 escape_bypass_speed（預設 0.05 m/s，人工救車實測值）
+        #   - 速度硬上限 escape_bypass_speed（★ 2026-08-27 更正：**預設 0.10**，
+        #     不是這行原本寫的 0.05 —— 8/17 就改掉了，見下面 declare 處的註解。
+        #     0.05 低於底盤死區 0.085，等於脫困時馬達根本不轉。）
+        #   ⚠ 這個「硬上限」只箝制旁路那一份 Twist；脫困期間正常鏈**同時也在發**
+        #     /cmd_vel，所以底盤實際收到的可能比這個值高（見 follow_speed）。
         #   - 距離上限沿用 escape_distance_m
         #   - 繞過 collision_monitor 之後**自己**做 _side_clearance 與
         #     _arc_clearance 檢查（那兩個檢查本來就在 _do_escape 裡）

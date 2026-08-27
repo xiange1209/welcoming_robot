@@ -214,8 +214,14 @@ class NavigationActionCcNode(Node):
         # 導航進行中的旗標。camera_manager_cc 訂閱它來決定相機要不要待機 ——
         # 相機相關行程實測吃掉約 110% CPU，導航期間關掉才跑得動。
         # latched：訂閱者晚啟動也能立刻知道目前狀態。
+        # ★ 2026-08-27 晚間：話題名改成**絕對名** "/navigation_active"。
+        #   原本是相對名，而兩個訂閱端（face_embedding_node.py、
+        #   camera_manager_cc_node.py）都寫死絕對名。目前沒有人用 namespace，
+        #   所以相對名剛好解析成同一個而連得上 —— 但**只要有人加了 namespace，
+        #   兩個訂閱端會同時靜默斷線**：人臉全速跑、相機管理失效，兩個都不報錯。
+        #   統一成絕對名就沒有這個地雷。
         self.nav_active_pub = self.create_publisher(
-            Bool, "navigation_active",
+            Bool, "/navigation_active",
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                        reliability=ReliabilityPolicy.RELIABLE),
         )

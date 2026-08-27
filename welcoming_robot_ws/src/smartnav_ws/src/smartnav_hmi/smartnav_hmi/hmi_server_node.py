@@ -811,8 +811,19 @@ class HmiServerNode(Node):
             12.0,
             ParameterDescriptor(description="沒有人看地圖多久後就停止訂閱位姿來源（秒）"),
         )
-        self.declare_parameter("video_fps", 12.0, ParameterDescriptor(description="MJPEG 串流上限幀率"))
-        self.declare_parameter("video_quality", 70, ParameterDescriptor(description="JPEG 壓縮品質 1-100"))
+        # ★★ 2026-08-27：12 -> 6 fps、品質 70 -> 55 ★★
+        #
+        # 平板看的是「機器人前面有什麼」與註冊時的取景，兩者都不需要 12 fps。
+        # 而這條在 Pi 4 上很貴：2026-08-24 實測，平板一開始看影像，
+        # hmi_server 就從 3.6% 跳到 45.2%（+43 個百分點）。
+        # 8/27 更量到導航 + 相機 + 人臉三者並存時全機 400.0% / 400、idle 0.0%、
+        # load average 35.7 —— 連 `ros2 node list` 都排不到 CPU。
+        #
+        # ★ 這一刀完全不影響人臉辨識：HMI 是自己解碼再編碼給平板，
+        #   與 face_embedding_node 各訂各的、各付各的 CPU。
+        #   （共用的只有 image_transport 的 republish，那筆是固定成本。）
+        self.declare_parameter("video_fps", 6.0, ParameterDescriptor(description="MJPEG 串流上限幀率"))
+        self.declare_parameter("video_quality", 55, ParameterDescriptor(description="JPEG 壓縮品質 1-100"))
         self.declare_parameter(
             "video_width", 640, ParameterDescriptor(description="MJPEG 輸出寬度，0 表示不縮放")
         )
@@ -1310,6 +1321,10 @@ class HmiServerNode(Node):
         self._server_thread = threading.Thread(target=self._run_server, daemon=True)
         self._server_thread.start()
 
+        # ★ 2026-08-27：把影像參數印進啟動 log。專案鐵則：
+        #   `ros2 param get` 不算驗證，要看啟動 log 或實際行為。
+        self.get_logger().info(
+            f"  平板影像：{self.video_fps:.0f} fps、JPEG 品質 {self.video_quality}")
         self.get_logger().info("✓ HMI 伺服器節點已初始化")
         urls = self.access_urls()
         if urls:

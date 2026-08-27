@@ -18,7 +18,31 @@
 #   除了白吃約 26% CPU、365 MB 記憶體，更嚴重的是
 #   **多份 scan_filter_cc 會同時發布過濾後的雷達**，下游收到交錯的訊息，
 #   定位吻合度掉到 88% 且車頭淨空對不上很可能就是這個造成的。
-PATTERNS='nav2_|map_service_cc|waypoint_service_cc|navigation_action_cc|path_teach_cc|steering_trim_cc|stuck_detector_cc|scan_filter_cc|async_slam_toolbox|frontier_explorer|smartnav_navigation_cc nav_bringup'
+# ★★ 2026-08-27 再補 cmd_vel_floor_cc —— **這是第三次同類事故** ★★
+#   前兩次見上面 8/14 與 8/17 的註解。這次的後果最嚴重：
+#   `cmd_vel_floor_cc` 是 8/26 新增、**直接發布 `/cmd_vel`** 給底盤的節點，
+#   而它不在這個清單裡，所以每重啟一次導航就多疊一個。
+#   8/27 當天實測累積到 **4 個**（存活 5943 / 2250 / 745 / 107 秒，
+#   正好對應四次重啟）—— **四個節點同時發布 /cmd_vel，底盤收到交錯的指令**。
+#   症狀會像「車子偶爾不聽話」，而且完全不會報錯。
+#
+# ★ 這條規則值得寫死在腦子裡：**新增任何會發布 /cmd_vel 或提供具名服務的節點時，
+#   同一個 commit 就要把它加進這個清單。**
+# ★★ 2026-08-27 晚間再補 camera_manager_cc —— **這是第四次同類事故** ★★
+#   它同樣在 smartnav_navigation_cc 套件裡、同樣由 demo.launch.py 拉起、
+#   同樣**提供具名服務**（/camera_standby、/camera_resume），
+#   但三支停止腳本一支都沒有它。
+#
+#   後果：`stop_nav_cc.sh` -> 重跑 `demo.launch.py`，
+#   舊的 camera_manager 還活著，26 秒時第二個起來，兩個都帶
+#   `start_with_camera: True` -> **兩份相機行程**，
+#   而 astra 相機被搶佔時的症狀是「平板黑畫面」或列舉失敗，
+#   完全看不出跟停止腳本有關。
+#
+# ★ 上面 8/14、8/17、8/27 三條註解記的是同一個病。
+#   規則再寫一次：**新增任何會發布 /cmd_vel、或提供具名服務的節點時，
+#   同一個 commit 就要加進這個清單。**
+PATTERNS='nav2_|map_service_cc|waypoint_service_cc|navigation_action_cc|path_teach_cc|steering_trim_cc|stuck_detector_cc|scan_filter_cc|cmd_vel_floor_cc|camera_manager_cc|async_slam_toolbox|frontier_explorer|smartnav_navigation_cc nav_bringup'
 
 MYPID=$$
 MYPPID=$PPID
@@ -56,6 +80,10 @@ sleep 1
 
 # pgrep -c 找不到東西時會印 0 並回傳 1，用 || echo 0 會多印一行，所以吞掉回傳值
 REMAIN=$(pgrep -fc "$PATTERNS" 2>/dev/null); REMAIN=${REMAIN:-0}
+# ★ 2026-08-27：把「會發布 /cmd_vel 的節點還剩幾個」單獨印出來 ——
+#   多一個就代表底盤會收到交錯指令，比總數更值得盯。
+FLOOR=$(pgrep -x cmd_vel_floor_c 2>/dev/null | wc -l)
+[ "$FLOOR" != "0" ] && echo "⚠ cmd_vel_floor_cc 仍有 $FLOOR 個存活（正常應為 0）"
 SENSORS=$(pgrep -fc 'lslidar_driver_node|wheeltec_robot_node|ekf_node' 2>/dev/null); SENSORS=${SENSORS:-0}
 echo "導航堆疊剩餘行程: $REMAIN"
 echo "底盤/雷達行程: $SENSORS"

@@ -79,6 +79,38 @@ class WaypointServiceCcNode(Node):
 
         self.declare_parameter("max_covariance_norm", 0.15)
         self.declare_parameter("global_localization_timeout_sec", 240.0)
+        # ★★ 2026-08-27：收斂後的獨立驗證。**預設 0.0 = 只報告不否決** ★★
+        #
+        # 這道檢查存在的理由：實測全域定位回報「✓ 成功」，但收斂到的位姿
+        # 只解釋得了 **42.2%** 的雷射點，正解是 90.5%（差 1.6 m、朝向差 122 度）。
+        # 判定收斂用的是 AMCL 協方差，而**協方差量的是「粒子彼此同不同意」，
+        # 不是「粒子對不對」** —— 走廊 180 度對稱，粒子可以一起收斂到錯的那一段。
+        #
+        # ★★ 但門檻**不能**設成會否決的值，因為分不開。同一套數學在**定位正常**時
+        #   量到的分佈（今天的 log，map_service 的 `_align_pose_with_scan`）：
+        #       對齊前  96 96 86 86 84 82 81 81 **75** 83
+        #       對齊後  92 91 90 90 89 88 86 **59** **41**
+        #   錯誤那次是 42.2% —— **落在正確位姿的分佈裡面**。
+        #   原因是這台雷達只有 240 根光束（1.5 度解析度），8 m 處相鄰光束間距 21 cm，
+        #   而容差只有 ±1 格（5 cm），所以**正確位姿的遠距光束本來就會 miss**。
+        #   再加上地圖過期（大廳少一張椅子、門開著）。
+        #
+        # 所以預設只印分數與警告，**不改變成敗判定**。要真的擋，需要的是
+        # 「跟鄰近的候選位姿比較」而不是絕對門檻 —— 那正是 relocalize.py 做的事
+        # （它把 42.2% 與 90.5% 分得很開，因為它比的是相對高低）。
+        #
+        # ★ 設 > 0 才會否決。先收集幾趟真實分佈再決定要不要開。
+        #
+        # ★★ 2026-08-27 晚間補充：上面那組 41/59/75/92% 是**另一把尺**量的 ★★
+        #   `map_service._align_pose_with_scan` 的 score() 是 `hit / len(pts)`，
+        #   分母是**所有有效光束**，落在地圖外的光束算 miss 但仍留在分母。
+        #   本檔的 _scan_match_score 則在 `total += 1` **之前**就把地圖外的
+        #   光束 `continue` 掉 —— 分母排除它們。
+        #   -> **本檔的分數系統性偏高**，兩者不能直接比較。
+        #   所以拿那組分佈來替這個參數定門檻，基礎並不成立。
+        #   ★ 要設門檻之前，先用**本檔自己**印出來的「收斂後驗證：雷射吻合度 N%」
+        #     收集幾趟真實分佈（正確與錯誤各幾筆），不要沿用舊尺的數字。
+        self.declare_parameter("localize_verify_min_score", 0.0)
         # 全域定位的巡遊速度。轉彎半徑 = linear / angular = 0.18 / 0.20 = 0.9 m，
         # 大於底盤最小轉彎半徑 0.8 m，指令才不會被底盤截斷。
         self.declare_parameter("relocalize_linear_speed", 0.18)
@@ -90,6 +122,9 @@ class WaypointServiceCcNode(Node):
         self.max_covariance_norm = float(self.get_parameter("max_covariance_norm").value)
         self.global_localization_timeout_sec = float(
             self.get_parameter("global_localization_timeout_sec").value
+        )
+        self.localize_verify_min_score = float(
+            self.get_parameter("localize_verify_min_score").value
         )
         self.relocalize_linear_speed = float(self.get_parameter("relocalize_linear_speed").value)
         self.relocalize_angular_speed = float(self.get_parameter("relocalize_angular_speed").value)
@@ -201,6 +236,10 @@ class WaypointServiceCcNode(Node):
         self.current_covariance_norm = float("inf")
         self.min_front_distance = float("inf")
         self._map_info = None
+        self._map_grid = None
+        # ★ 2026-08-27 晚間：(info, grid) 的原子快照，見 _map_callback
+        self._map_snapshot = None
+        self._last_scan = None
         # 只有全域定位進行中才需要處理雷射 (見 _scan_callback)
         self._localizing = False
         self._front_idx_n = -1
@@ -465,6 +504,33 @@ class WaypointServiceCcNode(Node):
                 }.get(outcome, f"全域定位失敗（{outcome}）")
                 return self._abort_localization(goal_handle, result, why)
 
+            # ★★ 2026-08-27：收斂之後再驗一次「這個位姿解釋得了眼前的雷射嗎」★★
+            #   收斂 ≠ 正確，理由見 _scan_match_score 的長註解。
+            score = self._scan_match_score()
+            if score < 0.0:
+                self.get_logger().warn(
+                    "收斂後無法驗證位姿（沒有地圖或雷射資料），"
+                    "這次的結果**沒有經過驗證**")
+            elif score < 0.60:
+                # 只警告不否決（見 localize_verify_min_score 的長註解）。
+                # 0.60 只是「值得看一眼」的提示線，不是判定線。
+                self.get_logger().warn(
+                    f"⚠ 收斂後雷射吻合度只有 {score * 100:.0f}% —— "
+                    f"走廊是 180 度對稱的，粒子有可能一起收斂到錯的那一段。"
+                    f"★ 請用 where_am_i.py 或 relocalize.py 覆核，"
+                    f"或改用「定位到這裡」")
+            if score >= 0.0 and 0.0 < self.localize_verify_min_score \
+                    and score < self.localize_verify_min_score:
+                return self._abort_localization(
+                    goal_handle, result,
+                    f"全域定位失敗：AMCL 收斂了，但收斂到的位姿只解釋得了 "
+                    f"{score * 100:.0f}% 的雷射點（門檻 "
+                    f"{self.localize_verify_min_score * 100:.0f}%）。"
+                    f"★ 走廊是 180 度對稱的，粒子很可能一起收斂到錯的那一段 —— "
+                    f"請把車推到一個已知地點，用「定位到這裡」而不是全域定位")
+            if score >= 0.0:
+                self.get_logger().info(f"　收斂後驗證：雷射吻合度 {score * 100:.0f}%")
+
             result.pose = copy.deepcopy(self.current_pose)
             result.success = True
             result.message = "全域定位成功"
@@ -605,6 +671,28 @@ class WaypointServiceCcNode(Node):
     # ==================================================================
     def _map_callback(self, msg: OccupancyGrid) -> None:
         self._map_info = msg.info
+        # ★ 2026-08-27：連佔據格一起存，給 _scan_match_score 用。
+        #   在此之前只存 info，所以這支節點有地圖卻沒辦法做任何比對。
+        self._map_grid = msg.data
+        # ★★ 2026-08-27 晚間修正：info 與 grid 要**一次寫進去** ★★
+        #
+        # 這支節點跑的是 **MultiThreadedExecutor**（見 main()），
+        # 而所有訂閱都掛在 `client_cb_group = ReentrantCallbackGroup()` ——
+        # 也就是 callback **會交錯**。
+        #
+        # 上面兩行是兩次獨立賦值，所以 _scan_match_score 有可能讀到
+        # 「A 圖的 info + B 圖的 grid」：width/height 對不上 data 長度，
+        # `grid[ny * w + nx]` 就會 IndexError。那個例外會被外層 except 接住，
+        # 印成「系統出現異常」—— 排查時完全看不出跟地圖切換有關。
+        #
+        # 換圖不是罕見事件：`current_map` 一變就會重發整張地圖。
+        #
+        # 合成一個 tuple 再一次賦值就沒有這個縫：CPython 下
+        # `self.x = (a, b)` 是先 BUILD_TUPLE 再 STORE_ATTR，
+        # 讀的那一端不可能看到半新半舊的組合。
+        # ★ 用 tuple 而不是 threading.Lock：鎖會讓地圖回呼卡在
+        #   240 點的比對迴圈後面，而 map 是 latched 話題，阻塞代價更高。
+        self._map_snapshot = (msg.info, msg.data)
 
     def _pose_in_map(self, pose) -> bool:
         """座標是否落在目前地圖範圍內
@@ -683,6 +771,94 @@ class WaypointServiceCcNode(Node):
         self.min_front_distance = self._sector_min(msg, self._front_ranges)
         self.min_rear_distance = self._sector_min(msg, self._rear_ranges)
         self._scan_stamp = time.monotonic()
+        # ★ 2026-08-27：留一整幀給收斂後的驗證用（見 _scan_match_score）。
+        #   只在 _localizing 期間留，平常不佔記憶體。
+        self._last_scan = msg
+
+    # 雷達相對 base_footprint 的位置（robot_model.yaml）
+    _LASER_DX = 0.08874
+    _LASER_DY = 0.00067
+
+    def _scan_match_score(self) -> float:
+        """把最新一幀雷射打到地圖上，回傳「落在障礙格上的比例」0~1。
+
+        ★★ 為什麼需要這個（2026-08-27 實測）★★
+
+        `_drive_until_converged` 判定收斂的依據是 **AMCL 的協方差**，
+        但**協方差量的是「粒子彼此同不同意」，不是「粒子對不對」**。
+        走廊是 180 度對稱的：把車頭轉半圈，兩側牆的雷射點照樣落在牆上。
+        所有粒子可以一起收斂到錯的那一段，而且非常有信心。
+
+        當天實測：全域定位回報「✓ 成功」，但
+
+            AMCL 收斂到的位姿    x=+1.550 y=+0.344 yaw=-12.1 度   吻合度 **42.2%**
+            獨立搜尋的正解        x=-0.050 y=+0.074 yaw=+109.9 度  吻合度 **90.5%**
+
+        差 1.6 公尺、朝向差 122 度。★ **而 42.2% 這個數字當下就算得出來** ——
+        系統有能力知道自己錯了，只是沒有檢查。
+
+        這裡補上那個檢查：收斂之後再問一次「這個位姿解釋得了眼前的雷射嗎」。
+        它與 AMCL 的判斷**完全獨立**，所以抓得到協方差抓不到的錯。
+
+        回傳 -1 代表資料不足（沒地圖或沒雷射），呼叫端應該當作「不判斷」而不是失敗。
+        """
+        # ★ 2026-08-27 晚間：從原子快照取，保證 info 與 grid 來自同一張地圖
+        #   （原本是分兩次讀 self._map_info / self._map_grid，見 _map_callback）
+        snap = self._map_snapshot
+        scan = self._last_scan
+        if snap is None or scan is None:
+            return -1.0
+        info, grid = snap
+        try:
+            tf = self.tf_buffer.lookup_transform("map", self.robot_base_frame, Time())
+        except Exception:  # noqa: BLE001
+            return -1.0
+
+        bx = tf.transform.translation.x
+        by = tf.transform.translation.y
+        q = tf.transform.rotation
+        byaw = 2.0 * math.atan2(q.z, q.w)
+        c, sn = math.cos(byaw), math.sin(byaw)
+        lx = bx + self._LASER_DX * c - self._LASER_DY * sn
+        ly = by + self._LASER_DX * sn + self._LASER_DY * c
+
+        res = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        w, h = info.width, info.height
+
+        # 取樣：**目標是「至多取 150 點」**，不是固定每 3 點取 1。
+        # ★ 2026-08-27 更正註解：原本寫「每 3 點取 1」與程式不符。
+        #   N10 只有 240 束 -> 240 // 150 = 1 -> step = 1 -> **整圈全取**。
+        #   （舊的 map_service._align_pose_with_scan 才是寫死 range(0, n, 3)。）
+        #   240 點的迴圈在 Pi 4 上約幾毫秒，不會拖慢收尾；
+        #   但若日後換成光束更多的雷達，這裡會自動降到每 N 點取 1。
+        step = max(1, len(scan.ranges) // 150)
+        hit = total = 0
+        for i in range(0, len(scan.ranges), step):
+            r = scan.ranges[i]
+            if r <= 0.0 or math.isinf(r) or math.isnan(r) or r > 8.0:
+                continue
+            if r < scan.range_min:
+                continue
+            a = scan.angle_min + i * scan.angle_increment
+            dx, dy = r * math.cos(a), r * math.sin(a)
+            wx = lx + dx * c - dy * sn
+            wy = ly + dx * sn + dy * c
+            gx = int((wx - ox) / res)
+            gy = int((wy - oy) / res)
+            if not (0 <= gx < w and 0 <= gy < h):
+                continue
+            total += 1
+            # 容許一格誤差：地圖解析度 5 cm，雷射與建圖時的位姿本來就有殘差
+            for ddx, ddy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = gx + ddx, gy + ddy
+                if 0 <= nx < w and 0 <= ny < h and grid[ny * w + nx] >= 65:
+                    hit += 1
+                    break
+        if total < 40:
+            return -1.0
+        return hit / total
 
     @staticmethod
     def _sector_min(msg: LaserScan, index_ranges) -> float:
