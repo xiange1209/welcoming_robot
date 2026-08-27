@@ -140,6 +140,7 @@ class UserAuthNode(Node):
         # ★★ 2026-08-26：人臉代表向量快取（理由見 _get_prototypes）★★
         self._proto_cache = {}      # {uuid: 正規化後的平均向量}
         self._proto_key = None      # (uuid, 樣本數) 快照，變了才重建
+        self._last_reject_log = 0.0  # E2：未達門檻的 log 節流時間戳
 
         # 建立註冊人臉服務
         self.register_face_service = self.create_service(
@@ -797,6 +798,29 @@ class UserAuthNode(Node):
                 best_match_uuid = user_uuid
 
         if max_similarity < self.recognition_threshold:
+            # ★ 2026-08-26：未過門檻時，把「最像的是誰」記進 log（給 E2 用）
+            #
+            # 回傳值刻意**不變** —— 回傳 uuid 會讓上游把沒認出來的人當成認出來了。
+            # 但 E2（誤認率／混淆矩陣）需要知道「這張臉最像資料庫裡的哪一位、
+            # 拿到幾分」。similarity 本來就有發（8/10 修過），缺的是「跟誰比出來的」。
+            #
+            # ★ 為什麼不加進 UserIdentity.msg：改 smartnav_msgs 要**全 workspace
+            #   重建**。只建部分套件會讓 type hash 對不上 —— 症狀是節點照跑、
+            #   ros2 topic list 看得到、但訂閱端一則都收不到**且沒有錯誤訊息**
+            #   （CLAUDE.md 明列的坑）。發表前不值得冒這個險，先用 log。
+            #
+            # 節流 2 秒：相機 15 FPS，不節流會把 log 洗爆。
+            # 用 get_clock() 而不是 time.monotonic()：跟本檔既有寫法一致
+            # （_last_face_time 也是），不為了一行 log 多一個 import。
+            if best_match_uuid:
+                _now = self.get_clock().now().nanoseconds / 1e9
+                if _now - self._last_reject_log > 2.0:
+                    self._last_reject_log = _now
+                    _info = self.user_manager.get_user_info(best_match_uuid)
+                    _who = _info["user_name"] if _info else best_match_uuid[:8]
+                    self.get_logger().info(
+                        f"未達門檻（E2 資料）：最像「{_who}」相似度 {max_similarity:.3f}"
+                        f" < {self.recognition_threshold:.2f}")
             return None, max_similarity
 
         return best_match_uuid, max_similarity

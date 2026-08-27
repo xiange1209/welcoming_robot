@@ -61,7 +61,9 @@ def make_bank_tools(node) -> dict:
             if goal_handle is None or not goal_handle.accepted:
                 return "執行結果: 失敗, 詳細信息: 導航請求未被接受"
 
-            action_result = node._wait_for_future(goal_handle.get_result_async(), 200.0)
+            # ★ 2026-08-26：逾時要主動取消 goal，否則嘴上說失敗、車還在走。
+            #   見 llm_service_node._wait_for_action_result 的長註解。
+            action_result = node._wait_for_action_result(goal_handle, 200.0, "帶位")
             if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                 return f"執行結果: 成功, 詳細信息: 已將貴賓帶到{room_name}"
             return f"執行結果: 失敗, 詳細信息: {action_result.result.message}"

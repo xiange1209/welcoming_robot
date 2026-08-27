@@ -469,6 +469,44 @@ class LLMServiceNode(Node):
 
         return future.result()
 
+    def _wait_for_action_result(self, goal_handle, timeout_sec: float, what: str) -> Any:
+        """等 action 的最終結果；**逾時就主動取消目標**。
+
+        Args:
+            goal_handle: send_goal_async 回來的 handle
+            timeout_sec: 等多久
+            what: 給訊息用的中文名稱（「導航」「建立地圖」「帶位」）
+
+        Returns:
+            action 的結果物件
+
+        Raises:
+            TimeoutError: 逾時（取消指令已送出）
+
+        ★★ 2026-08-26：原本三個會讓機器人**實際移動**的工具（建圖 500 秒、
+        導航 200 秒、帶位 200 秒）逾時後只是本地不再等待那個 future，
+        `goal_handle.cancel_goal_async()` **從來沒有被呼叫過**
+        （全套件唯一的 `.cancel(` 是初始化計時器，與 action 無關）。
+
+        後果不是「多等一下」，是**說法與動作矛盾**：
+          - 工具回「執行結果: 失敗」-> 模型依系統提示詞 §3 告訴客人「沒辦法帶路」
+          - `is_agent_running` 隨即釋放，客人可以再下指令
+          - **但底層的 Navigate 目標還在跑，車子還在走**
+          - 客人若再要求一次帶位，第二個目標會疊在第一個上面
+
+        取消失敗不往外拋：那時本來就已經要回報逾時了，再多一個例外只會讓
+        真正的原因（逾時）被蓋掉。取消失敗只記 log。
+        """
+        try:
+            return self._wait_for_future(goal_handle.get_result_async(), timeout_sec)
+        except TimeoutError:
+            try:
+                goal_handle.cancel_goal_async()
+                self.get_logger().warning(
+                    f"⚠ {what}超過 {timeout_sec:.0f} 秒未完成，已送出取消指令")
+            except Exception as exc:                       # noqa: BLE001
+                self.get_logger().error(f"✗ {what}逾時後送取消指令失敗: {exc}")
+            raise TimeoutError(f"{what}超過 {timeout_sec:.0f} 秒未完成，已中止本次請求")
     def _init_modern_llm_tools(self) -> None:
         """定義工具對照表"""
 
@@ -484,8 +522,8 @@ class LLMServiceNode(Node):
                 if not goal_handle.accepted:
                     return f"執行結果: 失敗, 詳細信息: 建立地圖請求被系統拒絕"
 
-                result_future = goal_handle.get_result_async()
-                action_result = self._wait_for_future(result_future, timeout_sec=500.0)
+                # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
+                action_result = self._wait_for_action_result(goal_handle, 500.0, "建立地圖")
 
                 id = action_result.result.map_info.map_id
                 name = action_result.result.map_info.map_name
@@ -601,8 +639,8 @@ class LLMServiceNode(Node):
                 if goal_handle is None or not goal_handle.accepted:
                     return f"執行結果: 失敗, 詳細信息: 導航請求未被接受"
 
-                result_future = goal_handle.get_result_async()
-                action_result = self._wait_for_future(result_future, timeout_sec=200.0)
+                # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
+                action_result = self._wait_for_action_result(goal_handle, 200.0, "導航")
 
                 if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                     return f"執行結果: 成功, 詳細信息: {action_result.result.message}"
@@ -883,7 +921,32 @@ class LLMServiceNode(Node):
                     self.get_logger().info(f"🛠️ LLM 決定呼叫服務: {tool_name}, 參數: {tool_args}")
 
                     if tool_name in self.tools_map:
-                        tool_result = self.tools_map[tool_name].invoke(tool_args)
+                        # ★★ 2026-08-26：工具呼叫要包起來 ★★
+                        #
+                        # LangChain 的 BaseTool.invoke() 會先用 args_schema
+                        # （由函式簽章自動產生的 pydantic model）驗證 LLM 給的參數，
+                        # 而驗證發生在**進入函式本體之前** —— 所以各工具自己那層
+                        # try/except 接不到。handle_tool_error / handle_validation_error
+                        # 兩個旗標預設都是 False，例外會一路炸到 _run_agent_loop
+                        # 最外層的 except，被 publish 成
+                        #   「✗ Agent 執行時發生異常: 1 validation error for ...」
+                        # 客人聽到的就是這串英文技術訊息。
+                        #
+                        # 而且那一炸會讓**這一輪剩下的工具呼叫全部中止** ——
+                        # 原本「查地點 -> 導航」兩步，第一步驗證失敗就整個垮掉。
+                        #
+                        # 3B 模型生出缺參數或型別不對的 tool call 並不罕見
+                        # （本檔多處註解都記錄過 qwen2.5:3b 的格式不穩）。
+                        # 接住之後回一句模型看得懂的話，讓它自己重試或改口，
+                        # 比整輪垮掉好。
+                        try:
+                            tool_result = self.tools_map[tool_name].invoke(tool_args)
+                        except Exception as exc:           # noqa: BLE001
+                            self.get_logger().error(
+                                f"✗ 工具 {tool_name} 呼叫失敗（參數={tool_args}）: {exc}")
+                            tool_result = (
+                                "執行結果: 失敗, 詳細信息: 工具參數不完整或格式不正確，"
+                                "請補齊必要資訊後重試，或改用其他方式協助客戶")
                     else:
                         tool_result = f"錯誤：找不到工具 {tool_name}"
 

@@ -77,6 +77,10 @@ class BankReceptionNode(Node):
         # 這裡只是再收緊一點，避免遠距離的低品質辨識觸發劇本。
         self.min_confidence = self.declare_parameter(
             "min_confidence", 0.5).get_parameter_value().double_value
+        # ★ 2026-08-26：黑名單專用門檻（理由見 identity_callback 的長註解）。
+        #   0.80 = 刻意保守：寧可漏報，也不要對無辜的人叫行員。
+        self.blacklist_min_confidence = self.declare_parameter(
+            "blacklist_min_confidence", 0.80).get_parameter_value().double_value
 
         self.notify_backend = self.declare_parameter(
             "notify_backend", "none").get_parameter_value().string_value
@@ -242,7 +246,33 @@ class BankReceptionNode(Node):
 
         # VIP 與黑名單是會觸發「說出名字」與「通報行員」的動作，
         # 誤判的代價比一般問候高得多，所以再加一道保守門檻。
-        if ptype in ("VIP", "BLACKLIST") and msg.similarity < self.min_confidence:
+        #
+        # ★★ 2026-08-26：黑名單改用自己的門檻 ★★
+        #
+        # 原本兩者共用 min_confidence，但**誤判的後果差很多**：
+        #   VIP 誤判   -> 叫錯名字，尷尬，當場可以打圓場
+        #   黑名單誤判 -> 自動送出 Telegram 通報，**沒有任何人工複核**，
+        #                 行員會被叫到現場面對一位無辜的客人
+        #
+        # 而且 min_confidence 預設 0.5 其實**擋不住任何東西**：
+        # user_auth_node 的 recognition_threshold 是 0.70，過得了那一關的
+        # similarity 一定 > 0.5，所以這道門在黑名單上等於不存在。
+        #
+        # 0.80 的依據（來自 user_auth_node.py 的實測註解）：
+        #   同一人 1 m   平均 0.7603（0.7215~0.8636）
+        #   兩個不同的人 0.515
+        # 0.80 落在「同一人分布」的上緣，會漏掉一部分真黑名單（偏保守），
+        # 但把誤報壓到很低。**這個取捨是刻意的** —— 漏報一次頂多是沒通報，
+        # 誤報一次是對著無辜的人叫行員。
+        #
+        # ⚠ 誤認率至今沒有量過（資料庫長期只有一個人），有第二個人可以測時
+        #   要重新檢視這個值。E2 實驗就是要補這一格。
+        if ptype == "BLACKLIST" and msg.similarity < self.blacklist_min_confidence:
+            self.get_logger().info(
+                f"黑名單命中但相似度 {msg.similarity:.3f} 未達 "
+                f"{self.blacklist_min_confidence:.2f}，不通報（避免誤報）")
+            return
+        if ptype == "VIP" and msg.similarity < self.min_confidence:
             return
 
         cooldown_key = msg.user_uuid or name
