@@ -49,6 +49,18 @@ _ALNUM_PATTERN = re.compile(r"[a-z0-9]+")
 _ALNUM_JOIN_PATTERN = re.compile(r"(?<=[a-z0-9])[-_.](?=[a-z0-9])")
 
 # 中文虛詞：口語問句中大量出現但不帶檢索訊號，保留會嚴重稀釋相似度
+# ★★ 2026-08-26（W6）：還沒填寫的知識庫段落一律不進索引 ★★
+#
+# knowledge/bank_faq.md 是一份**範本**，整份有 62 個「（請填寫）」。
+# 它在 enable_bank_tools:=false 時會被 search_bank_knowledge_tool 檢索到，
+# 模型會把括號裡的「例如 …」當成本行的規定唸出來 —— 這是最典型的幻覺，
+# 而且來源是我們自己餵給它的。
+#
+# 這不是「過濾掉不好看的字」，是**讓半成品知識庫安全降級成「查無資料」**：
+# 系統提示詞 §5 已經規定「查不到就說查不到」，只要不把範本當資料餵進去，
+# 那條規則就會生效。
+_PLACEHOLDER_MARKER = "請填寫"
+
 _UNIGRAM_WEIGHT = 0.35
 _STOPWORD_CHARS = frozenset(
     "的了嗎呢吧啊喔耶我你妳他她它您們請問想要有沒在是不就都也很會能可以怎麼什樣如何哪個那這些多少幫忙一下和跟與及還再又於為被把給對從到說知道且但或"
@@ -550,9 +562,18 @@ class BankKnowledgeStore:
             return len(self.chunks)
 
         chunks: List[KnowledgeChunk] = []
+        _skipped = 0        # 略過的「（請填寫）」範本段落數（W6）
         for name, content in raw_documents:
-            chunks.extend(split_markdown(content, source=name))
+            for _c in split_markdown(content, source=name):
+                if _PLACEHOLDER_MARKER in _c.text:
+                    _skipped += 1
+                    continue
+                chunks.append(_c)
 
+        if _skipped:
+            self._logger.warning(
+                f"知識庫有 {_skipped} 個段落含「{_PLACEHOLDER_MARKER}」尚未填寫，已略過不索引"
+                " —— 這些問題會回「查不到」，不會被編造答案")
         self.chunks = chunks
         self._content_hash = content_hash
         self.lexical.build(chunks)

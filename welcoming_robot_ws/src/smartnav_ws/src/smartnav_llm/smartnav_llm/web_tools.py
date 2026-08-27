@@ -160,7 +160,8 @@ class TTLCache:
 _cache = TTLCache()
 
 
-def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = _REQUEST_TIMEOUT) -> Any:
+def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None,
+                   timeout: float = _REQUEST_TIMEOUT, retries: int = 2) -> Any:
     """發出 GET 請求並解析 JSON，失敗時自動重試一次
 
     機器人多半以 Wi-Fi 連線，偶發的逾時比服務真正掛掉常見得多，
@@ -177,15 +178,17 @@ def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: f
     Raises:
         Exception: 重試後仍失敗時，拋出最後一次的例外
     """
+    # ★ 2026-08-26（W3）：重試次數改成可調，見 _load_stock_directory 的說明。
     last_error: Optional[Exception] = None
-    for attempt in range(2):
+    for attempt in range(retries):
         try:
             response = requests.get(url, params=params, headers=_BROWSER_HEADERS, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as exc:
             last_error = exc
-            if attempt == 0:
+            # ★ 最後一次嘗試就不要再睡 —— retries=1 時原本會白等 0.5 秒
+            if attempt < retries - 1:
                 _get_logger().warning(f"請求失敗將重試一次 ({url}): {exc}")
                 time.sleep(0.5)
 
@@ -224,8 +227,14 @@ def _load_stock_directory() -> Dict[str, Tuple[str, str, str]]:
     sources = [(_TWSE_LIST_API, "tse", "Code", "Name"), (_TPEX_LIST_API, "otc", "SecuritiesCompanyCode", "CompanyName")]
 
     for url, market, code_key, name_key in sources:
+            # ★★ 2026-08-26（W3）：20 秒 x 2 次重試 x 2 個來源 = 最壞 81 秒 ★★
+            #
+            # 這 81 秒內 llm_service_node 的 is_agent_running 一直是 True，
+            # 客人講任何話都只會得到「系統目前正在處理上一個指令」。
+            # 而這張表只是「名稱 -> 代號」的對照，載不進來時數字代號路徑仍可用，
+            # 不值得為它讓整個對話停擺。改成 6 秒、不重試 -> 最壞 12 秒。
         try:
-            for item in _http_get_json(url, timeout=20.0):
+            for item in _http_get_json(url, timeout=6.0, retries=1):
                 code = str(item.get(code_key, "")).strip()
                 name = str(item.get(name_key, "")).strip()
                 if not code or not name:
@@ -282,6 +291,13 @@ def query_stock_price(stock: str) -> str:
     Returns:
         str: 依既有工具慣例組成的「執行結果」字串
     """
+    # ★ 2026-08-26（W4）：把「對照表連不上」與「真的查無此股」分開回報。
+    #   兩者原本共用「查不到這檔股票」這句話 —— 網路問題會被說成
+    #   「機器人不認識台積電」，客人與現場人員都會往錯的方向排查。
+    #   純數字代號不需要對照表（_resolve_stock 會直接走代號路徑），所以只擋名稱查詢。
+    if not (stock or "").strip().isdigit() and not _load_stock_directory():
+        return ("執行結果: 失敗, 詳細信息: 股票名稱查詢服務目前連線失敗，"
+                "請稍後再試，或直接提供股票代號")
     resolved = _resolve_stock(stock)
     if not resolved:
         return f"執行結果: 失敗, 詳細信息: 查不到「{stock}」這檔股票，請確認名稱或提供股票代號"

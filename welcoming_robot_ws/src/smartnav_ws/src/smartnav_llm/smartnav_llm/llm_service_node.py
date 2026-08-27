@@ -630,6 +630,25 @@ class LLMServiceNode(Node):
         @tool
         def navigate_tool(waypoint_id: str) -> str:
             """控制機器人導航到特定地點，請提供地點ID而非座標，如果不知道導航地點，應該優先呼叫 list_waypoints_tool 工具來查詢地點列表信息"""
+            # ★ 2026-08-26（W7）：先確認這個 ID 真的存在。
+            #   小模型會自己編 waypoint_id（或把地點**名稱**當成 ID 傳進來）。
+            #   不擋的話會直接送出一個查無此點的 Navigate goal，錯誤要等到
+            #   action server 回來才知道，訊息還不會告訴模型「該去查列表」。
+            #   list_waypoints 是本機服務，成本很低。查不到列表就放行（不因為
+            #   驗證機制自己壞掉而擋住正常導航）。
+            try:
+                _lw = self._wait_for_future(
+                    self.list_waypoints_client.call_async(ListWaypoints.Request()), 5.0)
+                if _lw is not None and _lw.success:
+                    _ids = {wp.waypoint_id for wp in _lw.waypoints_info}
+                    if waypoint_id not in _ids:
+                        _names = [wp.waypoint_name for wp in _lw.waypoints_info]
+                        return (f"執行結果: 失敗, 詳細信息: 地點ID「{waypoint_id}」不存在。"
+                                f"現有地點：{_names}。請先呼叫 list_waypoints_tool "
+                                "取得正確的地點ID再導航")
+            except Exception as _exc:                      # noqa: BLE001
+                self.get_logger().warning(f"導航前地點驗證略過（查詢失敗）: {_exc}")
+
             goal = Navigate.Goal()
             goal.waypoint_id = waypoint_id
             future = self.navigate_client.send_goal_async(goal)
@@ -726,14 +745,34 @@ class LLMServiceNode(Node):
             self.tools_map["search_bank_knowledge_tool"] = search_bank_knowledge_tool
 
         if self.enable_web_tools:
+            # 匯率與時間留著：匯率是銀行業務（bank_faq.txt 有提到），
+            # 時間則被系統提示詞 §6 的規則直接依賴。
             self.tools_map.update(
                 {
-                    "query_stock_price_tool": query_stock_price_tool,
                     "query_exchange_rate_tool": query_exchange_rate_tool,
-                    "query_weather_tool": query_weather_tool,
                     "query_datetime_tool": query_datetime_tool,
                 }
             )
+            # ★★ 2026-08-26（W5）：股價／天氣拆成獨立開關 ★★
+            #
+            # 工具數量直接影響小模型的工具選擇準確率 —— 這是本檔 :660 附近
+            # 已經記錄過的實測結論（qwen2.5:3b 在工具太多時會挑錯）。
+            # 股價與天氣**都不在銀行迎賓的故事線裡**，卻各佔一個工具名額。
+            #
+            # ★ 預設**維持 True**，行為與 8/26 之前完全相同 —— 這是刻意的：
+            #   在上機當天悄悄拿掉功能，比多兩個工具危險。
+            #   彩排時若觀察到選錯工具，用
+            #       -p enable_stock_weather_tools:=false
+            #   一行就能收斂到 11 個工具，不必改程式。
+            if self.declare_parameter(
+                    "enable_stock_weather_tools",
+                    True).get_parameter_value().bool_value:
+                self.tools_map.update(
+                    {
+                        "query_stock_price_tool": query_stock_price_tool,
+                        "query_weather_tool": query_weather_tool,
+                    }
+                )
 
         # ── 銀行場景工具（2026-08-01 從 git 歷史復原）────────────
         #
