@@ -412,9 +412,22 @@ class PathTeachNode(Node):
         # `~/maprun/steer_asym_check_cc.py` 把左右極限量準，再依數據調。
         # ★ 這條路線本來就跑不通（多折返 5 敗），所以退回 0.80 沒有失去
         #   任何「原本會動的能力」——真正要修的是折返做不好，見 _do_escape。
+        # ★★ 2026-08-29 依當天實測更新：左 1.030 / 右 1.183 ★★
+        #
+        # steer_asym_check_cc.py 在大廳空曠處、起跑前定位 90.8%、電量 24.2 V：
+        #     8/17 基線   左 0.944 / 右 0.751（右比左緊 27%）
+        #     8/29 實測   左 1.030 / 右 1.183（**方向反過來**，差 13%）
+        # 兩件事跟著確立：
+        #   1. 這個不對稱**會漂**（電壓、舵機磨耗），不是量一次就能寫死的常數
+        #      —— 引用前要重量（steer_asym_check_cc.py，兩分鐘）。
+        #   2. 舊箝制值（左 0.95/右 0.80）比現實樂觀：右轉指令會超出舵機能力
+        #      48%，韌體不報錯、照算 AngleR，**靜默欠轉** ——「指令看起來對、
+        #      車子卻一路往漂」。倒車增益本來只有前進的 1/3，再疊上欠轉，
+        #      就是「撞到牆才轉舵」的完整成因鏈。
+        # 取實測值加 1.5~2% 餘裕：左 1.05、右 1.20。
         self.declare_parameter("min_turning_radius", 0.80)          # 相容用的舊參數
-        self.declare_parameter("min_turning_radius_right", 0.80)    # 實測 0.751，留 6.5% 餘裕
-        self.declare_parameter("min_turning_radius_left", 0.95)     # 實測 0.944，留 0.6% 餘裕
+        self.declare_parameter("min_turning_radius_right", 1.20)    # 8/29 實測 1.183
+        self.declare_parameter("min_turning_radius_left", 1.05)     # 8/29 實測 1.030
         # 關掉就退回舊行為（左右都用 min_turning_radius）——出事時的退路
         self.declare_parameter("asymmetric_turning", True)
         # ── 路徑可行性檢查（2026-08-06）★ 門檻是 0.76 不是 0.80 ──
@@ -547,6 +560,20 @@ class PathTeachNode(Node):
         # 但三次前後退太少」。窄轉角的三點轉向本來就要來回好幾趟才轉得夠，
         # 每次只轉 20 度，要轉過 60~90 度的彎需要 4~6 次。
         self.declare_parameter("max_escapes", 10)
+        # ★★ 2026-08-29：同一個地方零進展的脫困，最多容忍幾次 ★★
+        #
+        # 8/29 三趟 CSV（replay_path_75c58190328b_*.csv）量到的病：
+        #   同一個路徑索引脫困 9 次，其中 3 次 log 自己印
+        #   「弧線被擋，只轉了 +0 度」—— 零進展仍原地重試同一招，
+        #   而**每一次脫困都在破壞定位**（同日三次獨立確認：
+        #   掃描吻合度 94.2%→60.8%、100.0%→62.6%，AMCL 把 50~60 度
+        #   的實轉記成 140 度）。無效脫困不是「沒用」，是**負作用**。
+        #
+        # 規則：在同一個索引（±2）連續兩次脫困都「幾乎沒轉（<8 度）
+        # 也幾乎沒移（<0.10 m）」：
+        #   第 1 次 -> 升級：下一次脫困強制先直線拉開（_escape_force_straight）
+        #   第 2 次 -> 止損：直接放棄並講清楚，不再把 AMCL 愈轉愈爛
+        self.declare_parameter("escape_stall_max", 2)
         # 終點段推不動時，容差放寬幾倍才收下（見 _follow_loop 的「終點附近不要脫困」）。
         # 2.0 表示 goal_tolerance_m 0.20 -> 最多收到 0.40 m。
         self.declare_parameter("goal_tol_relax", 2.0)
@@ -724,6 +751,7 @@ class PathTeachNode(Node):
         self.escape_after = float(p("escape_after_sec").value)
         self.escape_dist = float(p("escape_distance_m").value)
         self.max_escapes = int(p("max_escapes").value)
+        self.escape_stall_max = int(p("escape_stall_max").value)
         self.escape_legs_max = int(p("escape_legs_max").value)
         self.escape_total_dyaw = math.radians(float(p("escape_total_dyaw_deg").value))
         self._escape_leg_yaw = None
@@ -845,6 +873,12 @@ class PathTeachNode(Node):
         # 一串脫困共用的轉向（見 _do_escape）。每次真的往前推進就清掉，
         # 讓下一次卡住重新判斷。
         self._escape_steer: Optional[float] = None
+        # 零進展脫困追蹤（★ 2026-08-29，_follow_loop 起跑時會再重設一次）
+        self._last_escape_dyaw = float("inf")
+        self._last_escape_move = float("inf")
+        self._last_escape_idx = -99
+        self._escape_stall_count = 0
+        self._escape_force_straight = False
         self._cmd_v_last = 0.0        # 最後一次下的線速度指令（卡住判定用）
         from rclpy.qos import ReliabilityPolicy as _RP
         self.create_subscription(
@@ -2346,6 +2380,12 @@ class PathTeachNode(Node):
                                                    pts[i].y - pts[i - 1].y)
         prog_s = -1.0
         self._escape_steer = None
+        # ★ 2026-08-29 零進展脫困的追蹤狀態（見 escape_stall_max 的說明）
+        self._last_escape_dyaw = float("inf")
+        self._last_escape_move = float("inf")
+        self._last_escape_idx = -99          # 上次脫困時的路徑索引
+        self._escape_stall_count = 0         # 同處零進展的連續次數
+        self._escape_force_straight = False  # 下次脫困強制先直線拉開
         move_hist: List[Tuple[float, float, float, float]] = []   # (t, x, y, |指令v|)
 
         # ★★ 2026-08-25：所有以「秒」為單位的判準改吃**實際量到的**週期 ★★
@@ -2705,6 +2745,8 @@ class PathTeachNode(Node):
                     prog_s = path_s[idx]
                     prog_t = now_t
                 self._escape_steer = None      # 真的在動，下次卡住重新判斷轉向
+                self._escape_stall_count = 0   # 有推進就把零進展計數歸零
+                self._escape_force_straight = False
             elif time.monotonic() - prog_t > self.no_progress:
                 # ★★ 2026-08-24：終點附近不要脫困 ★★
                 #
@@ -2767,7 +2809,20 @@ class PathTeachNode(Node):
                         f"{self.stall_progress:.2f} m），判定卡住，"
                         f"嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
                     self._stop(3)
-                    if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
+                    _esc_ok = self._do_escape(pts, idx, cur_dir, goal_handle, escapes)
+                    # ★ 2026-08-29：零進展要升級、要止損（見 _escape_stalled）
+                    if self._escape_stalled(idx):
+                        self._stop()
+                        goal_handle.abort()
+                        result.success = False
+                        result.message = (
+                            f"卡在第 {idx}/{len(pts)} 點，連續 "
+                            f"{self._escape_stall_count} 次脫困零進展（含直線拉開），"
+                            f"已止損放棄。★ 繼續脫困只會把定位愈轉愈爛 —— "
+                            f"請人工移車，或檢查這一段路徑是否超出最小迴轉半徑")
+                        self.get_logger().warn(result.message)
+                        return result
+                    if _esc_ok:
                         last_escape_t = time.monotonic()   # 開始偏離寬限期
                         prog_t = time.monotonic()
                         avoid_offset = 0.0
@@ -3005,7 +3060,20 @@ class PathTeachNode(Node):
                         self.get_logger().info(
                             f"等了 {waited:.0f} 秒仍不通，嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
                         _t_esc = time.monotonic()
-                        if self._do_escape(pts, idx, cur_dir, goal_handle, escapes):
+                        _esc_ok = self._do_escape(pts, idx, cur_dir, goal_handle, escapes)
+                        # ★ 2026-08-29：零進展要升級、要止損（見 _escape_stalled）
+                        if self._escape_stalled(idx):
+                            self._stop()
+                            goal_handle.abort()
+                            result.success = False
+                            result.message = (
+                                f"第 {idx}/{len(pts)} 點前方受阻，連續 "
+                                f"{self._escape_stall_count} 次脫困零進展（含直線拉開），"
+                                f"已止損放棄。★ 繼續脫困只會把定位愈轉愈爛 —— "
+                                f"請人工移車，或確認擋路的是不是牆（牆不會自己走開）")
+                            self.get_logger().warn(result.message)
+                            return result
+                        if _esc_ok:
                             last_escape_t = time.monotonic()   # 開始偏離寬限期
                             wait_started = 0.0
                             avoid_offset = 0.0
@@ -3162,6 +3230,39 @@ class PathTeachNode(Node):
         result.message = "節點關閉"
         return result
 
+    def _escape_stalled(self, idx: int) -> bool:
+        """剛結束的那次脫困有沒有「零進展」？記帳並回傳是否該止損。
+
+        ★★ 2026-08-29，見 escape_stall_max 的宣告說明 ★★
+
+        「零進展」= 幾乎沒轉（< 8 度）也幾乎沒移（< 0.10 m）——
+        淨效果由 _do_escape 的 finally 量好放在 _last_escape_dyaw/_move。
+        位姿量不到時是 inf，不會被記成停滯（寧可多試也不要冤枉）。
+
+        第 1 次零進展 -> 升級：設 _escape_force_straight，下一次脫困
+          不管側向閘門怎麼說都先直線拉開再打舵（弧線被擋時原地重試
+          同一條弧，就是 8/29 同索引 9 連敗的根源）。
+        第 escape_stall_max 次 -> 回傳 True，呼叫端放棄並講清楚 ——
+          每次無效脫困都在破壞 AMCL（8/29 三次獨立確認 94~100% -> 61~63%），
+          繼續掙扎只會把後續所有判斷的基礎愈弄愈爛。
+        """
+        stalled = (self._last_escape_dyaw < math.radians(8.0)
+                   and self._last_escape_move < 0.10)
+        self._last_escape_idx = idx
+        if not stalled:
+            self._escape_stall_count = 0
+            self._escape_force_straight = False
+            return False
+        self._escape_stall_count += 1
+        self._escape_force_straight = True
+        self.get_logger().warn(
+            f"脫困零進展（只轉 {math.degrees(self._last_escape_dyaw):.0f} 度、"
+            f"移 {self._last_escape_move:.2f} m），索引 {idx} 第 "
+            f"{self._escape_stall_count}/{self.escape_stall_max} 次"
+            + ("，下一次強制先直線拉開" if self._escape_stall_count < self.escape_stall_max
+               else " —— 止損，不再重試"))
+        return self._escape_stall_count >= self.escape_stall_max
+
     def _do_escape(self, pts, idx, cur_dir, goal_handle, attempt: int = 1) -> bool:
         """脫困的外層：開啟防撞旁路，並保證無論從哪個出口離開都會關掉。
 
@@ -3174,9 +3275,20 @@ class PathTeachNode(Node):
         車子會多滑一秒才停。
         """
         self._escape_bypass = True
+        # ★ 2026-08-29：量整串脫困的**淨效果**（轉了多少、移了多少），
+        #   給主迴圈的零進展判定用。量不到位姿時填 inf —— 寧可不判停滯，
+        #   也不要因為 AMCL 斷線就把一次可能有效的脫困記成零進展。
+        _p0 = self._robot_pose()
         try:
             return self._escape_legs(pts, idx, cur_dir, goal_handle, attempt)
         finally:
+            _p1 = self._robot_pose()
+            if _p0 is not None and _p1 is not None:
+                self._last_escape_dyaw = abs(norm_angle(_p1[2] - _p0[2]))
+                self._last_escape_move = math.hypot(_p1[0] - _p0[0], _p1[1] - _p0[1])
+            else:
+                self._last_escape_dyaw = float("inf")
+                self._last_escape_move = float("inf")
             self._escape_bypass = False
             if self.bypass_pub is not None:
                 self.bypass_pub.publish(Twist())
@@ -3610,10 +3722,22 @@ class PathTeachNode(Node):
         # 給貼牆排斥用，只是當時忘了接到這個閘門上）。
         side_min = 0.15
         s_left, s_right = self._side_clearance()
-        if min(s_left, s_right) < side_min:
+        # ★ 2026-08-29：上一次脫困零進展（弧線被擋原地打轉）時，
+        #   這裡的側向閘門可能不會開（弧被「前方」擋住、側向卻夠寬），
+        #   於是又去重試同一條被擋的弧。零進展後強制走一次直線拉開 ——
+        #   這就是「弧線轉不動時的升級策略」（8/29 三缺陷之三）。
+        _force_straight = self._escape_force_straight
+        if _force_straight:
+            self._escape_force_straight = False     # 一次有效，別黏著
+            self.get_logger().info("上次脫困零進展 -> 本次強制先直線拉開再打舵")
+        if min(s_left, s_right) < side_min or _force_straight:
             self.get_logger().info(
-                f"側向太窄（左 {s_left:.2f} m、右 {s_right:.2f} m），先直線"
+                f"側向太窄或強制拉開（左 {s_left:.2f} m、右 {s_right:.2f} m），先直線"
                 f"{'前進' if back_dir > 0 else '後退'}拉開距離再打方向")
+            # 側向接觸底線（與下面弧線段同一條規則，見該處 2026-08-29 註解）：
+            # 直線段名義上不動側向，但車頭歪著走時側隙仍會變差
+            _s0g = min(s_left, s_right)
+            _s_floor_g = (_s0g - 0.03) if _s0g < 0.04 else 0.01
             ts = time.monotonic()
             while time.monotonic() - ts < 5.0 and rclpy.ok():
                 if goal_handle.is_cancel_requested:
@@ -3626,7 +3750,14 @@ class PathTeachNode(Node):
                 if math.hypot(p[0] - x0, p[1] - y0) >= self.escape_dist:
                     break
                 l2, r2 = self._side_clearance()
-                if min(l2, r2) >= side_min:
+                # 強制拉開時不吃「側向已夠寬」的提前出場——重點本來就不是側向，
+                # 是離開被擋的弧線；走滿 escape_dist 或被前方擋下為止
+                if min(l2, r2) >= side_min and not _force_straight:
+                    break
+                if min(l2, r2) <= _s_floor_g:
+                    self.get_logger().warn(
+                        f"脫困直線段：側向淨空掉到 {min(l2, r2):+.2f} m"
+                        f"（底線 {_s_floor_g:+.2f}），中止")
                     break
                 if self._arc_clearance(back_dir, 0.0) <= 0.12:
                     self.get_logger().warn("直線方向也被擋住，無法拉開距離")
@@ -3723,6 +3854,23 @@ class PathTeachNode(Node):
                 if p is not None:
                     x0, y0, yaw0 = p
 
+        # ★★ 2026-08-29 側向接觸底線 ★★
+        #
+        # 8/29 三趟 CSV 抓到 55 筆**負的**側向淨空（左-0.10/右-0.08）——
+        # 車身已經在障礙輪廓裡，代表脫困把車**開進去**而不是拉出來。
+        # 既有的兩道檢查都看不到這件事：`_arc_clearance` 看的是弧線前方、
+        # `_body_margin(back_dir)` 只取行進方向那側（any_margin 被丟掉，
+        # 而且它以 0 為下限、進到裡面也只回 0，分不出「貼著」與「愈陷愈深」）。
+        # `_side_clearance` 會回負值，才量得出「陷多深」。
+        #
+        # 底線的訂法：起手還乾淨（>= 4 cm）就不准掉到 1 cm 以下；
+        # 起手已經貼牆/楔住（< 4 cm，可能是負的）就允許動、但不准再深 3 cm
+        # —— 楔住時什麼都不准動等於回到 8/03 的死鎖，完全不設限則是 8/29 的
+        # 55 筆負淨空，這條底線是兩個失敗案例的中間解。
+        _sl0, _sr0 = self._side_clearance()
+        _s0 = min(_sl0, _sr0)
+        _s_floor = (_s0 - 0.03) if _s0 < 0.04 else 0.01
+
         t0 = time.monotonic()
         while time.monotonic() - t0 < 8.0 and rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -3736,6 +3884,19 @@ class PathTeachNode(Node):
             dyaw_signed = norm_angle(yaw - yaw0)     # 有號：看得出是累積還是抵消
             dyaw = abs(dyaw_signed)
             moved = math.hypot(x - x0, y - y0)
+
+            _sl, _sr = self._side_clearance()
+            if min(_sl, _sr) <= _s_floor:
+                self._stop(3)
+                self.get_logger().warn(
+                    f"脫困：側向淨空掉到 {min(_sl, _sr):+.2f} m"
+                    f"（起手 {_s0:+.2f}、底線 {_s_floor:+.2f}），"
+                    f"再走就是往牆裡鑽，停止這一段（已轉 "
+                    f"{math.degrees(dyaw_signed):+.0f} 度）")
+                self._send_feedback(
+                    goal_handle, idx, len(pts), 0.0, "escaping",
+                    f"脫困第 {attempt} 次：側向 {min(_sl, _sr):+.2f} m 觸底線，停止")
+                return dyaw > math.radians(5.0)
 
             if dyaw >= target_dyaw:
                 self._stop(3)

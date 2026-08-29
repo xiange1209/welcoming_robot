@@ -36,7 +36,9 @@ speed 為 0 時修正量也是 0 —— 阿克曼車靜止時轉方向盤沒有�
 車子會移動約 0.5 公尺，請確認前方淨空。
 """
 
+import json
 import math
+import os
 import threading
 import time
 
@@ -83,7 +85,24 @@ class SteeringTrimCcNode(Node):
         #
         # 要重新校準：ros2 service call /measure_steering_trim std_srvs/srv/Trigger
         # (務必在 IMU 零偏已校準的狀態下量，否則會再次量錯)
-        self.declare_parameter("trim_rad_per_m", -0.072)
+        #
+        # ★★ 2026-08-29：-0.072 → -0.235，並加**持久化**（見 _load/_save_trim）★★
+        #
+        # 當日 steer_asym_check_cc.py（直發 /cmd_vel，量的是**未補償的底盤**）：
+        #     前進 +13.46 度/m、倒車 -15.70 度/m（反號，符合 ω = v·tanδ/L）
+        #     -> 等效舵角偏移 +4.32 度（偏左），抵消需要 -0.2349 rad/m
+        # 而本參數一直是 -0.072（只補了三成），且**每次開機都重置**——
+        # auto_trim 增益 0.02、每 2 秒視窗最多修 0.003，一趟導航根本追不完
+        # 0.16 rad/m 的缺口。
+        #
+        # 後果全記錄在案：前進時純追蹤增益 11.3 蓋得住這個偏差；
+        # **倒車增益只有 3.5**，蓋不住 -> 車子在走廊裡持續往同一側漂 ->
+        # 「大廳->原點的倒車每次都卡到右牆」。
+        #
+        # 兩件事一起修：初值換成當天實測，學到的 trim 存檔、下次開機接著用
+        # （這個量會漂——8/06 同一天內量過 -1.87 與 +12.7 度/m——
+        # 所以「上次學到的值」永遠比「寫死的常數」接近現實）。
+        self.declare_parameter("trim_rad_per_m", -0.235)
         self.declare_parameter("input_topic", "cmd_vel_smoothed")
         self.declare_parameter("output_topic", "cmd_vel_trimmed")
         # 補償量上限，避免參數設錯時整台車繞圈
@@ -165,6 +184,13 @@ class SteeringTrimCcNode(Node):
         self.declare_parameter("auto_trim_window_sec", 2.0)
 
         self.trim = float(self.get_parameter("trim_rad_per_m").value)
+        # ★ 2026-08-29：上次 auto_trim 學到的值優先於參數預設值。
+        #   偏移會漂（電壓、舵機磨耗、被撞），寫死的常數永遠是過期的；
+        #   「上次收斂到哪」是下次開機最好的起點。檔案不存在／壞掉就退回參數。
+        self._trim_file = os.path.join(
+            os.path.expanduser("~"), ".smartnav", "steering_trim.json")
+        self._trim_last_save = 0.0
+        self._load_trim()
         self.max_trim = float(self.get_parameter("max_trim_rad_s").value)
         self.steer_tau = float(self.get_parameter("steer_filter_tau").value)
         self.steer_deadband = float(self.get_parameter("steer_deadband_rad_s").value)
@@ -235,6 +261,45 @@ class SteeringTrimCcNode(Node):
 
         if bool(self.get_parameter("measure_mode").value):
             threading.Thread(target=self._measure_sequence, daemon=True).start()
+
+    def _load_trim(self) -> None:
+        """開機時讀上次 auto_trim 學到的值；沒有或不合理就用參數預設。
+
+        合理性檢查用 auto_trim_limit 同一個上限（此時參數還沒讀進 self，
+        直接讀參數值）——檔案被手改成離譜值時寧可丟掉。
+        """
+        limit = abs(float(self.get_parameter("auto_trim_limit").value))
+        try:
+            with open(self._trim_file, encoding="utf-8") as f:
+                data = json.load(f)
+            val = float(data["trim_rad_per_m"])
+            if abs(val) <= limit:
+                self.get_logger().info(
+                    f"載入上次學到的轉向補償 {val:+.4f} rad/m"
+                    f"（{math.degrees(val):+.2f} 度/m，存於 {data.get('saved_at', '?')}；"
+                    f"參數預設 {self.trim:+.4f} 未使用）")
+                self.trim = val
+            else:
+                self.get_logger().warn(
+                    f"{self._trim_file} 的值 {val:+.4f} 超過上限 {limit:.2f}，"
+                    f"忽略並使用參數預設 {self.trim:+.4f}")
+        except FileNotFoundError:
+            pass                                    # 第一次跑，正常
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"讀取 {self._trim_file} 失敗（{e}），使用參數預設")
+
+    def _save_trim(self) -> None:
+        """存目前的 trim（原子寫入：先寫暫存再 rename，斷電不會留半個檔）"""
+        try:
+            os.makedirs(os.path.dirname(self._trim_file), exist_ok=True)
+            tmp = self._trim_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"trim_rad_per_m": self.trim,
+                           "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           "updates": self._at_updates}, f)
+            os.replace(tmp, self._trim_file)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"寫入 {self._trim_file} 失敗：{e}")
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._odom = msg
@@ -312,6 +377,11 @@ class SteeringTrimCcNode(Node):
             return
         self.trim = new
         self._at_updates += 1
+        # ★ 2026-08-29：學到的值要落地，下次開機才接得上（30 秒節流，
+        #   停止腳本是 TERM 後補 KILL，指望 destroy 時存檔並不可靠）
+        if now - self._trim_last_save > 30.0:
+            self._trim_last_save = now
+            self._save_trim()
         if now - self._at_last_log > 5.0:
             self._at_last_log = now
             self.get_logger().info(
