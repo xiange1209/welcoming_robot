@@ -575,7 +575,7 @@ class PathTeachNode(Node):
         #   掃描吻合度 94.2%→60.8%、100.0%→62.6%，AMCL 把 50~60 度
         #   的實轉記成 140 度）。無效脫困不是「沒用」，是**負作用**。
         #
-        # 規則：在同一個索引（±2）連續兩次脫困都「幾乎沒轉（<8 度）
+        # 規則：連續兩次脫困（中間沒有沿路徑實質推進）都「幾乎沒轉（<8 度）
         # 也幾乎沒移（<0.10 m）」：
         #   第 1 次 -> 升級：下一次脫困強制先直線拉開（_escape_force_straight）
         #   第 2 次 -> 止損：直接放棄並講清楚，不再把 AMCL 愈轉愈爛
@@ -882,7 +882,6 @@ class PathTeachNode(Node):
         # 零進展脫困追蹤（★ 2026-08-29，_follow_loop 起跑時會再重設一次）
         self._last_escape_dyaw = float("inf")
         self._last_escape_move = float("inf")
-        self._last_escape_idx = -99
         self._escape_stall_count = 0
         self._escape_force_straight = False
         self._cmd_v_last = 0.0        # 最後一次下的線速度指令（卡住判定用）
@@ -2409,7 +2408,6 @@ class PathTeachNode(Node):
         # ★ 2026-08-29 零進展脫困的追蹤狀態（見 escape_stall_max 的說明）
         self._last_escape_dyaw = float("inf")
         self._last_escape_move = float("inf")
-        self._last_escape_idx = -99          # 上次脫困時的路徑索引
         self._escape_stall_count = 0         # 同處零進展的連續次數
         self._escape_force_straight = False  # 下次脫困強制先直線拉開
         move_hist: List[Tuple[float, float, float, float]] = []   # (t, x, y, |指令v|)
@@ -2770,9 +2768,23 @@ class PathTeachNode(Node):
                 if self.stall_progress <= 0 or path_s[idx] - prog_s >= self.stall_progress:
                     prog_s = path_s[idx]
                     prog_t = now_t
+                    # ★★ 2026-08-31 修正（T-NEW）：這兩行原本在 if 的**外層** ★★
+                    #
+                    #   脫困結束後的第一個控制週期**必然**判成「沒卡住」——
+                    #   成功出口與失敗出口都會重設 prog_t、清空 move_hist/sig_hist，
+                    #   於是三個卡住判準（指令vs實際、掃描簽章、弧長推進）全部不成立。
+                    #   計數在外層歸零 -> 每次脫困後都被清掉 -> escape_stall_max
+                    #   **永遠到不了**，_escape_force_straight 也活不過一個週期。
+                    #   結果是 8/29 新增的「零進展止損 + 強制直線拉開」在卡住分支
+                    #   是不可達的死碼 —— 而 8/29 記錄的病症正是「同一索引脫困 9 次」，
+                    #   止損就是為那個場景寫的，卻恰好在那個場景失效。
+                    #   把歸零綁進「真的推進了 stall_progress」才有意義。
+                    #   ★ 自限性：脫困若真的有效，_escape_stalled 內部就會把計數歸零；
+                    #     只有連續兩次「轉 <8 度且移 <0.10 m」才會止損。
+                    #   ★ 到校第一趟重播要盯這行 log：「脫困零進展…第 N/2 次」
+                    self._escape_stall_count = 0
+                    self._escape_force_straight = False
                 self._escape_steer = None      # 真的在動，下次卡住重新判斷轉向
-                self._escape_stall_count = 0   # 有推進就把零進展計數歸零
-                self._escape_force_straight = False
             elif time.monotonic() - prog_t > self.no_progress:
                 # ★★ 2026-08-24：終點附近不要脫困 ★★
                 #
@@ -2837,7 +2849,7 @@ class PathTeachNode(Node):
                     self._stop(3)
                     _esc_ok = self._do_escape(pts, idx, cur_dir, goal_handle, escapes)
                     # ★ 2026-08-29：零進展要升級、要止損（見 _escape_stalled）
-                    if self._escape_stalled(idx):
+                    if self._escape_stalled(idx, goal_handle.is_cancel_requested):
                         self._stop()
                         goal_handle.abort()
                         result.success = False
@@ -2860,6 +2872,11 @@ class PathTeachNode(Node):
                     prog_t = time.monotonic()      # 退不動也重計時，讓它再試
                     move_hist.clear()
                     sig_hist.clear()
+                    # ★ 2026-08-31 新增（T-10 旁證）：這條失敗 fall-through 少了
+                    #   continue，於是會繼續跑完本輪迴圈、在下面發出一筆非零速度。
+                    #   使用者按下取消時剛好在脫困中的話，車子會多動一個控制週期
+                    #   才停。對照組：阻擋分支的 fall-through 本來就有 continue。
+                    continue
                 else:
                     self._stop()
                     goal_handle.abort()
@@ -3088,7 +3105,7 @@ class PathTeachNode(Node):
                         _t_esc = time.monotonic()
                         _esc_ok = self._do_escape(pts, idx, cur_dir, goal_handle, escapes)
                         # ★ 2026-08-29：零進展要升級、要止損（見 _escape_stalled）
-                        if self._escape_stalled(idx):
+                        if self._escape_stalled(idx, goal_handle.is_cancel_requested):
                             self._stop()
                             goal_handle.abort()
                             result.success = False
@@ -3256,7 +3273,7 @@ class PathTeachNode(Node):
         result.message = "節點關閉"
         return result
 
-    def _escape_stalled(self, idx: int) -> bool:
+    def _escape_stalled(self, idx: int, cancelled: bool = False) -> bool:
         """剛結束的那次脫困有沒有「零進展」？記帳並回傳是否該止損。
 
         ★★ 2026-08-29，見 escape_stall_max 的宣告說明 ★★
@@ -3272,9 +3289,14 @@ class PathTeachNode(Node):
           每次無效脫困都在破壞 AMCL（8/29 三次獨立確認 94~100% -> 61~63%），
           繼續掙扎只會把後續所有判斷的基礎愈弄愈爛。
         """
+        # ★ 2026-08-31 修正（T-10）：**取消不是停滯**。取消時各層立刻 return，
+        #   位姿幾乎沒變 -> dyaw/move 都約等於 0 -> 會被記成一次零進展，
+        #   甚至可能對已在 CANCELING 的 goal 呼叫 abort()、回報成「止損」。
+        #   取消的正常出口是主迴圈頂端的 canceled()，不是這裡。
+        if cancelled:
+            return False
         stalled = (self._last_escape_dyaw < math.radians(8.0)
                    and self._last_escape_move < 0.10)
-        self._last_escape_idx = idx
         if not stalled:
             self._escape_stall_count = 0
             self._escape_force_straight = False
