@@ -36,9 +36,11 @@ from smartnav_msgs.action import FollowTaughtPath
 
 
 class ReplayTracer(Node):
-    def __init__(self, path_id: str, reverse: bool, speed: float):
+    def __init__(self, path_id: str, reverse: bool, speed: float, watch_index=None):
         super().__init__("replay_tracer_cc")
         self.path_id = path_id
+        # ★ 2026-08-30（CC-14）：要盯的索引改成可選，不再寫死家裡那條路徑的 60
+        self.watch_index = watch_index
         self.reverse = reverse
         self.speed = speed
         self.rows: list[dict] = []
@@ -101,7 +103,12 @@ class ReplayTracer(Node):
         if handle is None or not handle.accepted:
             print("✗ goal 被拒絕", file=sys.stderr)
             return 1
-        print("goal 已接受，開始走。★ 盯著索引 60 附近，看車實際在哪。\n", flush=True)
+        # ★ 2026-08-30 修正（CC-14）：舊版無條件印「盯著索引 60 附近」——
+        #   那是家裡那條路徑的門口位置，換場地後毫無意義而且會誤導判讀。
+        print("goal 已接受，開始走。", flush=True)
+        if self.watch_index is not None:
+            print(f"★ 盯著索引 {self.watch_index} 附近，看車實際在哪。", flush=True)
+        print(flush=True)
 
         rfut = handle.get_result_async()
         rclpy.spin_until_future_complete(self, rfut)
@@ -153,13 +160,27 @@ def main() -> int:
             #   舊版沒有任何 state 過濾就三者混算，而報告的 0.175 m 就是這樣算出來的。
             #   脫困佔全程 22~62%，污染量很大。以下只用真正的循跡列。
             TRACK_STATES = ("following", "slowing", "avoiding")
-            ct = sorted(abs(x["cross_track_m"]) for x in n.rows
-                        if x["state"] in TRACK_STATES)
+            track = [x for x in n.rows if x["state"] in TRACK_STATES]
+            ct = sorted(abs(x["cross_track_m"]) for x in track)
             n_skip = len(n.rows) - len(ct)
             if ct:
                 print(f"      橫向偏離（只計 {'/'.join(TRACK_STATES)}，{len(ct)} 筆）："
                       f"平均 {sum(ct)/len(ct):.3f} m、"
                       f"最大 {ct[-1]:.3f} m、95% {ct[int(len(ct)*0.95)]:.3f} m")
+                # ★ 2026-08-30 新增（CC-12）：上面那組是**時間加權**——每個控制
+                #   週期一列，所以車子慢下來或停住的地方會被重複取樣。而慢下來
+                #   正好就是循跡吃力的地方，分佈會被那幾個點主導。
+                #   報告要的是「沿路徑的偏離分佈」＝**距離加權**。路徑點大致等距，
+                #   所以先把同一索引的樣本平均掉再對索引統計，就是乾淨的距離加權。
+                per_idx = {}
+                for _x in track:
+                    per_idx.setdefault(_x["index"], []).append(abs(_x["cross_track_m"]))
+                di = sorted(sum(v) / len(v) for v in per_idx.values())
+                print(f"      ★ 距離加權（{len(di)} 個路徑索引）："
+                      f"平均 {sum(di)/len(di):.3f} m、"
+                      f"最大 {di[-1]:.3f} m、95% {di[int(len(di)*0.95)]:.3f} m")
+                print(f"        ★ 寫報告用這一組。時間加權那組每索引平均"
+                      f" {len(ct)/max(1,len(di)):.1f} 筆，重複取樣愈多偏差愈大")
             else:
                 print("      橫向偏離：無有效取樣（全程都在 escaping/blocked）")
             if n_skip:

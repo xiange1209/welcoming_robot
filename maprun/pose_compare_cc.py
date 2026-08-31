@@ -78,7 +78,11 @@ class PoseCompare(Node):
         hit = total = 0
         for i in range(0, n, step):
             r = s.ranges[i]
-            if not (s.range_min < r < s.range_max) or math.isinf(r) or math.isnan(r):
+            # ★ 2026-08-30 修正（CC-03）：舊版沒有 8 m 上限，而 N10 驅動的
+            #   range_max 是 30（ldlidar main.cpp:231），於是把參考實作
+            #   waypoint_service_cc_node.py:840 明確丟掉的長距離光束全收進來。
+            #   長光束的端點誤差隨距離放大，收進來會讓分數系統性偏高。
+            if not (s.range_min < r < s.range_max) or math.isinf(r) or math.isnan(r)                     or r > 8.0:
                 continue
             a = yaw + s.angle_min + i * s.angle_increment
             px, py = lx + r * math.cos(a), ly + r * math.sin(a)
@@ -86,14 +90,16 @@ class PoseCompare(Node):
             if not (0 <= gx < w and 0 <= gy < h):
                 continue          # 地圖外的光束不計入分母
             total += 1
+            # ★ 2026-08-30 修正（CC-03）：舊版是 3x3 含對角（容差 sqrt2 x 5
+            #   = 7.07 cm），參考實作 waypoint_service_cc_node.py:854 是
+            #   **5 格十字**（容差 ±5 cm）。連同上面的 8 m 上限，兩者在兩個軸上
+            #   都不同尺，本檔分數系統性偏高 —— 而報告曾據此建議把
+            #   localize_verify_min_score 設成 0.90。改成與參考實作同一把尺。
             found = False
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    nx, ny = gx + dx, gy + dy
-                    if 0 <= nx < w and 0 <= ny < h and grid[ny * w + nx] >= _OCC:
-                        found = True
-                        break
-                if found:
+            for ddx, ddy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = gx + ddx, gy + ddy
+                if 0 <= nx < w and 0 <= ny < h and grid[ny * w + nx] >= _OCC:
+                    found = True
                     break
             hit += found
         if total < 40:

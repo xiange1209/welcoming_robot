@@ -40,7 +40,14 @@ from smartnav_msgs.msg import UserIdentity
 
 # 臉寬校正：2026-08-19 實測，使用者站 50 cm 時臉寬 66~74 px（取 69）
 # ★ 綁定這顆相機與這個人的臉，是粗估不是量測儀器
-CAL_D, CAL_W = 0.50, 69.0
+# ★ 2026-08-30 修正（CC-08）：舊值 CAL_W = 69.0 是 8/19 校正的，但
+#   驗證結果_20260829.md:489/536 當天實測 50 cm 的平均臉寬是 **142 px**，
+#   差兩倍 —— dist_by_face_m 整欄都錯，而且沒人發現。
+#   ⚠ 更重要的是：同一份報告 :538-546 列出「臉寬 x 距離」= 67.9 / 97.6 /
+#   85.6 / 77.8，**不是定值**，代表單點針孔模型在這裡根本不成立。
+#   所以下面這一欄只能當**單調的遠近指標**（142/95/59/36 px），
+#   不能當量尺用，也不要寫進報告當距離量測值。真正的距離用雷射那欄。
+CAL_D, CAL_W = 0.50, 142.0
 FAN = math.radians(12)          # 正前方 ±12 度扇區
 
 DEFAULT_CONDITIONS = [
@@ -71,6 +78,15 @@ class E1Matrix(Node):
         n = len(m.ranges)
         for i in range(n):
             a = m.angle_min + i * m.angle_increment
+            # ★ 2026-08-30 修正（CC-07）：N10 驅動硬寫 angle_min = 0、
+            #   angle_max = 2*pi（ldlidar/src/ros2_node/main.cpp:228-229），
+            #   所以 a 落在 [0, 2*pi) 而不是 [-pi, pi)。舊版直接 abs(a) > FAN，
+            #   於是「正前方偏右」那半邊的角度是 6.07~6.28 rad，abs() 恆大於
+            #   門檻而被整片丟掉 —— 名義上的正前方 ±12 度，實際只掃到 0~+12 度，
+            #   而且完全偏在一側。先正規化到 [-pi, pi) 再比較。
+            #   （本專案其他吃 /scan 的程式走 cos/sin，不受角度慣例影響，
+            #     只有這支用了 abs(a) 直接比較。）
+            a = (a + math.pi) % (2.0 * math.pi) - math.pi
             if abs(a) > FAN:
                 continue
             r = m.ranges[i]
@@ -94,6 +110,8 @@ class E1Matrix(Node):
             #   發布端是「同一個 key 節流 2 秒、key 一翻轉立刻發」，所以
             #   間隔約 2.0 s 的是穩定樣本、遠小於 2 s 的是**翻轉爆發樣本**。
             "t_mono": round(time.monotonic(), 3),
+            # ★ 2026-08-30（CC-09）：門檻逐列存檔，事後才分得出哪批是哪個門檻
+            "threshold": getattr(self, "threshold", float("nan")),
             "condition": self.condition,
             "frame": self.count,
             "user_name": m.user_name,
@@ -137,12 +155,23 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", type=int, default=20)
     ap.add_argument("--conditions", default="")
+    # ★ 2026-08-30 新增（CC-09）：CSV 沒有任何一欄記下當時生效的
+    #   recognition_threshold。而「門檻中途從 0.8 改成 0.70，導致前後不是
+    #   同一個實驗」正是這支工具 docstring 自己列的重收理由 —— 同一個坑
+    #   不能踩第二次。門檻在 user_auth_node 的 __init__ 就讀進去了
+    #   （param set 不生效，專案鐵則 2），所以這裡只能由操作者填、並存進 CSV。
+    ap.add_argument("--threshold", type=float, default=0.70,
+                    help="收資料當下 user_auth_node 生效的 recognition_threshold，"
+                         "會逐列存進 CSV。務必與啟動參數一致。")
     a = ap.parse_args()
     conds = ([c.strip() for c in a.conditions.split(",") if c.strip()]
              if a.conditions else DEFAULT_CONDITIONS)
 
     rclpy.init()
     n = E1Matrix(a.frames)
+    n.threshold = a.threshold
+    print(f"★ 本次記錄的 recognition_threshold = {a.threshold}"
+          f"（★ 這是你告訴我的值，工具無法自動讀取——與 user_auth_node 的啟動參數不符的話，整批資料就白收了）")
     print("等 /user_identity …（需要 相機 + face_embedding + user_auth）")
     t0 = time.time()
     while time.time() - t0 < 15.0 and n.count_publishers("/user_identity") == 0:
