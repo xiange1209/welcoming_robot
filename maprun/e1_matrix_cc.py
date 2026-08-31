@@ -90,6 +90,10 @@ class E1Matrix(Node):
         self.count += 1
         self.rows.append({
             "wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            # ★ 2026-08-30 新增（CC-05）：秒級的 wall_time 分不出取樣間隔。
+            #   發布端是「同一個 key 節流 2 秒、key 一翻轉立刻發」，所以
+            #   間隔約 2.0 s 的是穩定樣本、遠小於 2 s 的是**翻轉爆發樣本**。
+            "t_mono": round(time.monotonic(), 3),
             "condition": self.condition,
             "frame": self.count,
             "user_name": m.user_name,
@@ -108,8 +112,19 @@ class E1Matrix(Node):
               f"(≈{d_face:.2f} m)  雷射 {self.laser_front:.2f} m", flush=True)
 
     def collect(self, cond: str) -> int:
+        # ★ 2026-08-30 修正（CC-06）：main() 用 input() 等人站位，那段時間節點
+        #   完全不 spin，/user_identity 的訊息在 DDS 收端佇列累積（KEEP_LAST
+        #   depth 10）。舊版一進來就 collecting=True，於是**上一格站位或走位
+        #   途中的最多 10 則舊訊息會被記成新情境**（20 幀裡佔一半），
+        #   剛好把「距離 x 辨識率」的曲線抹平 —— 而那正是 E1 要量的東西。
+        #   （bbox 全 0 的「無人」訊息會被 _id_cb 濾掉，但走位途中臉還在畫面裡。）
+        #   先關著閘門空轉把佇列排乾，再開始收。
         self.condition = cond
         self.count = 0
+        self.collecting = False
+        _t_drain = time.time()
+        while time.time() - _t_drain < 0.4:
+            rclpy.spin_once(self, timeout_sec=0.05)
         self.collecting = True
         t0 = time.time()
         while self.count < self.frames and time.time() - t0 < 90.0:
@@ -138,6 +153,17 @@ def main() -> int:
         return 1
 
     print(f"共 {len(conds)} 格，每格 {a.frames} 幀。\n")
+    # ★ 2026-08-30（CC-05）：這裡的「幀」是 /user_identity 的**訊息**，不是影像幀。
+    print("  ⚠ 取樣偏差警告：/user_identity 的發布端有節流"
+          "（user_auth_node.py:694，identity_publish_interval 預設 2.0 s）——")
+    print("    同一個判定結果 2 秒才發一則，但**判定一翻轉就立刻發**（相機 15 FPS）。")
+    print("    於是「翻轉事件」被過度取樣，而翻轉依定義認出/未認出各半，")
+    print("    **每一格的認出率都會被系統性拉向 50%**。")
+    print("    要拿到逐幀樣本，重收時必須用 launch 參數覆寫：")
+    print("      identity_publish_interval:=0.0   ← ★ 在 __init__ 就讀進去了，")
+    print("                                          ros2 param set 不會生效（鐵則 2）")
+    print("    不重收的話，事後用 CSV 的 t_mono 欄把間隔遠小於 2 s 的列標成")
+    print("    「翻轉樣本」分開統計，才知道真實的穩定辨識率。")
     try:
         for i, c in enumerate(conds, 1):
             ans = input(f"[{i}/{len(conds)}] 請站到 **{c}**，"

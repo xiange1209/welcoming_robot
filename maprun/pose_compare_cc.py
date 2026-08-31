@@ -125,9 +125,18 @@ def main() -> int:
     cur_map = None
     try:
         ns = pathlib.Path.home() / ".smartnav" / "nav_state.json"
-        cur_map = json.loads(ns.read_text(encoding="utf-8")).get("current_map")
+        # ★ 2026-08-30 修正（CC-02）：寫檔端 map_service_cc_node.py:1347 用的鍵是
+        #   "last_active_map"。"current_map" 只是一個 latched topic 名，
+        #   json 裡根本沒有這個欄位 -> .get() 恆回 None -> 下面的地圖過濾
+        #   整條失效，而且不拋例外、不印警告。症狀是**家裡的地點會混進
+        #   學校的候選名單**，只有表頭那行「目前地圖 None」看得出來。
+        cur_map = json.loads(ns.read_text(encoding="utf-8")).get("last_active_map")
     except Exception:
         pass
+    if not cur_map:
+        print("  ⚠ 讀不到目前地圖（~/.smartnav/nav_state.json 缺 last_active_map）"
+              "—— 以下候選**跨所有地圖**，換過場地的話會混進舊場地的地點！",
+              flush=True)
     try:
         db = json.loads(wp.read_text(encoding="utf-8"))["waypoints_db"]
         for _, v in db.items():

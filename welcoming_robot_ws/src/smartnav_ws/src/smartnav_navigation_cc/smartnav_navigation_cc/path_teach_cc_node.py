@@ -430,6 +430,12 @@ class PathTeachNode(Node):
         self.declare_parameter("min_turning_radius_left", 1.05)     # 8/29 實測 1.030
         # 關掉就退回舊行為（左右都用 min_turning_radius）——出事時的退路
         self.declare_parameter("asymmetric_turning", True)
+        # ★ 2026-08-30 新增（T-7）：地圖歸屬檢查要不要 fail-closed。
+        #   True＝路徑或目前地圖任一沒有名稱就拒絕重播（安全側）。
+        #   ★ 這個值在守門處**即時讀取**，不快取 —— 所以 ros2 param set
+        #     真的會生效（本檔沒有 on_set_parameters callback，
+        #     快取的話就會踩到專案鐵則 2）。
+        self.declare_parameter("strict_map_check", True)
         # ── 路徑可行性檢查（2026-08-06）★ 門檻是 0.76 不是 0.80 ──
         #
         # 2026-08-06 實測：教導路徑 path_2702ea459c8b 的索引 44~49
@@ -2258,10 +2264,30 @@ class PathTeachNode(Node):
             return result
 
         meta = entry["meta"]
-        if self.current_map and meta.get("map_id") and meta["map_id"] != self.current_map:
+        # ★ 2026-08-30 修正（T-7）：舊版是 **fail-open** ——
+        #     if self.current_map and meta.get("map_id") and meta[...] != self.current_map
+        #   兩邊任一為空字串就整條守門略過。而 map_service_cc_node.py:288（啟動時）
+        #   與 :416（進建圖/SLAM 模式）發的就是**空字串**；在那個狀態下錄的路徑，
+        #   存進 meta 的 map_id 也是 ""，於是那條路徑**一輩子不受地圖檢查保護**。
+        #   後果：搬去新場地後，家裡錄的路徑會直接在新地圖上重播，而且不報錯——
+        #   座標系不同，車子會照著舊座標往牆裡開。
+        #   改成 fail-closed：任一邊沒有地圖名稱就擋下，並在訊息裡明講怎麼放行。
+        _path_map = meta.get("map_id") or ""
+        if self.get_parameter("strict_map_check").value and                 (not _path_map or not self.current_map):
             goal_handle.abort()
             result.success = False
-            result.message = (f"路徑「{meta.get('name')}」屬於地圖 {meta['map_id']}，"
+            result.message = (
+                f"路徑「{meta.get('name')}」的地圖標記是「{_path_map or '(空)'}」、"
+                f"目前地圖是「{self.current_map or '(空)'}」——有一邊沒有名稱，"
+                f"無法確認座標系相同，拒絕重播。★ 空字串通常代表現在是建圖/SLAM "
+                f"模式，或這條路徑當初就是在 SLAM 模式下錄的。確認過確實是同一張"
+                f"地圖再放行：ros2 param set /path_teach_cc_node strict_map_check false")
+            self.get_logger().error("⛔ " + result.message)
+            return result
+        if _path_map and self.current_map and _path_map != self.current_map:
+            goal_handle.abort()
+            result.success = False
+            result.message = (f"路徑「{meta.get('name')}」屬於地圖 {_path_map}，"
                               f"目前地圖是 {self.current_map}。座標系不同，不能重播")
             return result
 

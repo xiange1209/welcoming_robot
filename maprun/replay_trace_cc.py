@@ -146,10 +146,26 @@ def main() -> int:
             print(f"      終點位置誤差 {r.final_error_m:.3f} m、"
                   f"朝向誤差 {r.final_yaw_error_deg:+.1f}°")
         if n.rows:
-            ct = [abs(x["cross_track_m"]) for x in n.rows]
-            ct.sort()
-            print(f"      橫向偏離：平均 {sum(ct)/len(ct):.3f} m、"
-                  f"最大 {ct[-1]:.3f} m、95% {ct[int(len(ct)*0.95)]:.3f} m")
+            # ★ 2026-08-30 修正（CC-04）：cross_track_m 這一欄在來源端混了三種物理量——
+            #   following/slowing/avoiding 才是真的橫向偏離；
+            #   escaping 七個呼叫點全部硬傳 0.0（會把平均往下拉）；
+            #   blocked 傳的是 dir_margin＝車身外緣淨空（公尺），根本不是偏離。
+            #   舊版沒有任何 state 過濾就三者混算，而報告的 0.175 m 就是這樣算出來的。
+            #   脫困佔全程 22~62%，污染量很大。以下只用真正的循跡列。
+            TRACK_STATES = ("following", "slowing", "avoiding")
+            ct = sorted(abs(x["cross_track_m"]) for x in n.rows
+                        if x["state"] in TRACK_STATES)
+            n_skip = len(n.rows) - len(ct)
+            if ct:
+                print(f"      橫向偏離（只計 {'/'.join(TRACK_STATES)}，{len(ct)} 筆）："
+                      f"平均 {sum(ct)/len(ct):.3f} m、"
+                      f"最大 {ct[-1]:.3f} m、95% {ct[int(len(ct)*0.95)]:.3f} m")
+            else:
+                print("      橫向偏離：無有效取樣（全程都在 escaping/blocked）")
+            if n_skip:
+                print(f"      ★ 已排除 {n_skip} 筆非循跡列"
+                      f"（escaping 硬傳 0.0、blocked 傳的是車身淨空）——"
+                      f"舊版把它們一起算進去，數字會偏低")
             print(f"      最遠索引 {max(x['index'] for x in n.rows)}"
                   f" / {n.rows[-1]['total']}")
         print(f"CSV -> {p}  （{len(n.rows)} 筆）")
