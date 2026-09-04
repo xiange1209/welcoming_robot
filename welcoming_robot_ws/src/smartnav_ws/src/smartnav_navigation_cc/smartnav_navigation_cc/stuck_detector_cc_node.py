@@ -60,7 +60,32 @@ class StuckDetectorCcNode(Node):
         self.declare_parameter("cmd_vel_topic", "cmd_vel")
         self.declare_parameter("odom_topic", "odom_combined")
         # 指令速度超過這個值才視為「要求車子移動」
-        self.declare_parameter("cmd_threshold", 0.05)
+        #
+        # ★★ 2026-08-31：0.05 -> 0.10，因為 0.05 落在底盤的低速死區裡面 ★★
+        #
+        #   底盤實測死區約 **0.085 m/s**：指令低於它，馬達根本不轉
+        #   （2026-08-17 逐段實測，0.05/0.07/0.08 的位移都是 0.000 m，
+        #    見 交接_20260817_車子端現況.md:61）。
+        #
+        #   而本節點的判定是「指令 > cmd_threshold 而且 實測 < motion_threshold」，
+        #   所以 **0.05 ~ 0.085 這一段是保證誤判區**：
+        #       指令 0.06  -> moving_requested = True
+        #       底盤在死區 -> 輪子不轉 -> actual ~ 0 < 0.02 -> actually_moving = False
+        #       持續 4 秒  -> 判定卡住 -> **取消導航目標**
+        #   車子並沒有被卡住，只是被要求做一件硬體做不到的事。
+        #   nav2 很容易下這個區間的指令：接近終點減速、障礙旁限速、窄處轉彎。
+        #
+        #   ★ 時間線：這個門檻是 2026-07-29（commit 5c61be8）定的，
+        #     而死區是 8/17 才量出來的 —— 門檻比量測早三週，之後沒人回頭改。
+        #     README 記錄過「卡住偵測器記的是**指令值**，於是報成像被東西卡住」，
+        #     但那次只修正了對症狀的理解，沒有修這個數字。
+        #
+        #   0.10 的依據：與 path_teach_cc 的 `min_move_speed`（0.10）一致 ——
+        #   那是本專案已經確立的「低於此值就別指望車子會動」的地板。
+        #   語意變成「**指令快到應該要會動了，卻沒動**，才算卡住」。
+        #   ⚠ 死區會隨電壓上移（0.085 是 23.7 V 量的），低電量時即使 0.10
+        #     也可能不動 —— 那是「電量 >= 23 V 才開始實驗」這條規則的另一個理由。
+        self.declare_parameter("cmd_threshold", 0.10)
         # 實際速度低於這個值視為「幾乎沒動」
         self.declare_parameter("motion_threshold", 0.02)
         # 上述狀態持續多久才判定卡住。
