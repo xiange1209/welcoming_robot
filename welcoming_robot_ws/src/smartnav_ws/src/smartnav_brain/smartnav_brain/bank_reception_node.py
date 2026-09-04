@@ -268,10 +268,22 @@ class BankReceptionNode(Node):
         # ⚠ 誤認率至今沒有量過（資料庫長期只有一個人），有第二個人可以測時
         #   要重新檢視這個值。E2 實驗就是要補這一格。
         if ptype == "BLACKLIST" and msg.similarity < self.blacklist_min_confidence:
+            # ★★ 2026-08-31 修正：原本這裡直接 return，於是這位訪客**整段劇本
+            #    都被跳過** —— 不問候、不發事件、也不寫 visit_log。★★
+            #
+            #    現場看到的是「有人站在鏡頭前，機器人完全不出聲」，
+            #    那看起來就是人臉系統壞了，而不是「保守地不通報」。
+            #    到訪統計頁也會少一筆。
+            #
+            #    降級成一般訪客才符合本檔自己的既定原則
+            #    （「不可以把認不出來的人當成黑名單」）：
+            #    通報照樣抑制（誤報的代價最高，這點不變），
+            #    但問候與紀錄照常，劇本不會斷在這裡。
             self.get_logger().info(
                 f"黑名單命中但相似度 {msg.similarity:.3f} 未達 "
-                f"{self.blacklist_min_confidence:.2f}，不通報（避免誤報）")
-            return
+                f"{self.blacklist_min_confidence:.2f}，"
+                f"不通報（避免誤報），改以一般訪客接待")
+            ptype = "GUEST"
         if ptype == "VIP" and msg.similarity < self.min_confidence:
             return
 

@@ -76,16 +76,56 @@ def _guard_duplicate_stack(context, *args, **kwargs):
         return [LogInfo(msg=f"[bringup] 重複堆疊檢查跳過（{exc}）")]
 
     names = [n.strip() for n in out.splitlines() if n.strip()]
-    watch = ("scan_filter_cc", "stuck_detector_cc", "path_teach_cc",
-             "controller_server", "amcl", "hmi_server", "llm_service")
-    dup = sorted({w for w in watch if sum(w in n for n in names) > 0})
+
+    # ★★ 2026-08-31 修正：守衛要問的是「我等一下會不會**再起一份**」，
+    #    不是「這個節點在不在」。★★
+    #
+    #    舊版把 hmi_server 無條件列進監視名單，但 `hmi` 的預設值就是 false，
+    #    理由正是「Pi 上 smartnav-hmi.service 已經跑了一份」（見下面的宣告）。
+    #    於是那個設計預期的組態會自我否決：
+    #      服務有跑 -> ros2 node list 看得到 hmi_server -> 守衛 raise
+    #      -> **整支 demo.launch.py 拒絕啟動**，而 systemd 的
+    #         Restart=on-failure 會每 10 秒重試、每次都失敗。
+    #    llm_service 同理（llm:=false 時）。
+    #
+    #    正確判準：某個節點已經在跑，只有當**本次啟動也會起它**時才算衝突。
+    watch = {
+        "scan_filter_cc": "sensors",
+        "stuck_detector_cc": "sensors",
+        "path_teach_cc": "nav",
+        "controller_server": "nav",
+        "amcl": "nav",
+        "hmi_server": "hmi",
+        "llm_service": "llm",
+    }
+
+    def _on(arg):
+        return LaunchConfiguration(arg).perform(context).lower() in ("true", "1")
+
+    dup = sorted({w for w, arg in watch.items()
+                  if _on(arg) and any(w in n for n in names)})
     if dup:
         raise RuntimeError(
-            "偵測到已經有節點在跑：" + "、".join(dup) + "。" +
-            "統一 launch 會再起一份，兩份併存會汙染定位數據而且不會報錯。" + "\n" +
-            "  先停乾淨：~/maprun/stop_nav_cc.sh、~/maprun/kill_sensors_cc.sh" + "\n" +
-            "  或確定要併存：ros2 launch smartnav_bringup demo.launch.py force:=true")
-    return [LogInfo(msg="[bringup] ✓ 沒有既有節點，可以啟動")]
+            "偵測到已經有節點在跑，而本次啟動會再起一份："
+            + "、".join(dup)
+            + "。兩份併存會汙染定位數據而且不會報錯。"
+            + " 先停乾淨：~/maprun/stop_nav_cc.sh、~/maprun/kill_sensors_cc.sh；"
+            + " 或確定要併存：ros2 launch smartnav_bringup demo.launch.py force:=true")
+
+    # ★★ 2026-08-31：反向檢查 —— 沒有 HMI 就等於**整台車啞掉** ★★
+    #    車上沒有喇叭，語音輸出走的是平板瀏覽器的 speechSynthesis
+    #    （/speech_text -> HMI -> 瀏覽器唸出來）。所以「hmi:=false 而且
+    #    外面也沒有一份在跑」不是少一個附屬功能，是**發表當天沒有聲音、
+    #    平板也沒有畫面**，而且完全不會有任何錯誤訊息。
+    #    註：smartnav-hmi.service 這個檔**不在版本庫裡**，全樹只出現在
+    #    下面那句註解中 —— 重灌 Pi 之後很可能就沒有了。
+    msgs = [LogInfo(msg="[bringup] ✓ 重複堆疊檢查通過")]
+    if not _on("hmi") and not any("hmi_server" in n for n in names):
+        msgs.append(LogInfo(
+            msg="[bringup] ⛔ 沒有 HMI 在跑，而 hmi:=false —— 車上沒有喇叭，"
+                "語音輸出靠平板瀏覽器，這樣等於**沒有聲音也沒有畫面**。"
+                "請改帶 hmi:=true，或先確認 smartnav-hmi.service 有起來。"))
+    return msgs
 
 
 def generate_launch_description():
