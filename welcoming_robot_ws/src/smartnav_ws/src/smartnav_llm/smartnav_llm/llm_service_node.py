@@ -9,6 +9,7 @@
 
 import re
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import List, Any
@@ -220,6 +221,12 @@ class LLMServiceNode(Node):
         self.ollama_base_url = (
             self.declare_parameter("ollama_base_url", "http://192.168.137.1:11434").get_parameter_value().string_value
         )
+        # ★ 2026-08-31：等導航堆疊的**總期限**（見 _wait_for_services）。
+        #   等不到就降級啟動——對話一定可用，只有導航工具會在被呼叫時失敗。
+        #   設 0 或負數＝無限等（舊行為，不建議）。
+        self.services_wait_timeout_sec = float(
+            self.declare_parameter("services_wait_timeout_sec", 45.0)
+            .get_parameter_value().double_value)
         # 2026-08-10 實測換模型：orieg/gemma3-tools 是 11.8B，「你好」要 117 秒，
         # 而且會為了打招呼誤叫 query_datetime_tool（回你日期而不是回你好）。
         # qwen2.5:3b 同樣四題平均 4.1 秒（1.5~7.6，7.6 是模型冷載入那次），
@@ -450,13 +457,49 @@ class LLMServiceNode(Node):
             ("create_map", self.create_map_client),
             ("navigate", self.navigate_client),
         ]
+        # ★★ 2026-08-31 修正：加上**總期限**，等不到就降級啟動，不要卡死 ★★
+        #
+        #   舊寫法是 `while not client.wait_for_service(timeout_sec=2.0)` ——
+        #   那個 timeout_sec 只是**單次輪詢的間隔**，迴圈本身沒有出口。
+        #   上面 8/17 的註解已經記錄過這個坑的後果：某個 server 沒起來時
+        #   「整個 LLM 節點就卡在初始化、連『你好』都不會回」。
+        #   當時的解法是把 global_localization 移出清單，但**剩下六項全是
+        #   導航堆疊的相依**（map_service / waypoint_service / navigation_action），
+        #   而對話功能一個都不需要。
+        #
+        #   實際會踩到的情境：
+        #     - demo.launch.py 帶 nav:=false
+        #     - nav2 的 lifecycle activate 在 CPU 尖峰下逾時（本專案記錄過）
+        #     - 導航堆疊被單獨重啟
+        #   症狀都是「平板打字沒反應」，看起來像 LLM 壞了。
+        #
+        #   降級是安全的：ROS 的 client 會持續探索，server 晚點起來照樣能用；
+        #   真的沒起來時工具呼叫會自己逾時並回報（工具例外已於 cfcf124 修過
+        #   不會炸穿對話）。對話一定可用，比「全部或全不」好。
+        _wait_budget = float(self.services_wait_timeout_sec)
+        _deadline = (time.monotonic() + _wait_budget) if _wait_budget > 0 else float("inf")
+        _missing = []
         for service_name, client in services:
             while not client.wait_for_service(timeout_sec=2.0):
+                if time.monotonic() > _deadline:
+                    _missing.append(service_name)
+                    break
                 self.get_logger().warn(f"⌛ 等待服務 {service_name}...")
         for action_name, client in actions:
             while not client.wait_for_server(timeout_sec=2.0):
+                if time.monotonic() > _deadline:
+                    _missing.append(action_name)
+                    break
                 self.get_logger().warn(f"⌛ 等待動作 {action_name}...")
-        self.get_logger().info("✓ 所有基礎服務與動作已就緒")
+        if _missing:
+            self.get_logger().warn(
+                f"⚠ 等不到（{self.services_wait_timeout_sec:.0f} 秒）："
+                + "、".join(_missing)
+                + " —— **仍然啟動**，對話功能完全可用，"
+                + "只有需要這些的導航工具會在被呼叫時失敗。"
+                + " 導航堆疊晚點起來的話會自動接上，不必重啟本節點。")
+        else:
+            self.get_logger().info("✓ 所有基礎服務與動作已就緒")
 
     def _wait_for_future(self, future, timeout_sec: float) -> Any:
         """等待服務回應的輔助函式"""
