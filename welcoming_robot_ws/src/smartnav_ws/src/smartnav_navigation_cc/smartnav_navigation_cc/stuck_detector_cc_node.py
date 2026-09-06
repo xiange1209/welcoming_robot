@@ -117,6 +117,8 @@ class StuckDetectorCcNode(Node):
         self._cmd_speed = 0.0
         self._cmd_time = 0.0
         self._actual_speed = 0.0
+        # ★ 2026-09-06：odom 的新鮮度。0.0 代表「從來沒收到過」。
+        self._odom_time = 0.0
         self._suspect_since = None
         self._last_trigger = 0.0
         self._stuck = False
@@ -137,6 +139,7 @@ class StuckDetectorCcNode(Node):
     def _odom_cb(self, msg: Odometry) -> None:
         with self._lock:
             self._actual_speed = abs(msg.twist.twist.linear.x)
+            self._odom_time = time.monotonic()
 
     def _check(self) -> None:
         now = time.monotonic()
@@ -144,6 +147,34 @@ class StuckDetectorCcNode(Node):
             cmd = self._cmd_speed
             cmd_age = now - self._cmd_time
             actual = self._actual_speed
+            odom_age = (now - self._odom_time) if self._odom_time else None
+
+        # ★★ 2026-09-06：收不到 odom 就**不准判定卡住** ★★
+        #
+        #   `_actual_speed` 初值是 0.0，而唯一的寫入者是 _odom_cb。所以只要
+        #   odom 沒來，它就永遠是 0 -> actually_moving 恆為 False ->
+        #   導航中指令是連續的（cmd_age 那道守衛擋不住）-> 4 秒後判定卡住
+        #   -> **取消每一個導航目標**，而且症狀是「導航一直被莫名取消」。
+        #
+        #   這不是假想：本節點的 odom_topic 預設是 `odom_combined`，那是
+        #   `wheeltec_ekf.launch.py:43` 把 robot_localization 的
+        #   `/odometry/filtered` remap 出來的。**只跑 base_serial 而沒跑 EKF 時
+        #   這個話題根本不存在**（底盤驅動自己發的是 `odom`）。
+        #
+        #   判定「卡住」必須基於**觀測到車子沒動**，不能基於**沒有觀測**。
+        if odom_age is None or odom_age > 2.0:
+            if odom_age is None:
+                self.get_logger().warn(
+                    f"⚠ 從未收到 {self.get_parameter('odom_topic').value} —— "
+                    f"卡住偵測停用（沒有觀測就不能判定卡住）。"
+                    f"檢查 robot_localization 的 ekf_node 有沒有起來",
+                    throttle_duration_sec=10.0)
+            else:
+                self.get_logger().warn(
+                    f"⚠ odom 已 {odom_age:.1f} 秒沒更新 —— 卡住偵測暫停",
+                    throttle_duration_sec=10.0)
+            self._reset()
+            return
 
         # 指令太舊代表現在根本沒有人在下命令 (例如導航已結束)
         if cmd_age > 1.0:
