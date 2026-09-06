@@ -951,6 +951,24 @@ function selectTab(btn) {
 document.addEventListener("visibilitychange", () => {
   const onMap = (document.querySelector("#tabs button.active") || {}).dataset;
   const page = onMap && onMap.page;
+  // ★★ 2026-09-06：影像串流也要跟著停 ★★
+  //
+  // 這一行原本沒有，而它是這個節點**最貴的一條路徑**漏掉的那道閘。
+  // 漏掉的後果（整條鏈都確認過）：
+  //   平板停在迎賓頁（p-greet，展示時的常態）→ 螢幕關掉或切到別的 App
+  //   → selectTab 不會觸發，MJPEG 那條長連線還開著
+  //   → 後端 _video_viewers > 0，而 WebSocket 也還活著（pong 由網路層自動回，
+  //      JS 被節流不影響），clients_present() 為 true
+  //   → _video_wanted() 兩個條件都成立 → _client_tick 一直維持相機訂閱
+  //   → Pi 以 video_fps 持續搬運影格給**沒有人在看的螢幕**。
+  //
+  // 對照既有的地圖／系統心跳：那兩條 8/17 就已經接上 visibilitychange 了，
+  // 只有影像沒接——而實測帳上影像那條是 ~22%（見 face_embedding_node.py 的
+  // CPU 預算註解），比地圖與系統頁加起來還貴。
+  //
+  // updateStreams(null) 會讓所有分頁都比對不中，等於把每一路 src 都拿掉；
+  // 回到前景時用目前分頁再叫一次，會帶新的 timestamp 重新接上。
+  updateStreams(document.hidden ? null : page);
   setMapWatch(!document.hidden && (page === "p-map" || page === "p-teleop"));
   setSystemWatch(!document.hidden && page === "p-system");
   if (!document.hidden && page === "p-system") refreshSystem();
@@ -1463,7 +1481,16 @@ let sysTimer = null;
 function setSystemWatch(on) {
   if (sysTimer) { clearInterval(sysTimer); sysTimer = null; }
   // 只在系統開關頁而且分頁沒被隱藏時輪詢：Pi4 的 CPU 不該花在沒人看的畫面上
-  if (on) sysTimer = setInterval(refreshSystem, 2000);
+  //
+  // ★ 2026-09-06：2000 -> 4000。/api/system/status 是本站**最貴的一支端點**：
+  //   每次都要掃過整個 /proc（_local_ros_processes 逐一開 cmdline）、查 ROS 圖，
+  //   再對每一個 lifecycle 節點做一次**阻塞式 get_state 服務呼叫**
+  //   （nav2 全開時是 8~10 個）。
+  //   後端有 _nodes_cache 但 TTL 剛好也是 2.0 秒，跟這裡的 2000 ms 打平 ——
+  //   加上網路來回一定超過，所以那個快取**每一次都 miss**，等於沒有。
+  //   拉到 4000 讓快取真的擋得住（多台平板同時看時差別更大），
+  //   而節點上下線這種事延遲 4 秒看到完全不影響操作。
+  if (on) sysTimer = setInterval(refreshSystem, 4000);
 }
 
 async function refreshSystem() {
