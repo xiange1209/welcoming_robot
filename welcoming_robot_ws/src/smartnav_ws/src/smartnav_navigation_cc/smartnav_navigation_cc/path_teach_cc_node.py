@@ -174,6 +174,9 @@ class PathTeachNode(Node):
         #   詳細量測見 min_move_speed 的說明。
         self.declare_parameter("escape_bypass_speed", 0.10)
         self.declare_parameter("scan_topic", "scan")
+        # 掃描超過幾秒沒更新就當作「沒有掃描」（→ 障礙檢查一律保守側 → 煞停）。
+        # 見 _get_scan()。設 0 可停用這道守衛（不建議，只留給除錯）。
+        self.declare_parameter("scan_stale_sec", 2.0)
         # 錄製時要「聽」哪個話題判斷行進方向。
         # 這跟 cmd_topic 是**不同的東西**：cmd_topic 是重播時本節點自己
         # 發布的位置（cmd_vel_smoothed，之後還會經過 steering_trim 與
@@ -774,6 +777,7 @@ class PathTeachNode(Node):
         self.escape_dir_margin = float(p("escape_dir_margin_m").value)
         self.scan_still_m = float(p("scan_still_m").value)
         self.laser_x = float(p("laser_x_offset_m").value)
+        self.scan_stale_sec = float(p("scan_stale_sec").value)
         self.wall_keepout = float(p("wall_keepout_m").value)
         self.wall_push_max = float(p("wall_push_max_m").value)
 
@@ -794,6 +798,24 @@ class PathTeachNode(Node):
 
         self._scan: Optional[LaserScan] = None
         self._scan_lock = threading.Lock()
+        # ★★ 2026-09-06：掃描新鮮度。原本只有 self._scan，而它一旦被設過就
+        #   **永遠不會變回 None** —— 雷達停掉後，下面五個讀取點會繼續拿著
+        #   最後那一張快照當現況，而其中四個是安全檢查（車身外緣硬停、貼牆
+        #   否決、脫困弧線淨空）。
+        #
+        #   實機證據：`.ros/log` 裡 global_costmap 曾連續警告
+        #   `/scan_slam observation buffer has not been updated`，
+        #   從 1.58 秒一路數到 **10.58 秒**（2026-08-27 那次），
+        #   接著才是 TF 外推失敗。也就是說「掃描停了但節點都還活著」
+        #   在這台車上是**發生過的實況**，不是假想。
+        #
+        #   ★ 這與今天在 stuck_detector_cc 修的是同一個型態：
+        #     「沒有觀測」被當成「觀測到安全值」。
+        #   ★ 好消息是四個幾何檢查點對 None 本來就寫成保守側
+        #     （回 0.0 = 當作貼牆），所以只要讓過期的掃描「等於沒有」，
+        #     那四處**不必改任何邏輯**就自動繼承正確行為。
+        self._scan_time = 0.0
+        self._scan_stale_warned = False
 
         self.current_map = ""
         self._following = False
@@ -1025,6 +1047,40 @@ class PathTeachNode(Node):
     def _scan_cb(self, msg: LaserScan) -> None:
         with self._scan_lock:
             self._scan = msg
+            self._scan_time = time.monotonic()
+            if self._scan_stale_warned:
+                self._scan_stale_warned = False
+                self.get_logger().info("✅ 掃描恢復")
+
+    def _get_scan(self) -> Optional[LaserScan]:
+        """取當前掃描；**超過 scan_stale_sec 沒更新就當作沒有**。
+
+        所有讀取 self._scan 的地方一律走這支，不要直接讀欄位——
+        直接讀等於把「雷達停了」看成「雷達回報一切安全」。
+
+        門檻選 2.0 秒而不是更緊：N10 是 10 Hz，2 秒 = 漏掉 20 幀，
+        這是明確的失效而不是抖動。**不能設太緊**，因為回 None 會讓
+        幾何檢查回 0.0（當作貼牆）進而硬停 —— 而 log 裡已經有 57 次
+        「控制迴圈只跑到 N Hz，CPU 吃緊」，門檻太緊會在 CPU 尖峰時誤停。
+        """
+        if self.scan_stale_sec <= 0.0:          # 明確停用（除錯用）
+            with self._scan_lock:
+                return self._scan
+        with self._scan_lock:
+            scan = self._scan
+            age = time.monotonic() - self._scan_time if self._scan_time else None
+            stale = age is None or age > self.scan_stale_sec
+            if stale and scan is not None and not self._scan_stale_warned:
+                self._scan_stale_warned = True
+                warn = age
+            else:
+                warn = None
+        if warn is not None:
+            self.get_logger().error(
+                f"⛔ 掃描已 {warn:.1f} 秒沒更新（門檻 {self.scan_stale_sec:.1f}）——"
+                "從現在起所有障礙檢查一律當作『貼牆』（會煞停）。"
+                "先查雷達節點與 scan_filter_cc 還在不在")
+        return None if stale else scan
 
     def _scan_signature(self, bins: int = 60) -> Optional[List[float]]:
         """把當前掃描壓成 bins 個數字，用來判斷「車子到底有沒有真的移動」。
@@ -1048,8 +1104,7 @@ class PathTeachNode(Node):
         取每個扇區的**最小值**而不是平均：對單點雜訊穩健，
         而牆面距離正是我們要看的量。
         """
-        with self._scan_lock:
-            scan = self._scan
+        scan = self._get_scan()
         if scan is None or not scan.ranges:
             return None
         n = len(scan.ranges)
@@ -1611,8 +1666,7 @@ class PathTeachNode(Node):
 
         回傳 inf 代表這個方向淨空。
         """
-        with self._scan_lock:
-            scan = self._scan
+        scan = self._get_scan()
         if scan is None:
             # 沒有雷達資料時回 0 而不是 inf：寧可誤停也不要盲衝
             return 0.0
@@ -1716,8 +1770,7 @@ class PathTeachNode(Node):
           - `dir_margin`：行進方向那一側的餘裕（負 = 已經進到車身裡）
           - `any_margin`：**任何方向**的最小餘裕，用來抓轉彎外甩的側向刮擦
         """
-        with self._scan_lock:
-            scan = self._scan
+        scan = self._get_scan()
         if scan is None:
             return 0.0, 0.0                 # 沒資料當作貼牆，寧可保守
         # 車身矩形（雷達座標系；雷達在 base_footprint 前方 laser_x）
@@ -1775,8 +1828,7 @@ class PathTeachNode(Node):
         只取與車身縱向重疊的掃描點（前後各放寬 5 cm），因為遠處的牆
         不影響現在會不會刮到。
         """
-        with self._scan_lock:
-            scan = self._scan
+        scan = self._get_scan()
         if scan is None:
             return 0.0, 0.0                     # 沒資料時當作貼牆，寧可保守
         front, rear, half_w = 0.40, -0.09, 0.185    # 車身矩形（base_footprint 在後輪軸心）
@@ -1813,8 +1865,7 @@ class PathTeachNode(Node):
         這比直帶保守得多也精確得多——它問的是「車子照這個方向盤角度開，
         會不會撞到」，正是真正要回答的問題。
         """
-        with self._scan_lock:
-            scan = self._scan
+        scan = self._get_scan()
         if scan is None:
             return 0.0
         pts = []
@@ -2051,6 +2102,9 @@ class PathTeachNode(Node):
     def _lift_deadband(self, lin: float, ang: float) -> Tuple[float, float]:
         """把非零但低於底盤死區的線速度抬到 min_move_speed，角速度按同比例縮放。
 
+        ★★ 2026-09-06：呼叫端請改用 `_slow()` 做減速，不要讓乘出來的值掉進死區。
+           見 `_slow()` 的說明與實機 log 的證據。
+
         為什麼要縮 ω：阿克曼是 ω = v·κ。只把 v 抬高而讓 ω 不動，等於要求
         **更小的轉彎半徑**；韌體照 R = Vx/Vz 換算舵角，會打得比 min_turning_radius
         還緊，前輪刮地 —— 那正是教導路徑產生「車子做不到」那些段落的現象。
@@ -2080,6 +2134,47 @@ class PathTeachNode(Node):
                 f"{math.copysign(self.min_move_speed, lin):+.3f}（累計 {self._deadband_hits} 次）"
             )
         return math.copysign(self.min_move_speed, lin), ang * scale
+
+    def _slow(self, speed: float, factor: float) -> float:
+        """減速，但**不要減到死區裡去**。
+
+        ★★ 2026-09-06：這支是從實機 log 反推出來的（`.ros/log`，765 個 log）。
+
+        `_lift_deadband` 的警告「指令 N m/s 低於底盤死區，抬到 N」
+        在 log 裡出現 **1,918 則**，而那行是 `% 20 == 1` 才印一次
+        —— 也就是實際抬升約 **38,000 次**。而且每一則的數值都一模一樣：
+        `+0.090 -> +0.100`。
+
+        追下去發現不是規劃器輸出在死區邊緣抖動，而是**三個寫死的減速倍率
+        乘出來剛好落在死區裡**：
+
+            follow_speed 0.15 × 0.6（貼牆減速）  = 0.090  < 0.10  -> 被抬回 0.100
+            follow_speed 0.15 × 0.5（繞障減速）  = 0.075  < 0.10  -> 被抬回 0.100
+            follow_speed 0.15 × 0.5（橫移置中）  = 0.075  < 0.10  -> 被抬回 0.100
+
+        ★ 後果有兩層，第二層才是真正麻煩的：
+
+        1. **三個「慢」在物理上是同一個速度**。可用速度區間只有
+           [min_move_speed 0.10, follow_speed 0.15]，跨度 1.5 倍，
+           任何小於 0.667 的倍率都會塌到同一個值。
+           「繞障要比貼牆更慢」這個意圖表達不出來。
+
+        2. **警告失去意義**。`_lift_deadband` 的註解自己就寫著
+           「頻繁觸發代表規劃出來的速度整段都在死區裡，那是規劃/減速策略的
+           問題，不該只靠這裡硬抬」—— 作者留了字條，但沒有人回來處理，
+           於是這個警告被正常運作洗成背景雜訊 3.8 萬次。
+           真的有規劃問題時，那則警告已經沒有人會看了。
+
+        ★ **這個改動不改變任何行為**：抬升本來就把這些值變成 min_move_speed，
+        這裡只是把它寫明白，讓警告恢復成「真的出事了」的訊號。
+        要讓減速真正有差別，得提高 follow_speed（會改變行為，屬調參決策）。
+        """
+        slowed = speed * factor
+        if self.min_move_speed > 0.0 and slowed < self.min_move_speed:
+            # 原速本來就在死區以下時不要反而加速 —— 那種情況交給
+            # _lift_deadband 處理並記 log，因為它確實是非預期狀況。
+            return min(speed, self.min_move_speed)
+        return slowed
 
     # ==================================================================
     # 終點朝向對齊（三點調頭）
@@ -3085,7 +3180,7 @@ class PathTeachNode(Node):
                         self.get_logger().info(f"前方障礙，橫向偏移 {off * 100:+.0f} cm 繞過")
                     avoid_offset = off
                     state = "avoiding"
-                    speed *= 0.5
+                    speed = self._slow(speed, 0.5)   # 繞障（見 _slow：不要減進死區）
                     wait_started = 0.0
                 else:
                     # 繞不過去 -> 停下等
@@ -3157,8 +3252,12 @@ class PathTeachNode(Node):
                 wait_started = 0.0
                 if clearance <= slow_d:
                     # 線性減速：距離越近越慢，最低到 30%
+                    # ★ 2026-09-06：走 _slow 而不是直接乘 —— 0.15 × 0.3 = 0.045
+                    #   遠低於死區 0.10，實際會被 _lift_deadband 抬回去。
+                    #   包起來之後這條線性減速的實際範圍是 0.15 -> 0.10 然後打平，
+                    #   跟以前跑出來的一模一樣，只是現在**寫出來了**。
                     span = max(1e-3, slow_d - stop_d)
-                    speed *= max(0.3, (clearance - stop_d) / span)
+                    speed = self._slow(speed, max(0.3, (clearance - stop_d) / span))
                     state = "slowing"
                 else:
                     state = "following"
@@ -3186,7 +3285,7 @@ class PathTeachNode(Node):
                 wall_push = -min(self.wall_push_max, self.wall_keepout - sl)     # 往右推
             if wall_push != 0.0 and state == "following":
                 state = "slowing"
-                speed *= 0.6
+                speed = self._slow(speed, 0.6)   # 貼牆（見 _slow：不要減進死區）
                 if int(time.monotonic() * 2) % 4 == 0:
                     self.get_logger().info(
                         f"貼牆（左 {sl:.2f} m、右 {sr:.2f} m），"
@@ -3856,7 +3955,7 @@ class PathTeachNode(Node):
                 self.get_logger().info(
                     f"橫移置中：左 {s_left:.2f} / 右 {s_right:.2f} m，"
                     f"往{side_txt}橫移（前進打{side_txt} -> 回打反向）")
-                v_c = self.follow_speed * 0.5
+                v_c = self._slow(self.follow_speed, 0.5)   # 橫移置中（見 _slow）
                 for leg, (sgn, dur) in enumerate((
                         (away, self.centre_leg_sec),
                         (-away, self.centre_leg_sec * self.centre_back_ratio))):
