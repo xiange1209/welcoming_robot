@@ -35,6 +35,18 @@ import sys
 import tarfile
 import time
 
+# ★ 2026-09-09：Windows 主控台預設是 CP950，印 "✓" 會丟 UnicodeEncodeError。
+#   踩到的方式很惡劣：**包已經成功寫出來了**，卻在最後一行報告成功時崩掉，
+#   看起來像打包失敗。今天（實驗室測試日）差點因此以為沒打包成功。
+#   這裡在最前面就把輸出改成 UTF-8，errors="replace" 保證永遠不會因為
+#   印字而讓打包看起來失敗。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):    # 被重導向到不支援的串流時忽略
+            pass
+
 SKIP_DIR = {"__pycache__", ".git", "build", "install", "log", ".pytest_cache",
             "node_modules", ".vscode", "logs", "logs_0814"}
 SKIP_EXT = {".pyc", ".pyo", ".so", ".o", ".a"}
