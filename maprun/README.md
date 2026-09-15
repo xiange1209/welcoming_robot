@@ -4,6 +4,7 @@
 「我要回答什麼問題」。這份索引照問題分類，路徑寫全。
 
 ★ 規則兩條，違反過很多次：
+
 - **不要用 `pkill -f` / `pgrep -f`**。停節點用 `kill_node_cc.sh <package> <executable>`，
   查行程用 `pgrep -x`。理由寫在 `kill_node_cc.sh` 檔頭（踩過五次，每次都是 shell 自己被殺）。
 - **感測器一定要早於導航啟動**。反過來會進入救不回來的 mapping 死結。
@@ -13,7 +14,7 @@
 ## 每天開機的四支
 
 | 指令 | 做什麼 |
-|---|---|
+| --- | --- |
 | `run_sensors_cc.sh` | 底盤 + 雷達 + IMU 補償。**第一個跑** |
 | `run_nav_cc.sh` | 導航堆疊（`auto` / `mapping`） |
 | `run_asr_cc.sh` | 語音（會自己找音效卡編號、設 `Mic,0` 與 `Mic,1` 增益） |
@@ -27,7 +28,7 @@
 ## 車子現在在哪？定位對不對？
 
 | 工具 | 回答 |
-|---|---|
+| --- | --- |
 | `tools_0814/where_am_i.py <半徑> <角度>` | 「車子現在在哪個**已知地點**」。不在地點上就沒轍 |
 | `tools_0817/relocalize.py [--set] [--free360]` | 「AMCL 跟丟了，幫我在地圖上找回來」。★ 車被**人搬過**才加 `--free360` |
 | `pose_check_cc.py` | 「現在這個估計**對不對**」。不給正確答案，只給是非 |
@@ -39,7 +40,7 @@
 ## 車子為什麼不動 / 亂撞？
 
 | 工具 | 回答 |
-|---|---|
+| --- | --- |
 | `tools_0817/odom_feedback_check.py` | ★ **「指令速度 → 實際輪速 → EKF 速度」這條鏈斷在哪**。死區問題先用這支 |
 | `tools_0817/nav_trace.py <秒>` | 全程逐筆 CSV：指令 vs 實速，專抓 `/cmd_vel` 的**發布空窗** |
 | `steer_asym_check_cc.py` | 左右轉彎半徑不對稱（實測左 0.944 / 右 0.751） |
@@ -52,7 +53,7 @@
 ## 車子卡住了（現場救車）
 
 | 工具 | 做什麼 |
-|---|---|
+| --- | --- |
 | `tools_0817/unwedge.py` | 把楔在牆邊、規劃器已拒絕出手的車推開 |
 | `tools_0810/rescue.py` | 人工把貼右牆的車拉開 |
 | `tools_0810/turn_and_go.py` | 大廳掉頭 → 純前進開回起點 |
@@ -66,7 +67,7 @@
 ★ 先分清楚是**收音**還是**模型** —— `asr_breakdown.py` 就是為這件事寫的。
 
 | 工具 | 回答 |
-|---|---|
+| --- | --- |
 | `tools_0819/asr_breakdown.py` | ★ 「VAD 沒觸發」還是「辨識錯」。同時出 `cer_first` 與 `cer_best` |
 | `tools_0819/asr_cer.py` | 字錯率 CER 與即時率 RTF。★ README 的 25.6% 要跟 **best** 比 |
 | `tools_0814/asr_inject_cc.py` | 把 WAV 當麥克風重播。★ 重播前要先停 `voice_trigger` |
@@ -77,7 +78,7 @@
 ### 雙麥克風（Astra S 內建，卡號每次開機會變）
 
 | 工具 | 做什麼 |
-|---|---|
+| --- | --- |
 | `tools_0817/rec_dual_cc.sh <名稱> <秒>` | 錄雙聲道 |
 | `tools_0817/mic_snr_cc.py --fit <wav>` | 訓練消噪係數 |
 | `tools_0817/mic_validate_cc.py` | 跨場次驗證，決定要不要補增益 |
@@ -91,7 +92,7 @@
 ## 人臉
 
 | 工具 | 回答 |
-|---|---|
+| --- | --- |
 | `tools_0814/sync_lag.py` | ★ 時間戳落後多久 + 模擬固定佇列。「遮住鏡頭還是 VIP」用這支 |
 | `tools_0814/face_rate.py` | 管線每一段的速率，找註冊瓶頸 |
 | `tools_0814/face_verify_and_register.py` | 站定一次同時做「驗同步」與「註冊」 |
@@ -106,7 +107,7 @@
 ## LLM
 
 | 工具 | 回答 |
-|---|---|
+| --- | --- |
 | `tools_0814/llm_tool_bench.py` | 工具選擇準確率（只發 `user_text`，不碰動作） |
 | `tools_0814/offline_probe.py` | 不啟 ROS，直接拿節點的工具定義問 ollama |
 | `tools_0814/compare_prompts.py` | 離線比較不同 system prompt |
@@ -119,7 +120,7 @@
 ## 資源占用 / 效能
 
 | 工具 | 回答 |
-|---|---|
+| --- | --- |
 | `tools_0814/cpu_report.py <秒>` | 各節點 CPU／記憶體，直接輸出報告用的表格（E7） |
 | `tools_0810/proc_sampler.py` | 逐行程採樣：「哪些該留 Pi、哪些該搬筆電」 |
 | `tools_0810/cpu_sampler.py` | 每秒 CPU／記憶體／溫度寫 CSV |
@@ -146,12 +147,7 @@ maprun/
 ├── tools_0810/     走廊實跑、救車、資源採樣
 ├── tools_0814/     ASR 離線工具、人臉管線、LLM 對照、where_am_i
 ├── tools_0817/     雙麥克風、重新定位、軌跡記錄、脫困
-├── tools_0819/     ASR 拆解與 CER、端到端延遲、人臉距離
-├── logs/           所有節點的執行 log（nav_cc.log 是符號連結指向最新那份）
-├── logs_0814/      ★ ASR 兩個節點的 log 在這裡，不在 logs/
-├── maps/           建圖過程的分段地圖
-├── maps_backup/    地圖資料庫備份
-└── 舊版_勿用/       舊 smartnav_navigation 的啟動腳本，看 README.txt 就知道為什麼別碰
+└── tools_0819/     ASR 拆解與 CER、端到端延遲、人臉距離
 ```
 
 ★ `logs_0814/` 這個名字會誤導 —— 它裝的是**現在**的 ASR log，
