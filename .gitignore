@@ -40,11 +40,22 @@ id_rsa*
 # 人臉特徵在台灣《個人資料保護法》屬**特種個資**，一旦進了公開 repo
 # 就無法真正收回（git rm 只改變當前狀態，歷史裡永遠拿得到）。
 #
-# 現在還沒外洩，只是因為實機還沒跑過人臉註冊。
-# 跑過一次之後再 `git add .smartnav`，特種個資就直接上公開 repo 了。
+# ★★ 2026-09-18 更正：上一句原本寫「現在還沒外洩，只是因為實機還沒跑過人臉註冊」，
+#    **這個前提已經不成立** —— 9/17 實驗室當天透過 HMI 註冊了三個身分，
+#    `car_data_20260917_完整.tar.gz` 裡已有三組 `embeddings/*.npy` + `images/*.png`
+#    + `user_registry.json` + `visit_log.db`。
+#    實測確認下面這些規則目前**都蓋得到**，也查過 git 歷史沒有 commit 過，
+#    所以沒有外洩；但「還沒跑過所以安全」這道防線已經沒了，只剩規則本身。
 # ★ 同步 .smartnav 時請用具名路徑 add，不要整個目錄加。
 .smartnav/face_database/
 .smartnav/visit_log.db
+# ★★ 2026-09-18 補：Telegram bot token 的落點。
+#    `bank_reception_node.py:151` 定義 SECRETS_PATH = ~/.smartnav/secrets/bank_reception.yaml，
+#    而 2026-09-18 實測 `git check-ignore` **exit 1（沒有被擋）** ——
+#    上面的憑證規則只涵蓋 *.pem/*.key/*.crt/*.p12/.env，**不含 *.yaml**，
+#    而 `.smartnav/` 本身是有版控的（11 個檔受追蹤）。
+#    該檔目前尚未建立，所以還沒外洩；建立之後若 `git add .smartnav` 就會直接進 repo。
+.smartnav/secrets/
 *.db
 *.sqlite
 *.sqlite3

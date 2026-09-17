@@ -514,11 +514,26 @@
 </div>
 
 <div class="page" id="p-system">
+  <!-- ★★ 2026-09-18：測試情境。放在節點開關**前面**是刻意的 ★★
+       十顆獨立開關對應的是「節點」，但人在現場想的是「任務」。
+       兩者的對應關係散在程式碼與四份文件裡，而且有幾條反直覺
+       （測人臉要關導航、測語音要關人臉），漏關的代價是當場查不出來。
+       所以先給任務按鈕，下面的逐項開關留給要微調的時候。 -->
+  <div class="card" style="flex:1">
+    <h3>測試情境</h3>
+    <div class="meta" style="margin-bottom:10px; line-height:1.6">
+      按一下就把該開的開、該關的關。<b>不確定要開哪些的時候按這裡就對了。</b><br>
+      展開可以先看它會做什麼——有幾條「要關掉」的理由不直覺，值得看一眼。
+    </div>
+    <div class="list" id="scenlist"></div>
+  </div>
+
   <div class="card" style="flex:1">
     <h3>節點開關</h3>
     <div class="meta" style="margin-bottom:10px; line-height:1.6">
       綠燈＝執行中。啟動需要時間（導航堆疊約 60 秒），按下後請等狀態變綠再操作下一項。<br>
-      一般順序：<b>底盤 → 導航堆疊</b>；要相機避障就在中間加開相機。
+      一般順序：<b>底盤 → 導航堆疊</b>；要相機避障就在中間加開相機。<br>
+      ★ 相機有<b>兩種模式且互斥</b>（只有一台）：人臉要彩色、導航避障要深度。
     </div>
     <!-- ★ 2026-08-17：原本這裡寫 style="flex:none"，平板上**整頁捲不動**。
          `.list` 本身是 `overflow-y:auto; flex:1`（可捲），但行內 flex:none 把
@@ -1493,7 +1508,70 @@ function setSystemWatch(on) {
   if (on) sysTimer = setInterval(refreshSystem, 4000);
 }
 
+/* ── 測試情境（2026-09-18）─────────────────────────────
+   內容是靜態的（後端寫死的表），所以**只抓一次**就好 ——
+   /api/system/status 已經是本站最貴的端點，不要再多一條 4 秒輪詢。 */
+let scenLoaded = false;
+async function loadScenarios() {
+  const box = $("scenlist");
+  if (!box || scenLoaded) return;
+  const r = await api("/api/scenarios");
+  const list = (r && r.scenarios) || [];
+  if (!list.length) return;          // 後端是舊版就整區留白，不要畫出空殼
+  scenLoaded = true;
+  box.innerHTML = "";
+
+  list.forEach((s) => {
+    const d = document.createElement("details");
+    d.style.cssText = "border-bottom:1px solid var(--line); padding:8px 2px";
+
+    const sum = document.createElement("summary");
+    sum.style.cssText = "cursor:pointer; display:flex; gap:10px; align-items:center; list-style:none";
+    sum.innerHTML =
+      `<b style="flex:1">${s.label}</b>` +
+      `<span class="meta" style="font-size:12px">展開看細節</span>`;
+    d.appendChild(sum);
+
+    const body = document.createElement("div");
+    body.style.cssText = "padding:8px 2px 4px 6px";
+    body.innerHTML =
+      `<div class="meta" style="margin-bottom:6px">${s.why}</div>` +
+      (s.start.length
+        ? `<div style="font-size:13px; margin:3px 0"><b style="color:#8fd9c4">開：</b>${s.start.join(" → ")}</div>`
+        : "") +
+      // 「要關什麼」比「要開什麼」更難想到，所以給它自己一行而不是塞在括號裡
+      (s.stop.length
+        ? `<div style="font-size:13px; margin:3px 0"><b style="color:#ffb3b3">關：</b>${s.stop.join("、")}</div>`
+        : `<div class="meta" style="font-size:12px; margin:3px 0">不關任何東西</div>`) +
+      (s.note ? `<div class="meta" style="font-size:12px; margin-top:6px; line-height:1.55">${s.note}</div>` : "");
+
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; justify-content:flex-end; margin-top:8px";
+    const b = document.createElement("button");
+    b.className = "btn primary";
+    b.textContent = "套用這個情境";
+    b.onclick = async () => {
+      // 會動到很多單元，而且有些是「停止」—— 誤按的代價不小，所以要確認
+      const what =
+        (s.start.length ? `開：${s.start.join("、")}\n` : "") +
+        (s.stop.length ? `關：${s.stop.join("、")}\n` : "");
+      if (!confirm(`套用「${s.label}」？\n\n${what}\n停止會等它真的收乾淨，可能要幾十秒。`)) return;
+      b.disabled = true;
+      setText("sysmsg", `套用「${s.label}」…（停止要等，請不要重複按）`);
+      const rr = await post(`/api/scenarios/${s.key}`);
+      setText("sysmsg", (rr && rr.message) || "套用失敗");
+      b.disabled = false;
+      refreshSystem();
+    };
+    row.appendChild(b);
+    body.appendChild(row);
+    d.appendChild(body);
+    box.appendChild(d);
+  });
+}
+
 async function refreshSystem() {
+  loadScenarios();                   // 首次進系統開關頁時順手把情境抓回來
   const box = $("syslist");
   if (!box) return;
   const r = await api("/api/system/status");
@@ -1570,6 +1648,10 @@ async function refreshSystem() {
           `${pending.action !== "stop" ? "（導航堆疊約需 60 秒，請不要重複按）" : ""}</div>`
         : "") +
       (u.partial && !pending ? `<div class="meta" style="color:#ffcc66; font-size:12px">部分節點在跑，狀態不完整</div>` : "") +
+      // ★ 2026-09-18：相機兩種模式都是同一個 astra_camera_node，光看綠燈分不出
+      //   現在是彩色還是深度 —— 而那正是「人臉為什麼沒畫面」的答案所在。
+      //   後端用指令列裡的 launch 檔名比對出來，這裡照實顯示。
+      (u.mode ? `<div class="meta" style="color:#8fd9c4; font-size:12px">目前模式：${u.mode}</div>` : "") +
       // 前置條件不足時直接講清楚，不要讓人按了沒反應才去翻 log
       (u.blocked ? `<div class="meta" style="color:#ffb3b3; font-size:12px">⚠ ${u.blocked} —— 啟動會失敗</div>` : "");
 

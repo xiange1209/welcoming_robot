@@ -2794,12 +2794,45 @@ class HmiServerNode(Node):
             # 啟動後要靜止校準 IMU，時間較長
             "start_hint": "啟動後約 20 秒完成 IMU 零偏校準，期間車子必須靜止",
         },
+        # ★★ 2026-09-18：從「深度相機」一個按鈕改成「相機 + 兩個模式」★★
+        #
+        # 舊版只有深度避障那一種，而 `camera_face_only.launch.py`（人臉用的純彩色）
+        # **沒有任何啟動入口** —— kill_camera_cc.sh:46 一直知道怎麼殺它，
+        # 但 maprun 裡沒有腳本會起它，這張表裡也沒有對應單元。
+        # 後果是「想在平板上測人臉辨識」這件事從按鈕上做不到：
+        # 按得到「人臉辨識」節點，卻沒有東西餵它影像。
+        #
+        # 為什麼是「一個單元 + 兩個 variant」而不是兩個單元：
+        # **相機只有一台**，兩種模式都起 astra_camera_node，物理上互斥。
+        # 拆成兩個單元的話，起了深度模式會讓彩色模式也顯示執行中 ——
+        # 這正是導航堆疊 8 月踩過的坑（見下方 nav 的註解），不要再踩一次。
+        #
+        # detect 只留 astra_camera_node（兩種模式的共同必要條件，也是唯一的相機行程）。
+        # 深度模式多起的 depth_obstacle_cc 不列進 detect，否則人臉模式會被誤判成 partial。
+        # 目前是哪個模式由 variant_detect 比對指令列得出，另外回報成 mode。
         "camera": {
-            "label": "深度相機（避障點雲）",
-            "detect": ["astra_camera_node", "depth_obstacle_cc"],
-            "start": ["/home/user/maprun/run_camera_obstacle_cc.sh", "false", "160", "120", "5.0", "2"],
+            "label": "相機",
+            "detect": ["astra_camera_node"],
             "stop": ["/home/user/maprun/kill_camera_cc.sh"],
-            "start_hint": "160x120 深度 + 降頻點雲，約佔 30% CPU",
+            # ⚠ 換模式一定要先停：相機只有一台，而 system_control 在單元執行中時
+            #   會拒絕 start（避免重複啟動）。前端在執行中也只畫「停止」鈕，
+            #   所以實際操作就是「停止 → 按另一個模式」。
+            "start_hint": "兩種模式互斥（只有一台相機）。要換模式先按停止，再按另一個",
+            "variant_detect": {
+                "face": "camera_face_only.launch",
+                "obstacle": "camera_obstacle_cc.launch",
+            },
+            "variants": {
+                "face": {
+                    "label": "人臉模式（彩色）",
+                    "cmd": ["/home/user/maprun/run_camera_face_cc.sh", "15", "85"],
+                },
+                "obstacle": {
+                    "label": "避障模式（深度點雲）",
+                    "cmd": ["/home/user/maprun/run_camera_obstacle_cc.sh",
+                            "false", "160", "120", "5.0", "2"],
+                },
+            },
         },
         # 導航堆疊只有一個單元，但有三種啟動方式。
         #
@@ -2842,7 +2875,16 @@ class HmiServerNode(Node):
         "face": {
             "label": "人臉辨識",
             "detect": ["face_embedding"],
-            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_vision", "face_embedding"],
+            # ★ 2026-09-18：補上 enable_gpu:=false。
+            #   節點預設是 True（face_embedding_node.py 的 declare_parameter），
+            #   RPi4 沒有 CUDA，會先噴一串誤導性的 CUDA 警告才退回 CPUExecutionProvider。
+            #   demo.launch.py 一直有覆寫，只有這條面板路徑沒有 —— 從平板起的人臉節點
+            #   跟從 demo.launch.py 起的行為不一樣，而 log 看起來像壞了。
+            #   ⚠ 第 3 個位置 "face" 是 **log 檔名，不可省略**：
+            #     run_node_cc.sh 的 LOGNAME 吃 $3、參數從 "${@:4}" 才開始傳，
+            #     漏掉的話 --ros-args 會被當成 log 檔名吃掉，參數靜默失效且不報錯。
+            "start": ["/home/user/maprun/run_node_cc.sh", "smartnav_vision", "face_embedding",
+                      "face", "--ros-args", "-p", "enable_gpu:=false"],
             "stop": ["/home/user/maprun/kill_node_cc.sh", "smartnav_vision", "face_embedding"],
             "start_hint": "迎賓流程的觸發點。需要深度相機的彩色影像",
             "requires": {"module": "insightface"},
@@ -3162,6 +3204,110 @@ class HmiServerNode(Node):
             self._requires_cache[module] = cached
         return cached
 
+    # ------------------------------------------------------------------
+    # 測試情境（2026-09-18 新增）
+    # ------------------------------------------------------------------
+    # ★ 為什麼要這張表：使用者的原話是「我無法只用那些按鈕就來執行我這個專題的測試
+    #   —— 我想要測試人臉辨識與註冊，我不知道要開哪些」。
+    #
+    # 十個獨立開關對應的是**節點**，但人在現場想的是**任務**。
+    # 兩者之間的對應關係散在程式碼與四份文件裡，而且有幾條是反直覺的：
+    #   - 測人臉要關導航（skip_while_navigating 預設 true，導航中完全不推論）
+    #   - 測語音要關人臉（9/17 實測 703 次 input overflow，真因是人臉吃光 CPU）
+    #   - 建圖要關人臉（建圖+探索時 idle 只剩 0.4%，TF 出現空窗、目標全 abort）
+    # 這些「要關什麼」比「要開什麼」更難想到，而漏關的代價是當場查不出來。
+    #
+    # stop 先做、start 後做，且 start 照順序（感測器要 20 秒 IMU 校準、導航要 60 秒）。
+    SCENARIOS = {
+        "face": {
+            "label": "測人臉辨識 / 註冊",
+            "why": "只開彩色相機 + 人臉 + 認證。註冊與辨識都靠同一條鏈",
+            "stop": ["nav", "asr_chain"],
+            "start": ["camera:face", "face", "user_auth"],
+            "note": "不需要底盤與雷達。導航一定要關 —— 導航中人臉節點完全不推論，"
+                    "註冊採樣會逾時然後把剛註冊的人回滾刪掉",
+        },
+        "mapping": {
+            "label": "建圖",
+            "why": "底盤雷達 + 導航堆疊（建圖模式）。其餘全關，把 CPU 讓出來",
+            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera"],
+            "start": ["sensors", "nav:mapping"],
+            "note": "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
+                    "導航堆疊再約 60 秒。人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗",
+        },
+        "teach": {
+            "label": "教導路徑 錄製 / 重播",
+            "why": "底盤雷達 + 導航堆疊（定位模式）。path_teach 隨導航堆疊自動起",
+            "stop": ["face", "llm", "asr_chain", "camera"],
+            "start": ["sensors", "nav:localization"],
+            "note": "需要 map→base_footprint 的 TF，所以導航堆疊一定要起。"
+                    "換過地圖的話舊路徑會被擋下來，那是正確行為不是壞掉",
+        },
+        "voice": {
+            "label": "測語音 / LLM 對話",
+            "why": "語音輸入 + LLM。出聲走平板瀏覽器，車上沒喇叭",
+            "stop": ["face", "nav", "camera"],
+            "start": ["asr_chain", "llm"],
+            "note": "★ 人臉一定要關：9/17 實測音訊破碎 703 次，直接死因就是人臉推論"
+                    "吃光 CPU、音訊執行緒排不進去。另外平板要先在畫面上點一下解鎖朗讀",
+        },
+        "demo": {
+            "label": "完整迎賓故事線",
+            "why": "全鏈路。順序照 demo.launch.py 的分階段：感測 → 導航 → 視覺 → 語音 → LLM",
+            "stop": [],
+            "start": ["sensors", "nav:localization", "camera:face", "face",
+                      "user_auth", "bank_reception", "asr_chain", "llm"],
+            "note": "⚠ 這是唯一近乎全開的情境，CPU 帳已逼近 400%。"
+                    "全部起完約需 90 秒，請等狀態全綠再開始演",
+        },
+    }
+
+    def scenario_apply(self, key: str) -> tuple:
+        """套用一個測試情境：先停該停的，再依序啟動該開的。
+
+        回傳 (成功與否, 逐步結果的文字列表)。
+        ★ 任何一步失敗都**繼續往下做**並記錄 —— 半套用的狀態仍然比原地不動有用，
+          而且面板上每個單元的燈號會誠實反映實際情形，操作者看得出是哪一步沒成。
+        """
+        spec = self.SCENARIOS.get(key)
+        if spec is None:
+            return False, [f"未知的情境：{key}"]
+
+        steps = []
+        ok_all = True
+        for unit in spec["stop"]:
+            ok, msg = self.system_control(unit, "stop")
+            steps.append(f"{'✓' if ok else '✗'} 停止 {unit}：{msg}")
+            ok_all = ok_all and ok
+        for item in spec["start"]:
+            unit, _, variant = item.partition(":")
+            action = f"start:{variant}" if variant else "start"
+            ok, msg = self.system_control(unit, action)
+            steps.append(f"{'✓' if ok else '✗'} 啟動 {item}：{msg}")
+            ok_all = ok_all and ok
+        return ok_all, steps
+
+    def scenario_list(self) -> list:
+        """給前端畫按鈕用。把單元 key 換成看得懂的名稱。"""
+        out = []
+        for key, spec in self.SCENARIOS.items():
+            def _label(item):
+                unit, _, variant = item.partition(":")
+                u = self.SYSTEM_UNITS.get(unit, {})
+                base = u.get("label", unit)
+                if variant:
+                    base += f"（{u.get('variants', {}).get(variant, {}).get('label', variant)}）"
+                return base
+            out.append({
+                "key": key,
+                "label": spec["label"],
+                "why": spec["why"],
+                "note": spec.get("note", ""),
+                "start": [_label(i) for i in spec["start"]],
+                "stop": [_label(i) for i in spec["stop"]],
+            })
+        return out
+
     def system_status(self) -> list:
         """回報每個單元是否在跑"""
         procs = self._proc_cmdlines()
@@ -3182,10 +3328,19 @@ class HmiServerNode(Node):
                     if needle in cmd:
                         found.append(needle)
                         break
+            # ★ 2026-09-18：有些單元的「模式」看行程名分不出來（相機的彩色/深度
+            #   都是同一個 astra_camera_node），只能比對指令列裡的 launch 檔名。
+            #   不做的話面板只會說「相機在跑」，而操作者最需要知道的是**哪一種**在跑。
+            mode = ""
+            for vk, needle in (spec.get("variant_detect") or {}).items():
+                if any(needle in cmd for pid, cmd in procs if pid != mypid):
+                    mode = spec.get("variants", {}).get(vk, {}).get("label", vk)
+                    break
             units.append(
                 {
                     "key": key,
                     "label": spec["label"],
+                    "mode": mode,
                     "running": len(found) == len(spec["detect"]),
                     "partial": 0 < len(found) < len(spec["detect"]),
                     "hint": spec.get("start_hint", ""),
@@ -3740,6 +3895,23 @@ class HmiServerNode(Node):
             # 用 {action:path} 而不是 {action}，冒號才不會被路由切掉。
             ok, msg = self.system_control(unit, action)
             return JSONResponse({"success": ok, "message": msg}, status_code=200 if ok else 400)
+
+        # ★ 2026-09-18：測試情境。用 /api/scenarios 而不是 /api/system/scenario/... ——
+        #   上面那條是 {unit}/{action:path} 的萬用路由，會把 scenario 吃掉當成單元名。
+        @app.get("/api/scenarios", dependencies=admin_only)
+        async def api_scenarios() -> JSONResponse:
+            return JSONResponse({"scenarios": self.scenario_list()})
+
+        @app.post("/api/scenarios/{key}", dependencies=admin_only)
+        async def api_scenario_apply(key: str) -> JSONResponse:
+            # ★ 一定要丟到執行緒：停止走的是 subprocess.run(timeout=60)，
+            #   一個情境最多停 6 個單元 = 最壞 6 分鐘。在事件迴圈裡跑會把整個 HMI 凍住，
+            #   而平板那端看起來就像網頁當掉。
+            ok, steps = await asyncio.to_thread(self.scenario_apply, key)
+            return JSONResponse(
+                {"success": ok, "steps": steps, "message": "\n".join(steps)},
+                status_code=200 if ok else 400,
+            )
 
         @app.get("/api/waypoints", dependencies=admin_only)
         async def api_waypoints() -> JSONResponse:
