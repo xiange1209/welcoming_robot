@@ -12,6 +12,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob.glob(os.path.join("launch", "*.py"))),
+        (os.path.join("share", package_name, "config"), glob.glob(os.path.join("config", ".env"))),
         (os.path.join("share", package_name, "web"), glob.glob(os.path.join("web", "*.html"))),
     ],
     install_requires=["setuptools"],
