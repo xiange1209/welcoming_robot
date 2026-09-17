@@ -5,9 +5,10 @@
 """
 
 import logging
+import os
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -146,32 +147,75 @@ def get_default_logger(module_name: str) -> logging.Logger:
     return logger
 
 
-def get_model_path(model_type: str) -> Optional[Path]:
-    """取得模型文件路徑
+def model_path_candidates(model_type: str, override: Optional[str] = None) -> List[Path]:
+    """列出會依序嘗試的模型目錄，**不檢查存在與否**。
 
-    使用 ROS 2 功能包共享路徑搜尋模型文件
+    找不到模型時要把這張清單原樣印出來——否則現場只會看到「找不到」，
+    不知道到底找過哪裡。
+    """
+    cands: List[Path] = []
+    if override:
+        cands.append(Path(override).expanduser())
+    env_dir = os.environ.get("SMARTNAV_AUDIO_MODELS_DIR")
+    if env_dir:
+        cands.append(Path(env_dir).expanduser() / model_type)
+    try:
+        cands.append(Path(get_package_share_directory("smartnav_audio")) / "models" / model_type)
+    except Exception:
+        pass                       # 套件沒裝好時仍要能走後面的退路
+    cands.append(Path.home() / "models" / model_type)
+    return cands
+
+
+def get_model_path(model_type: str, override: Optional[str] = None,
+                   logger=None) -> Optional[Path]:
+    """取得模型目錄。找不到時**大聲失敗**並列出找過的每一條路徑。
+
+    ★★ 2026-09-18：改寫。原本只找套件 share 目錄，找不到就回 None ★★
+
+    9/17 新實驗室實測到的事故：`smartnav_audio` 套件裡**根本沒有 `models/` 目錄**
+    （`setup.py:14-18` 用 `glob.glob("models/**")` 掃套件原始碼，掃不到東西），
+    於是 `share/smartnav_audio/models/` 不存在，本函式對 asr 與 vad 都回 None。
+
+    後果是兩個**靜默失效**：
+      - `speech_recognizer_node`：只印一行 warning 就繼續，recognizer 從未建立。
+        節點正常啟動、正常訂閱 `/audio_in`、**永遠不吐結果**。
+      - `voice_trigger_node`：VAD 從不觸發，講話完全沒反應。
+    節點活著、話題接上、增益正確，外觀跟「沒人講話」一模一樣。
+
+    ★ 查過 `backup_20260828.tar.gz` 裡也沒有 `models/`，所以不是哪次事故弄壞的，
+      是**從來就缺**——表示在家能動的那幾次是靠別的方式找到模型。
+
+    這次的修法（車子端交接建議的 (b) 案）：
+      1. 多給幾條退路：呼叫端參數 > 環境變數 `SMARTNAV_AUDIO_MODELS_DIR`
+         > 套件 share > `~/models/<type>`。
+         Pi 上模型實體就在 `~/models/`，最後那條退路直接讓現行機器可用。
+      2. **找不到一律 `logger.error` 並印出找過的完整清單**，不再只是 warning。
+         呼叫端仍自行決定要不要 raise（見各節點）。
 
     Args:
         model_type: 模型類型 ('vad', 'kws', 'asr', 'tts')
+        override: 呼叫端指定的路徑（通常來自 ROS 參數），優先於一切
+        logger: 有給就用它，否則用模組預設 logger
 
     Returns:
-        Path: 模型路徑，如果找不到則回傳 None
+        Path: 模型目錄；全部找不到時回傳 None
     """
-    try:
-        # 取得 ROS 2 功能包共享目錄
-        pkg_share_dir = get_package_share_directory("smartnav_audio")
-        model_path = Path(pkg_share_dir) / "models" / model_type
-
-        if model_path.exists():
-            logger = get_default_logger(__name__)
-            logger.info(f"找到 {model_type} 模型目錄: {model_path}")
-            return model_path
-
-        return None
-    except Exception as e:
-        logger = get_default_logger(__name__)
-        logger.warning(f"無法取得模型路徑 ({model_type}): {e}")
-        return None
+    log = logger or get_default_logger(__name__)
+    cands = model_path_candidates(model_type, override)
+    for path in cands:
+        try:
+            if path.exists():
+                log.info(f"找到 {model_type} 模型目錄: {path}")
+                return path
+        except OSError:
+            continue               # 路徑不合法或權限不足，換下一條
+    tried = "\n".join(f"      {i + 1}. {p}" for i, p in enumerate(cands))
+    log.error(
+        f"✗ 找不到 {model_type} 模型目錄。已依序嘗試：\n{tried}\n"
+        f"    -> 可用 SMARTNAV_AUDIO_MODELS_DIR 指到模型所在的上層目錄，"
+        f"或用節點的 {model_type}_model_dir 參數直接指定。")
+    return None
 
 
 def validate_sample_rate(sample_rate: int) -> bool:

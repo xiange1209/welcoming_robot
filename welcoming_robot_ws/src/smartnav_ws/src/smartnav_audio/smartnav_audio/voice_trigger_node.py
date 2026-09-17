@@ -58,6 +58,13 @@ class VoiceTriggerNode(Node):
         # ============ 參數聲明 ============
 
         # 基本音訊參數
+        # ★ 2026-09-18：VAD 模型路徑可覆寫。留空 = 走預設搜尋順序
+        #   （SMARTNAV_AUDIO_MODELS_DIR -> 套件 share -> ~/models/vad）。
+        #   9/17 實測：套件裡根本沒有 models/ 目錄，VAD 一次都沒觸發過，
+        #   而症狀跟「沒人講話」一模一樣，現場很難分辨。
+        self.declare_parameter(
+            "vad_model_dir", "",
+            ParameterDescriptor(description="VAD 模型目錄，留空則自動搜尋（見 voice_utils.get_model_path）"))
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("chunk_size", 512)
         self.declare_parameter("device", -1)
@@ -209,7 +216,10 @@ class VoiceTriggerNode(Node):
         """
         # 初始化 VAD
         try:
-            vad_model_dir = get_model_path("vad")
+            vad_model_dir = get_model_path(
+                "vad",
+                override=self.get_parameter("vad_model_dir").get_parameter_value().string_value,
+                logger=self.get_logger())
             if vad_model_dir:
                 vad_model_path = vad_model_dir / "silero_vad.onnx"
                 if vad_model_path.exists():
@@ -250,7 +260,11 @@ class VoiceTriggerNode(Node):
                 else:
                     self.get_logger().warning(f"✗ VAD 模型文件不存在: {vad_model_path}")
             else:
-                self.get_logger().warning("✗ 未找到 VAD 模型目錄")
+                # ★ 2026-09-18：warning -> error。VAD 沒載入時整條語音鏈不動，
+                #   但節點照常啟動、麥克風照常錄音，外觀跟「現場很安靜」無法區分。
+                self.get_logger().error(
+                    "✗ VAD 模型未載入 —— 本節點會正常運行但**永遠不會觸發語音輸入**。"
+                    "請依上面的路徑清單確認，或設定 vad_model_dir 參數。")
         except Exception as e:
             self.get_logger().warning(f"✗ 載入 VAD 模型失敗: {e}")
 

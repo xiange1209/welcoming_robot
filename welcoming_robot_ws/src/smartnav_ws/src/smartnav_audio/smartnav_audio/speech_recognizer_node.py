@@ -146,6 +146,36 @@ class SpeechRecognizerNode(Node):
         self.declare_parameter(
             "echo_overlap_ratio", 0.8,
             ParameterDescriptor(description="重疊比例門檻。太低會把客人複述的話也丟掉"))
+        # ★★ 2026-09-18：bigram 抓不到「開頭對、後半爛掉」的回音 ★★
+        #
+        # 9/17 實驗室實測到的漏網之魚（asr_recognizer.log）：
+        #   機器人說：好的請問您遇到了什麼問題或者需要什麼幫助呢
+        #   ASR 聽成：好的請問您遇到的什麼工作的那麼睡到
+        #   共用 bigram 7/16 = 0.44 < 0.80  ->  判定「不是回音」，送進 LLM
+        #
+        # 這不是門檻調錯。ASR 把後半段整段聽爛時 bigram 本來就掉得很快，
+        # 而調低門檻會把「客人用機器人的詞回答」那類（0.60）一起誤殺，
+        # 正是 8/20 換成 bigram 要解決的問題。兩者無法用同一個門檻分開。
+        #
+        # 但**開頭**幾乎不爛：上例前 7 字逐字相同。原因是 TTS 一出聲麥克風
+        # 立刻收到最乾淨的一段，之後才被自身殘響與 VAD 切段拖垮。
+        # 所以補一條獨立規則：共同前綴夠長就算回音。
+        #
+        # 為什麼安全（人開口的方式跟複誦不一樣）：
+        #   機器人「請問您要辦理什麼業務呢」/ 客人「我要辦理業務」-> 共同前綴 0
+        #   機器人「您好歡迎光臨」        / 客人「您好我要開戶」-> 共同前綴 2
+        # 客人幾乎不會連續 6 個字複製機器人的句首。設 0 可關閉本規則。
+        self.declare_parameter(
+            "echo_prefix_chars", 6,
+            ParameterDescriptor(description="與機器人剛講的話共同前綴達這麼多字就算回音（抓 ASR 聽爛後半段的情況）；0 = 關閉"))
+
+        # ★ 2026-09-18：模型路徑可覆寫。留空 = 走預設搜尋順序
+        #   （SMARTNAV_AUDIO_MODELS_DIR -> 套件 share -> ~/models/asr）。
+        #   9/17 現場靠在 install/ 底下手動做軟連結才跑起來，
+        #   而 install/ 會被下一次 colcon build 清掉 —— 這個參數就是那個臨時解的正式版。
+        self.declare_parameter(
+            "asr_model_dir", "",
+            ParameterDescriptor(description="ASR 模型目錄，留空則自動搜尋（見 voice_utils.get_model_path）"))
 
         self.declare_parameter(
             "prefer_int8_model", True,
@@ -193,6 +223,8 @@ class SpeechRecognizerNode(Node):
             "echo_filter_sec").get_parameter_value().double_value
         self.echo_overlap = self.get_parameter(
             "echo_overlap_ratio").get_parameter_value().double_value
+        self.echo_prefix_chars = int(self.get_parameter(
+            "echo_prefix_chars").get_parameter_value().integer_value)
         self._robot_said = []      # [(時刻, 正規化後的字串)]
         self._echo_drops = 0
         self.prefer_int8_model = self.get_parameter(
@@ -345,7 +377,12 @@ class SpeechRecognizerNode(Node):
         """
         try:
             # 使用本地 ASR 模型
-            asr_model_dir = get_model_path("asr")
+            # ★ 2026-09-18：加上可覆寫路徑（見 voice_utils.get_model_path 的說明）。
+            #   參數留空時行為不變，仍走 share -> ~/models/asr 的搜尋順序。
+            asr_model_dir = get_model_path(
+                "asr",
+                override=self.get_parameter("asr_model_dir").get_parameter_value().string_value,
+                logger=self.get_logger())
             if asr_model_dir:
                 # ★★ 2026-08-17：優先載入 int8 版本 ★★
                 #
@@ -536,7 +573,14 @@ class SpeechRecognizerNode(Node):
                 self.recognizer = recognizer
                 self.stream = recognizer.create_stream()
             else:
-                self.get_logger().warning("未找到本地 ASR 模型目錄")
+                # ★★ 2026-09-18：warning -> error ★★
+                # 原本只印一行 warning 就繼續，`self.recognizer` 留在 None。
+                # 節點照樣啟動、照樣訂閱 /audio_in、**永遠不吐辨識結果**，
+                # 而 9/17 現場花了很久才發現是模型沒載入而不是麥克風有問題。
+                # get_model_path 已經把找過的路徑清單印出來了，這裡補一句後果。
+                self.get_logger().error(
+                    "✗ ASR 模型未載入 —— 本節點會正常運行但**永遠不會輸出辨識結果**。"
+                    "請依上面的路徑清單確認模型位置，或設定 asr_model_dir 參數。")
         except Exception as e:
             self.get_logger().error(f"初始化 ASR 模型失敗: {e}")
 
@@ -794,7 +838,26 @@ class SpeechRecognizerNode(Node):
                     f"⊘ 判定為回音（bigram 重疊 {ratio:.2f} >= {self.echo_overlap:.2f}）："
                     f"'{text}' ~ '{said}'")
                 return True
+            # ★ 第二條規則：開頭逐字相同（bigram 抓不到「後半段被聽爛」的回音）
+            #   ratio 已經算過且沒過門檻，走到這裡才檢查，所以不影響原本的判定。
+            if self.echo_prefix_chars > 0:
+                n = self._common_prefix_len(got, said)
+                if n >= self.echo_prefix_chars:
+                    self.get_logger().info(
+                        f"⊘ 判定為回音（共同前綴 {n} 字 >= {self.echo_prefix_chars}，"
+                        f"bigram 僅 {ratio:.2f}）：'{text}' ~ '{said}'")
+                    return True
         return False
+
+    @staticmethod
+    def _common_prefix_len(a: str, b: str) -> int:
+        """兩個字串從頭算起有幾個字相同。"""
+        n = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                break
+            n += 1
+        return n
 
     @staticmethod
     def _bigrams(s: str) -> set:

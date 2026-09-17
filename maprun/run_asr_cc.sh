@@ -60,7 +60,19 @@ echo "[run_asr] ALSA card=$CARD, sounddevice index=$IDX"
 #     arecord -D hw:$CARD,0 -f S16_LE -r 16000 -c 2 -d 15 /tmp/t.wav
 #     然後比較「安靜時的 RMS」與「講話時的 RMS」，差 8 dB 以上才夠 VAD 用。
 #   ★ 左聲道才是真的麥克風（實測比右聲道大 5 dB），分析時取 channel 0。
-GAIN="${ASR_MIC_GAIN:-66}"
+# ★★ 2026-09-18：預設 66 -> 60（依 9/17 新實驗室實測）★★
+#
+#   增益  RMS      峰值          削波取樣   VAD
+#   66   -20.8   +0.0 dBFS        581     觸發但辨識內容全亂   ← 家裡校準值，這裡過載
+#   60     —        —              —      ✓ 觸發，「哈嘍」正確  ← 採用
+#   48   -45.7   -26.8 dBFS         0     0 次觸發（原廠預設，太小）
+#
+# ★ 順帶更正一個文件錯誤：兩點解出的刻度是 **1.38 dB/單位**
+#   （18 個單位 = 24.9 dB），不是舊文件推測的 0.5 dB/單位。
+#
+# 目標值怎麼來的：對照模型自帶的 test_wavs（RMS -26.0／峰值 -9.7／削波 0），
+# 要留 8~10 dB 餘裕 -> 從 66 降 9 dB -> 約 6.5 個單位 -> 60。
+GAIN="${ASR_MIC_GAIN:-60}"
 amixer -c "$CARD" sset 'Mic',0 "$GAIN" cap >/dev/null 2>&1
 amixer -c "$CARD" sset 'Mic',1 "$GAIN" cap >/dev/null 2>&1
 echo "[run_asr] Mic,0 與 Mic,1 增益都設為 $GAIN (0-120)"
@@ -94,7 +106,21 @@ echo "[run_asr] speech_recognizer 已啟動（載入模型約需 10-25 秒）"
 #   ~/maprun/tools_0817/mic_snr_cc.py --fit 安靜.wav
 # 把印出來的係數存成 $COEF_FILE（逗號分隔）。
 # ⚠ 係數跟環境／麥克風增益綁在一起，換場地或改 amixer 增益要重訓。
-MIC_MODE="${ASR_MIC_MODE:-cancel}"
+# ★★ 2026-09-18：預設 cancel -> left（因為上面把增益從 66 改成 60）★★
+#
+# 這兩個改動是**綁在一起的，不能只改一個**：
+# DEFAULT_COEFFS 那組 FIR 係數是在「家裡、增益 66」下用 mic_snr_cc.py --fit 訓出來的，
+# 正如本檔下方那句警告寫的「係數跟環境／麥克風增益綁在一起」。
+# 換了場地又降了 6 個單位增益，那組係數已經不成立，硬用等於拿錯誤的模型去減噪。
+#
+# 9/17 實際跑通的組合就是 **增益 60 + left**，所以把預設對齊現場實況，
+# 現場不必再記得帶兩個環境變數。
+#
+# 要拿回 cancel 的 +8.2 dB SNR，得在新場地重訓：
+#   錄一段「安靜、沒有人講話」的雙聲道 wav（增益要用 60），然後
+#   ~/maprun/tools_0817/mic_snr_cc.py --fit 安靜.wav
+#   把係數存成 $COEF_FILE，再 ASR_MIC_MODE=cancel 啟動。
+MIC_MODE="${ASR_MIC_MODE:-left}"
 COEF_FILE="${ASR_MIC_COEFFS:-/home/user/maprun/tools_0817/mic_cancel_coeffs.txt}"
 MIC_ARGS="-p mic_mode:=$MIC_MODE"
 if [ "$MIC_MODE" = "cancel" ]; then

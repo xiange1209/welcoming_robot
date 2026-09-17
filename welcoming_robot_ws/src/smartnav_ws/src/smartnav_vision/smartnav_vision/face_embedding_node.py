@@ -9,7 +9,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rcl_interfaces.msg import ParameterDescriptor
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from sensor_msgs.msg import CompressedImage
 
 from std_msgs.msg import Bool
@@ -87,11 +87,26 @@ class FaceEmbeddingNode(Node):
         #     每 3 秒一幀 -> 人臉約 64%  -> 全機約 259%  ✓
         #
         # 兩段式：待機時全速（迎賓要反應快），導航中降頻（把核心讓給控制迴圈）。
-        # 預設 idle = 0.0（不限制）所以**沒有導航時行為完全不變**，不會有回歸。
+        #
+        # ★★ 2026-09-18：預設值 0.0 -> 1.0（依 9/17 實驗室實測）★★
+        #
+        # 原本預設 0.0（不限制），理由是「沒有導航時行為完全不變，不會有回歸」。
+        # 9/17 在新實驗室量到那個「不變」的行為其實是**預設組態即飽和**：
+        #
+        #   process_interval_sec = 0.0  ->  本節點 198% CPU、全機 idle 0.0%、load 14.7
+        #   process_interval_sec = 1.0  ->  本節點 127% CPU、偵測產出 0.97 Hz
+        #
+        # 關鍵是**降頻幾乎不損失偵測率**：單幀推論本來就要約 1004 ms
+        #   （`車子/人臉模型基準_20260819.md`，1.92 核心秒/幀），
+        #   上限本來就在 1 Hz 附近，0.0 多燒掉的 71% 核心買不到吞吐量。
+        #
+        # 而飽和是有代價的：同日 ASR 錄到 703 次 `input overflow`，
+        # 直接死因就是人臉推論吃光 CPU、音訊執行緒排不進去。
+        # 也就是說舊預設值是用「語音鏈壞掉」換「人臉快 0.03 Hz」。
         self.declare_parameter(
             "process_interval_sec",
-            0.0,
-            ParameterDescriptor(description="待機時兩幀之間最少間隔幾秒。0 = 不限制"),
+            1.0,
+            ParameterDescriptor(description="待機時兩幀之間最少間隔幾秒。0 = 不限制（★ 會吃滿 CPU 並餓死音訊）"),
         )
         self.declare_parameter(
             "process_interval_navigating_sec",
@@ -149,6 +164,34 @@ class FaceEmbeddingNode(Node):
         self._n_done = 0
         self._n_skip = 0
         self._last_report = time.monotonic()
+
+        # ★★ 2026-09-18：讓 `ros2 param set process_interval_sec` 真的生效 ★★
+        #
+        # 9/17 實驗室實測：`ros2 param set` 回報「Set parameter successful」，
+        # 節點行為卻完全不變 —— 因為上面三個值只在 __init__ 讀一次進快取。
+        # 唯一能看出沒生效的線索是啟動 log 那句「目前間隔 0.0 秒」。
+        #
+        # 同一個坑 `steering_trim_cc_node.py:214` 修過（註解還寫著
+        # 「★ 讓 ros2 param set trim_rad_per_m 真的生效 ★」），視覺節點漏了。
+        #
+        # 這幾個值在熱路徑上（每幀都讀），所以用回呼更新快取，不在影像回呼裡現讀。
+        # 實際效益：現場要在「人臉反應快」與「把核心讓給導航／音訊」之間切換時，
+        # 不必重啟節點 —— 重啟一次要重載 InsightFace 模型，現場等得很痛。
+        def _on_param(params):
+            for p in params:
+                if p.name == "process_interval_sec":
+                    self._interval_idle = float(p.value)
+                    self.get_logger().info(f"待機間隔更新為 {self._interval_idle:.2f} 秒")
+                elif p.name == "process_interval_navigating_sec":
+                    self._interval_nav = float(p.value)
+                    self.get_logger().info(f"導航中間隔更新為 {self._interval_nav:.2f} 秒")
+                elif p.name == "skip_while_navigating":
+                    self._skip_when_nav = bool(p.value)
+                    self.get_logger().info(
+                        f"導航中{'完全跳過' if self._skip_when_nav else '改用降頻'}")
+            return SetParametersResult(successful=True)
+
+        self.add_on_set_parameters_callback(_on_param)
 
         # 初始化臉部引擎
         try:
