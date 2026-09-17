@@ -91,8 +91,8 @@ echo "[run_asr] speech_recognizer 已啟動（載入模型約需 10-25 秒）"
 #   SNR 比 left 好 +8.2 dB，且係數的泛化跨過一次完整重開機驗證過
 #   （舊係數在重開機後新錄音上 -13.62 dB，重訓上界 -13.68 dB，只差 0.06 dB）。
 #
-#   ASR_MIC_MODE=cancel    ★ FIR 噪音消除（預設）
-#   ASR_MIC_MODE=left      只讀左聲道 = 2026-08-17 之前的行為【單聲道退路】
+#   ASR_MIC_MODE=cancel    FIR 噪音消除（★ 2026-09-18 起**不再是預設**，見下方說明）
+#   ASR_MIC_MODE=left      ★ 現行預設。只讀左聲道 = 2026-08-17 之前的行為
 #   ASR_MIC_MODE=average   兩聲道平均（實測 ΔSNR 只有 +0.14 dB，等於沒用）
 #   ASR_MIC_MODE=beamform  延遲相加，指向車子側面（實測 ΔSNR -0.07 dB）
 #
