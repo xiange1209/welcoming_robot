@@ -528,6 +528,23 @@
     <div class="list" id="scenlist"></div>
   </div>
 
+  <!-- ★ 2026-09-21：一鍵驗證。
+       跟上面的「測試情境」分開是刻意的——情境是「把東西開起來」，
+       驗證是「證明它真的在做事」。9/17 的教訓就是節點全部亮綠燈、
+       話題也都在，但 ASR 從沒建立過辨識器、降幀從未生效。 -->
+  <div class="card" style="flex:1">
+    <h3>一鍵驗證</h3>
+    <div class="meta" style="margin-bottom:10px; line-height:1.6">
+      按下去會實際<b>量</b>，不是讀設定值。<code>ros2 param get</code> 不算驗證。<br>
+      有兩項要輸入捲尺／量角器讀數，網頁沒有鍵盤輸入，那兩顆只會給你指令去終端機貼。
+    </div>
+    <div class="list" id="veriflist"></div>
+    <pre id="verifout" style="display:none; margin-top:10px; padding:10px;
+         background:var(--bg2); border:1px solid var(--line); border-radius:6px;
+         font-size:12px; line-height:1.5; white-space:pre-wrap; word-break:break-all;
+         max-height:420px; overflow:auto"></pre>
+  </div>
+
   <div class="card" style="flex:1">
     <h3>節點開關</h3>
     <div class="meta" style="margin-bottom:10px; line-height:1.6">
@@ -1570,8 +1587,64 @@ async function loadScenarios() {
   });
 }
 
+/* ── 一鍵驗證（2026-09-21）────────────────────────────
+   跟情境一樣是靜態表，只抓一次。 */
+let verifLoaded = false;
+async function loadVerify() {
+  const box = $("veriflist");
+  if (!box || verifLoaded) return;
+  const r = await api("/api/verify");
+  const list = (r && r.items) || [];
+  if (!list.length) return;          // 後端是舊版就留白，不要畫空殼
+  verifLoaded = true;
+  box.innerHTML = "";
+
+  list.forEach((v) => {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; gap:10px; align-items:flex-start; " +
+                        "padding:9px 2px; border-bottom:1px solid var(--line)";
+
+    const info = document.createElement("div");
+    info.style.cssText = "flex:1; min-width:0";
+    info.innerHTML =
+      `<div><b>${v.label}</b>` +
+      (v.runnable ? "" : ' <span class="meta">（要鍵盤輸入）</span>') +
+      `</div><div class="meta" style="line-height:1.55">${v.why}` +
+      (v.note ? `<br>${v.note}` : "") + `</div>`;
+
+    const btn = document.createElement("button");
+    btn.textContent = v.runnable ? "執行" : "看指令";
+    btn.className = v.runnable ? "" : "ghost";
+    btn.style.cssText = "flex:0 0 auto";
+    btn.onclick = async () => {
+      const out = $("verifout");
+      out.style.display = "block";
+      if (!v.runnable) {
+        // 網頁沒有 stdin，不假裝能跑——直接把指令給他去終端機貼
+        out.textContent = `這支要輸入現場量到的數值，請在終端機執行：\n\n  ${v.script}`;
+        return;
+      }
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = "執行中…";
+      out.textContent = `${v.label} 執行中，請稍候…\n（V1 光量幀率就要 12 秒）`;
+      // ★ 用 post() 不是 api(path,"POST")——api 的第二參數是 options 物件
+      const r2 = await post(`/api/verify/${v.key}`);
+      out.textContent = (r2 && r2.output) || "(沒有輸出或請求失敗)";
+      btn.disabled = false;
+      btn.textContent = old;
+      out.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    };
+
+    row.appendChild(info);
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+
 async function refreshSystem() {
   loadScenarios();                   // 首次進系統開關頁時順手把情境抓回來
+  loadVerify();                      // 驗證清單同樣只抓一次
   const box = $("syslist");
   if (!box) return;
   const r = await api("/api/system/status");

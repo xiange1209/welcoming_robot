@@ -3262,6 +3262,84 @@ class HmiServerNode(Node):
         },
     }
 
+    # ★ 2026-09-21 新增：一鍵驗證。
+    #   runnable=False 的那兩支要讀鍵盤輸入（人拿捲尺／量角器量到的值），
+    #   網頁沒有 stdin，所以只顯示指令讓你複製到終端機貼，不假裝能跑。
+    VERIFY_SCRIPTS = {
+        "v0": {
+            "label": "V0 開工前檢查",
+            "why": "電池、裝置、時鐘、五項修正有沒有部署到車上",
+            "script": "/home/user/maprun/verify/verify_0_preflight.sh",
+            "runnable": True,
+            "note": "這關沒過就別往下做，後面量到的數字都不可信",
+        },
+        "v1": {
+            "label": "V1 修正生效驗證",
+            "why": "量相機實際幀率、人臉 CPU、模型載入、麥克風增益",
+            "script": "/home/user/maprun/verify/verify_1_fixes.sh",
+            "runnable": True,
+            "note": "★ 先按「測人臉辨識 / 註冊」把相機與人臉開起來，再按這個。"
+                    "ros2 param get 不算驗證，這支量的是實際輸出",
+        },
+        "v2": {
+            "label": "V2 建圖後記錄",
+            "why": "確認地圖存了，並記下門口／走廊／最窄處三個淨寬",
+            "script": "/home/user/maprun/verify/verify_2_map.sh",
+            "runnable": False,
+            "note": "要輸入捲尺量到的寬度，請在終端機跑",
+        },
+        "v3": {
+            "label": "V3 舵機量測",
+            "why": "前輪離地打滿舵，量實際角度（不是校準）",
+            "script": "/home/user/maprun/verify/verify_3_steer.sh",
+            "runnable": False,
+            "note": "要輸入量角器讀數，請在終端機跑",
+        },
+        "v4": {
+            "label": "V4 循跡誤差統計",
+            "why": "當場算出今天重現幾趟的 95 百分位，不必等回電腦",
+            "script": "/home/user/maprun/verify/verify_4_replay.sh",
+            "runnable": True,
+            "note": "教導錄一條、重現 4 趟之後再按",
+        },
+        "collect": {
+            "label": "打包回傳",
+            "why": "把驗證結果與原始數據打包，並印出 scp 指令",
+            "script": "/home/user/maprun/verify/collect_data.sh",
+            "runnable": True,
+            "note": "★ 已排除 secrets 與 face_database，打包前會自我複查",
+        },
+    }
+
+    def verify_run(self, key: str) -> tuple:
+        """跑一支驗證腳本，把畫面輸出原封不動回傳給前端。"""
+        spec = self.VERIFY_SCRIPTS.get(key)
+        if spec is None:
+            return False, f"沒有這個驗證項目：{key}"
+        if not spec.get("runnable", True):
+            return False, ("這支要讀鍵盤輸入，網頁跑不了。請在終端機執行：\n"
+                           f"  {spec['script']}")
+        try:
+            # ★ 逾時放寬到 300 秒：V1 光量幀率就要 12 秒，V4 要掃全部 CSV。
+            r = subprocess.run([spec["script"]], capture_output=True, text=True,
+                               timeout=300, env={**os.environ, "TERM": "dumb"})
+            out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+            # 去掉 ANSI 色碼，平板上看才不會一堆亂碼
+            out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+            return r.returncode == 0, out.strip() or "(沒有輸出)"
+        except subprocess.TimeoutExpired:
+            return False, "逾時（300 秒）—— 腳本可能卡在等輸入，改到終端機跑"
+        except FileNotFoundError:
+            return False, f"找不到腳本 {spec['script']} —— 車上還沒有這批檔案，需要先 scp 上來"
+        except Exception as exc:                                   # noqa: BLE001
+            return False, f"執行失敗：{exc}"
+
+    def verify_list(self) -> list:
+        return [{"key": k, "label": v["label"], "why": v["why"],
+                 "runnable": v.get("runnable", True),
+                 "script": v["script"], "note": v.get("note", "")}
+                for k, v in self.VERIFY_SCRIPTS.items()]
+
     def scenario_apply(self, key: str) -> tuple:
         """套用一個測試情境：先停該停的，再依序啟動該開的。
 
@@ -3912,6 +3990,18 @@ class HmiServerNode(Node):
                 {"success": ok, "steps": steps, "message": "\n".join(steps)},
                 status_code=200 if ok else 400,
             )
+
+        # ★ 2026-09-21：一鍵驗證。同樣避開 /api/system/{unit}/{action} 萬用路由。
+        @app.get("/api/verify", dependencies=admin_only)
+        async def api_verify_list() -> JSONResponse:
+            return JSONResponse({"items": self.verify_list()})
+
+        @app.post("/api/verify/{key}", dependencies=admin_only)
+        async def api_verify_run(key: str) -> JSONResponse:
+            # 一樣丟執行緒——V1 量幀率就要 12 秒，在事件迴圈裡跑會把 HMI 凍住
+            ok, out = await asyncio.to_thread(self.verify_run, key)
+            return JSONResponse({"success": ok, "output": out},
+                                status_code=200 if ok else 400)
 
         @app.get("/api/waypoints", dependencies=admin_only)
         async def api_waypoints() -> JSONResponse:
