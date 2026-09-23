@@ -1,0 +1,302 @@
+@import "tailwindcss";
+
+/* ══════════════════════════════════════════════════════════════
+   設計語彙：iOS 風格的純色卡片
+
+   顏色取自 Apple 的 Dark Mode 系統色（System Blue/Green/Red…的
+   dark variant），而不是自創一組——在 iPad 上跟系統控制項並排時
+   才不會看起來像另一個世界的東西。
+
+   ══════════════════════════════════════════════════════════════ */
+@theme {
+  --color-ink: #05070a;
+  --color-ink-soft: #0b0f15;
+
+  --color-surface: #10151c;
+  --color-surface-strong: #161c25;
+  --color-outline: #8d9199;
+  --color-outline-variant: #43474e;
+  --color-well: oklch(1 0 0 / 10%);
+  --color-veil: oklch(1 0 0 / 16%);
+
+  --color-label: #f2f5f8;
+  --color-label-2: oklch(1 0 0 / 62%);
+  --color-label-3: oklch(1 0 0 / 38%);
+
+  --color-blue: #0a84ff;
+  --color-on-blue: #ffffff;
+  --color-green: #30d158;
+  --color-red: #ff453a;
+  --color-on-red: #ffffff;
+  --color-orange: #ff9f0a;
+  --color-gold: #ffd60a;
+  --color-purple: #bf5af2;
+  --color-teal: #40cbe0;
+
+  --radius-ios: 14px;
+  --radius-card: 20px;
+  --radius-sheet: 28px;
+
+  /* iOS 的「滑出／滑入」曲線。系統 sheet 用的就是這條：
+     起步快、尾段長時間緩慢收斂，看起來像有重量的東西停下來。 */
+  --ease-ios: cubic-bezier(0.32, 0.72, 0, 1);
+  /* 輕量控制項（按鈕回彈、分頁指示丸）用的微彈簧 */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
+}
+
+/* ── 基底 ──────────────────────────────────────────────── */
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-ink);
+    color: var(--color-label);
+    font-family: var(--font-sans);
+    /* 手機網址列會伸縮，100vh 比實際可視區高，內容會被切掉 */
+    min-height: 100dvh;
+    overscroll-behavior-y: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 數字一律等寬：狀態列的電壓、車速、CPU 每秒都在變，
+     比例字寬會讓整列左右抽動，像壞掉一樣。 */
+  .tnum,
+  input[type="number"] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-veil);
+    border-radius: 99px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* ── 元件層 ────────────────────────────────────────────── */
+@layer components {
+  .surface {
+    background: var(--color-surface);
+    border: 1px solid var(--color-outline-variant);
+    box-shadow: 0 8px 32px oklch(0 0 0 / 34%);
+  }
+
+  .surface-strong {
+    background: var(--color-surface-strong);
+    border: 1px solid var(--color-outline-variant);
+    box-shadow: 0 20px 60px oklch(0 0 0 / 50%);
+  }
+
+  /* 可點目標一律 ≥44pt（Apple HIG）。站著用平板時手會抖，
+     這是原版就踩過的坑，直接寫進基礎元件而不是靠 media query 補。 */
+  .tap {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  /* 按下去要「陷下去」。iOS 的按壓回饋是縮小而不是變色，
+     縮到 0.96 是系統控制項的實測值。 */
+  .pressable {
+    transition:
+      transform 0.22s var(--ease-spring),
+      background-color 0.2s ease,
+      opacity 0.2s ease;
+  }
+  .pressable:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  .field {
+    background: var(--color-surface);
+    border: 1px solid var(--color-outline-variant);
+    border-radius: var(--radius-ios);
+    padding: 10px 13px;
+    color: var(--color-label);
+    font-size: 15px;
+    font-family: inherit;
+    transition:
+      border-color 0.2s ease,
+      background-color 0.2s ease;
+  }
+  .field::placeholder {
+    color: var(--color-label-3);
+  }
+  .field:focus {
+    outline: none;
+    border-color: var(--color-blue);
+    background: var(--color-well);
+  }
+
+  /* 分段控制（iOS Segmented Control）：滑動的白色丸子 */
+  .segment {
+    position: relative;
+    display: flex;
+    padding: 3px;
+    border-radius: 12px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-outline-variant);
+  }
+
+  /* 原生 range 在深色背景下預設是看不清的灰條 */
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 28px;
+    background: transparent;
+    touch-action: none;
+  }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 99px;
+    background: var(--color-veil);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 24px;
+    height: 24px;
+    margin-top: -10px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 2px 8px oklch(0 0 0 / 45%);
+    cursor: grab;
+  }
+  input[type="range"]::-moz-range-track {
+    height: 4px;
+    border-radius: 99px;
+    background: var(--color-veil);
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 24px;
+    height: 24px;
+    border: none;
+    border-radius: 50%;
+    background: #fff;
+  }
+
+  /* 底部導覽列在窄螢幕要能橫向捲，但捲軸本身會破壞懸浮藥丸的外型 */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* iOS 開關 */
+  .ios-switch {
+    position: relative;
+    width: 51px;
+    height: 31px;
+    border-radius: 99px;
+    background: var(--color-veil);
+    transition: background-color 0.3s var(--ease-ios);
+    flex: none;
+  }
+  .ios-switch[data-on="true"] {
+    background: var(--color-blue);
+  }
+  .ios-switch::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 27px;
+    height: 27px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 2px 6px oklch(0 0 0 / 35%);
+    transition: transform 0.3s var(--ease-ios);
+  }
+  .ios-switch[data-on="true"]::after {
+    transform: translateX(20px);
+  }
+}
+
+/* ── 動畫 ──────────────────────────────────────────────── */
+@keyframes ios-fade-scale {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ios-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(24px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ios-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* 錄製中／急停確認用的漣漪 */
+@keyframes ios-ripple {
+  0% {
+    box-shadow: 0 0 0 0 oklch(0.65 0.22 25 / 45%);
+  }
+  100% {
+    box-shadow: 0 0 0 14px oklch(0.65 0.22 25 / 0%);
+  }
+}
+
+.anim-page {
+  animation: ios-fade-scale 0.32s var(--ease-ios) both;
+}
+.anim-sheet {
+  animation: ios-sheet-in 0.44s var(--ease-ios) both;
+}
+.anim-pulse {
+  animation: ios-pulse 1.4s ease-in-out infinite;
+}
+.anim-ripple {
+  animation: ios-ripple 1.3s ease-out infinite;
+}
+
+/* HIG：「減少動態效果」是輔助使用設定，不是偏好。
+   打開時仍要有狀態變化的提示，但不要有位移與縮放。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .anim-pulse {
+    animation: ios-pulse 1.4s ease-in-out infinite !important;
+  }
+}
