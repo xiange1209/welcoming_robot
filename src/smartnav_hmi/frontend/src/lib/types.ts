@@ -180,6 +180,29 @@ export interface SysUnit {
   variants?: SysVariant[];
 }
 
+/** 測試情境：一鍵把該開的開、該關的關（後端 SystemControlManager.SCENARIOS） */
+export interface Scenario {
+  key: string;
+  label: string;
+  why: string;
+  note?: string;
+  /** 會啟動的單元（後端已換成看得懂的名稱） */
+  start: string[];
+  /** 會先停掉的單元 */
+  stop: string[];
+}
+
+/** 一鍵驗證項目（後端 SystemControlManager.VERIFY_SCRIPTS） */
+export interface VerifyItem {
+  key: string;
+  label: string;
+  why: string;
+  note?: string;
+  /** false＝要讀鍵盤輸入（捲尺、量角器讀數），網頁跑不了，只能給指令 */
+  runnable: boolean;
+  script: string;
+}
+
 export interface HealthNode {
   name: string;
   ok: boolean;

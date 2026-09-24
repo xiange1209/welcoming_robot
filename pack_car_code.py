@@ -72,8 +72,13 @@ def want(p: pathlib.Path) -> bool:
 
 
 def collect():
+    # ★ 2026-09-24：原本收的是 welcoming_robot_ws/，但 9/23 目錄已攤平成 src/，
+    #   照舊寫法會打出「只有 maprun、沒有任何 ROS 套件」的包，而且不報錯——
+    #   上車 colcon build 建的是舊程式碼，卻以為已經更新了。
+    #   ⚠ 本機可能還殘留舊的 welcoming_robot_ws/（被 gitignore 的快取與備份），
+    #     這裡刻意不收它。
     targets = []
-    for d in ("welcoming_robot_ws", "maprun"):
+    for d in ("src", "maprun"):
         if pathlib.Path(d).is_dir():
             targets += [p for p in pathlib.Path(d).rglob("*")
                         if p.is_file() and want(p)]
@@ -84,13 +89,71 @@ def collect():
     return sorted(set(targets))
 
 
+def preflight() -> list:
+    """打包前的硬性檢查。回傳錯誤訊息清單，空的代表可以打包。
+
+    兩項都是「漏了不會報錯、上車才發現」的靜默失效，所以在這裡擋。
+    """
+    errs = []
+
+    # 1) frontier 是 git 子模組。沒 init 的話 src/frontier_exploration_ros2/ 是空目錄，
+    #    包照樣打得出來，但車上會少一整個套件。
+    sub = pathlib.Path("src/frontier_exploration_ros2")
+    if not (sub / "package.xml").exists():
+        errs.append("frontier 子模組沒初始化（src/frontier_exploration_ros2/ 是空的）\n"
+                    "      修法：git submodule update --init src/frontier_exploration_ros2")
+    else:
+        # ★ 子模組是獨立的 git repo，父 repo 的 .gitattributes（eol=lf）管不到它。
+        #   它吃的是系統層 core.autocrlf，而 Git for Windows 預設是 true
+        #   → 簽出後全變 CRLF（2026-09-24 實際發生）。
+        #   ★ 不要用下面通用的「改寫位元組」修法：那會讓子模組變成有修改的髒狀態。
+        #     要修 checkout 設定，讓它從上游的 LF blob 重新簽出。
+        crlf = [p for p in sub.rglob("*")
+                if p.is_file() and ".git" not in p.parts
+                and p.suffix in EXEC_TEXT and b"\r\n" in p.read_bytes()]
+        if crlf:
+            errs.append(f"frontier 子模組有 {len(crlf)} 個檔是 CRLF（Windows 的 autocrlf 害的，上游本身是 LF）\n"
+                        "      修法（只要做一次）：\n"
+                        "        git -C src/frontier_exploration_ros2 config core.autocrlf false\n"
+                        "        git -C src/frontier_exploration_ros2 rm -rq --cached .\n"
+                        "        git -C src/frontier_exploration_ros2 reset -q --hard")
+
+    # 2) 前端是 React，dist/ 被 gitignore。setup.py 把 frontend/dist/** 裝進 share，
+    #    沒建置的話 HMI 後端照跑、平板打開是一片空白。
+    fe = pathlib.Path("src/smartnav_hmi/frontend")
+    dist_index = fe / "dist" / "index.html"
+    if not dist_index.exists():
+        errs.append("前端還沒建置（找不到 frontend/dist/index.html）\n"
+                    "      修法：cd src/smartnav_hmi/frontend && npm ci && npm run build")
+    else:
+        # 改了 TSX 卻忘了重建 —— dist 比原始碼舊就擋下來
+        srcs = [p for p in (fe / "src").rglob("*") if p.is_file()]
+        newest = max((p.stat().st_mtime for p in srcs), default=0)
+        if newest > dist_index.stat().st_mtime:
+            stale = max(srcs, key=lambda p: p.stat().st_mtime)
+            errs.append(f"前端 dist 比原始碼舊（{stale.relative_to(fe)} 在建置之後又改過）\n"
+                        "      修法：cd src/smartnav_hmi/frontend && npm run build")
+    return errs
+
+
 def main() -> int:
     stamp = sys.argv[1] if len(sys.argv) > 1 else time.strftime("%Y%m%d")
     out = f"car_code_{stamp}.tar.gz"
 
+    if not pathlib.Path("src").is_dir():
+        print("✗ 找不到 src/ —— 請在 車子/ 目錄執行，並確認在 9/23 之後的分支上")
+        return 1
+
+    errs = preflight()
+    if errs:
+        print("✗ 打包前檢查沒過：")
+        for e in errs:
+            print("   ·", e)
+        return 1
+
     targets = collect()
     if not targets:
-        print("✗ 找不到 welcoming_robot_ws/ 或 maprun/ —— 請在 車子/ 目錄執行")
+        print("✗ 找不到 src/ 或 maprun/ —— 請在 車子/ 目錄執行")
         return 1
 
     hits, crlf, md_crlf = [], [], []
@@ -122,9 +185,16 @@ def main() -> int:
             print("   ", f, "->", h)
         return 1
 
+    def _mode(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+        # ★ Windows 檔案系統沒有執行權限位元，tarfile 會把 .sh 記成 0644，
+        #   解壓到車上就是 Permission denied。直接在包裡寫成 0755，
+        #   不靠人記得上車後 chmod +x。
+        ti.mode = 0o755 if ti.name.endswith(".sh") else 0o644
+        return ti
+
     with tarfile.open(out, "w:gz") as t:
         for p in targets:
-            t.add(p, arcname=str(p).replace("\\", "/"))
+            t.add(p, arcname=str(p).replace("\\", "/"), filter=_mode)
 
     md5 = hashlib.md5(pathlib.Path(out).read_bytes()).hexdigest()
     print(f"✓ {out}")
@@ -135,7 +205,17 @@ def main() -> int:
     if md_crlf:
         print(f"  （.md 帶 CRLF {len(md_crlf)} 個，無害不處理）")
     print()
+    print("── 筆電 ──")
     print(f"  scp {out} user@192.168.137.106:~/")
+    print()
+    print("── Pi ──（repo 的 src/ 對應 workspace 的 src/，所以分兩次解壓）")
+    print(f"  1) cd ~ && tar -xzf {out} --exclude='src/*'   # 先拿 maprun（含遷移腳本）")
+    print("  2) ~/maprun/verify/migrate_layout.sh            # ★ 只有第一次升結構要跑")
+    print(f"  3) cd ~/welcoming_robot_ws && tar -xzf ~/{out} src")
+    print("  4) colcon build --symlink-install && source install/setup.bash")
+    print()
+    print("  第 2 步漏掉的話，新舊兩份套件會同時在 src/ 底下，")
+    print("  colcon 報 Duplicate package names。")
     return 0
 
 
