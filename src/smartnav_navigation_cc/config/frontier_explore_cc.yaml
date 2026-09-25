@@ -1,9 +1,20 @@
 # =============================================================================
 # frontier_exploration_ros2 參數 - senior_akm 自動探索建圖
 # =============================================================================
-# 阿克曼底盤的關鍵差異：不能原地轉、最小轉彎半徑 0.8 m。
+# 阿克曼底盤的關鍵差異：不能原地轉。
 # 距離門檻若比轉彎直徑還小，規劃器一定回 "no valid path found"，
 # explorer 會不斷重選同一個 frontier 而空轉。
+#
+# ★★ 2026-09-24 重新對照 ★★
+#   本檔大部分數值是 7/28~7/29 照「最小轉彎半徑 0.8 m、reverse_penalty 1.05、
+#   inflation 0.22」調的，之後 nav2_senior_akm_cc.yaml 改成：
+#       Smac minimum_turning_radius 0.95（:907，迴轉直徑 1.9 m）
+#       reverse_penalty 2.5（:1017）、global inflation 0.55 / cost_scaling 3.5（:801-802）
+#   而實車 8/29 實測左 1.030 / 右 1.183（比規劃器還大）。
+#   **這個組合從來沒一起跑過探索**（8/19~9/15 的 21 份 nav log 裡 explorer 都只停在待機）。
+#   下面每個受影響的參數都重寫了註解；只有跟「卡住迴圈」邏輯直接綁定的三個值
+#   （suppression 的 threshold / timeout / no_progress）確定要改，其餘標成
+#   「待模擬驗證」，留給 smartnav_sim 調 —— 用算的拍板會重演 7/28 的走廊事故。
 # =============================================================================
 
 frontier_explorer:
@@ -102,6 +113,10 @@ frontier_explorer:
     # 這個值愈小 = 認為轉向愈慢 = 需要大幅轉向的目標時間成本愈高。
     # 0.12 讓「要掉頭才能到」的目標幾乎不可能勝出，
     # 符合這台車的物理限制：走廊 0.99 m、轉彎直徑 1.6 m，掉不了頭。
+    # ★ 2026-09-24：轉彎直徑現在是 1.9 m（規劃器 R 0.95），實車更大（R 1.03~1.18），
+    #   結論只會更成立，值不變。但注意上游評分是差速模型（|航向差|/wmax，
+    #   mrtsp_ordering.cpp:102-107），而且會被除以 sqrt(gain)（:141）——
+    #   大群集（例如幻影開口）仍可能壓過前方的小 frontier。待模擬驗證。
     max_angular_speed_wmax: 0.12
     sensor_effective_range_m: 1.5
 
@@ -122,6 +137,11 @@ frontier_explorer:
     # 0.9 m 仍大於車長 0.46 m 的兩倍，不會挑到貼在車頭的無意義目標。
     # 安全性不靠這個門檻把關，而是靠 collision_monitor 與 MPPI 的
     # consider_footprint 真實碰撞檢查 —— 激進但不會撞。
+    # ★ 2026-09-24：上面「reverse_penalty 降到 1.05」的前提已經不在（現在是 2.5，
+    #   規劃器不再樂意用多段倒車就位），0.9 也遠小於現在的迴轉直徑 1.9 m。
+    #   但上游實作裡 candidate_min_goal_distance 只決定「群集裡挑哪個點」，
+    #   沒有 >= 門檻的點就退回最近點（frontier_search.cpp:456-514），不會刪掉近的
+    #   frontier，所以單純調大效果有限。值暫不動，待模擬驗證。
     frontier_selection_min_distance: 0.9
     frontier_candidate_min_goal_distance_m: 0.9
     frontier_visit_tolerance: 0.5
@@ -141,6 +161,18 @@ frontier_explorer:
     # (實測 explorer 送 (7.14,1.04)、planner 連續數十次 no valid path)。
     # 配合 inflation_radius 降到 0.22，75 大致對應「膨脹帶外緣」，
     # 讓 explorer 與規劃器的可行性判斷一致。
+    #
+    # ★ 2026-09-24：上面的前提已經失效 —— global inflation 現在是 0.55 / cost_scaling 3.5。
+    #   重新換算（nav2 膨脹成本 252·exp(-k(d-0.205))，OccupancyGrid 刻度 1+97(c-1)/251）：
+    #       occ 75  ≈ 離障礙 0.28 m   ← 現值：比車的外接半徑 0.46 m 還近，
+    #                                    目標姿態本身就可能讓車頭撞牆，規劃器會失敗
+    #       occ 50  ≈ 離障礙 0.40 m
+    #       occ 40  ≈ 離障礙 0.46 m   （= 外接半徑）
+    #       0.99 m 走廊正中央 ≈ occ 36（global）/ 31（local，scaling 4.0）
+    #   看起來該降，但**降到 40 在 0.99 m 走廊中央只剩約 6 cm 寬的容許帶（兩側各 3 cm）**，SLAM 把走廊畫窄
+    #   幾公分就會把所有 frontier 濾光 —— 正是 7/28 那次「一啟動就沒有 frontier」。
+    #   現在搭配「第一次失敗就抑制」（下方 threshold 1），近牆的壞目標會很快被跳過，
+    #   所以先維持 75，列為模擬調參的第一順位。換算公式取自上游 nav2，本 repo 沒有原始碼。
     occ_threshold: 75
     # 6 -> 3：窄走廊的 frontier 本來就破碎，群集門檻太大會一併濾掉
     # 3 -> 2：雜物多的小房間，frontier 破碎得更厲害，門檻再放寬才不會漏掉
@@ -158,16 +190,35 @@ frontier_explorer:
 
     # 2 次規劃失敗就封鎖該區域。不可達的 frontier (例如在牆的另一側)
     # 沒有必要重試更多次。
-    frontier_suppression_attempt_threshold: 2
+    # ★ 2026-09-24：2 -> 1。失敗次數是按「目標點落在哪個 0.5 m 格」記的
+    #   （frontier_suppression.cpp:95-111, 328-351），但目標點是「離群集質心最近的
+    #   free 鄰格」（frontier_search.cpp:470-514），**地圖每更新一次就可能移到隔壁格，
+    #   計數跟著歸零**，於是門檻 2 常常永遠到不了，同一個到不了的點一試再試。
+    #   阿克曼車的失敗幾乎都是幾何性的（轉不過、掉不了頭），第二次也不會成功，
+    #   第一次失敗就抑制。偶發的失敗也只是抑制一段時間，之後還會再試。
+    frontier_suppression_attempt_threshold: 1
     frontier_suppression_base_size_m: 1.0
     frontier_suppression_expansion_size_m: 0.5
-    frontier_suppression_timeout_s: 90.0
+    # ★ 2026-09-24：90 -> 300。90 秒一到抑制就過期，同一個到不了的點會被再拿出來試，
+    #   每次又耗掉一輪「開過去＋無進展逾時」。改長之後，全部都被抑制的情況改由
+    #   map_service_cc 的停滯看門狗（exploration_stall_timeout_sec 240 秒）判定
+    #   「剩下的都到不了」並存圖結束 —— explorer 自己在全部被抑制時只會原地等
+    #   （stay），永遠不會發完成事件（上游 README:1525）。
+    frontier_suppression_timeout_s: 300.0
     # 窄處掉頭要來回切換好幾次，車子會有很長一段時間 distance_remaining
     # 幾乎沒變化。30 秒太短會把「正在努力掉頭」誤判成卡死而放棄這個 frontier。
     # 60 -> 25：配合關閉 goal_preemption，讓「試不動的目標」更快被放棄。
     # 窄處掉頭確實需要時間，但 25 秒仍足夠一次來回切換；
     # 真正不可達的目標不該讓車子卡兩分鐘。
-    frontier_suppression_no_progress_timeout_s: 25.0
+    # ★ 2026-09-24：25 -> 15。stuck_detector_cc 在探索期間已經不再自己取消目標
+    #   （它取消的話 explorer 不記失敗，會又選回同一點 —— 見 stuck_detector 檔頭），
+    #   改由這個看門狗負責。所以真的被矮障礙卡住時，車要推到這個逾時才停，不能太長。
+    #   15 秒也刻意比 nav2 的 progress_checker（20 秒，nav2 yaml:245-246）短：
+    #   讓 explorer 先取消並記失敗，而不是等 nav2 進入 BT 恢復、原地來回倒車
+    #   （7/28 使用者形容的「只有前後移而已」）。
+    #   代價：多段倒車就位超過 15 秒沒縮短距離會被放棄。實測窄處的多段就位本來就沒成功過，
+    #   待模擬驗證。看門狗每 timeout/4 檢查一次（frontier_explorer_node.cpp:614），最壞約 19 秒。
+    frontier_suppression_no_progress_timeout_s: 15.0
     frontier_suppression_progress_epsilon_m: 0.25
     # nav2 在 Pi 4 上要一段時間才全部 active，太早開始記錄失敗會污染 frontier 記憶
     frontier_suppression_startup_grace_period_s: 30.0

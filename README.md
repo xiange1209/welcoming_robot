@@ -8,28 +8,32 @@
 
 大學部畢業專題。WHEELTEC 阿克曼實車 ＋ 人臉辨識 ＋ 語音對話 ＋ 自主導航。
 
-> **這是 `車子` 分支——目前實際在實車上運行的完整系統。**
-> 專案總覽、硬體層說明與完整實測數據在 [`master` 分支](../../tree/master)。
-> 兩個分支的 git 歷史互相獨立，是同一專案的兩個層次。
+> **`master` 是唯一的開發主線**（2026-09-24 起；原本的 `車子` 分支已併入）——目前實際在實車上運行的完整系統。
+> `wheeltec` 分支是 2026-07 的舊線，保留作紀錄，不合併進 master。
 
 ---
 
-## 這個分支有什麼
+## 目錄
+
+repo 根目錄**就是** ROS 2 workspace（在這裡 `colcon build`）。
 
 ```
 .
-├── welcoming_robot_ws/          完整 ROS 2 workspace
-│   └── src/smartnav_ws/src/
-│       ├── smartnav_msgs/           介面定義（msg / srv / action）
-│       ├── smartnav_vision/         人臉向量擷取（InsightFace 512D）
-│       ├── smartnav_brain/          身份驗證、使用者管理、銀行迎賓劇本
-│       ├── smartnav_audio/          喚醒詞、ASR（sherpa-onnx）、雙麥克風降噪
-│       ├── smartnav_llm/            LLM 對話 Agent（LangChain + Ollama）
-│       ├── smartnav_navigation_cc/  ★ 導航重寫版：SLAM、AMCL、教導-重現路徑
-│       ├── smartnav_navigation/     舊版（模擬用，frame 不同不可混用）
-│       ├── smartnav_hmi/            平板網頁介面（FastAPI）＋ 瀏覽器 TTS 出聲
-│       └── smartnav_bringup/        demo.launch.py（311 行，五階段延遲啟動）＋ systemd
-├── maprun/                      建圖／導航／節點管理的操作腳本
+├── src/
+│   ├── smartnav_msgs/           介面定義（msg / srv / action）
+│   ├── smartnav_vision/         人臉向量擷取（InsightFace 512D）
+│   ├── smartnav_brain/          身份驗證、使用者管理、銀行迎賓劇本
+│   ├── smartnav_audio/          喚醒詞、ASR（sherpa-onnx）、雙麥克風降噪
+│   ├── smartnav_llm/            LLM 對話 Agent（LangChain + Ollama）
+│   ├── smartnav_navigation_cc/  ★ 導航重寫版：SLAM、AMCL、教導-重現路徑、自動探索
+│   ├── smartnav_navigation/     舊版（模擬用，frame 不同不可混用）
+│   ├── smartnav_hmi/            平板網頁介面（React 前端＋FastAPI）＋ 瀏覽器 TTS 出聲
+│   ├── smartnav_bringup/        demo.launch.py（311 行，五階段延遲啟動）＋ systemd
+│   ├── smartnav_sim/            （開發中）筆電 WSL 的 Gazebo 建圖模擬，不上車
+│   └── frontier_exploration_ros2/  ★ git 子模組（上游 frontier 探索）
+├── maprun/                      操作腳本（Pi 上位於 ~/maprun）
+├── cyclonedds.xml               DDS 設定（env.sh 先找 ~/，再找 repo 根目錄）
+├── pack_car_code.py             打包上車（實機更新的正式途徑）
 ├── .smartnav/                   地圖、地點、教導路徑資料
 └── *.md                         交接與分析文件（見下）
 ```
@@ -237,12 +241,19 @@ ros2 action send_goal /follow_taught_path smartnav_msgs/action/FollowTaughtPath 
 
 ## 快速開始
 
+**已經在跑的車：用打包更新**（`python pack_car_code.py`，它會印出完整的 Pi 端步驟）。
+下面的 clone 只適用於**全新的 Pi 或開發機**——`~/welcoming_robot_ws` 已經存在時 clone 會失敗。
+
 ```bash
-git clone -b 車子 https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws_repo
-cd ~/welcoming_robot_ws_repo/welcoming_robot_ws
-colcon build --symlink-install     # ★ 一律從 workspace 頂層建置
-source install/setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# ★ --recurse-submodules：frontier 探索是子模組，漏掉它 src/frontier_exploration_ros2 是空的
+git clone --recurse-submodules https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws
+cd ~/welcoming_robot_ws
+ln -s ~/welcoming_robot_ws/maprun ~/maprun      # 所有腳本都寫死 ~/maprun
+# 平板網頁的前端要先建置（dist/ 不進 git，沒建 = 平板白畫面）。
+# Pi 上沒有 Node.js 的話，在筆電建好再 scp 整個 dist/ 過來
+(cd src/smartnav_hmi/frontend && npm ci && npm run build)
+colcon build --symlink-install                  # ★ 一律從 workspace 頂層建置
+source install/setup.bash                       # 之後用 maprun/env.sh（會設好 CycloneDDS）
 ```
 
 ```bash

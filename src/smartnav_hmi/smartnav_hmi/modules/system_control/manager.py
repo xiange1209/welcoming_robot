@@ -230,13 +230,27 @@ class SystemControlManager:
             "note": "不需要底盤與雷達。導航一定要關 —— 導航中人臉節點完全不推論，"
             "註冊採樣會逾時然後把剛註冊的人回滾刪掉",
         },
+        # ★ 2026-09-24：原本只有一個叫「建圖」的情境，但它起的是 nav:mapping ——
+        #   run_nav_cc.sh mapping **false**，frontier explorer 根本不會啟動，
+        #   按了「開始建圖」車子也不會自己動（create_map 會退回遙控建圖）。
+        #   名稱看不出這件事，所以拆成兩個、名字寫清楚。
         "mapping": {
-            "label": "建圖",
-            "why": "底盤雷達 + 導航堆疊（建圖模式）。其餘全關，把 CPU 讓出來",
+            "label": "建圖（遙控）",
+            "why": "底盤雷達 + 導航堆疊（建圖模式）。人用遙控把環境走一遍。其餘全關，把 CPU 讓出來",
             "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera"],
             "start": ["sensors", "nav:mapping"],
             "note": "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
-            "導航堆疊再約 60 秒。人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗",
+            "導航堆疊再約 60 秒。人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗。"
+            "全綠後到「遙控建圖」分頁按「開始建圖」，遙控走完一圈再按「完成存檔」",
+        },
+        "auto_mapping": {
+            "label": "建圖（自動探索）",
+            "why": "同上，但啟動 frontier explorer，車子會自己找沒去過的地方開過去",
+            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera"],
+            "start": ["sensors", "nav:explore"],
+            "note": "⚠ 車子會自己跑動，旁邊要有人顧著。全綠後（約 80 秒）到「遙控建圖」分頁按「開始建圖」才會開始探索。"
+            "會在三種情況自動存圖：探索完成、4 分鐘沒有新區域（剩下的地方到不了）、30 分鐘上限。"
+            "想提早結束就在同一頁按「完成存檔」—— 不要用取消，取消會丟掉這張圖",
         },
         "teach": {
             "label": "教導路徑 錄製 / 重播",

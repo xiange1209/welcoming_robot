@@ -83,7 +83,9 @@ def collect():
             targets += [p for p in pathlib.Path(d).rglob("*")
                         if p.is_file() and want(p)]
     targets += list(pathlib.Path(".").glob("*.md"))
-    for extra in ("e1_results.csv",):
+    # cyclonedds.xml：解壓在 ~ 之下就落在 ~/cyclonedds.xml，正是 env.sh 找的位置。
+    # 2026-09-25 前沒收它 —— 換一片新 SD 卡照 README 部署，nav2 會因 participant 索引耗盡而崩
+    for extra in ("e1_results.csv", "cyclonedds.xml"):
         if pathlib.Path(extra).exists():
             targets.append(pathlib.Path(extra))
     return sorted(set(targets))

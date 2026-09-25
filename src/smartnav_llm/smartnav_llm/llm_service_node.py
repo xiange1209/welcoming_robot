@@ -563,7 +563,12 @@ class LLMServiceNode(Node):
                     return f"執行結果: 失敗, 詳細信息: 建立地圖請求被系統拒絕"
 
                 # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
-                action_result = self._wait_for_action_result(goal_handle, 500.0, "建立地圖")
+                # ★ 2026-09-25：500 -> 1920，與 HMI 的 constants.py "create_map" 同值。
+                #   這裡一逾時就送取消，而 map_service 收到取消會**丟掉這趟的圖**、還原舊圖。
+                #   500 秒比 map_service 的 exploration_timeout_sec（1800）短得多，
+                #   等於自動探索超過 8 分鐘、或遙控超過 8 分鐘，整趟就白跑（2026-09-25 審查抓到）。
+                #   1920 = 1800 秒探索上限 + 存圖與切回定位的收尾時間。
+                action_result = self._wait_for_action_result(goal_handle, 1920.0, "建立地圖")
 
                 id = action_result.result.map_info.map_id
                 name = action_result.result.map_info.map_name

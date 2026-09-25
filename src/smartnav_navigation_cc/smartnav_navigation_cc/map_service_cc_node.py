@@ -59,7 +59,7 @@ from rclpy.time import Time
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Bool, Empty, String
 from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
 from nav_msgs.msg import OccupancyGrid
@@ -99,7 +99,30 @@ class MapServiceCcNode(Node):
         self.declare_parameter("use_exploration", True)
         self.declare_parameter("nav2_lifecycle_manager", "lifecycle_manager_navigation_cc")
         # 自動探索的最長時間。舊版寫 1200 秒，實測整層樓跑不完就被砍掉。
+        # ★ 2026-09-24：這個值改了之後，HMI 的等待上限（smartnav_hmi core/constants.py
+        #   ACTION_TIMEOUTS["create_map"]）必須跟著大於它，否則 HMI 會先送取消。
+        #   舊版就是這樣：這裡改成 1800，HMI 還停在 480，從平板建圖 8 分鐘後必定白跑。
         self.declare_parameter("exploration_timeout_sec", 1800.0)
+        # ★ 2026-09-24：探索停滯看門狗。已知面積在這段時間內沒有長大
+        #   stall_min_gain_m2 以上，就判定「剩下的 frontier 都到不了」，存圖結束。
+        #
+        #   為什麼需要：frontier_explorer 在「所有 frontier 都被暫時抑制」時只會
+        #   原地等（stay）或回起點等（return_to_start），**兩者都不會發完成事件**
+        #   （上游 README:1525）；抑制又會過期，同一個到不了的 frontier 過期後
+        #   會被再試一次。阿克曼車在窄處有很多到不了的 frontier，於是探索幾乎
+        #   **永遠不會自然結束**，只能等逾時 —— 而逾時以前是不存圖的。
+        #
+        #   240 秒的依據（與 frontier_explore_cc.yaml 的關係）：
+        #     - 要比「一個 frontier 目標的嘗試」長好幾倍：開過去＋無進展逾時
+        #       （frontier_suppression_no_progress_timeout_s 15 秒），才不會在
+        #       explorer 還在換著試別的點、或正在繞遠路時就誤判
+        #     - 要比抑制逾時（frontier_suppression_timeout_s 300 秒）短：全部都被抑制時，
+        #       由這裡先判定結束存圖，而不是等抑制過期、把到不了的點再試一輪
+        #   正常探索時地圖每 3 秒更新一次（slam map_update_interval），四分鐘
+        #   完全沒長大 0.5 m² 是很強的訊號。0 表示關閉。
+        #   ★ 用 ROS 時鐘而不是牆鐘：模擬（use_sim_time）的 RTF 不是 1 時才不會提早觸發。
+        self.declare_parameter("exploration_stall_timeout_sec", 240.0)
+        self.declare_parameter("exploration_stall_min_gain_m2", 0.5)
         # 等 map -> base_footprint 出現的時間 (Pi 4 冷開機時 slam 第一張圖要好幾秒)
         self.declare_parameter("tf_ready_timeout_sec", 60.0)
         self.declare_parameter("lifecycle_transition_timeout_sec", 25.0)
@@ -119,6 +142,12 @@ class MapServiceCcNode(Node):
         self.use_exploration = bool(self.get_parameter("use_exploration").value)
         self.nav2_lcm = self.get_parameter("nav2_lifecycle_manager").value
         self.exploration_timeout_sec = float(self.get_parameter("exploration_timeout_sec").value)
+        self.exploration_stall_timeout_sec = float(
+            self.get_parameter("exploration_stall_timeout_sec").value
+        )
+        self.exploration_stall_min_gain_m2 = float(
+            self.get_parameter("exploration_stall_min_gain_m2").value
+        )
         self.tf_ready_timeout_sec = float(self.get_parameter("tf_ready_timeout_sec").value)
         self.save_map_timeout_sec = float(self.get_parameter("save_map_timeout_sec").value)
         self.amcl_refresh_period_sec = float(self.get_parameter("amcl_refresh_period_sec").value)
@@ -177,6 +206,13 @@ class MapServiceCcNode(Node):
         )
         self.current_map_pub = self.create_publisher(String, "current_map", latched)
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "initialpose", 10)
+        # ★ 2026-09-24：自動探索是否進行中，給 stuck_detector_cc 看。
+        #   探索期間卡住偵測器**不能自己取消導航目標**：frontier_explorer 只把
+        #   「它自己的無進展看門狗」發的取消記成失敗（上游
+        #   frontier_explorer_core_dispatch.cpp:1093-1102），外部取消一律當成正常
+        #   搶佔 —— 於是它 1 秒後又選回同一個到不了的點，形成無限迴圈。
+        #   latched：卡住偵測器晚起來也拿得到目前狀態。
+        self.exploration_active_pub = self.create_publisher(Bool, "exploration_active", latched)
 
         # frontier_explorer 的完成事件是 transient_local，訂閱當下就會收到上一輪
         # 留在那裡的舊事件，所以一定要用 _exploration_epoch 過濾。
@@ -283,9 +319,16 @@ class MapServiceCcNode(Node):
         self._exploration_done_epoch = -1
         # /finish_map 觸發旗標
         self._finish_requested = False
+        # 停滯看門狗：本輪探索目前已知的面積（m²），以及最後一次「有長大」的 ROS 時間。
+        # 只在 _map_info_callback 裡、探索進行中才更新。
+        self._stall_lock = threading.Lock()
+        self._known_area_m2 = 0.0
+        self._area_at_last_gain_m2 = 0.0
+        self._last_gain_time = None
 
         self._load_maps_db()
         self.current_map_pub.publish(String(data=""))
+        self.exploration_active_pub.publish(Bool(data=False))
 
         # 定期把位姿寫回 nav_state.json，這樣下次開機才接得回來。
         # 30 秒一次：夠頻繁到重啟不會差太多，又不會一直寫 SD 卡。
@@ -721,6 +764,12 @@ class MapServiceCcNode(Node):
         map_id = "map_" + uuid.uuid4().hex[:12]
 
         self.get_logger().info(f"收到建立地圖請求: {request.map_name} -> {map_id}")
+        # ★ 2026-09-25：逾時從「收到請求」起算，不是從「開始等探索結束」起算。
+        #   呼叫端（HMI、LLM 都是 1920 秒）從目標被接受就開始計時，而這之間還有
+        #   切換建圖模式（lifecycle 轉換＋等 TF，最壞好幾分鐘）與啟動探索。
+        #   起點不一致的話，準備時間一長，呼叫端會先逾時送取消 -> 這趟的圖被丟掉。
+        #   起點一致之後，1920 − 1800 = 120 秒才真的是留給存圖與切回定位的。
+        deadline = time.monotonic() + self.exploration_timeout_sec
 
         try:
             if not self._enter_mapping_mode():
@@ -728,9 +777,15 @@ class MapServiceCcNode(Node):
 
             self._finish_requested = False
             if not self._start_exploration():
+                # ★ 2026-09-25：START 被拒（例如 explorer 還卡在上一趟的 STOPPING）時，
+                #   _start_exploration 已經把 _exploration_active 設成 True。
+                #   舊版這裡直接 abort 不重置 -> 之後每一次 create_map／switch_map／delete_map
+                #   都被當成「建圖進行中」擋掉，只能重啟導航堆疊。
+                self._stop_exploration()
+                self._restore_after_failed_mapping()
                 return self._abort(goal_handle, result, "無法啟動探索服務，地圖建立失敗")
 
-            outcome = self._wait_for_mapping_done(goal_handle)
+            outcome = self._wait_for_mapping_done(goal_handle, deadline)
             self._stop_exploration()
 
             if outcome == "cancel":
@@ -741,13 +796,19 @@ class MapServiceCcNode(Node):
                 self._restore_after_failed_mapping()
                 return result
 
-            if outcome == "timeout":
-                # 逾時不代表沒東西可存，但沿用舊版語意回報失敗，
-                # 讓呼叫端知道這張圖不完整。
-                return self._abort(goal_handle, result, "地圖建立超時，已自動停止探索")
+            # ★ 2026-09-24：逾時與停滯都**存圖**，不再丟棄。
+            #   舊版逾時直接 abort 不存，而 explorer 在阿克曼車上幾乎永遠不會自然完成
+            #   （見 exploration_stall_timeout_sec 的說明）—— 等於幾乎每一趟都白跑。
+            #   沒探索完的圖仍然是可用的圖：可以直接拿來導航已走過的區域，
+            #   或之後再遙控補完。所以照樣回報成功，只在訊息裡講清楚沒探索完。
+            #   （使用者主動取消仍然走上面的還原路徑 —— 那是明確的「不要這張」。）
+            note = {
+                "timeout": f"（探索逾時 {self.exploration_timeout_sec:.0f} 秒，已存下目前進度，可能有區域沒走到）",
+                "stalled": f"（探索停滯：地圖 {self.exploration_stall_timeout_sec:.0f} 秒沒有長大，已存下目前的地圖）",
+            }.get(outcome, "")
 
-            # ---- 探索完成，開始存檔 ----
-            self.get_logger().info("探索結束，準備存檔")
+            # ---- 探索結束（完成／逾時／停滯），開始存檔 ----
+            self.get_logger().info(f"探索結束（{outcome}），準備存檔")
             end_pose = self._current_robot_pose()
 
             if not self._save_map(map_id):
@@ -766,9 +827,9 @@ class MapServiceCcNode(Node):
             map_info.map_name = request.map_name
             result.map_info = map_info
             result.success = True
-            result.message = f'地圖 "{request.map_name}" 建立成功'
+            result.message = f'地圖 "{request.map_name}" 建立成功{note}'
             goal_handle.succeed()
-            self.get_logger().info(f"✓ 地圖建立成功: {map_id} ({request.map_name})")
+            self.get_logger().info(f"✓ 地圖建立成功: {map_id} ({request.map_name}){note}")
             return result
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"地圖建立發生例外: {exc}")
@@ -797,9 +858,13 @@ class MapServiceCcNode(Node):
             self.get_logger().error("回復定位模式失敗，留在建圖模式")
             self._enter_mapping_mode()
 
-    def _wait_for_mapping_done(self, goal_handle) -> str:
-        """等建圖結束，回傳 'done' / 'cancel' / 'timeout'"""
-        deadline = time.monotonic() + self.exploration_timeout_sec
+    def _wait_for_mapping_done(self, goal_handle, deadline=None) -> str:
+        """等建圖結束，回傳 'done' / 'cancel' / 'timeout' / 'stalled'
+
+        deadline：time.monotonic() 的絕對時間；沒給就從現在起算 exploration_timeout_sec
+        """
+        if deadline is None:
+            deadline = time.monotonic() + self.exploration_timeout_sec
         epoch = self._exploration_epoch
 
         while rclpy.ok():
@@ -814,6 +879,22 @@ class MapServiceCcNode(Node):
                 self.get_logger().info("收到 /exploration_complete，探索完成")
                 return "done"
 
+            # 停滯：explorer 沒有宣告完成，但地圖已經很久沒長大。
+            # ★ 2026-09-25：只陳述現象，不下原因 —— 最常見的是剩下的 frontier 這台阿克曼車
+            #   到不了，但 TF 空窗（CPU 不夠）、explorer 沒在動也會長得一模一樣。
+            #   分類交給 maprun/verify/verify_5_explore.sh report。
+            if self.use_exploration and self.exploration_stall_timeout_sec > 0:
+                stalled = self._stall_seconds()
+                if stalled is not None and stalled > self.exploration_stall_timeout_sec:
+                    with self._stall_lock:
+                        area = self._known_area_m2
+                    self.get_logger().warning(
+                        f"探索停滯：已知面積 {area:.1f} m² 已經 {stalled:.0f} 秒沒有長大 "
+                        f"{self.exploration_stall_min_gain_m2} m² 以上，結束探索並存下目前的地圖"
+                        "（原因用 verify_5_explore.sh report 分類）"
+                    )
+                    return "stalled"
+
             if time.monotonic() > deadline:
                 return "timeout"
 
@@ -825,6 +906,10 @@ class MapServiceCcNode(Node):
         """啟動自動探索；手動建圖模式下直接回 True"""
         self._exploration_epoch += 1
         self._exploration_active = True
+        with self._stall_lock:
+            self._known_area_m2 = 0.0
+            self._area_at_last_gain_m2 = 0.0
+            self._last_gain_time = None
 
         if not self.use_exploration:
             self.get_logger().info("未啟用自動探索，請用遙控把環境走一遍，完成後呼叫 /finish_map")
@@ -858,11 +943,14 @@ class MapServiceCcNode(Node):
             self.get_logger().error(f"探索服務拒絕啟動: {res.message}")
             return False
 
+        # 只有 explorer 真的在跑才叫卡住偵測器讓步；遙控建圖沒有導航目標，不必
+        self.exploration_active_pub.publish(Bool(data=True))
         self.get_logger().info("✓ 自動探索已啟動")
         return True
 
     def _stop_exploration(self) -> None:
         self._exploration_active = False
+        self.exploration_active_pub.publish(Bool(data=False))
         if not self.use_exploration:
             return
         if not self.control_exploration_client.service_is_ready():
@@ -1035,6 +1123,34 @@ class MapServiceCcNode(Node):
     def _map_info_callback(self, msg: OccupancyGrid) -> None:
         self._last_map_info = msg.info
         self._last_map = msg
+
+        # 停滯看門狗只在自動探索進行中才計算。遙控建圖沒有 explorer，人在開，
+        # 停下來看一看是正常的，不能被判成停滯而提早存圖。
+        if not (self._exploration_active and self.use_exploration):
+            return
+        # 已知面積 = 非 unknown(-1) 的格數 × 格面積。array.count 是 C 實作，
+        # 一張 400×400 的圖約 1 ms，slam 每 3 秒才更新一次，負擔可忽略。
+        res = msg.info.resolution
+        known = len(msg.data) - msg.data.count(-1)
+        area = known * res * res
+        now = self.get_clock().now()
+        with self._stall_lock:
+            self._known_area_m2 = area
+            if self._last_gain_time is None:
+                # 本輪第一張圖：從這裡開始計時，不從按下按鈕那刻起算 ——
+                # Pi 4 冷開機時 slam 的第一張圖可能要好幾秒。
+                self._area_at_last_gain_m2 = area
+                self._last_gain_time = now
+            elif area - self._area_at_last_gain_m2 >= self.exploration_stall_min_gain_m2:
+                self._area_at_last_gain_m2 = area
+                self._last_gain_time = now
+
+    def _stall_seconds(self) -> Optional[float]:
+        """距離最後一次「地圖有長大」過了幾秒（ROS 時鐘）；還沒收到第一張圖回傳 None"""
+        with self._stall_lock:
+            if self._last_gain_time is None:
+                return None
+            return (self.get_clock().now() - self._last_gain_time).nanoseconds / 1e9
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._last_scan = msg

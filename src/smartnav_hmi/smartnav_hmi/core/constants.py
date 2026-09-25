@@ -77,7 +77,13 @@ MAX_PHOTOS = 20
 # 這裡的值只在動作伺服器整個掛掉時才會用到，避免留下永不結束的執行緒
 # 這些值必須**大於**對應節點自己的逾時。小於的話 HMI 會先放棄等待
 ACTION_TIMEOUTS = {
-    "create_map": 480.0,  # 節點內建 400 秒
+    # ★ 2026-09-24：480 -> 1920。註解原本寫「節點內建 400 秒」，但 map_service_cc 的
+    #   exploration_timeout_sec 早就改成 1800 了 —— 違反了上面「必須大於節點逾時」這條規則，
+    #   從平板開始的自動建圖 8 分鐘後 HMI 就送取消，節點走取消分支還原舊地圖，
+    #   **這趟建的圖直接丟掉**。1920 = 1800 探索上限 + 存圖（save_map_timeout 25 秒）
+    #   + 切回定位模式（lifecycle 轉換各 25 秒）+ 餘裕。
+    #   以後改 exploration_timeout_sec 要同步改這裡。
+    "create_map": 1920.0,
     "global_localization": 260.0,  # 節點內建 200 秒
     "navigate": 340.0,  # 節點內建 300 秒（navigation_timeout_sec）
 }
