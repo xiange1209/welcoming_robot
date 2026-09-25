@@ -217,10 +217,13 @@ frontier_explorer:
     #   讓 explorer 先取消並記失敗，而不是等 nav2 進入 BT 恢復、原地來回倒車
     #   （7/28 使用者形容的「只有前後移而已」）。
     #   代價：多段倒車就位超過 15 秒沒縮短距離會被放棄。實測窄處的多段就位本來就沒成功過，
-    #   待模擬驗證。看門狗每 timeout/4 檢查一次（frontier_explorer_node.cpp:614），最壞約 19 秒。
+    #   待模擬驗證。看門狗週期 = clamp(timeout/4, 0.25, 1.0) 秒（frontier_explorer_node.cpp:613-616），
+    #   15 秒時被夾成每 1 秒一次，最壞約 16 秒（9/25 更正：原本寫「每 timeout/4、最壞 19 秒」是錯的）。
     frontier_suppression_no_progress_timeout_s: 15.0
     frontier_suppression_progress_epsilon_m: 0.25
-    # nav2 在 Pi 4 上要一段時間才全部 active，太早開始記錄失敗會污染 frontier 記憶
+    # nav2 在 Pi 4 上要一段時間才全部 active，太早開始記錄失敗會污染 frontier 記憶。
+    # ★ 上游是**每次 START 都重算**寬限期（dispatch.cpp:230-238），期間看門狗不動作、失敗不記。
+    #   stuck_detector_cc 的 defer_grace_sec 必須跟這裡同值（9/25）：寬限期內它照舊取消，過了才讓步。
     frontier_suppression_startup_grace_period_s: 30.0
     frontier_suppression_max_attempt_records: 256
     frontier_suppression_max_regions: 64

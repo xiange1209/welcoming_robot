@@ -98,6 +98,12 @@ chk "修正2 人臉參數回呼"    "$SRC/smartnav_vision/smartnav_vision/face_e
 chk "修正3 回音共同前綴"    "$SRC/smartnav_audio/smartnav_audio/speech_recognizer_node.py" "_common_prefix_len"
 chk "修正4 HMI 測試情境"    "$HMI_SC/manager.py"                                          "SCENARIOS"
 chk "修正6 HMI 一鍵驗證"    "$HMI_SC/manager.py"                                          "VERIFY_SCRIPTS"
+# 9/24~9/25 自動建圖修正（沒部署的話 V5 的分類會失準，情境也可能讓車自己開走）
+NCC="$SRC/smartnav_navigation_cc/smartnav_navigation_cc"
+chk "修正7 探索中卡住讓步"   "$NCC/stuck_detector_cc_node.py"                             "defer_grace_sec"
+chk "修正8 停滯存圖＋STOP 後備" "$NCC/map_service_cc_node.py"                             "_cancel_all_nav_goals"
+chk "修正9 換情境先停導航"   "$HMI_SC/manager.py"                                          '"localization", "false"'
+chk "修正10 LLM 建圖等 1920 秒" "$SRC/smartnav_llm/smartnav_llm/llm_service_node.py"         "1920.0"
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"

@@ -56,6 +56,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 
+from action_msgs.srv import CancelGoal
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -120,7 +121,7 @@ class MapServiceCcNode(Node):
         #       由這裡先判定結束存圖，而不是等抑制過期、把到不了的點再試一輪
         #   正常探索時地圖每 3 秒更新一次（slam map_update_interval），四分鐘
         #   完全沒長大 0.5 m² 是很強的訊號。0 表示關閉。
-        #   ★ 用 ROS 時鐘而不是牆鐘：模擬（use_sim_time）的 RTF 不是 1 時才不會提早觸發。
+        #   ★ 計時用哪個時鐘見 _stall_now：實車用 monotonic、模擬用 ROS 時鐘。
         self.declare_parameter("exploration_stall_timeout_sec", 240.0)
         self.declare_parameter("exploration_stall_min_gain_m2", 0.5)
         # 等 map -> base_footprint 出現的時間 (Pi 4 冷開機時 slam 第一張圖要好幾秒)
@@ -191,6 +192,10 @@ class MapServiceCcNode(Node):
         )
         self.control_exploration_client = self.create_client(
             ControlExploration, "/control_exploration", callback_group=self.client_cb_group
+        )
+        # 探索結束時直接取消 nav2 的目標，不只靠 explorer 自己停（見 _stop_exploration）
+        self.nav_cancel_client = self.create_client(
+            CancelGoal, "/navigate_to_pose/_action/cancel_goal", callback_group=self.client_cb_group
         )
         self.nav2_manage_client = self.create_client(
             ManageLifecycleNodes, f"/{self.nav2_lcm}/manage_nodes", callback_group=self.client_cb_group
@@ -953,16 +958,36 @@ class MapServiceCcNode(Node):
         self.exploration_active_pub.publish(Bool(data=False))
         if not self.use_exploration:
             return
-        if not self.control_exploration_client.service_is_ready():
-            return
 
-        req = ControlExploration.Request()
-        req.action = ControlExploration.Request.ACTION_STOP
+        if self.control_exploration_client.service_is_ready():
+            req = ControlExploration.Request()
+            req.action = ControlExploration.Request.ACTION_STOP
+            try:
+                wait_for_future(self.control_exploration_client.call_async(req), timeout_sec=10.0)
+                self.get_logger().info("已停止自動探索")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"停止探索失敗: {exc}")
+        else:
+            self.get_logger().warn("/control_exploration 服務不在，無法通知 explorer 停止")
+
+        # ★ 2026-09-25（審查 safety#7）：不管 STOP 成不成功，都直接對 nav2 送「取消全部」。
+        #   STOP 逾時（Pi 滿載時 explorer 在算決策圖）或服務暫時看不到時，舊版靜默跳過，
+        #   接著照常存圖、切定位、回報成功 —— explorer 其實還在派目標，車子「建圖完成」後
+        #   繼續自己開，而且 exploration_active 已是 False、停滯與逾時看門狗也都不在了。
+        #   STOP 成功時 explorer 自己也會取消，多送一次取消全部是冪等的。
+        self._cancel_all_nav_goals()
+
+    def _cancel_all_nav_goals(self) -> None:
+        """對 /navigate_to_pose 送「取消全部」（goal_info 全零 = 全部目標）"""
+        if not self.nav_cancel_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("找不到 navigate_to_pose 的 cancel_goal 服務（nav2 沒起來？），略過取消")
+            return
         try:
-            wait_for_future(self.control_exploration_client.call_async(req), timeout_sec=10.0)
-            self.get_logger().info("已停止自動探索")
+            res = wait_for_future(self.nav_cancel_client.call_async(CancelGoal.Request()), timeout_sec=5.0)
+            n = len(getattr(res, "goals_canceling", []) or [])
+            self.get_logger().info(f"已對 nav2 送出取消全部目標（{n} 個正在取消）")
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f"停止探索失敗: {exc}")
+            self.get_logger().warn(f"取消 nav2 目標失敗: {exc}")
 
     def _align_pose_with_scan(self, pose):
         """用當前雷射與地圖做一次對齊，回傳修正後的 (x, y, yaw)
@@ -1133,7 +1158,7 @@ class MapServiceCcNode(Node):
         res = msg.info.resolution
         known = len(msg.data) - msg.data.count(-1)
         area = known * res * res
-        now = self.get_clock().now()
+        now = self._stall_now()
         with self._stall_lock:
             self._known_area_m2 = area
             if self._last_gain_time is None:
@@ -1145,12 +1170,25 @@ class MapServiceCcNode(Node):
                 self._area_at_last_gain_m2 = area
                 self._last_gain_time = now
 
+    def _stall_now(self) -> float:
+        """停滯看門狗的時鐘（秒）
+
+        ★ 2026-09-25 從 ROS 時鐘改掉（審查 correctness#6）：
+          實車上 ROS 時鐘 = 系統時間，而 Pi 沒有 RTC —— 開機時時間停在上次關機，
+          筆電熱點連上外網後 NTP 一校就往前跳好幾小時，下一輪 _stall_seconds 遠大於 240
+          -> 探索被腰斬。往回跳則變成負數，看門狗等於關掉。
+          monotonic 不受校時影響。模擬（use_sim_time）才用 ROS 時鐘，RTF<1 時才不會提早觸發。
+        """
+        if self.get_parameter("use_sim_time").value:
+            return self.get_clock().now().nanoseconds / 1e9
+        return time.monotonic()
+
     def _stall_seconds(self) -> Optional[float]:
-        """距離最後一次「地圖有長大」過了幾秒（ROS 時鐘）；還沒收到第一張圖回傳 None"""
+        """距離最後一次「地圖有長大」過了幾秒（見 _stall_now）；還沒收到第一張圖回傳 None"""
         with self._stall_lock:
             if self._last_gain_time is None:
                 return None
-            return (self.get_clock().now() - self._last_gain_time).nanoseconds / 1e9
+            return self._stall_now() - self._last_gain_time
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._last_scan = msg
@@ -1197,6 +1235,9 @@ class MapServiceCcNode(Node):
 
         # 讓 _wait_for_mapping_done 開始認 /exploration_complete
         self.use_exploration = True
+        # ★ 2026-09-25（審查 safety#8／upstream#5）：這條手動交接路徑以前沒發 True，
+        #   卡住偵測器照舊取消 -> explorer 不記失敗 -> 選回同一點的迴圈在這裡原封不動
+        self.exploration_active_pub.publish(Bool(data=True))
         self.get_logger().info("✓ 已手動啟動自動探索")
         response.success = True
         response.message = "自動探索已開始，完成後會自動存檔"
