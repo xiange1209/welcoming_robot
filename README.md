@@ -8,8 +8,9 @@
 
 大學部畢業專題。WHEELTEC 阿克曼實車 ＋ 人臉辨識 ＋ 語音對話 ＋ 自主導航。
 
-> **`master` 是唯一的開發主線**（2026-09-24 起；原本的 `車子` 分支已併入）——目前實際在實車上運行的完整系統。
-> `wheeltec` 分支是 2026-07 的舊線，保留作紀錄，不合併進 master。
+> **`master` 是唯一的開發主線**（2026-09-24 起，原本的 `車子` 分支已併入並刪除），兩位組員都在這裡開發。
+> 車上要跑還需要 **`wheeltec` 分支**：17 個 WHEELTEC 廠商驅動（底盤、光達、相機），
+> clone 到 `src/wheeltec_ws/` 跟我們的套件一起建置（見「部署到 Pi」）。兩個分支歷史各自獨立，**不合併**。
 
 ---
 
@@ -30,7 +31,8 @@ repo 根目錄**就是** ROS 2 workspace（在這裡 `colcon build`）。
 │   ├── smartnav_hmi/            平板網頁介面（React 前端＋FastAPI）＋ 瀏覽器 TTS 出聲
 │   ├── smartnav_bringup/        demo.launch.py（311 行，五階段延遲啟動）＋ systemd
 │   ├── smartnav_sim/            （開發中）筆電 WSL 的 Gazebo 建圖模擬，不上車
-│   └── frontier_exploration_ros2/  ★ git 子模組（上游 frontier 探索）
+│   ├── frontier_exploration_ros2/  ★ git 子模組（上游 frontier 探索）
+│   └── wheeltec_ws/             ← wheeltec 分支 clone 到這裡（已 gitignore，不進 master）
 ├── maprun/                      操作腳本（Pi 上位於 ~/maprun）
 ├── cyclonedds.xml               DDS 設定（env.sh 先找 ~/，再找 repo 根目錄）
 ├── pack_car_code.py             打包上車（實機更新的正式途徑）
@@ -50,6 +52,14 @@ repo 根目錄**就是** ROS 2 workspace（在這裡 `colcon build`）。
 設計取捨的理由，以及踩過的坑。
 
 ## 進度總覽
+
+### 2026-09-25 主線合併與自動建圖修正（待上車驗證）
+
+- 9/23 組員重構（目錄攤平成 `src/`、HMI 改 React＋模組化 FastAPI、frontier 改子模組），9/24 合併成單一 `master`。
+- 自動建圖：逾時與停滯改為**存圖**（舊版逾時直接丟圖）；卡住偵測在探索中讓給 explorer 的看門狗處理，
+  避免「取消 → 又選回同一點」的無限迴圈；切換測試情境時先停導航再用正確模式重啟。
+  三個角度的程式審查後補修，行為測試 53/53——**尚未上車**。
+- 下次上車：平板「系統開關 → 建圖（自動探索）」跑一趟，結束後按一鍵驗證的 **V5**，它會把卡住原因分成 CPU／TF、幾何、實體三類。
 
 ### 2026-09-17 新實驗室靜態驗證
 
@@ -239,22 +249,45 @@ ros2 action send_goal /follow_taught_path smartnav_msgs/action/FollowTaughtPath 
 教導-重現是「人走一次給它看」。當環境約束緊到讓可行解幾乎不存在時，
 搜尋的成本會爆炸，而示範的成本不變。
 
-## 快速開始
+## 部署到 Pi
 
-**已經在跑的車：用打包更新**（`python pack_car_code.py`，它會印出完整的 Pi 端步驟）。
-下面的 clone 只適用於**全新的 Pi 或開發機**——`~/welcoming_robot_ws` 已經存在時 clone 會失敗。
+**已經在跑的車：用打包更新**（在筆電跑 `python pack_car_code.py`，它會印出完整的 Pi 端步驟）。
+打包只帶我們自己的程式；車上的 `src/wheeltec_ws/` 解壓時不會被動到。
+
+**全新的 Pi（或換新 SD 卡）：clone 兩份。**`~/welcoming_robot_ws` 已經存在時 clone 會失敗。
 
 ```bash
-# ★ --recurse-submodules：frontier 探索是子模組，漏掉它 src/frontier_exploration_ros2 是空的
+# 0. astra 相機驅動要的系統套件（rosdep 蓋不到）
+sudo apt install -y libuvc-dev libgoogle-glog-dev
+# 1. 主線。★ --recurse-submodules：frontier 探索是子模組，漏掉它 src/frontier_exploration_ros2 是空的
 git clone --recurse-submodules https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws
+# 2. 廠商驅動（wheeltec 分支）放進 src/wheeltec_ws —— 跟車上現在的結構一樣，一次 colcon build 全部建好
+git clone -b wheeltec --single-branch https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws/src/wheeltec_ws
 cd ~/welcoming_robot_ws
 ln -s ~/welcoming_robot_ws/maprun ~/maprun      # 所有腳本都寫死 ~/maprun
-# 平板網頁的前端要先建置（dist/ 不進 git，沒建 = 平板白畫面）。
-# Pi 上沒有 Node.js 的話，在筆電建好再 scp 整個 dist/ 過來
+# 3. 平板網頁的前端要先建置（dist/ 不進 git，沒建 = 平板白畫面）。
+#    Pi 上沒有 Node.js 的話，在筆電建好再 scp 整個 dist/ 過來
 (cd src/smartnav_hmi/frontend && npm ci && npm run build)
+# 4. 建置（第一次會比較久：廠商的 C++ 驅動要編譯）
+rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install                  # ★ 一律從 workspace 頂層建置
 source install/setup.bash                       # 之後用 maprun/env.sh（會設好 CycloneDDS）
 ```
+
+17 個廠商套件裡我們直接用到的是底盤 `turn_on_wheeltec_robot`、光達 `lslidar_driver`、相機 `astra_camera`
+（連同它們依賴的 `serial`、`wheeltec_robot_msg`、`wheeltec_robot_urdf`、`lslidar_msgs`、`astra_camera_msgs`），
+其餘照車上現況一起建，不影響執行。
+
+## 兩人協作（都在 master 上）
+
+| 要做的事 | 怎麼做 |
+|---|---|
+| 開始工作前 | `git pull --rebase`；子模組有更新時再 `git submodule update --init` |
+| 推上去 | `git push origin master`。被拒絕＝對方先推了 → 先 `git pull --rebase` 再推。**不要 `--force`** |
+| 大一點的改動 | 開**英文名**的分支（例 `feature/auto-mapping`），做完跟對方說一聲再合進 master；分支**不刪** |
+| 改廠商驅動 | 到 `src/wheeltec_ws/` 裡改、在那裡 commit、`git push origin wheeltec`。**廠商碼不要進 master** |
+| 不進 git（已 gitignore） | `build/ install/ log/`、`frontend/dist/`、`node_modules/`、`.smartnav/secrets/`（Telegram token）、`.smartnav/face_database/` |
+| 在 Windows 上 | 子模組會被系統的 `autocrlf` 改成 CRLF，上車就壞 → `git -C src/frontier_exploration_ros2 config core.autocrlf false` 後重新簽出（`pack_car_code.py` 會擋並給完整指令） |
 
 ```bash
 # 建圖
@@ -296,5 +329,5 @@ source install/setup.bash                       # 之後用 maprun/env.sh（會�
 
 ## 授權
 
-MIT（見 [`master` 分支的 LICENSE](../../blob/master/LICENSE)）。
-`src/` 下的 WHEELTEC 廠商程式碼依其原始授權條款。
+MIT（見 [LICENSE](LICENSE)）。
+`wheeltec` 分支裡的 WHEELTEC 廠商程式碼依其原始授權條款。

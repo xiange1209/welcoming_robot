@@ -48,7 +48,12 @@ for _s in (sys.stdout, sys.stderr):
             pass
 
 SKIP_DIR = {"__pycache__", ".git", "build", "install", "log", ".pytest_cache",
-            "node_modules", ".vscode", "logs", "logs_0814"}
+            "node_modules", ".vscode", "logs", "logs_0814",
+            # ★ 2026-09-25：
+            #   wheeltec_ws —— 廠商驅動是另一個 repo（wheeltec 分支），車上已經有了。
+            #     筆電若也 clone 了一份，Windows 的 autocrlf 會把它變成 CRLF，打包上車會蓋掉車上正常的那份
+            #   smartnav_sim —— 只在筆電 WSL 用；有了 package.xml 之後依賴 ros_gz，Pi 上沒裝，會讓 colcon build 失敗
+            "wheeltec_ws", "smartnav_sim"}
 SKIP_EXT = {".pyc", ".pyo", ".so", ".o", ".a"}
 SKIP_NAME = {".gitignore"}
 

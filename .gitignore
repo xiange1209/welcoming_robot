@@ -176,3 +176,8 @@ HMI效能_*.md
 # 2026-09-23 目錄攤平成 src/ 之前的舊結構。從舊分支切過來會留下被忽略的
 # 快取、備份檔與巢狀 .git，不擋的話 git add . 會把它們收進來。
 /welcoming_robot_ws/
+
+# 廠商驅動：wheeltec 分支 clone 到這裡（見 README「部署到 Pi」），是另一個獨立的 repo。
+# 不擋的話 git add . 會把 17 個廠商套件（528 檔）收進 master —— 同學規則明訂兩條線不合併。
+# 要改廠商碼：到 src/wheeltec_ws/ 裡 commit、push 到 wheeltec 分支。
+/src/wheeltec_ws/
