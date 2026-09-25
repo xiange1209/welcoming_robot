@@ -8,16 +8,22 @@
 
 ## 怎麼用
 
-在 Pi 上把這個分支 clone 到主線 workspace 的 `src/wheeltec_ws/`，跟我們的套件一起 `colcon build`
-（車上現在就是這個結構）：
+在 Pi 上把這個分支 clone 成**獨立的底層 workspace** `~/wheeltec_ws`，先建它，主線再疊在上面：
 
 ```bash
-git clone --recurse-submodules https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws
-git clone -b wheeltec --single-branch https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws/src/wheeltec_ws
+source /opt/ros/jazzy/setup.bash
+sudo apt install -y libuvc-dev libgoogle-glog-dev          # astra 相機驅動要的，rosdep 蓋不到
+git clone -b wheeltec --single-branch https://github.com/xiange1209/welcoming_robot.git ~/wheeltec_ws
+cd ~/wheeltec_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build && source install/setup.bash                  # ★ 先 source 這裡，再去建主線
 ```
 
-完整步驟（apt 相依、前端建置、建置指令）見 master 的 README「部署到 Pi」。
-master 的 `.gitignore` 已經擋掉 `src/wheeltec_ws/`，所以放在裡面不會被誤 commit 進 master。
+接著照 master 的 README「部署到 Pi」clone 並建 `~/welcoming_robot_ws`；它的 `setup.bash` 會自動帶上這裡。
+
+**為什麼不放進主線的 `src/`**：主線 repo 規定所有套件直接放在 `./src`、不准有 `*_ws/` 子目錄（master 的 `CLAUDE.md`）。
+現在車上的放法是 `~/welcoming_robot_ws/src/wheeltec_ws/`、跟主線一起建——那樣也能跑，**不用搬**；
+master 的 `.gitignore` 也擋住了那個路徑，不會被誤 commit 進 master。
 
 ## 內容：`src/` 底下 17 個套件
 
@@ -41,7 +47,7 @@ master 的 `.gitignore` 已經擋掉 `src/wheeltec_ws/`，所以放在裡面不�
 
 ## 規則
 
-- **改廠商碼**：到 `src/wheeltec_ws/` 裡改 → commit → `git push origin wheeltec`。
+- **改廠商碼**：到 `~/wheeltec_ws/`（這個分支的 clone）裡改 → commit → `git push origin wheeltec`。
   改之前先想清楚——車子能跑是建立在這些原廠碼上面。
 - **不要把這個分支合併進 master**，也**不要刪這個分支**。
 - STM32 韌體是原廠的，不在這裡，也不要改。
