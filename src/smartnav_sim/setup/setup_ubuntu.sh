@@ -128,8 +128,12 @@ done
 
 [ "${#LINKED[@]}" -gt 0 ] || die "一個套件都沒連結到，檢查 $REPO/src"
 
+# ★ ROS 的 setup.bash 會讀好幾個沒設定的變數（AMENT_TRACE_SETUP_FILES 等），
+#   在上面的 set -u 底下會直接中止整支腳本（2026-09-26 第一次跑就卡在這）。source 時暫時關掉。
+set +u
 # shellcheck disable=SC1091
 source /opt/ros/jazzy/setup.bash
+set -u
 # rosdep 補其他依賴。解析不到的鍵只警告，不中止（例如 ament_* 測試依賴）
 rosdep install --from-paths "$WS/src" --ignore-src --rosdistro jazzy -y \
   --skip-keys "frontier_exploration_ros2_rviz" || warn "rosdep 有部分依賴沒解析到，看上面的訊息；通常不影響 build"
