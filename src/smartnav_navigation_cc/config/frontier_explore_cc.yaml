@@ -146,6 +146,23 @@ frontier_explorer:
     frontier_candidate_min_goal_distance_m: 0.9
     frontier_visit_tolerance: 0.5
 
+    # ★★ 2026-09-26：fork 修補 0002（smartnav-patches，說明在 車子/patches/）★★
+    #   Gazebo 模擬 8 組調參（backups/研究數據/模擬調參_20260926/）證實：只調參數解不了，
+    #   卡住的兩個原因在上游選點邏輯本身：
+    #   (1) 目標點只從「frontier 旁邊那一格空地」挑，篩選只看全域 costmap 成本。
+    #       還沒被看見的牆沒有膨脹成本 -> 走廊裡的目標點貼著牆、甚至在牆裡 -> 規劃必敗、被抑制，
+    #       0.99 m 的東走廊一次都沒進去過（模擬 E、F 組）。
+    #   (2) 到達目標後什麼都不記。沙發／櫃檯後面 0.35~0.45 m 的縫從外面看不透，
+    #       frontier 永遠在，explorer 一直回去試（每次約 18 秒）。
+    #   修補：目標點要離「牆與未知格」都至少 clearance，從 frontier 往已知空地找（搜尋半徑內找不到就放棄
+    #   這個 frontier —— 車子到不了夠寬的地方，看也看不到）；到達目標算一次嘗試，還在的就抑制。
+    #   0.35：車半寬 0.185 綽綽有餘；0.99 m 走廊中央離牆 0.495，還留 0.145 給 SLAM 把走廊畫窄。
+    #   效果（模擬，同場地同 nav2 參數）：23.0 -> 33.0 m²（北門關閉）、平均 28.4 -> 35.4 m²（北門打開），
+    #   東走廊與盡頭房從沒到過變成到得了。搜尋半徑 0.5 試過更差（28.2，被引到櫃檯角卡死），維持 1.0。
+    frontier_candidate_clearance_m: 0.35
+    frontier_candidate_search_radius_m: 1.0
+    frontier_suppress_on_arrival: true
+
     # === 60 -> 90 (2026-07-28) ===
     # 這是「鄰居 cost 超過多少就視為此 frontier 被擋住」的門檻。
     #

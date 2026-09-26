@@ -1,0 +1,605 @@
+diff --git a/include/frontier_exploration_ros2/frontier_explorer_core.hpp b/include/frontier_exploration_ros2/frontier_explorer_core.hpp
+index 1db58e8..2374ae1 100644
+--- a/include/frontier_exploration_ros2/frontier_explorer_core.hpp
++++ b/include/frontier_exploration_ros2/frontier_explorer_core.hpp
+@@ -89,6 +89,14 @@ struct FrontierExplorerCoreParams
+   int occ_threshold{OCC_THRESHOLD};
+   int min_frontier_size_cells{MIN_FRONTIER_SIZE};
+   double frontier_candidate_min_goal_distance_m{0.0};
++  // [smartnav patch] Clearance-aware goal selection; see FrontierSearchOptions. 0 = upstream behavior.
++  double frontier_candidate_clearance_m{0.0};
++  double frontier_candidate_search_radius_m{1.0};
++  // [smartnav patch] Reaching a frontier goal (nav2 SUCCEEDED or goal_preemption_complete_if_within_m)
++  // counts as one suppression attempt. A frontier that is still there after the robot stood next to it
++  // cannot be observed from reachable space (e.g. a gap behind furniture); without this it is re-selected
++  // forever. If the frontier was actually explored, the extra record has nothing left to suppress.
++  bool frontier_suppress_on_arrival{false};
+   double frontier_selection_min_distance{0.5};
+   bool escape_enabled{false};
+   double frontier_visit_tolerance{0.30};
+diff --git a/include/frontier_exploration_ros2/frontier_search.hpp b/include/frontier_exploration_ros2/frontier_search.hpp
+index 0c6e6ca..e539fe5 100644
+--- a/include/frontier_exploration_ros2/frontier_search.hpp
++++ b/include/frontier_exploration_ros2/frontier_search.hpp
+@@ -51,6 +51,14 @@ struct FrontierSearchOptions
+   int occ_threshold{OCC_THRESHOLD};
+   int min_frontier_size_cells{MIN_FRONTIER_SIZE};
+   double candidate_min_goal_distance_m{0.0};
++  // [smartnav patch] Clearance-aware goal selection. When > 0, the dispatched goal must be at least
++  // this far (m) from every non-free occupancy cell, i.e. from known obstacles AND from unknown space.
++  // Upstream picks a free cell right next to the frontier, which is often flush against a wall that has
++  // not been observed yet (no inflation cost), so the planner cannot reach it. 0 keeps upstream behavior.
++  double candidate_clearance_m{0.0};
++  // [smartnav patch] How far (m, 8-connected steps over free cells) from the frontier's free neighbors
++  // to look for such a cell. A frontier with no qualifying cell inside this radius yields no candidate.
++  double candidate_search_radius_m{1.0};
+ };
+ 
+ // Scratch context for one search pass. Stores reusable caches keyed by map cell.
+@@ -77,6 +85,9 @@ public:
+   void begin_visible_frontier_scan();
+   // Returns true only on the first visible frontier mark in the current scope.
+   bool mark_visible_frontier_cell_once(int map_x, int map_y);
++  // [smartnav patch] Distance (m) from the cell to the nearest non-free occupancy cell or the map edge.
++  // Computed once per search pass (chamfer distance transform) on first use.
++  double clearance_m(int map_x, int map_y);
+ 
+ private:
+   std::size_t cell_index(int map_x, int map_y) const;
+@@ -121,6 +132,10 @@ private:
+   uint32_t visible_frontier_cell_generation_{1};
+   FrontierSearchOptions search_options_;
+ 
++  // [smartnav patch] Chamfer-3/4 distance to the nearest non-free cell, in 1/3-cell units.
++  std::vector<int32_t> clearance_chamfer_;
++  bool clearance_ready_{false};
++
+   // Frontier eligibility helper needs direct access to stamp/cache internals.
+   friend bool is_frontier_point(
+     FrontierPoint * point,
+diff --git a/src/frontier_explorer_core_dispatch.cpp b/src/frontier_explorer_core_dispatch.cpp
+index ed1282b..00c3ff1 100644
+--- a/src/frontier_explorer_core_dispatch.cpp
++++ b/src/frontier_explorer_core_dispatch.cpp
+@@ -482,6 +482,14 @@ if (!active_goal_cost_status.has_value()) {
+     distance_completed_frontier = frontier_with_goal_point(
+       *active_goal_frontier,
+       *active_goal_point);
++    if (params.frontier_suppress_on_arrival) {
++      // [smartnav patch] Standing within complete_if_within of the goal counts as one attempt.
++      // With a 360-degree lidar, a frontier that survives this close a look is not observable
++      // from reachable space; recording it stops the explorer from shuttling back to it.
++      callbacks.log_info(
++        "[smartnav patch] Frontier goal reached by distance; recording arrival so an unobservable frontier is not revisited");
++      record_failed_frontier_attempt(distance_completed_frontier);
++    }
+     request_active_goal_cancel(completion_distance_reason);
+     return;
+   }
+@@ -1090,6 +1098,10 @@ void FrontierExplorerCore::get_result_callback(
+       callbacks.log_info("Reached start pose while frontiers remain temporarily suppressed");
+     } else if (status == action_msgs::msg::GoalStatus::STATUS_SUCCEEDED) {
+       callbacks.log_info("Frontier goal reached");
++      if (params.frontier_suppress_on_arrival && goal_kind == "frontier") {
++        // [smartnav patch] Same rule as the complete_if_within path in consider_preempt_active_goal().
++        record_failed_frontier_attempt(context.has_value() ? context->frontier : std::optional<FrontierLike>{});
++      }
+     } else if (status == action_msgs::msg::GoalStatus::STATUS_CANCELED) {
+       // Expected during explicit preemption/cancel paths.
+       callbacks.log_debug(goal_kind + " was canceled before completion");
+diff --git a/src/frontier_explorer_core_frontiers.cpp b/src/frontier_explorer_core_frontiers.cpp
+index 45d8eb0..8941727 100644
+--- a/src/frontier_explorer_core_frontiers.cpp
++++ b/src/frontier_explorer_core_frontiers.cpp
+@@ -305,7 +305,10 @@ FrontierSnapshot FrontierExplorerCore::get_frontier_snapshot(
+         raw_frontier_debug_cache->min_goal_distance == min_goal_distance &&
+         raw_frontier_debug_cache->search_options.occ_threshold == options.occ_threshold &&
+         raw_frontier_debug_cache->search_options.min_frontier_size_cells == options.min_frontier_size_cells &&
+-        raw_frontier_debug_cache->search_options.candidate_min_goal_distance_m == options.candidate_min_goal_distance_m)
++        raw_frontier_debug_cache->search_options.candidate_min_goal_distance_m == options.candidate_min_goal_distance_m &&
++        // [smartnav patch]
++        raw_frontier_debug_cache->search_options.candidate_clearance_m == options.candidate_clearance_m &&
++        raw_frontier_debug_cache->search_options.candidate_search_radius_m == options.candidate_search_radius_m)
+       {
+         raw_frontier_count = raw_frontier_debug_cache->frontier_count;
+       } else {
+diff --git a/src/frontier_explorer_core_init.cpp b/src/frontier_explorer_core_init.cpp
+index 594f0fc..b04a70d 100644
+--- a/src/frontier_explorer_core_init.cpp
++++ b/src/frontier_explorer_core_init.cpp
+@@ -75,6 +75,9 @@ FrontierExplorerCore::FrontierExplorerCore(
+   params.frontier_candidate_min_goal_distance_m = std::max(
+     0.0,
+     params.frontier_candidate_min_goal_distance_m);
++  // [smartnav patch]
++  params.frontier_candidate_clearance_m = std::max(0.0, params.frontier_candidate_clearance_m);
++  params.frontier_candidate_search_radius_m = std::max(0.0, params.frontier_candidate_search_radius_m);
+   // Visible-gain geometry is clamped here so later preemption checks can assume valid ranges.
+   params.goal_preemption_lidar_range_m = std::max(
+     0.1,
+@@ -189,6 +192,8 @@ FrontierSearchOptions FrontierExplorerCore::frontier_search_options() const
+   options.occ_threshold = params.occ_threshold;
+   options.min_frontier_size_cells = params.min_frontier_size_cells;
+   options.candidate_min_goal_distance_m = params.frontier_candidate_min_goal_distance_m;
++  options.candidate_clearance_m = params.frontier_candidate_clearance_m;  // [smartnav patch]
++  options.candidate_search_radius_m = params.frontier_candidate_search_radius_m;  // [smartnav patch]
+   return options;
+ }
+ 
+diff --git a/src/frontier_explorer_node.cpp b/src/frontier_explorer_node.cpp
+index 06b9965..4d75235 100644
+--- a/src/frontier_explorer_node.cpp
++++ b/src/frontier_explorer_node.cpp
+@@ -118,6 +118,10 @@ FrontierExplorerNode::FrontierExplorerNode(const rclcpp::NodeOptions & options)
+   this->declare_parameter<int>("occ_threshold", 50);
+   this->declare_parameter<int>("min_frontier_size_cells", 5);
+   this->declare_parameter<double>("frontier_candidate_min_goal_distance_m", 0.0);
++  // [smartnav patch] clearance-aware goal selection and arrival suppression (0 / false = upstream behavior)
++  this->declare_parameter<double>("frontier_candidate_clearance_m", 0.0);
++  this->declare_parameter<double>("frontier_candidate_search_radius_m", 1.0);
++  this->declare_parameter<bool>("frontier_suppress_on_arrival", false);
+   this->declare_parameter<double>("frontier_selection_min_distance", 0.5);
+   this->declare_parameter<bool>("escape_enabled", false);
+   this->declare_parameter<double>("frontier_visit_tolerance", 0.30);
+@@ -191,6 +195,12 @@ FrontierExplorerNode::FrontierExplorerNode(const rclcpp::NodeOptions & options)
+   params_.min_frontier_size_cells = this->get_parameter("min_frontier_size_cells").as_int();
+   params_.frontier_candidate_min_goal_distance_m = this->get_parameter(
+     "frontier_candidate_min_goal_distance_m").as_double();
++  // [smartnav patch]
++  params_.frontier_candidate_clearance_m = this->get_parameter(
++    "frontier_candidate_clearance_m").as_double();
++  params_.frontier_candidate_search_radius_m = this->get_parameter(
++    "frontier_candidate_search_radius_m").as_double();
++  params_.frontier_suppress_on_arrival = this->get_parameter("frontier_suppress_on_arrival").as_bool();
+   params_.frontier_selection_min_distance = this->get_parameter(
+     "frontier_selection_min_distance").as_double();
+   params_.escape_enabled = this->get_parameter("escape_enabled").as_bool();
+@@ -370,6 +380,13 @@ FrontierExplorerNode::FrontierExplorerNode(const rclcpp::NodeOptions & options)
+     params_.min_frontier_size_cells,
+     params_.frontier_candidate_min_goal_distance_m,
+     debugOutputsEnabled() ? "debug-log-level" : "disabled");
++  // [smartnav patch] Log the values the core actually uses (after clamping), not just the parameters.
++  RCLCPP_INFO(
++    this->get_logger(),
++    "[smartnav patch] goal clearance=%.2fm, clearance search radius=%.2fm, suppress on arrival=%s",
++    core_->params.frontier_candidate_clearance_m,
++    core_->params.frontier_candidate_search_radius_m,
++    core_->params.frontier_suppress_on_arrival ? "true" : "false");
+   RCLCPP_INFO(
+     this->get_logger(),
+     "MRTSP config: solver='%s', dp_candidate_limit=%zu, dp_planning_horizon=%zu, sensor_effective_range_m=%.2f, weight_distance_wd=%.2f, weight_gain_ws=%.2f, max_linear_speed_vmax=%.2f, max_angular_speed_wmax=%.2f",
+diff --git a/src/frontier_search.cpp b/src/frontier_search.cpp
+index 77b9673..7949d4b 100644
+--- a/src/frontier_search.cpp
++++ b/src/frontier_search.cpp
+@@ -21,6 +21,9 @@ limitations under the License.
+ #include <deque>
+ #include <cstdint>
+ #include <limits>
++#include <unordered_map>
++#include <utility>
++#include <vector>
+ 
+ namespace frontier_exploration_ros2
+ {
+@@ -181,6 +184,62 @@ bool FrontierSearchContext::mark_visible_frontier_cell_once(int map_x, int map_y
+   return true;
+ }
+ 
++double FrontierSearchContext::clearance_m(int map_x, int map_y)
++{
++  // [smartnav patch] Lazily build a chamfer-3/4 distance transform over the occupancy map:
++  // seeds are every cell that is not FreeSpace (occupied, unknown, or anything in between),
++  // so the result is the distance to the nearest obstacle *or* unexplored cell.
++  // Two raster passes, O(size_x * size_y), once per search pass.
++  if (!clearance_ready_) {
++    constexpr int32_t kFar = std::numeric_limits<int32_t>::max() / 4;
++    const int free_cost = static_cast<int>(OccupancyGrid2d::CostValues::FreeSpace);
++    clearance_chamfer_.assign(static_cast<std::size_t>(size_x_) * static_cast<std::size_t>(size_y_), kFar);
++    for (int y = 0; y < size_y_; ++y) {
++      for (int x = 0; x < size_x_; ++x) {
++        if (occupancy_map_.getCost(x, y) != free_cost) {
++          clearance_chamfer_[cell_index(x, y)] = 0;
++        }
++      }
++    }
++    const auto relax = [this](int nx, int ny, int32_t step, int32_t & best) {
++        if (nx < 0 || ny < 0 || nx >= size_x_ || ny >= size_y_) {
++          return;
++        }
++        best = std::min(best, clearance_chamfer_[cell_index(nx, ny)] + step);
++      };
++    for (int y = 0; y < size_y_; ++y) {
++      for (int x = 0; x < size_x_; ++x) {
++        int32_t & d = clearance_chamfer_[cell_index(x, y)];
++        relax(x - 1, y, 3, d);
++        relax(x - 1, y - 1, 4, d);
++        relax(x, y - 1, 3, d);
++        relax(x + 1, y - 1, 4, d);
++      }
++    }
++    for (int y = size_y_ - 1; y >= 0; --y) {
++      for (int x = size_x_ - 1; x >= 0; --x) {
++        int32_t & d = clearance_chamfer_[cell_index(x, y)];
++        relax(x + 1, y, 3, d);
++        relax(x + 1, y + 1, 4, d);
++        relax(x, y + 1, 3, d);
++        relax(x - 1, y + 1, 4, d);
++      }
++    }
++    clearance_ready_ = true;
++  }
++
++  if (map_x < 0 || map_y < 0 || map_x >= size_x_ || map_y >= size_y_) {
++    return 0.0;
++  }
++  const double resolution = occupancy_map_.map().info.resolution;
++  // The map edge counts as an obstacle: nothing is known beyond it.
++  const int edge_cells = std::min(
++    std::min(map_x + 1, map_y + 1),
++    std::min(size_x_ - map_x, size_y_ - map_y));
++  const double chamfer_cells = static_cast<double>(clearance_chamfer_[cell_index(map_x, map_y)]) / 3.0;
++  return std::min(chamfer_cells, static_cast<double>(edge_cells)) * resolution;
++}
++
+ std::pair<double, double> FrontierSearchContext::world_point(int map_x, int map_y)
+ {
+   // map_to_world_cache_[i] is valid iff stamp[i] == current generation.
+@@ -467,6 +526,32 @@ std::optional<FrontierCandidate> build_frontier_candidate(
+   double best_any_distance_sq = std::numeric_limits<double>::infinity();
+   double best_far_distance_sq = std::numeric_limits<double>::infinity();
+ 
++  // Ranking shared by upstream selection and the [smartnav patch] clearance search:
++  // closest to the frontier centroid, preferring cells beyond the robot-distance exclusion radius.
++  const auto consider_goal_cell = [&](int map_x, int map_y) {
++      const auto world = context->world_point(map_x, map_y);
++      const double centroid_distance_sq = squared_distance(world, frontier_centroid);
++      if (centroid_distance_sq < best_any_distance_sq) {
++        best_any_distance_sq = centroid_distance_sq;
++        best_any_goal_point = world;
++      }
++
++      if (apply_min_goal_distance) {
++        // Goal-distance gating uses squared radius:
++        //   (x - xr)^2 + (y - yr)^2 >= min_goal_distance^2
++        const double dx = world.first - current_pose.position.x;
++        const double dy = world.second - current_pose.position.y;
++        const double robot_distance_sq = (dx * dx) + (dy * dy);
++        if (robot_distance_sq >= min_goal_distance_sq && centroid_distance_sq < best_far_distance_sq) {
++          best_far_distance_sq = centroid_distance_sq;
++          best_far_goal_point = world;
++        }
++      }
++    };
++  // [smartnav patch] Clearance mode collects the upstream candidates as seeds instead of ranking them.
++  const bool use_clearance = options.candidate_clearance_m > 0.0;
++  std::vector<std::pair<int, int>> clearance_seeds;
++
+   for (auto * frontier_point : new_frontier) {
+     // Candidate goal points are chosen from free, unblocked neighbors around frontier cells.
+     for_each_neighbor(frontier_point, occupancy_map, frontier_cache, [&](FrontierPoint * neighbor) {
+@@ -490,25 +575,70 @@ std::optional<FrontierCandidate> build_frontier_candidate(
+         return;
+       }
+ 
+-      const auto world = context->world_point(neighbor->mapX, neighbor->mapY);
+-      const double centroid_distance_sq = squared_distance(world, frontier_centroid);
+-      if (centroid_distance_sq < best_any_distance_sq) {
+-        best_any_distance_sq = centroid_distance_sq;
+-        best_any_goal_point = world;
++      if (use_clearance) {
++        // [smartnav patch] Upstream candidates become seeds of the clearance search below.
++        clearance_seeds.emplace_back(neighbor->mapX, neighbor->mapY);
++        return;
+       }
++      consider_goal_cell(neighbor->mapX, neighbor->mapY);
++    });
++  }
+ 
+-      if (apply_min_goal_distance) {
+-        // Goal-distance gating uses squared radius:
+-        //   (x - xr)^2 + (y - yr)^2 >= min_goal_distance^2
+-        const double dx = world.first - current_pose.position.x;
+-        const double dy = world.second - current_pose.position.y;
+-        const double robot_distance_sq = (dx * dx) + (dy * dy);
+-        if (robot_distance_sq >= min_goal_distance_sq && centroid_distance_sq < best_far_distance_sq) {
+-          best_far_distance_sq = centroid_distance_sq;
+-          best_far_goal_point = world;
++  if (use_clearance) {
++    // [smartnav patch] Walk outward over free cells (8-connected, bounded number of steps) and accept only
++    // cells that keep candidate_clearance_m from obstacles and unknown space and are not cost-blocked.
++    // Among those, the same ranking as upstream applies (closest to the frontier centroid, preferring
++    // cells beyond the robot-distance exclusion radius). The effect is a goal pulled back into known,
++    // open space from which the frontier is still in view, instead of a cell flush against an unseen wall.
++    const double resolution = occupancy_map.map().info.resolution;
++    const int max_steps = std::max(
++      0, static_cast<int>(std::ceil(options.candidate_search_radius_m / resolution)));
++    const int free_cost = static_cast<int>(OccupancyGrid2d::CostValues::FreeSpace);
++    const int size_x = occupancy_map.getSizeX();
++    const int size_y = occupancy_map.getSizeY();
++    std::unordered_map<int64_t, int> steps_by_cell;
++    std::deque<std::pair<int, int>> queue;
++    const auto key_of = [size_x](int x, int y) {
++        return static_cast<int64_t>(y) * static_cast<int64_t>(size_x) + static_cast<int64_t>(x);
++      };
++    for (const auto & seed : clearance_seeds) {
++      if (steps_by_cell.emplace(key_of(seed.first, seed.second), 0).second) {
++        queue.push_back(seed);
++      }
++    }
++    while (!queue.empty()) {
++      const auto [cx, cy] = queue.front();
++      queue.pop_front();
++      const int steps = steps_by_cell[key_of(cx, cy)];
++      if (
++        // 1e-6: resolution is float32, so "exactly N cells" can land a hair below N * resolution.
++        context->clearance_m(cx, cy) + 1e-6 >= options.candidate_clearance_m &&
++        !context->global_cost_blocked(cx, cy))
++      {
++        consider_goal_cell(cx, cy);
++      }
++      if (steps >= max_steps) {
++        continue;
++      }
++      for (int dy = -1; dy <= 1; ++dy) {
++        for (int dx = -1; dx <= 1; ++dx) {
++          if (dx == 0 && dy == 0) {
++            continue;
++          }
++          const int nx = cx + dx;
++          const int ny = cy + dy;
++          if (nx < 0 || ny < 0 || nx >= size_x || ny >= size_y) {
++            continue;
++          }
++          if (occupancy_map.getCost(nx, ny) != free_cost) {
++            continue;
++          }
++          if (steps_by_cell.emplace(key_of(nx, ny), steps + 1).second) {
++            queue.emplace_back(nx, ny);
++          }
+         }
+       }
+-    });
++    }
+   }
+ 
+   const auto & goal_point = best_far_goal_point.has_value() ? best_far_goal_point : best_any_goal_point;
+diff --git a/test/test_decision_map_and_mrtsp.cpp b/test/test_decision_map_and_mrtsp.cpp
+index 44dd853..ae32e4a 100644
+--- a/test/test_decision_map_and_mrtsp.cpp
++++ b/test/test_decision_map_and_mrtsp.cpp
+@@ -1307,5 +1307,108 @@ TEST(MrtspOrderingTests, StartCostFallsBackToEuclideanWithoutApproxRobotCenterDi
+   EXPECT_NEAR(motion_time_cost, 0.5 + kHalfPi, 1e-9);
+ }
+ 
++// ── [smartnav patch] clearance-aware goal selection ─────────────────────────
++
++TEST(SmartnavClearanceTests, ClearanceTransformMeasuresDistanceToObstaclesUnknownAndEdge)
++{
++  auto map_msg = build_grid(21, 21, 0);
++  map_msg.info.resolution = 0.1;
++  set_cell(map_msg, 10, 10, 100);
++  set_cell(map_msg, 2, 15, -1);
++  auto costmap_msg = build_grid(21, 21, 0);
++  costmap_msg.info.resolution = 0.1;
++  const OccupancyGrid2d occupancy_map(map_msg);
++  const OccupancyGrid2d costmap(costmap_msg);
++  FrontierSearchContext context(occupancy_map, costmap, std::nullopt);
++  // nav_msgs resolution is float32 (0.1 is stored as 0.100000001), hence the 1e-6 tolerances.
++
++  EXPECT_NEAR(context.clearance_m(10, 10), 0.0, 1e-6);
++  EXPECT_NEAR(context.clearance_m(13, 10), 0.3, 1e-6);  // straight: exact
++  EXPECT_NEAR(context.clearance_m(13, 13), 0.4, 1e-6);  // chamfer 3/4 diagonal (true 0.424)
++  EXPECT_NEAR(context.clearance_m(5, 15), 0.3, 1e-6);   // unknown cells count as non-free
++  EXPECT_NEAR(context.clearance_m(0, 5), 0.1, 1e-6);    // the map edge counts too
++}
++
++TEST(SmartnavClearanceTests, ClearanceGoalAvoidsUnseenWallFragment)
++{
++  // Corridor 1.0 m wide at 0.1 m cells: walls on rows 0 and 11. Cells x=20..29 of row 1 are still
++  // unknown (the wall there was only seen at a grazing angle), so the costmap has no inflation there.
++  auto map_msg = build_grid(40, 12, 0);
++  map_msg.info.resolution = 0.1;
++  set_rect(map_msg, 0, 0, 39, 0, 100);
++  set_rect(map_msg, 0, 11, 39, 11, 100);
++  set_rect(map_msg, 20, 1, 29, 1, -1);
++  auto costmap_msg = build_grid(40, 12, 0);
++  costmap_msg.info.resolution = 0.1;
++  const OccupancyGrid2d occupancy_map(map_msg);
++  const OccupancyGrid2d costmap(costmap_msg);
++
++  const auto run = [&](double clearance) {
++      FrontierCache frontier_cache(40, 12);
++      std::vector<FrontierPoint *> frontier_points;
++      for (int x = 20; x <= 29; ++x) {
++        frontier_points.push_back(frontier_cache.getPoint(x, 1));
++      }
++      FrontierSearchOptions options;
++      options.min_frontier_size_cells = 1;
++      options.candidate_clearance_m = clearance;
++      options.candidate_search_radius_m = 1.0;
++      return build_frontier_candidate(
++        frontier_points, {20, 1}, occupancy_map, costmap, std::nullopt,
++        frontier_cache, make_pose(0.5, 0.6), 0.0, options);
++    };
++
++  // Upstream: the goal is the free cell touching the unseen wall (row 2, 0.1 m from it).
++  const auto upstream = run(0.0);
++  ASSERT_TRUE(upstream.has_value());
++  ASSERT_TRUE(upstream->goal_point.has_value());
++  EXPECT_NEAR(upstream->goal_point->second, 0.25, 1e-6);
++
++  // Patched: pulled back to row 4 (0.3 m from the fragment), still alongside it.
++  const auto patched = run(0.3);
++  ASSERT_TRUE(patched.has_value());
++  ASSERT_TRUE(patched->goal_point.has_value());
++  EXPECT_NEAR(patched->goal_point->second, 0.45, 1e-6);
++  EXPECT_GE(patched->goal_point->first, 2.0);
++  EXPECT_LE(patched->goal_point->first, 3.0);
++}
++
++TEST(SmartnavClearanceTests, NarrowGapFrontierGetsViewpointOutsideGapOrNone)
++{
++  // A 0.3 m gap (x=13..15) between two 0.6 m wide, 0.7 m deep obstacles; the back of the gap is unknown.
++  // The robot (0.37 m wide) cannot enter; the only usable viewpoint is in the open area above.
++  auto map_msg = build_grid(30, 30, 0);
++  map_msg.info.resolution = 0.1;
++  set_rect(map_msg, 7, 0, 12, 6, 100);
++  set_rect(map_msg, 16, 0, 21, 6, 100);
++  set_rect(map_msg, 13, 0, 15, 2, -1);
++  auto costmap_msg = build_grid(30, 30, 0);
++  costmap_msg.info.resolution = 0.1;
++  const OccupancyGrid2d occupancy_map(map_msg);
++  const OccupancyGrid2d costmap(costmap_msg);
++
++  const auto run = [&](double radius) {
++      FrontierCache frontier_cache(30, 30);
++      std::vector<FrontierPoint *> frontier_points{
++        frontier_cache.getPoint(13, 2), frontier_cache.getPoint(14, 2), frontier_cache.getPoint(15, 2)};
++      FrontierSearchOptions options;
++      options.min_frontier_size_cells = 1;
++      options.candidate_clearance_m = 0.3;
++      options.candidate_search_radius_m = radius;
++      return build_frontier_candidate(
++        frontier_points, {13, 2}, occupancy_map, costmap, std::nullopt,
++        frontier_cache, make_pose(1.5, 2.5), 0.0, options);
++    };
++
++  const auto found = run(1.0);
++  ASSERT_TRUE(found.has_value());
++  ASSERT_TRUE(found->goal_point.has_value());
++  EXPECT_GE(found->goal_point->second, 0.95 - 1e-6);  // above the obstacles (they end at y=0.7)
++  EXPECT_NEAR(found->goal_point->first, 1.45, 0.1 + 1e-6);
++
++  // No cell with enough clearance within 0.3 m of the gap: the frontier is not offered at all.
++  EXPECT_FALSE(run(0.3).has_value());
++}
++
+ }  // namespace
+ }  // namespace frontier_exploration_ros2
+diff --git a/test/test_preemption_flow.cpp b/test/test_preemption_flow.cpp
+index c08bc8a..98cae16 100644
+--- a/test/test_preemption_flow.cpp
++++ b/test/test_preemption_flow.cpp
+@@ -1516,5 +1516,121 @@ TEST(PreemptionFlowTests, GoalSucceededRedispatchesImmediatelyWhenPostGoalSettle
+   EXPECT_EQ(dispatch_calls, 2);
+ }
+ 
++// ── [smartnav patch] arrival counts as one suppression attempt ──────────────
++
++std::unique_ptr<FrontierExplorerCore> make_arrival_core(bool suppress_on_arrival)
++{
++  auto core = make_preemption_core();
++  core->params.goal_preemption_enabled = false;
++  core->params.goal_skip_on_blocked_goal = false;
++  core->params.goal_preemption_complete_if_within_m = 0.25;
++  core->params.frontier_suppression_enabled = true;
++  core->params.frontier_suppression_attempt_threshold = 1;
++  core->params.frontier_suppress_on_arrival = suppress_on_arrival;
++  core->active_goal_frontier = FrontierCandidate{{4.0, 5.0}, {3.0, 5.0}, 8};
++  core->active_goal_frontiers = {*core->active_goal_frontier};
++  core->callbacks.get_current_pose = []() {
++      return std::optional<geometry_msgs::msg::Pose>(make_pose(3.1, 5.0));
++    };
++  return core;
++}
++
++TEST(PreemptionFlowTests, SmartnavArrivalByDistanceSuppressesFrontierWhenEnabled)
++{
++  auto core = make_arrival_core(true);
++  auto fake_handle = std::make_shared<FakeGoalHandle>();
++  core->goal_handle = fake_handle;
++
++  core->consider_preempt_active_goal("map");
++
++  EXPECT_EQ(fake_handle->cancel_calls, 1);
++  ASSERT_NE(core->frontier_suppression_, nullptr);
++  EXPECT_EQ(core->frontier_suppression_->region_count(), 1U);
++}
++
++TEST(PreemptionFlowTests, SmartnavArrivalByDistanceKeepsUpstreamBehaviorWhenDisabled)
++{
++  auto core = make_arrival_core(false);
++  auto fake_handle = std::make_shared<FakeGoalHandle>();
++  core->goal_handle = fake_handle;
++
++  core->consider_preempt_active_goal("map");
++
++  EXPECT_EQ(fake_handle->cancel_calls, 1);
++  EXPECT_TRUE(
++    core->frontier_suppression_ == nullptr || core->frontier_suppression_->region_count() == 0U);
++}
++
++TEST(PreemptionFlowTests, SmartnavGoalSucceededDoesNotRedispatchSameFrontierWhenEnabled)
++{
++  // Same scenario as GoalSucceededRedispatchesImmediatelyWhenPostGoalSettleDisabled, where upstream
++  // sends the very same frontier again right after reaching it. With arrival suppression it is skipped.
++  FrontierExplorerCoreParams params;
++  params.post_goal_settle_enabled = false;
++  params.return_to_start_on_complete = false;
++  params.frontier_suppression_enabled = true;
++  params.frontier_suppression_attempt_threshold = 1;
++  params.frontier_suppress_on_arrival = true;
++  // The constructor arms the startup grace period; failures (and arrivals) inside it are not recorded.
++  params.frontier_suppression_startup_grace_period_s = 0.0;
++
++  int64_t now_ns = 1'000'000'000;
++  FrontierExplorerCoreCallbacks callbacks;
++  callbacks.now_ns = [&now_ns]() {
++      now_ns += 100'000'000;
++      return now_ns;
++    };
++  callbacks.get_current_pose = []() {
++      return std::optional<geometry_msgs::msg::Pose>(make_pose(1.0, 1.0));
++    };
++  callbacks.log_info = [](const std::string &) {};
++  callbacks.log_warn = [](const std::string &) {};
++  callbacks.log_debug = [](const std::string &) {};
++  callbacks.log_error = [](const std::string &) {};
++  callbacks.wait_for_action_server = [](double) {return true;};
++
++  int dispatch_calls = 0;
++  callbacks.dispatch_goal_request = [&dispatch_calls](const GoalDispatchRequest &) {
++      dispatch_calls += 1;
++    };
++  callbacks.frontier_search = [](
++    const geometry_msgs::msg::Pose &,
++    const OccupancyGrid2d &,
++    const OccupancyGrid2d &,
++    const std::optional<OccupancyGrid2d> &,
++    double,
++    bool)
++    {
++      FrontierSearchResult result;
++      result.frontiers = {FrontierCandidate{{2.0, 2.0}, {2.0, 2.0}, 10}};
++      result.robot_map_cell = {1, 1};
++      return result;
++    };
++
++  FrontierExplorerCore core(params, callbacks);
++  auto map_msg = build_grid(20, 20, 0);
++  auto costmap_msg = build_grid(20, 20, 0);
++  core.map = OccupancyGrid2d(map_msg);
++  core.costmap = OccupancyGrid2d(costmap_msg);
++  core.map_generation = 1;
++  core.costmap_generation = 1;
++  core.local_costmap_generation = 0;
++
++  core.try_send_next_goal();
++  ASSERT_EQ(dispatch_calls, 1);
++
++  auto fake_handle = std::make_shared<FakeGoalHandle>();
++  core.goal_response_callback(core.current_dispatch_id, fake_handle, true, "");
++  core.get_result_callback(
++    core.current_dispatch_id,
++    action_msgs::msg::GoalStatus::STATUS_SUCCEEDED,
++    0,
++    "");
++
++  ASSERT_NE(core.frontier_suppression_, nullptr);
++  EXPECT_EQ(core.frontier_suppression_->region_count(), 1U);
++  EXPECT_EQ(dispatch_calls, 1);
++}
++
+ }  // namespace
+ }  // namespace frontier_exploration_ros2

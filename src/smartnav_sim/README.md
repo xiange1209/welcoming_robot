@@ -121,6 +121,9 @@ ros2 run smartnav_sim map_area --watch 30     # 每 30 秒印一次「已知空�
 | `frontier_suppression_timeout_s` | 150 | 被封鎖的點更晚才重試；**超過約 164 就會在重試前被停滯看門狗收尾**（見下方規則 2） | 到不了的點更常被拿出來再試 | 封鎖過期後是否又去試同一個點 |
 | ★ `frontier_suppression_no_progress_timeout_s` | 15 | 窄處多段倒車有更多時間；但真的卡住時車子要推更久才放棄 | 更快放棄目標 | 車子卡在牆邊推多久。**要小於 nav2 的 20 秒**（規則 3） |
 | `frontier_suppression_startup_grace_period_s` | 30 | — | — | **不要單獨改**（規則 1） |
+| ★ `frontier_candidate_clearance_m`（9/26 修補） | 0.35 | 目標離牆更遠、更安全；**超過約 0.45，0.99 m 走廊裡找不到目標**，走廊會被跳過 | 目標貼近牆與未知區，0 = 上游行為（目標會落在還沒看到的牆邊） | 東走廊有沒有進去、`no valid path` 次數 |
+| `frontier_candidate_search_radius_m`（9/26 修補） | 1.0 | 家具死角的入口也會被當成目標，車子被引到家具旁邊 | 0.5 實測更差（28.2 m²，卡在櫃檯角） | 車子有沒有被引到沙發、櫃檯旁 |
+| `frontier_suppress_on_arrival`（9/26 修補） | true | — | false = 上游行為：到了還在的 frontier 會一直回去 | log 裡「reached by distance; recording arrival」的次數 |
 
 ### A2. 卡住與收尾（改程式裡的預設值，存檔後重開模擬）
 
@@ -138,6 +141,7 @@ ros2 run smartnav_sim map_area --watch 30     # 每 30 秒印一次「已知空�
 | 參數 | 行號 | 現值 | 調大 | 調小 |
 |---|---|---|---|---|
 | Smac `minimum_turning_radius` | :907 | 0.95 | 規劃更接近實車（1.03／1.18），但很多地方會變成「規劃不出路」→ 探索提早結束 | 規劃出更彎的路，實車跟不上 → 卡住（akm_realism 的「舵角到底」會暴增） |
+| Smac `cost_penalty`（9/26 改） | :1031 | 2.0 | 路徑更靠通道中央；太大在雜訊多的地圖會 no valid path | 1.4 時路徑貼著家具，4 組卡在同一個櫃檯角 |
 | `reverse_penalty` | :1017 | 2.5 | 更不願意倒車，窄處更難就位 | 更願意多段倒車；4.0 時實測變成 20 次短折返 |
 | 全域 `inflation_radius` / `cost_scaling_factor` | :801-802 | 0.55 / 3.5 | 路徑離牆更遠；窄走廊可能直接不通 | 路徑更貼牆；要跟 `occ_threshold` 一起想 |
 | MPPI `vx_max` | :293 | 0.25 | 開更快 | 開更慢（別低於 0.1，會被死區吃掉） |
@@ -192,22 +196,25 @@ ros2 launch smartnav_sim sim_explore.launch.py gui:=false 2>&1 | tee ~/base1.log
 
 另開視窗 `ros2 run smartnav_sim map_area --watch 30`。記下最後面積、怎麼結束的。
 
-**2026-09-26 已跑過的 8 組（每組一次，詳細紀錄在本機 `專題/backups/研究數據/模擬調參_20260926/`）**：
+**2026-09-26 的調參紀錄**（每組 1～2 次，全部 log 在本機 `專題/backups/研究數據/模擬調參_20260926/`，`結果總表.md` 可直接引用）：
 
-| 組 | 改了什麼 | 最後面積 | 結果 |
-|---|---|---|---|
-| A | 基準（守門員已修） | 28.6 m² | 卡在北門口，停滯收尾 |
-| B | `occ_threshold` 50 | 31.0 m² | 最好的一組，到過東走廊入口；東走廊目標點落在牆裡 |
-| C | B＋規劃器／控制器半徑 1.20 | 26.1 m² | 更差：照樣規劃穿門，卡在門裡 4 分鐘 |
-| D | `occ` 60＋全域 `footprint_padding` 0.08 | 28.0 m² | 直進北走廊，出不來 |
-| E | 北門關起來（預設參數） | 23.0 m² | 一次都沒往東：東走廊目標點貼著還沒看到的牆 |
-| F | E＋`max_planning_time` 5 秒 | 23.2 m² | 無改善，排除「規劃時間不夠」 |
-| G | 實車 8/03 地圖（預設參數） | 7.9／14.0 m²（56%） | 卡在窄處 5 分鐘，停滯收尾 |
+第一輪只調參數（`occ_threshold`、迴轉半徑、`footprint_padding`、規劃時間）8 組都沒有穩定改善。
+原因在 explorer 的選點邏輯，所以改了 fork 的程式（修補 0002，見 `車子/patches/`），再在修補版上找參數：
 
-結論：**參數沒有找到穩定的改善，所以一個都沒改**。卡住的原因是三種結構性問題：
-窄門直進得去、出不來；家具後面的死角；走廊目標點貼著還沒看到的牆。
-這些要改 explorer 的程式（fork）才解得掉。8 趟都由停滯看門狗存圖收尾，**不會卡死，只是圖不完整**。
-上車的實務對策：比 1.17 m 窄的門先擋起來；走廊用遙控通過（`nav_bringup_cc.launch.py` 的 `auto_start_exploration:=false`：create_map 後先待命，遙控過窄處再 `/start_exploration`）。
+| 設定 | 瓶頸測試場（全場約 42 m²） | 北門關閉版（約 36 m²） |
+|---|---|---|
+| 修補前（A～D 平均） | 28.4 m²，東走廊一次都沒進去 | 23.0 m²（E） |
+| 只加修補 0002 | 39.6、31.1 m²（I、L） | 33.0 m²（H），205 秒到盡頭房 |
+| **修補＋Smac `cost_penalty` 2.0（現行設定）** | **38.7、37.5 m²（O、O2），兩次都到盡頭房** | — |
+
+- 試過沒採用：行為樹放行 START_OCCUPIED、迴轉半徑 1.20、`footprint_padding` 0.06、搜尋半徑 0.5（都沒比較好）
+- `cost_penalty` 1.4 時路徑貼著家具走，4 組在同一個櫃檯角卡死；2.0 兩次都沒卡在家具邊
+- **實車 8/03 地圖**：兩版都建完門內的房間、停在同一扇窄門前（原圖 14.0 m² 建到 7.8）＝實車「門口窄轉角四版未成」
+- **還沒解決**：窄開口旁偶爾「Start occupied」卡死，由停滯看門狗存圖收尾（不會卡著不收尾）
+
+上車的實務對策仍然適用：比 1.17 m 窄的門先擋起來；過窄門用遙控
+（`nav_bringup_cc.launch.py` 的 `auto_start_exploration:=false`：create_map 後先待命，遙控過窄處再 `/start_exploration`）。
+想自己重現：`world:=bottlenecks_door_closed.sdf` 就是北門關閉版。
 
 ### 實驗 2：理想車對照
 
@@ -313,5 +320,6 @@ TF `odom_combined → base_footprint → {base_link, laser}`，吃 `/cmd_vel`。
 | `smartnav_sim/map_area.py` | 印出已知面積 |
 | `config/bridge.yaml` | Gazebo ↔ ROS 話題對接 |
 | `worlds/bottlenecks.sdf` | 瓶頸測試場 |
+| `worlds/bottlenecks_door_closed.sdf` | 同上，北門窄門口擋起來（＝現場把窄門擋起來的做法） |
 | `test/` | 單元測試（`python3 -m pytest test/`，不需要 ROS） |
 | `setup/` | WSL＋ROS 2＋Gazebo 安裝腳本 |

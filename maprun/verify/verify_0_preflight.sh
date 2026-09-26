@@ -107,17 +107,26 @@ chk "修正10 LLM 建圖等 1920 秒" "$SRC/smartnav_llm/smartnav_llm/llm_servic
 # ★ 上游 explorer 的修補（C++，要重新 colcon build 才生效）。沒修補的話看門狗會把每個
 #   開超過 15 秒的目標誤判失敗 —— 自動建圖「常常卡住」很可能就是這個
 chk "修正11 frontier 看門狗濾 0" "$SRC/frontier_exploration_ros2/src/frontier_suppression.cpp" "smartnav patch"
+# 9/26：explorer 選點要離牆與未知格 0.35 m、到達目標後抑制看不透的死角（fork 修補 0002）
+chk "修正14 frontier 選點淨空" "$SRC/frontier_exploration_ros2/src/frontier_search.cpp"       "candidate_clearance_m"
 # 上面只證明「原始碼」是修補版。C++ 要重新編譯才生效，而 make 看的是檔案時間：
 # 編出來的 .o 比原始碼舊 = 解壓後還沒重新 colcon build，車上跑的仍是舊的 explorer（2026-09-25 審查）
-SUPP_SRC="$SRC/frontier_exploration_ros2/src/frontier_suppression.cpp"
-SUPP_OBJ=$(find "$WS/build/frontier_exploration_ros2" -name 'frontier_suppression.cpp.o' 2>/dev/null | head -1)
-if [ -z "$SUPP_OBJ" ]; then
-  rec "修正11b frontier 已重新編譯" WARN "找不到編譯產物" "還沒 colcon build？（第一次升新結構會整個重建）"
-elif [ -f "$SUPP_SRC" ] && [ "$(stat -c %Y "$SUPP_OBJ")" -lt "$(stat -c %Y "$SUPP_SRC")" ]; then
-  rec "修正11b frontier 已重新編譯" FAIL "原始碼比編出來的新" \
+# ★ 9/26 起修補改到 6 個 .cpp，每一個都要比（只看一個的話，漏編其他檔也會 PASS）
+STALE=""; NOOBJ=""
+for f in frontier_suppression frontier_search frontier_explorer_core_dispatch \
+         frontier_explorer_core_init frontier_explorer_core_frontiers frontier_explorer_node; do
+  S="$SRC/frontier_exploration_ros2/src/$f.cpp"
+  O=$(find "$WS/build/frontier_exploration_ros2" -name "$f.cpp.o" 2>/dev/null | head -1)
+  if [ -z "$O" ]; then NOOBJ="$NOOBJ $f"
+  elif [ -f "$S" ] && [ "$(stat -c %Y "$O")" -lt "$(stat -c %Y "$S")" ]; then STALE="$STALE $f"; fi
+done
+if [ -n "$NOOBJ" ]; then
+  rec "修正11b frontier 已重新編譯" WARN "找不到編譯產物：$NOOBJ" "還沒 colcon build？（第一次升新結構會整個重建）"
+elif [ -n "$STALE" ]; then
+  rec "修正11b frontier 已重新編譯" FAIL "原始碼比編出來的新：$STALE" \
       "解壓後沒重新建置 —— cd ~/welcoming_robot_ws && colcon build --symlink-install --packages-select frontier_exploration_ros2"
 else
-  rec "修正11b frontier 已重新編譯" PASS "已用目前的原始碼編譯" ""
+  rec "修正11b frontier 已重新編譯" PASS "6 個修補檔都已用目前的原始碼編譯" ""
 fi
 chk "修正12 卡住預算與後備"   "$NCC/map_service_cc_node.py"                             "exploration_stuck_repeat_limit"
 # 9/26：防撞狀態 10 秒沒變就停止抬速度 → 指令被死區吃掉、車子停住（模擬實測誤擋 3084 則）

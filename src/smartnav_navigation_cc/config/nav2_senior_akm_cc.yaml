@@ -1021,7 +1021,14 @@ planner_server:
       # 2.0 -> 1.4：這是「盡量走在通道中央」的傾向強度。
       # 地圖有雜訊時，高成本區到處都是，權重太大會讓 Hybrid-A* 找不到
       # 它認為夠便宜的路而回 no valid path。調低讓它願意接受次佳但可行的路線。
-      cost_penalty: 1.4
+      # ★★ 2026-09-26：1.4 -> 2.0（Gazebo 模擬，explorer 修補 0002 之後）★★
+      #   1.4 時路徑會貼著家具走：4 組裡有 4 組（J/K/M/N）在同一個櫃檯角
+      #   「Start occupied」卡死 —— 後軸離櫃檯北緣 16 cm 往西開，車身壓進櫃檯 2 cm，
+      #   規劃失敗、而 BackUp／DriveOnHeading 也因 Collision Ahead 動不了，只能等停滯收尾。
+      #   2.0 兩次都沒卡在家具邊：38.7、37.5 m²（全場約 42；1.4 時 39.6、31.1），兩次都到盡頭房。
+      #   上面擔心的 no valid path：2.0 那兩趟規劃失敗 44、8 次，1.4 那兩趟 9、19 次，沒有變差的趨勢。
+      #   ★ 只在模擬驗證過（每組兩次）。上車若「以前規劃得出來的點現在說 no valid path」，先退回 1.4。
+      cost_penalty: 2.0
       retrospective_penalty: 0.015
       lookup_table_size: 20.0
       cache_obstacle_heuristic: true

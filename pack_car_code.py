@@ -148,9 +148,16 @@ def preflight() -> list:
         #   於是每個開超過 15 秒的目標都被判失敗、抑制掉（2026-09-25 查證 nav2 原始碼＋編譯實測）。
         #   修補已 commit 進我們的 fork，但 9/25 以前 clone 的子模組還指著上游原版 ——
         #   包照樣打得出來，車上的 explorer 卻是沒修的版本。
-        supp = sub / "src" / "frontier_suppression.cpp"
-        if supp.exists() and "[smartnav patch]" not in supp.read_text(encoding="utf-8", errors="replace"):
-            errs.append("frontier 子模組還是上游原版，沒有我們的修補（看門狗會把每個開超過 15 秒的目標誤判失敗）\n"
+        # ★ 2026-09-26：改成「patches/ 裡每個 .patch 改到的檔案都要有標記」，
+        #   而不是只看 frontier_suppression.cpp —— 0002（選點淨空＋到達抑制）改了另外 7 個檔，
+        #   停在 9/25 那版 fork（只有 0001）的子模組會通過舊檢查、上車卻沒有 0002。
+        unpatched = [f for f in sorted(_patched_files())
+                     if not pathlib.Path(f).exists()
+                     or "[smartnav patch]" not in pathlib.Path(f).read_text(encoding="utf-8", errors="replace")]
+        if unpatched:
+            errs.append(f"frontier 子模組缺我們的修補（{len(unpatched)} 個檔沒有 [smartnav patch] 標記，"
+                        f"例如 {unpatched[0]}）\n"
+                        "      沒修補的後果：看門狗誤判、目標點貼牆、同一個看不透的死角一直回去（patches/ 的 README）\n"
                         f"      修法：{PATCH_APPLY}")
 
         # 父 repo 記錄的子模組指標（gitlink）。還指著上游原版的話，別人 clone --recurse-submodules
