@@ -8,28 +8,33 @@
 
 大學部畢業專題。WHEELTEC 阿克曼實車 ＋ 人臉辨識 ＋ 語音對話 ＋ 自主導航。
 
-> **這是 `車子` 分支——目前實際在實車上運行的完整系統。**
-> 專案總覽、硬體層說明與完整實測數據在 [`master` 分支](../../tree/master)。
-> 兩個分支的 git 歷史互相獨立，是同一專案的兩個層次。
+> **`master` 是唯一的開發主線**（2026-09-24 起，原本的 `車子` 分支已併入並刪除），兩位組員都在這裡開發。
+> 車上要跑還需要 **`wheeltec` 分支**：17 個 WHEELTEC 廠商驅動（底盤、光達、相機），
+> 另外 clone 成 `~/wheeltec_ws` 當底層 workspace，我們的疊在上面（見「部署到 Pi」）。兩個分支歷史各自獨立，**不合併**。
 
 ---
 
-## 這個分支有什麼
+## 目錄
+
+repo 根目錄**就是** ROS 2 workspace（在這裡 `colcon build`）。
 
 ```
 .
-├── welcoming_robot_ws/          完整 ROS 2 workspace
-│   └── src/smartnav_ws/src/
-│       ├── smartnav_msgs/           介面定義（msg / srv / action）
-│       ├── smartnav_vision/         人臉向量擷取（InsightFace 512D）
-│       ├── smartnav_brain/          身份驗證、使用者管理、銀行迎賓劇本
-│       ├── smartnav_audio/          喚醒詞、ASR（sherpa-onnx）、雙麥克風降噪
-│       ├── smartnav_llm/            LLM 對話 Agent（LangChain + Ollama）
-│       ├── smartnav_navigation_cc/  ★ 導航重寫版：SLAM、AMCL、教導-重現路徑
-│       ├── smartnav_navigation/     舊版（模擬用，frame 不同不可混用）
-│       ├── smartnav_hmi/            平板網頁介面（FastAPI）＋ 瀏覽器 TTS 出聲
-│       └── smartnav_bringup/        demo.launch.py（311 行，五階段延遲啟動）＋ systemd
-├── maprun/                      建圖／導航／節點管理的操作腳本
+├── src/
+│   ├── smartnav_msgs/           介面定義（msg / srv / action）
+│   ├── smartnav_vision/         人臉向量擷取（InsightFace 512D）
+│   ├── smartnav_brain/          身份驗證、使用者管理、銀行迎賓劇本
+│   ├── smartnav_audio/          喚醒詞、ASR（sherpa-onnx）、雙麥克風降噪
+│   ├── smartnav_llm/            LLM 對話 Agent（LangChain + Ollama）
+│   ├── smartnav_navigation_cc/  ★ 導航重寫版：SLAM、AMCL、教導-重現路徑、自動探索
+│   ├── smartnav_navigation/     舊版（模擬用，frame 不同不可混用）
+│   ├── smartnav_hmi/            平板網頁介面（React 前端＋FastAPI）＋ 瀏覽器 TTS 出聲
+│   ├── smartnav_bringup/        demo.launch.py（311 行，五階段延遲啟動）＋ systemd
+│   ├── smartnav_sim/            （開發中）筆電 WSL 的 Gazebo 建圖模擬，不上車
+│   └── frontier_exploration_ros2/  ★ git 子模組（上游 frontier 探索的 fork，含我們的修補）
+├── maprun/                      操作腳本（Pi 上位於 ~/maprun）
+├── cyclonedds.xml               DDS 設定（env.sh 先找 ~/，再找 repo 根目錄）
+├── pack_car_code.py             打包上車（實機更新的正式途徑）
 ├── .smartnav/                   地圖、地點、教導路徑資料
 └── *.md                         交接與分析文件（見下）
 ```
@@ -46,6 +51,14 @@
 設計取捨的理由，以及踩過的坑。
 
 ## 進度總覽
+
+### 2026-09-25 主線合併與自動建圖修正（待上車驗證）
+
+- 9/23 組員重構（目錄攤平成 `src/`、HMI 改 React＋模組化 FastAPI、frontier 改子模組），9/24 合併成單一 `master`。
+- 自動建圖：逾時與停滯改為**存圖**（舊版逾時直接丟圖）；卡住偵測在探索中讓給 explorer 的看門狗處理，
+  避免「取消 → 又選回同一點」的無限迴圈；切換測試情境時先停導航再用正確模式重啟。
+  三個角度的程式審查後補修，行為測試 53/53——**尚未上車**。
+- 下次上車：平板「系統開關 → 建圖（自動探索）」跑一趟，結束後按一鍵驗證的 **V5**，它會把卡住原因分成 CPU／TF、幾何、實體三類。
 
 ### 2026-09-17 新實驗室靜態驗證
 
@@ -235,15 +248,58 @@ ros2 action send_goal /follow_taught_path smartnav_msgs/action/FollowTaughtPath 
 教導-重現是「人走一次給它看」。當環境約束緊到讓可行解幾乎不存在時，
 搜尋的成本會爆炸，而示範的成本不變。
 
-## 快速開始
+## 部署到 Pi
+
+**已經在跑的車：用打包更新**（在筆電跑 `python pack_car_code.py`，它會印出完整的 Pi 端步驟）。
+打包只帶我們自己的程式，不含廠商驅動；車上現有的廠商驅動解壓時不會被動到。
+
+**全新的 Pi（或換新 SD 卡）：clone 兩份、建兩個 workspace。**廠商驅動（`wheeltec` 分支）自成一個
+底層 workspace，我們的疊在它上面——這是 ROS 的標準 underlay／overlay 做法，repo 裡也就不會出現巢狀的
+`*_ws/`（本 repo 的 `CLAUDE.md` 明文禁止）。
 
 ```bash
-git clone -b 車子 https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws_repo
-cd ~/welcoming_robot_ws_repo/welcoming_robot_ws
-colcon build --symlink-install     # ★ 一律從 workspace 頂層建置
-source install/setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+source /opt/ros/jazzy/setup.bash
+# 0. astra 相機驅動要的系統套件（rosdep 蓋不到）
+sudo apt install -y libuvc-dev libgoogle-glog-dev
+
+# 1. 底層：廠商驅動（wheeltec 分支），先建
+git clone -b wheeltec --single-branch https://github.com/xiange1209/welcoming_robot.git ~/wheeltec_ws
+cd ~/wheeltec_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build                                    # 廠商的 C++ 驅動，第一次要一段時間
+source install/setup.bash                       # ★ 先 source 底層再建主線，主線才疊得上去
+
+# 2. 主線。★ --recurse-submodules：frontier 探索是子模組，漏掉它 src/frontier_exploration_ros2 是空的
+git clone --recurse-submodules https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws
+cd ~/welcoming_robot_ws
+ln -s ~/welcoming_robot_ws/maprun ~/maprun      # 所有腳本都寫死 ~/maprun
+# 平板網頁的前端要先建置（dist/ 不進 git，沒建 = 平板白畫面）。
+# Pi 上沒有 Node.js 的話，在筆電建好再 scp 整個 dist/ 過來
+(cd src/smartnav_hmi/frontend && npm ci && npm run build)
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install                  # ★ 一律從 workspace 頂層建置
+source install/setup.bash                       # 之後用 maprun/env.sh；主線的 setup.bash 會自動帶上 ~/wheeltec_ws
 ```
+
+17 個廠商套件裡我們直接用到的是底盤 `turn_on_wheeltec_robot`、光達 `lslidar_driver`、相機 `astra_camera`
+（連同它們依賴的 `serial`、`wheeltec_robot_msg`、`wheeltec_robot_urdf`、`lslidar_msgs`、`astra_camera_msgs`），
+其餘照車上現況一起建，不影響執行。
+
+> 現在車上的放法不一樣：廠商驅動在 `~/welcoming_robot_ws/src/wheeltec_ws/`，跟我們的套件同一次 build
+> （2026-09-25 查 Pi 備份確認，與 `wheeltec` 分支 528 個檔案逐一相同）。那樣也能跑，**不用搬**；
+> 只是新裝的一律照上面分兩個 workspace。
+
+## 兩人協作（都在 master 上）
+
+| 要做的事 | 怎麼做 |
+|---|---|
+| 開始工作前 | `git pull --rebase`；子模組有更新時再 `git submodule update --init` |
+| frontier 子模組 | 指向我們的 fork [`xiange1209/frontier_exploration_ros2`](https://github.com/xiange1209/frontier_exploration_ros2/tree/smartnav-patches) 的 `smartnav-patches` 分支（上游 + 看門狗修補，說明見 `patches/`）。**2026-09-25 以前 clone 的要做一次**：`git pull` 之後依序執行 `git submodule sync`、`git submodule update --init`（分兩行打：Windows PowerShell 5.1 不認 `&&`），否則還是上游原版（`pack_car_code.py` 會擋） |
+| 推上去 | `git push origin master`。被拒絕＝對方先推了 → 先 `git pull --rebase` 再推。**不要 `--force`** |
+| 大一點的改動 | 開**英文名**的分支（例 `feature/auto-mapping`），做完跟對方說一聲再合進 master；分支**不刪** |
+| 改廠商驅動 | 到 `~/wheeltec_ws/`（`wheeltec` 分支的 clone）裡改、commit、`git push origin wheeltec`。**廠商碼不要進 master** |
+| 不進 git（已 gitignore） | `build/ install/ log/`、`frontend/dist/`、`node_modules/`、`.smartnav/secrets/`（Telegram token）、`.smartnav/face_database/` |
+| 在 Windows 上 | 子模組會被系統的 `autocrlf` 改成 CRLF，上車就壞 → `git -C src/frontier_exploration_ros2 config core.autocrlf false` 後重新簽出（`pack_car_code.py` 會擋並給完整指令） |
 
 ```bash
 # 建圖
@@ -285,5 +341,5 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 ## 授權
 
-MIT（見 [`master` 分支的 LICENSE](../../blob/master/LICENSE)）。
-`src/` 下的 WHEELTEC 廠商程式碼依其原始授權條款。
+MIT（見 [LICENSE](LICENSE)）。
+`wheeltec` 分支裡的 WHEELTEC 廠商程式碼依其原始授權條款。

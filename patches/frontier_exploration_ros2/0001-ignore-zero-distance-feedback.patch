@@ -1,0 +1,20 @@
+diff --git a/src/frontier_suppression.cpp b/src/frontier_suppression.cpp
+index e456e4a..408f9a7 100644
+--- a/src/frontier_suppression.cpp
++++ b/src/frontier_suppression.cpp
+@@ -381,6 +381,15 @@ void FrontierSuppression::note_goal_progress(int dispatch_id, double distance_re
+ 
+   auto & progress = *state_.active_goal_progress;
+   progress.last_feedback_ns = now_ns;
++  // [smartnav patch] Nav2 on Jazzy publishes distance_remaining = 0.0 whenever it has no path:
++  // before the first plan of every goal (the previous goal's haltTree cleared {path}) and after a
++  // planning failure. Seeding or updating the baseline with that 0 locks the watchdog - nothing
++  // can ever be epsilon below 0 - so every goal longer than the timeout is canceled as
++  // "no progress" and suppressed even while the robot is closing in. Treat it as no information;
++  // a goal that never gets a path is still caught, measured from the acceptance-time seed.
++  if (distance_remaining <= 1e-3) {
++    return;
++  }
+   if (!progress.has_feedback) {
+     // The first feedback sample seeds both "best seen" and "last meaningful progress" state.
+     // From this point on, timeout decisions are based on actual navigation feedback.

@@ -66,7 +66,7 @@ def make_bank_tools(node) -> dict:
             action_result = node._wait_for_action_result(goal_handle, 200.0, "帶位")
             if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                 return f"執行結果: 成功, 詳細信息: 已將貴賓帶到{room_name}"
-            return f"執行結果: 失敗, 詳細信息: {action_result.result.message}"
+            return node._nav_failure_text(action_result)
         except Exception as e:
             return f"執行結果: 失敗, 詳細信息: {str(e)}"
 

@@ -466,6 +466,9 @@ class HmiServerNode(Node):
         self.action_clients["follow_taught_path"] = ActionClient(
             self, FollowTaughtPath, "follow_taught_path", callback_group=cb
         )
+        # 急停用的「取消全部」client 趁現在建好（JobRunner 建構時 action_clients 還是空的）。
+        # 急停當下才建的話，第一次 service_is_ready() 幾乎一定是 False 而被跳過
+        self.jobs._ensure_cancel_clients()
 
         # ── 位姿來源（畫機器人在地圖上的位置）───────────────
         if self.enable_map:

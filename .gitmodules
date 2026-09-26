@@ -1,3 +1,4 @@
 [submodule "src/frontier_exploration_ros2"]
 	path = src/frontier_exploration_ros2
-	url = https://github.com/mertgulerx/frontier_exploration_ros2
+	url = https://github.com/xiange1209/frontier_exploration_ros2
+	branch = smartnav-patches

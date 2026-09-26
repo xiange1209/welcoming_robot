@@ -8,6 +8,7 @@
   <license>MIT</license>
 
   <depend>rclpy</depend>
+  <depend>action_msgs</depend>
   <depend>smartnav_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>

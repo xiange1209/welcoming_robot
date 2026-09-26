@@ -547,6 +547,22 @@ class LLMServiceNode(Node):
                 self.get_logger().error(f"✗ {what}逾時後送取消指令失敗: {exc}")
             raise TimeoutError(f"{what}超過 {timeout_sec:.0f} 秒未完成，已中止本次請求")
 
+    @staticmethod
+    def _nav_failure_text(action_result) -> str:
+        """導航／帶位沒成功時給模型看的結果文字
+
+        ★ 2026-09-25（審查）：「取消」與「被外部停止」一定要跟「失敗」分開，而且要寫明不可重試。
+          以前 ABORTED 一律回「導航過程中發生錯誤」、帶位的取消也回「失敗」——
+          提示詞 §3 叫模型「失敗先自動重試」，平板按了緊急停止，模型卻再叫一次導航，車子又開出去。
+          navigation_action_cc 在「nav2 被別人取消、外層沒收到取消」時會回「導航被外部停止…請勿自動重試」。
+        """
+        msg = getattr(action_result.result, "message", "") or ""
+        if action_result.status == GoalStatus.STATUS_CANCELED:
+            return f"執行結果: 取消（不可重試）, 詳細信息: {msg or '導航請求被系統或使用者取消'}"
+        if "外部停止" in msg:
+            return f"執行結果: 已被停止（不可重試）, 詳細信息: {msg}"
+        return f"執行結果: 失敗, 詳細信息: {msg or '導航過程中發生錯誤'}"
+
     def _init_modern_llm_tools(self) -> None:
         """定義工具對照表"""
 
@@ -563,7 +579,12 @@ class LLMServiceNode(Node):
                     return f"執行結果: 失敗, 詳細信息: 建立地圖請求被系統拒絕"
 
                 # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
-                action_result = self._wait_for_action_result(goal_handle, 500.0, "建立地圖")
+                # ★ 2026-09-25：500 -> 1920，與 HMI 的 constants.py "create_map" 同值。
+                #   這裡一逾時就送取消，而 map_service 收到取消會**丟掉這趟的圖**、還原舊圖。
+                #   500 秒比 map_service 的 exploration_timeout_sec（1800）短得多，
+                #   等於自動探索超過 8 分鐘、或遙控超過 8 分鐘，整趟就白跑（2026-09-25 審查抓到）。
+                #   1920 = 1800 秒探索上限 + 存圖與切回定位的收尾時間。
+                action_result = self._wait_for_action_result(goal_handle, 1920.0, "建立地圖")
 
                 id = action_result.result.map_info.map_id
                 name = action_result.result.map_info.map_name
@@ -704,12 +725,7 @@ class LLMServiceNode(Node):
 
                 if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                     return f"執行結果: 成功, 詳細信息: {action_result.result.message}"
-                elif action_result.status == GoalStatus.STATUS_CANCELED:
-                    return "執行結果: 取消, 詳細信息: 導航請求被系統或使用者取消"
-                elif action_result.status == GoalStatus.STATUS_ABORTED:
-                    return f"執行結果: 失敗, 詳細信息: 導航過程中發生錯誤"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {action_result.result.message}"
+                return self._nav_failure_text(action_result)
             except Exception as e:
                 return f"執行結果: 失敗, 詳細信息: {str(e)}"
 

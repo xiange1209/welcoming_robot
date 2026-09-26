@@ -29,6 +29,11 @@ class JobRunner:
     # 解法：直接對 action 的 cancel 服務送「取消全部」。ROS 2 action 規格：
     # goal_id 全零 + stamp 全零 = 取消該伺服器上**所有**目標，與是誰送出的無關。
     ACTION_CANCEL_ALL = ("navigate", "follow_taught_path", "global_localization", "create_map")
+    # ★ 2026-09-25：再加上 nav2 本體，而且排第一個。自動探索（frontier explorer）與 LLM 的導航，
+    #   最後都是 navigate_to_pose 的目標；HMI 送的零速會被 nav2 controller 下一拍（10~20 Hz）蓋掉。
+    #   以前探索中按急停，要等 create_map 取消 → map_service 0.5 秒輪詢 → 叫 explorer STOP 車才停。
+    #   直接取消 nav2 不依賴任何中間節點（審查 safety#5）。
+    RAW_CANCEL = {"nav2": "/navigate_to_pose"}
 
     def __init__(self, node, state, service_clients: Dict[str, Any], action_clients: Dict[str, Any],
                  service_timeout: float, cancel_callback_group):
@@ -39,6 +44,10 @@ class JobRunner:
         self.service_timeout = service_timeout
         self._cancel_cb_group = cancel_callback_group
         self._cancel_srv_clients: Dict[str, Any] = {}
+        # ★ 2026-09-25：取消用的 client 啟動時就建好。以前是急停當下才建，
+        #   新 client 還沒完成 discovery，service_is_ready() 幾乎一定是 False 而被跳過 ——
+        #   開機後第一次按急停，這條「取消全部」其實沒送出去。
+        self._ensure_cancel_clients()
 
         self._job_counter = itertools.count(1)
         # 進行中的動作 goal handle 登記簿，供取消使用
@@ -164,23 +173,38 @@ class JobRunner:
         self.state.set_job(job_id, status="cancelling", message="取消中…")
         return True
 
+    def _cancel_service_names(self) -> Dict[str, str]:
+        """要送「取消全部」的 action 與其取消服務名（依序；nav2 本體排第一）"""
+        names: Dict[str, str] = {}
+        for name, action in self.RAW_CANCEL.items():
+            names[name] = f"{action}/_action/cancel_goal"
+        for name in self.ACTION_CANCEL_ALL:
+            client = self.action_clients.get(name)
+            if client is not None:
+                # action 的取消服務固定是 <action_name>/_action/cancel_goal
+                names[name] = f"{client._action_name}/_action/cancel_goal"
+        return names
+
+    def _ensure_cancel_clients(self) -> None:
+        for name, srv_name in self._cancel_service_names().items():
+            if name in self._cancel_srv_clients:
+                continue
+            try:
+                self._cancel_srv_clients[name] = self._node.create_client(
+                    CancelGoal, srv_name, callback_group=self._cancel_cb_group
+                )
+            except Exception as e:  # noqa: BLE001
+                self._node.get_logger().warning(f"建立 {name} 的取消 client 失敗: {e}")
+
     def cancel_all_action_goals(self) -> List[str]:
         """對所有會讓車子移動的 action 送『取消全部』。回傳成功送出的動作名。"""
         node = self._node
+        self._ensure_cancel_clients()
         sent: List[str] = []
-        for name in self.ACTION_CANCEL_ALL:
-            client = self.action_clients.get(name)
-            if client is None:
-                continue
+        for name in self._cancel_service_names():
+            srv = self._cancel_srv_clients.get(name)
             try:
-                srv = self._cancel_srv_clients.get(name)
-                if srv is None:
-                    # action 的取消服務固定是 <action_name>/_action/cancel_goal
-                    srv = node.create_client(
-                        CancelGoal, f"{client._action_name}/_action/cancel_goal", callback_group=self._cancel_cb_group
-                    )
-                    self._cancel_srv_clients[name] = srv
-                if not srv.service_is_ready():
+                if srv is None or not srv.service_is_ready():
                     continue
                 # 全零 goal_id + 全零 stamp = 取消全部
                 srv.call_async(CancelGoal.Request())

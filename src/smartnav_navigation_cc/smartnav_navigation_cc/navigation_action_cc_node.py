@@ -43,6 +43,11 @@ from std_srvs.srv import Trigger
 from smartnav_msgs.action import FollowTaughtPath, Navigate
 from smartnav_msgs.srv import DeleteTaughtPath, GetWaypoint, PlanTaughtPath
 
+# 內層導航被別人取消（平板急停、卡住偵測），外層卻沒收到取消時的結果訊息。
+# ★ 「請勿自動重試」是寫給 LLM 看的：它的提示詞要求失敗先自動重試，
+#   把急停回報成一般失敗，車子會在急停之後又被叫出去（2026-09-25 審查）。
+EXTERNAL_STOP_MSG = "導航被外部停止（緊急停止或卡住偵測），請勿自動重試"
+
 
 def wait_for_future(future, timeout_sec: float) -> Any:
     """阻塞等待 future 完成"""
@@ -392,6 +397,10 @@ class NavigationActionCcNode(Node):
             if outcome == "stalled":
                 return self._abort(goal_handle, result, "導航停滯無法前進，已自動取消")
 
+            if outcome == "external_cancel":
+                # 外層沒收到取消，狀態還是 EXECUTING —— 只能 abort，不能 canceled()
+                return self._abort(goal_handle, result, EXTERNAL_STOP_MSG)
+
             if outcome != "succeeded":
                 return self._abort(goal_handle, result, "導航過程出現異常，導航失敗")
 
@@ -488,6 +497,8 @@ class NavigationActionCcNode(Node):
 
             if outcome == "cancel":
                 return self._canceled(goal_handle, result)
+            if outcome == "external_cancel":
+                return self._abort(goal_handle, result, EXTERNAL_STOP_MSG)
             if outcome == "timeout":
                 return self._abort(goal_handle, result, "導航逾時，已自動取消")
             if outcome == "reject":
@@ -510,6 +521,10 @@ class NavigationActionCcNode(Node):
             self.get_logger().error(
                 f"教導-重現第 {attempt} 次失敗：{last_why}"
                 f"　★ 臨時路徑 {path_id} 已保留供查驗")
+            # ★ 2026-09-25：失敗之後、決定重試或放棄之前先看取消。舊版只在下一輪開頭檢查，
+            #   最後一輪與「原地失敗兩次」這兩個出口會漏掉，把使用者的取消回報成失敗
+            if goal_handle.is_cancel_requested:
+                return self._canceled(goal_handle, result)
 
             # 「有沒有移動」決定值不值得再試。卡在同一個地方時，重新規劃
             # 拿到的會是幾乎一樣的路徑與一樣的結果 —— 那是浪費電量與時間。
@@ -591,6 +606,9 @@ class NavigationActionCcNode(Node):
 
         if outcome in ("cancel", "timeout"):
             return outcome, res, plan.path_id
+        if res is not None and res.status == GoalStatus.STATUS_CANCELED:
+            # 重播被別人取消、外層卻沒收到取消 —— 當成「失敗」會重新規劃再開一次
+            return "external_cancel", res, plan.path_id
 
         ok = res is not None and res.status == GoalStatus.STATUS_SUCCEEDED \
             and getattr(res.result, "success", False)
@@ -703,7 +721,11 @@ class NavigationActionCcNode(Node):
 
         if not result_future.done():
             return None, "failed"
-        return result_future.result(), "done"
+        res = result_future.result()
+        # 急停同時取消重播與 /navigate：重播的結果常比外層取消旗標先到（見 _outer_cancel_arrived）
+        if self._outer_cancel_arrived(goal_handle, res.status):
+            return res, "cancel"
+        return res, "done"
 
     def _cancel_taught(self, follow_goal_handle) -> None:
         try:
@@ -719,7 +741,10 @@ class NavigationActionCcNode(Node):
                 self._last_progress_time = time.monotonic()
 
     def _monitor_navigation(self, goal_handle, nav2_goal_handle) -> str:
-        """盯著 Nav2 的結果，回傳 succeeded / cancel / timeout / stalled / failed"""
+        """盯著 Nav2 的結果，回傳 succeeded / cancel / timeout / stalled / external_cancel / failed
+
+        external_cancel：nav2 被別人取消（急停、卡住偵測），外層卻沒收到取消 —— 不能當成一般失敗重試
+        """
         result_future = nav2_goal_handle.get_result_async()
         deadline = time.monotonic() + self.navigation_timeout_sec
 
@@ -744,7 +769,33 @@ class NavigationActionCcNode(Node):
             return "failed"
 
         status = result_future.result().status
-        return "succeeded" if status == GoalStatus.STATUS_SUCCEEDED else "failed"
+        if self._outer_cancel_arrived(goal_handle, status):
+            return "cancel"
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            return "succeeded"
+        if status == GoalStatus.STATUS_CANCELED:
+            return "external_cancel"
+        return "failed"
+
+    def _outer_cancel_arrived(self, goal_handle, inner_status) -> bool:
+        """內層（nav2 或重播）結束之後，判斷這次是不是外層 /navigate 的取消
+
+        ★ 2026-09-25（審查）：平板急停會幾乎同時對 /navigate_to_pose 與 /navigate 送「取消全部」
+          （nav2 排第一，自動探索與 MPPI 才停得住）。nav2 幾十毫秒就回 CANCELED，而監看迴圈每 0.5 秒
+          才醒一次、醒來先看結果 —— 外層的取消旗標晚幾毫秒才設，於是被判成「失敗」。
+          LLM 的提示詞要求「失敗先自動重試」，**車子就可能在急停之後又開出去**。
+          所以：外層旗標已設就是取消；內層是 CANCELED 時最多再等 1 秒看外層旗標。
+        """
+        if goal_handle.is_cancel_requested:
+            return True
+        if inner_status != GoalStatus.STATUS_CANCELED:
+            return False
+        t_end = time.monotonic() + 1.0
+        while time.monotonic() < t_end:
+            if goal_handle.is_cancel_requested:
+                return True
+            time.sleep(0.05)
+        return False
 
     def _cancel_nav2(self, nav2_goal_handle) -> None:
         try:

@@ -9,6 +9,17 @@
 
 set -eo pipefail
 
+# ★ 2026-09-25 停用。以下舊內容保留作參考，不會執行到。
+#   它傳的 hmi_server_node.py 與 web/index.html 在 9/23 HMI 改成 React＋模組化 FastAPI 後都不存在了，
+#   路徑也還是舊的 welcoming_robot_ws/src/smartnav_ws/。照跑會在 Pi 上 cd 失敗或傳錯東西。
+cat >&2 <<'MSG'
+✗ deploy_hmi.sh 已停用（對應的是 9/23 以前的 HMI）。
+  更新 HMI 請用整包部署（包很小，約 2~3 MB）：
+    cd src/smartnav_hmi/frontend && npm ci && npm run build && cd ../../..
+    python pack_car_code.py      # 會印出 Pi 端的完整步驟
+MSG
+exit 1
+
 PI_IP="${1:?請給 Pi 的 IP，例如 ./deploy_hmi.sh 192.168.1.100}"
 PI_USER="${2:-user}"
 WS="~/welcoming_robot_ws/src/smartnav_ws/src/smartnav_hmi"

@@ -9,6 +9,11 @@ source /opt/ros/jazzy/setup.bash
 source /home/user/welcoming_robot_ws/install/setup.bash
 
 export CYCLONEDDS_URI=file:///home/user/cyclonedds.xml
+# git clone 部署時 ~/cyclonedds.xml 不存在，但 repo 根目錄（= workspace）有一份一樣的
+# （2026-09-25 比對 md5 相同）。少了它 nav2 節點一多就會耗盡 participant 索引而大量崩潰。
+if [ ! -f /home/user/cyclonedds.xml ] && [ -f /home/user/welcoming_robot_ws/cyclonedds.xml ]; then
+  export CYCLONEDDS_URI=file:///home/user/welcoming_robot_ws/cyclonedds.xml
+fi
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export ROS_DOMAIN_ID=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST

@@ -1,0 +1,259 @@
+<?xml version="1.0"?>
+<!--
+  senior_akm 模擬車（Gazebo Harmonic）
+
+  ★ 原點 base_footprint = 後輪軸心、地面高度 —— 跟 nav2 設定一致
+    （nav2_senior_akm_cc.yaml 的 footprint [-0.09 … 0.40]：車尾 0.09、車頭 0.40）。
+    Gazebo 的 AckermannSteering 算里程計也是以後軸為準，兩邊剛好對上。
+
+  尺寸出處：
+    軸距 0.322、輪距 0.322、胎徑 0.125、韌體最小迴轉半徑 0.750
+      → F103RCT6 韌體 robot_select_init.h（SENIOR_AKM_*）；廠商 URDF 量出來是 0.319／0.308，以韌體為準
+    base_footprint → base_link 高 0.0423、→ laser (0.08874, 0.00067, 0.11102)
+      → turn_on_wheeltec_robot/config/robot_model.yaml（senior_akm），與實車靜態 TF 同源
+    車寬 0.37（外框）→ nav2 footprint
+
+  ★ 光達高度故意不用實車的 0.111：輪胎頂在 0.125，0.111 的掃描面會切到自己的前輪，
+    costmap 會在車子四周畫出假障礙。改成 0.15（高過輪胎與車殼）。
+    2D 導航只看平面，z 不影響任何演算法。
+  ★ 光達 x 預設跟實車 TF 一樣 0.0887。實車「光達中心到後軸」還沒量過（待辦），
+    若量出來不一樣，可以用 lidar_x_actual 把模擬光達放到實際位置、TF 維持 0.0887，
+    看 TF 錯位對建圖的影響。
+-->
+<robot name="smartnav_akm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="lidar_x" default="0.08874"/>
+  <!-- same = 跟 lidar_x 一樣（感測器就在 TF 說的位置） -->
+  <xacro:arg name="lidar_x_actual" default="same"/>
+  <xacro:arg name="lidar_z" default="0.15"/>
+  <xacro:arg name="lidar_samples" default="390"/>
+  <xacro:property name="lidar_x" value="$(arg lidar_x)"/>
+  <xacro:property name="lidar_x_actual_raw" value="$(arg lidar_x_actual)"/>
+  <xacro:property name="lidar_z" value="$(arg lidar_z)"/>
+  <xacro:property name="lidar_samples" value="$(arg lidar_samples)"/>
+
+  <xacro:property name="PI" value="3.141592653589793"/>
+  <xacro:property name="wheel_base" value="0.322"/>
+  <xacro:property name="track" value="0.322"/>
+  <xacro:property name="wheel_r" value="0.0625"/>
+  <xacro:property name="wheel_w" value="0.045"/>
+  <xacro:property name="base_link_z" value="0.0423"/>
+  <!-- 韌體最小迴轉半徑 0.750 對應的舵角：atan(0.322 / 0.750) = 0.4056 rad（23.2 度）。
+       實車做不到這麼小（左 1.030／右 1.183），那部分交給 akm_realism 節點截斷。 -->
+  <xacro:property name="steer_limit" value="0.4056"/>
+  <!-- 車殼：x -0.09～0.40、寬 0.24（輪子在外側，含輪子總寬 0.37）、離地 0.04～0.12 -->
+  <xacro:property name="body_x0" value="-0.09"/>
+  <xacro:property name="body_x1" value="0.40"/>
+  <xacro:property name="body_w" value="0.24"/>
+  <xacro:property name="body_z0" value="0.04"/>
+  <xacro:property name="body_z1" value="0.12"/>
+  <xacro:property name="body_mass" value="5.0"/>
+  <xacro:property name="wheel_mass" value="0.3"/>
+
+  <!-- 光達掃描規格：ls_N10（wheeltec_param.yaml lidar_type: ls_N10_uart）。
+       每圈 390 點是由 scan_filter 的實測「車尾 80 度內 87 根光束」推的（≈0.92 度/點）；
+       0.15 m 最小距離取自 lslidar_x10.yaml 的 min_range。待 V0 讀實車 /scan 規格後校正。 -->
+
+  <!-- ─── 慣量 ─────────────────────────────────────────── -->
+  <xacro:macro name="box_inertial" params="m x y z ox oy oz">
+    <inertial>
+      <origin xyz="${ox} ${oy} ${oz}"/>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(y*y+z*z)/12}" ixy="0" ixz="0"
+               iyy="${m*(x*x+z*z)/12}" iyz="0" izz="${m*(x*x+y*y)/12}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- 輪子轉軸是 y：iyy = m r²/2，另外兩軸 = m(3r² + w²)/12 -->
+  <xacro:macro name="wheel_link" params="name">
+    <link name="${name}">
+      <inertial>
+        <mass value="${wheel_mass}"/>
+        <inertia ixx="${wheel_mass*(3*wheel_r*wheel_r+wheel_w*wheel_w)/12}" ixy="0" ixz="0"
+                 iyy="${wheel_mass*wheel_r*wheel_r/2}" iyz="0"
+                 izz="${wheel_mass*(3*wheel_r*wheel_r+wheel_w*wheel_w)/12}"/>
+      </inertial>
+      <visual>
+        <origin rpy="${PI/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+        <material name="tyre"><color rgba="0.15 0.15 0.15 1"/></material>
+      </visual>
+      <collision>
+        <origin rpy="${PI/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+      </collision>
+    </link>
+    <gazebo reference="${name}">
+      <mu1>1.0</mu1>
+      <mu2>1.0</mu2>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- ─── 車身 ─────────────────────────────────────────── -->
+  <link name="base_footprint"/>
+
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${base_link_z}"/>
+  </joint>
+
+  <link name="base_link">
+    <xacro:box_inertial m="${body_mass}" x="${body_x1-body_x0}" y="${body_w}" z="${body_z1-body_z0}"
+                        ox="${(body_x0+body_x1)/2}" oy="0" oz="${(body_z0+body_z1)/2-base_link_z}"/>
+    <visual>
+      <origin xyz="${(body_x0+body_x1)/2} 0 ${(body_z0+body_z1)/2-base_link_z}"/>
+      <geometry><box size="${body_x1-body_x0} ${body_w} ${body_z1-body_z0}"/></geometry>
+      <material name="shell"><color rgba="0.74 0.90 0.96 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="${(body_x0+body_x1)/2} 0 ${(body_z0+body_z1)/2-base_link_z}"/>
+      <geometry><box size="${body_x1-body_x0} ${body_w} ${body_z1-body_z0}"/></geometry>
+    </collision>
+  </link>
+
+  <!-- ─── 後輪（驅動輪，里程計用這兩顆）──────────────────── -->
+  <xacro:wheel_link name="rl_wheel"/>
+  <xacro:wheel_link name="rr_wheel"/>
+  <joint name="rl_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rl_wheel"/>
+    <origin xyz="0 ${track/2} ${wheel_r-base_link_z}"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+  <joint name="rr_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rr_wheel"/>
+    <origin xyz="0 ${-track/2} ${wheel_r-base_link_z}"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ─── 前輪（轉向＋自由滾動；實車是後驅）───────────────── -->
+  <xacro:macro name="steer_link" params="name">
+    <link name="${name}">
+      <inertial>
+        <mass value="0.05"/>
+        <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+  <xacro:steer_link name="fl_steer"/>
+  <xacro:steer_link name="fr_steer"/>
+  <joint name="fl_steer_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="fl_steer"/>
+    <origin xyz="${wheel_base} ${track/2} ${wheel_r-base_link_z}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.6" upper="0.6" effort="10" velocity="5"/>
+  </joint>
+  <joint name="fr_steer_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="fr_steer"/>
+    <origin xyz="${wheel_base} ${-track/2} ${wheel_r-base_link_z}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.6" upper="0.6" effort="10" velocity="5"/>
+  </joint>
+  <xacro:wheel_link name="fl_wheel"/>
+  <xacro:wheel_link name="fr_wheel"/>
+  <joint name="fl_wheel_joint" type="continuous">
+    <parent link="fl_steer"/>
+    <child link="fl_wheel"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+  <joint name="fr_wheel_joint" type="continuous">
+    <parent link="fr_steer"/>
+    <child link="fr_wheel"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ─── 光達 ─────────────────────────────────────────── -->
+  <!-- TF（robot_state_publisher 發）用 lidar_x；Gazebo 裡的感測器放在 lidar_x_actual。
+       兩者預設相同。laser 連結要有 inertial，否則 URDF 轉 SDF 時整個連結（連同感測器）會被丟掉。 -->
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="laser"/>
+    <origin xyz="${lidar_x} 0.00067 ${lidar_z}"/>
+  </joint>
+  <link name="laser">
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+    </inertial>
+    <visual>
+      <geometry><cylinder radius="0.035" length="0.04"/></geometry>
+      <material name="lidar"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+  </link>
+
+  <gazebo reference="laser">
+    <sensor name="lidar" type="gpu_lidar">
+      <!-- 感測器相對 laser 連結的位移 = 實際位置 − TF 位置（預設 0） -->
+      <pose>${0.0 if str(lidar_x_actual_raw) == 'same' else float(lidar_x_actual_raw) - float(lidar_x)} 0 0 0 0 0</pose>
+      <gz_frame_id>laser</gz_frame_id>
+      <topic>/smartnav_sim/scan</topic>
+      <update_rate>10</update_rate>
+      <always_on>true</always_on>
+      <visualize>false</visualize>
+      <lidar>
+        <scan>
+          <horizontal>
+            <samples>${lidar_samples}</samples>
+            <resolution>1</resolution>
+            <!-- 跟實車一樣從 −180 度起算（scan_filter_cc 的車尾遮罩依賴這點）；
+                 最後一點停在 180 − 一格，不然頭尾兩點重疊 -->
+            <min_angle>${-PI}</min_angle>
+            <max_angle>${PI - 2*PI/float(lidar_samples)}</max_angle>
+          </horizontal>
+          <vertical>
+            <samples>1</samples>
+            <resolution>1</resolution>
+            <min_angle>0</min_angle>
+            <max_angle>0</max_angle>
+          </vertical>
+        </scan>
+        <range>
+          <min>0.15</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </lidar>
+    </sensor>
+  </gazebo>
+
+  <!-- ─── 阿克曼驅動＋里程計 ──────────────────────────────── -->
+  <!-- 只列後輪當驅動輪（實車是後驅、編碼器在後輪馬達上）；前輪自由滾動、只管轉向。
+       里程計直接發 odom_combined -> base_footprint，取代實車的 EKF。 -->
+  <gazebo>
+    <plugin filename="gz-sim-ackermann-steering-system" name="gz::sim::systems::AckermannSteering">
+      <left_joint>rl_wheel_joint</left_joint>
+      <right_joint>rr_wheel_joint</right_joint>
+      <left_steering_joint>fl_steer_joint</left_steering_joint>
+      <right_steering_joint>fr_steer_joint</right_steering_joint>
+      <kingpin_width>${track}</kingpin_width>
+      <steering_limit>${steer_limit}</steering_limit>
+      <wheel_base>${wheel_base}</wheel_base>
+      <wheel_separation>${track}</wheel_separation>
+      <wheel_radius>${wheel_r}</wheel_radius>
+      <min_velocity>-0.6</min_velocity>
+      <max_velocity>0.6</max_velocity>
+      <min_acceleration>-1.0</min_acceleration>
+      <max_acceleration>1.0</max_acceleration>
+      <topic>/smartnav_sim/cmd_vel</topic>
+      <odom_topic>/smartnav_sim/odom</odom_topic>
+      <tf_topic>/smartnav_sim/tf</tf_topic>
+      <frame_id>odom_combined</frame_id>
+      <child_frame_id>base_footprint</child_frame_id>
+      <odom_publish_frequency>30</odom_publish_frequency>
+      <!-- 轉向關節的 P 增益。不設的話舵角到位太慢：2026-09-26 實測左右打到底的半徑
+           都比指令大 15%（1.181／1.369）。設 10 之後穩態半徑（里程計）左 1.007／右 1.163，
+           跟 akm_realism 的 1.030／1.183 差 2%。 -->
+      <steer_p_gain>10.0</steer_p_gain>
+    </plugin>
+  </gazebo>
+
+</robot>

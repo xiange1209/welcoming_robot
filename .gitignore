@@ -173,3 +173,12 @@ HMI效能_*.md
 路徑資料庫盤點_*.md
 # 2026-09-10：出發清單。內部工作文件，走 tarball 交付。
 出發清單_*.md
+
+# 2026-09-23 目錄攤平成 src/ 之前的舊結構。從舊分支切過來會留下被忽略的
+# 快取、備份檔與巢狀 .git，不擋的話 git add . 會把它們收進來。
+/welcoming_robot_ws/
+
+# 廠商驅動（wheeltec 分支）。新裝的放在 repo 外的 ~/wheeltec_ws（README「部署到 Pi」），
+# 但車上現有的是放在 src/wheeltec_ws/ —— 誰把車上的 workspace 整包拷回來、或照舊習慣 clone 進來，
+# git add . 就會把 17 個廠商套件（528 檔）收進 master。同學規則明訂兩條線不合併，這裡先擋住。
+/src/wheeltec_ws/

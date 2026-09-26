@@ -69,9 +69,11 @@
 **完全不抬**。`SLOWDOWN` 仍然抬——「減速」的語意是「慢慢走」不是「停下」，
 一個讓馬達停轉的減速已經違背它自己的意圖（那正是 8/24 查到的病）。
 
-★ 收不到狀態訊息（逾時、nav2_msgs 匯入失敗）時**一律不抬**並印 error。
+★ 真的不知道防撞狀態（狀態話題上沒有發布端、nav2_msgs 匯入失敗）時**一律不抬**並印 error。
   這裡刻意選 fail-safe：本節點的功能是效能修正，防撞不是；
   兩者衝突時讓效能修正失效，不能讓防撞失效。
+  ★ 但「很久沒收到新狀態」**不算**不知道 —— 那個話題是狀態改變時才發，
+    沒有新訊息就是狀態沒變（2026-09-26 修，見 `_safety_is_braking`）。
 
 ## ★ 曲率必須一起等比例放大
 
@@ -149,9 +151,16 @@ class CmdVelFloorNode(Node):
             #
             # 留 10 秒是為了「發布端還在、但語意上真的失聯」這種極端情況，
             # 而 3.2 秒的實測最大間隔離它還有三倍餘裕。
+            #
+            # ★★ 2026-09-26：上面「三倍餘裕」不成立，改成逾時後只確認發布端 ★★
+            #   8/27 那 20 秒剛好狀態常變。Gazebo 模擬 12 分鐘自動建圖
+            #   （smartnav_sim，筆電 WSL）：collision_monitor 在 832→855 秒整整 23 秒沒換狀態，
+            #   本節點總結「抬過死區 817 則、因不知道防撞狀態而不抬 **3084 則**」——
+            #   被誤擋的是正常抬升的 3.8 倍，那些指令全被底盤死區吃掉、車子停住。
+            #   現在逾時只代表「去確認一下發布端還在不在」，在就照最後一則狀態判斷。
             "state_stale_sec", 10.0,
             ParameterDescriptor(
-                description="狀態訊息多久沒來就當作不知道（不知道 = 不抬）"))
+                description="狀態訊息多久沒來就確認一次發布端還在不在（不在 = 不抬）"))
 
         self.in_topic = self.get_parameter("in_topic").get_parameter_value().string_value
         self.out_topic = self.get_parameter("out_topic").get_parameter_value().string_value
@@ -174,6 +183,9 @@ class CmdVelFloorNode(Node):
         self._action_t = 0.0
         self._polygon = ""
         self._stale_warned = False
+        # 發布端檢查的快取（這在 20 Hz 的熱路徑上，圖查詢一秒做一次就夠）
+        self._pub_check_t = -1e9
+        self._pub_alive = False
 
         # 指令話題要 RELIABLE：漏一則停止指令的代價太高。
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
@@ -209,11 +221,24 @@ class CmdVelFloorNode(Node):
         self._action_t = time.monotonic()
         self._stale_warned = False
 
+    def _state_publisher_alive(self) -> bool:
+        """防撞狀態話題上還有沒有發布端（快取 1 秒）"""
+        now = time.monotonic()
+        if now - self._pub_check_t >= 1.0:
+            self._pub_check_t = now
+            try:
+                self._pub_alive = self.count_publishers(self.state_topic) > 0
+            except Exception:  # noqa: BLE001
+                self._pub_alive = False
+        return self._pub_alive
+
     def _safety_is_braking(self) -> Tuple[bool, str]:
         """防撞現在是不是正在把速度往下壓。回 (要不要按住, 原因)。
 
         ★ 這裡的預設值刻意是「按住」：不知道就不抬。
           本節點是效能修正、防撞不是，兩者衝突時該失效的是前者。
+        ★ 但「不知道」只有一種：狀態話題上**沒有發布端**。
+          有發布端卻沒有新訊息 = 狀態沒變（on-change 話題），照最後一則判斷。
         """
         if CollisionMonitorState is None:
             return True, "沒有 CollisionMonitorState"
@@ -233,16 +258,21 @@ class CmdVelFloorNode(Node):
             # ★ 分辨的方法：發布端**在不在**。
             #   有發布端但還沒發過 = 狀態就是 DO_NOTHING（on-change 的語意）-> 可以抬
             #   連發布端都沒有       = 真的不知道 -> fail-safe 不抬
-            try:
-                if self.count_publishers(self.state_topic) > 0:
-                    return False, ""
-            except Exception:  # noqa: BLE001
-                pass
+            if self._state_publisher_alive():
+                return False, ""
             return True, "防撞狀態話題上沒有任何發布端"
         if time.monotonic() - self._action_t > self.state_stale:
-            return True, (f"防撞狀態超過 {self.state_stale:.1f} 秒沒更新"
-                          f"（★ 這個話題是狀態改變時才發，正常運作時本來就會"
-                          f"隔幾秒才有一則；會看到這行代表真的很久沒動靜）")
+            # ★★ 2026-09-26：跟上面「還沒收到」同一個道理，8/27 只修了一半 ★★
+            #   舊版這裡直接回「不抬」：收到過一則之後，只要狀態 10 秒不變
+            #   （一路 DO_NOTHING 或一路 SLOWDOWN，最常見的情況）就停止抬速度，
+            #   死區問題原樣回來。模擬 12 分鐘實測誤擋 3084 則（見 state_stale_sec 的註解）。
+            #   而且本節點的輸入 cmd_vel_prefloor **就是 collision_monitor 發的**：
+            #   還有指令進來，它就一定活著，沒有新狀態只會是「狀態沒變」。
+            #   這裡只剩一種真的要擋的情況：發布端已經不在了。
+            if not self._state_publisher_alive():
+                return True, (f"防撞狀態超過 {self.state_stale:.1f} 秒沒更新，"
+                              f"而且話題上已經沒有發布端")
+            # 發布端還在：往下照最後一則狀態判斷
         # APPROACH = 按碰撞剩餘時間連續縮放（正在煞車，那個小值就是要的結果）
         # STOP     = 明確要停
         approach = getattr(CollisionMonitorState, "APPROACH", 3)
@@ -280,8 +310,9 @@ class CmdVelFloorNode(Node):
                     self._stale_warned = True
                     self.get_logger().warning(
                         f"⚠ 不抬：{why}。不知道防撞狀態就不抬（fail-safe）。"
-                        f"★ 若車子在死區以下不動，先查 {self.state_topic} "
-                        f"有沒有在發（`ros2 topic hz {self.state_topic}`）")
+                        f"★ 若車子在死區以下不動，先查 collision_monitor 還在不在"
+                        f"（`ros2 topic info {self.state_topic}` 的 Publisher count；"
+                        f"不要用 topic hz，它是狀態改變才發的）")
             self.pub.publish(msg)
             return
 

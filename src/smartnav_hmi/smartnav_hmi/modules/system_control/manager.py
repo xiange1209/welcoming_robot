@@ -6,6 +6,8 @@
 
 import importlib.util
 import os
+import re
+import subprocess
 from typing import Dict, Optional
 
 from std_srvs.srv import Trigger
@@ -86,6 +88,11 @@ class SystemControlManager:
                 },
                 "localization": {
                     "label": "定位 + 導航",
+                    # ★ 2026-09-25：第二個參數一定要明寫 false。run_nav_cc.sh 的預設是
+                    #   USE_EXPLORATION="${2:-true}"，只給 localization 會連 frontier explorer
+                    #   一起起、而且 auto_start=true —— 之後在建圖頁按「開始建圖」車子就自己開走，
+                    #   平白也多吃 CPU。README「兩個參數都要給」講的就是這個。
+                    "cmd": ["/home/user/maprun/run_nav_cc.sh", "localization", "false"],
                 },
             },
         },
@@ -188,20 +195,44 @@ class SystemControlManager:
             "note": "不需要底盤與雷達。導航一定要關 —— 導航中人臉節點完全不推論，"
             "註冊採樣會逾時然後把剛註冊的人回滾刪掉",
         },
+        # ★ 2026-09-24：原本只有一個叫「建圖」的情境，但它起的是 nav:mapping ——
+        #   run_nav_cc.sh mapping **false**，frontier explorer 根本不會啟動，
+        #   按了「開始建圖」車子也不會自己動（create_map 會退回遙控建圖）。
+        #   名稱看不出這件事，所以拆成兩個、名字寫清楚。
+        #
+        # ★ 2026-09-25：凡是指定了 nav 模式（nav:xxx）的情境，stop 清單都要有 "nav"。
+        #   system_control 看到導航堆疊已經在跑就拒絕 start（防止疊兩套 Nav2），
+        #   而 scenario_apply 失敗照樣往下做 —— 於是從「教導路徑」換到「建圖（遙控）」時，
+        #   導航其實還停在舊模式，步驟列表只多一行「已經在執行中」，很容易看漏。
+        #   先停再用正確的模式啟動，代價是每次多等約 60 秒。
         "mapping": {
-            "label": "建圖",
-            "why": "底盤雷達 + 導航堆疊（建圖模式）。其餘全關，把 CPU 讓出來",
-            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera"],
+            "label": "建圖（遙控）",
+            "why": "底盤雷達 + 導航堆疊（建圖模式）。人用遙控把環境走一遍。其餘全關，把 CPU 讓出來",
+            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
             "start": ["sensors", "nav:mapping"],
-            "note": "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
-            "導航堆疊再約 60 秒。人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗",
+            "note": "導航堆疊會先停掉、再用建圖模式重啟（換模式一定要重啟）。"
+            "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
+            "導航堆疊再約 60 秒。人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗。"
+            "全綠後到「遙控建圖」分頁按「開始建圖」，遙控走完一圈再按「完成存檔」",
+        },
+        "auto_mapping": {
+            "label": "建圖（自動探索）",
+            "why": "同上，但啟動 frontier explorer，車子會自己找沒去過的地方開過去",
+            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
+            "start": ["sensors", "nav:explore"],
+            "note": "⚠ 車子會自己跑動，旁邊要有人顧著。導航堆疊會先停掉、再用探索模式重啟；"
+            "全綠後（約 80 秒）到「遙控建圖」分頁按「開始建圖」才會開始探索。"
+            "四種情況會自動存圖：探索完成、4 分鐘地圖沒有長大、同一處卡住 3 次（疑似有低於雷達的障礙，清掉再建）、30 分鐘上限。"
+            "想提早結束按同一頁的「完成存檔」（會存圖；「取消」會丟掉這張圖）。"
+            "★ 緊急狀況照樣直接按緊急停止 —— 安全優先，圖可以重建。"
+            "結束後到「一鍵驗證」按 V5 看這趟卡在哪一類",
         },
         "teach": {
             "label": "教導路徑 錄製 / 重播",
             "why": "底盤雷達 + 導航堆疊（定位模式）。path_teach 隨導航堆疊自動起",
-            "stop": ["face", "llm", "asr_chain", "camera"],
+            "stop": ["face", "llm", "asr_chain", "camera", "nav"],
             "start": ["sensors", "nav:localization"],
-            "note": "需要 map→base_footprint 的 TF，所以導航堆疊一定要起。"
+            "note": "需要 map→base_footprint 的 TF，所以導航堆疊一定要起（會先停再用定位模式重啟）。"
             "換過地圖的話舊路徑會被擋下來，那是正確行為不是壞掉",
         },
         "voice": {
@@ -215,7 +246,8 @@ class SystemControlManager:
         "demo": {
             "label": "完整迎賓故事線",
             "why": "全鏈路。順序照 demo.launch.py 的分階段：感測 → 導航 → 視覺 → 語音 → LLM",
-            "stop": [],
+            # 只停導航：它若停在建圖模式，nav:localization 會被拒絕，整場演示跑在錯的模式（見上方 9/25 註解）
+            "stop": ["nav"],
             "start": [
                 "sensors",
                 "nav:localization",
@@ -227,6 +259,70 @@ class SystemControlManager:
                 "llm",
             ],
             "note": "⚠ 這是唯一近乎全開的情境，CPU 帳已逼近 400%。全部起完約需 90 秒，請等狀態全綠再開始演",
+        },
+    }
+
+    # ------------------------------------------------------------------
+    # 一鍵驗證（2026-09-21 新增，2026-09-24 搬進模組化結構）
+    # ------------------------------------------------------------------
+    # 跟上面的「測試情境」分開是刻意的：情境是「把東西開起來」，
+    # 驗證是「證明它真的在做事」。9/17 的教訓就是節點全亮綠燈、話題也都在，
+    # 但 ASR 從沒建立過辨識器、相機降幀從未生效。
+    #
+    # runnable=False 的兩支要讀鍵盤輸入（捲尺／量角器量到的值），
+    # 網頁沒有 stdin，所以只回傳指令讓人去終端機貼，不假裝能跑。
+    VERIFY_SCRIPTS = {
+        "v0": {
+            "label": "V0 開工前檢查",
+            "why": "電池、裝置、時鐘、目錄結構，以及各項修正有沒有部署到車上",
+            "script": "/home/user/maprun/verify/verify_0_preflight.sh",
+            "runnable": True,
+            "note": "這關沒過就別往下做，後面量到的數字都不可信",
+        },
+        "v1": {
+            "label": "V1 修正生效驗證",
+            "why": "量相機實際幀率、人臉 CPU、模型載入、麥克風增益",
+            "script": "/home/user/maprun/verify/verify_1_fixes.sh",
+            "runnable": True,
+            "note": "★ 先套用「測人臉辨識 / 註冊」情境把相機與人臉開起來，再按這個。"
+            "ros2 param get 不算驗證，這支量的是實際輸出",
+        },
+        "v2": {
+            "label": "V2 建圖後記錄",
+            "why": "確認地圖存了，並記下門口／走廊／最窄處三個淨寬",
+            "script": "/home/user/maprun/verify/verify_2_map.sh",
+            "runnable": False,
+            "note": "要輸入捲尺量到的寬度，請在終端機跑",
+        },
+        "v3": {
+            "label": "V3 舵機量測",
+            "why": "前輪離地打滿舵，量實際角度（是量測，不是校準）",
+            "script": "/home/user/maprun/verify/verify_3_steer.sh",
+            "runnable": False,
+            "note": "要輸入量角器讀數，請在終端機跑",
+        },
+        "v4": {
+            "label": "V4 循跡誤差統計",
+            "why": "當場算出今天重現幾趟的 95 百分位，不必等回電腦",
+            "script": "/home/user/maprun/verify/verify_4_replay.sh",
+            "runnable": True,
+            "note": "教導錄一條、重現 4 趟之後再按",
+        },
+        "v5": {
+            "label": "V5 自動探索報告",
+            "why": "解析最近一趟自動探索的導航 log，把卡住分成 CPU／TF、幾何、實體三類",
+            # 不帶參數 = report 模式（watch 模式會一直記到 Ctrl-C，網頁跑不了）
+            "script": "/home/user/maprun/verify/verify_5_explore.sh",
+            "runnable": True,
+            "note": "探索結束（自動存圖或按「完成存檔」）後再按。"
+            "想一併記 CPU 的話，探索開始前另開終端機跑 verify_5_explore.sh watch",
+        },
+        "collect": {
+            "label": "打包回傳",
+            "why": "把驗證結果與原始數據打包，並印出 scp 指令",
+            "script": "/home/user/maprun/verify/collect_data.sh",
+            "runnable": True,
+            "note": "★ 已排除 secrets 與 face_database，打包前會自我複查",
         },
     }
 
@@ -335,6 +431,52 @@ class SystemControlManager:
             )
         return out
 
+    def verify_run(self, key: str) -> tuple:
+        """跑一支驗證腳本，把畫面輸出原封不動回傳給前端。
+
+        ★ 會阻塞到腳本結束（V1 光量幀率就要 12 秒），router 一定要丟執行緒。
+        """
+        spec = self.VERIFY_SCRIPTS.get(key)
+        if spec is None:
+            return False, f"沒有這個驗證項目：{key}"
+        if not spec.get("runnable", True):
+            return False, f"這支要讀鍵盤輸入，網頁跑不了。請在終端機執行：\n  {spec['script']}"
+        try:
+            # 逾時放寬到 300 秒：V1 量幀率 12 秒，V4 要掃當天全部 CSV
+            r = subprocess.run(
+                [spec["script"]],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env={**os.environ, "TERM": "dumb"},
+            )
+            out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+            # 去掉 ANSI 色碼，平板上看才不會一堆亂碼
+            out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+            return r.returncode == 0, out.strip() or "(沒有輸出)"
+        except subprocess.TimeoutExpired:
+            return False, "逾時（300 秒）—— 腳本可能卡在等輸入，改到終端機跑"
+        except FileNotFoundError:
+            return False, (f"找不到腳本 {spec['script']} —— 車上還沒有這批檔案，需要先把 maprun 解壓上去")
+        except PermissionError:
+            return False, f"腳本沒有執行權限：chmod +x {spec['script']}"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"執行失敗：{exc}"
+
+    def verify_list(self) -> list:
+        """給前端畫按鈕用"""
+        return [
+            {
+                "key": k,
+                "label": v["label"],
+                "why": v["why"],
+                "runnable": v.get("runnable", True),
+                "script": v["script"],
+                "note": v.get("note", ""),
+            }
+            for k, v in self.VERIFY_SCRIPTS.items()
+        ]
+
     def system_status(self) -> list:
         """回報每個單元是否在跑"""
         procs = proc_cmdlines()
@@ -419,7 +561,9 @@ class SystemControlManager:
                 if u["running"]:
                     return False, {"message": f"{spec['label']} 已經在執行中，不需要再啟動一次"}
                 if u["partial"]:
-                    return False, {"message": f"{spec['label']} 正在啟動或只起來一半，請先按停止再重新啟動，不要重複按啟動"}
+                    return False, {
+                        "message": f"{spec['label']} 正在啟動或只起來一半，請先按停止再重新啟動，不要重複按啟動"
+                    }
                 break
         ok, operation = self._supervisor.request_unit(unit, action, variant_key)
         if ok:
