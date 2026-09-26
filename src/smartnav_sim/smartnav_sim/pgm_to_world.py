@@ -332,7 +332,8 @@ def suggest_start(grid, meta, clearance_m=0.35):
     if pick == (r0, c0):
         return 0.0, 0.0, True
     x, y = _rc_to_xy(grid, meta, *pick)
-    return round(x, 2), round(y, 2), False
+    # + 0.0 把 round 產生的 -0.0 變回 0.0（不然 log 會印「起點 (-0.0, …)」）
+    return round(x, 2) + 0.0, round(y, 2) + 0.0, False
 
 
 def convert(map_yaml, height=1.0, min_blob=3, seal=True, world_name=None):
@@ -350,8 +351,8 @@ def convert(map_yaml, height=1.0, min_blob=3, seal=True, world_name=None):
     boxes = grid_to_boxes(grid, meta, height)
     origin_cell = {FREE: "空地", WALL: "牆", UNKNOWN: "未知", None: "地圖外"}[cell_at(grid, meta, 0.0, 0.0)]
     sx, sy, at_origin = suggest_start(grid, meta)
-    start_txt = ("(0, 0) ✓" if at_origin else
-                 f"({sx}, {sy}) —— 原點那格是「{origin_cell}」或離牆太近，改放最近的寬敞空地")
+    why = "離牆不到 0.35 m" if origin_cell == "空地" else f"是「{origin_cell}」"
+    start_txt = "(0, 0) ✓" if at_origin else f"({sx}, {sy}) —— 原點那格{why}，改放最近的寬敞空地"
     name = world_name or os.path.splitext(os.path.basename(map_yaml))[0]
     summary = (
         f"地圖 {os.path.basename(map_yaml)}：{w}×{h} 格、解析度 {meta['resolution']} m"
