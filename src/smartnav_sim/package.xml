@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>smartnav_sim</name>
+  <version>0.1.0</version>
+  <description>SmartNav Gazebo 模擬 —— senior_akm 阿克曼車＋N10 光達，接實車同一套 smartnav_navigation_cc 導航鏈，上車前先驗自動建圖參數（只在筆電 WSL 跑，不上車）</description>
+  <maintainer email="104887107+xiange1209@users.noreply.github.com">xiange1209</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>smartnav_msgs</exec_depend>
+  <exec_depend>smartnav_navigation_cc</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

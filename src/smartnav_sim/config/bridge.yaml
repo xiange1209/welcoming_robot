@@ -1,0 +1,43 @@
+# ros_gz_bridge：Gazebo ↔ ROS 2 的話題對接
+#
+# 目標是讓導航鏈「看不出來」這不是實車：話題名稱、frame、型別都跟實車一樣
+# （實車的介面契約見 smartnav_navigation_cc/fake_robot_cc_node.py 開頭）。
+#
+#   實車                              模擬
+#   /scan        ← lslidar_driver     ← gpu_lidar（frame laser）
+#   /odom_combined、TF odom_combined → base_footprint
+#                ← robot_localization EKF   ← AckermannSteering 里程計（後輪編碼器）
+#   /cmd_vel     → wheeltec 底盤      → akm_realism（死區／不對稱／偏移）→ /cmd_vel_sim → AckermannSteering
+#
+# ★ 模擬沒有 IMU 與 EKF：里程計直接由外掛的輪速積分發。實車的 IMU 零偏問題
+#   （imu_bias_corrector_cc）在模擬裡不會出現。
+
+- ros_topic_name: "/clock"
+  gz_topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/scan"
+  gz_topic_name: "/smartnav_sim/scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/odom_combined"
+  gz_topic_name: "/smartnav_sim/odom"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "gz.msgs.Odometry"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/tf"
+  gz_topic_name: "/smartnav_sim/tf"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cmd_vel_sim"
+  gz_topic_name: "/smartnav_sim/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ

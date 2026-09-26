@@ -1,0 +1,112 @@
+<?xml version="1.0"?>
+<!--
+  瓶頸測試場（手工設計，數字取自實車現場）
+  
+    ┌──────────── 北走廊 0.99 ────────────┐
+    │   ╔══ 0.967 窄門口（接 90 度轉角）   │
+    │ 大廳 6×4 m                          ├── 東走廊 0.99 × 5 m ──┐ 盡頭房 3×3 m
+    │   起點 (0,0) 面向東 →                │                       │（需三點轉向）
+    └─────────────────────────────────────┘                       ┘
+  
+  預期（實車的已知結果，模擬應該重現）：
+    - 大廳、東走廊、盡頭房：到得了（東走廊是直進，0.99 m 夠）
+    - 北走廊：從窄門口進去要立刻 90 度轉彎。規劃器（Smac）用 0.95 m、控制器（MPPI）用 0.80 m 半徑，可能覺得過得去，
+      但實車最小半徑是 左 1.030／右 1.183（akm_realism 有模擬）→ 跟不上路徑、卡住。
+      這正是 explorer 看門狗、卡住後備、預算這三層要處理的情境。
+    - 選路門檻是淨寬 ≥ 1.17 m（車子/README.md「2026-08-30 現況」），這裡兩個瓶頸都刻意低於門檻。
+  改版面：直接改下面的方塊（標籤就是說明），不需要重新產生。
+-->
+<sdf version="1.10">
+  <world name="bottlenecks">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.4 0.2 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>200 200</size></plane></geometry>
+          <surface><friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>200 200</size></plane></geometry>
+          <material><ambient>0.85 0.83 0.78 1</ambient><diffuse>0.85 0.83 0.78 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="walls">
+      <static>true</static>
+      <link name="link">
+        <!-- 大廳南牆　大廳內部 x -3~3、y -2~2 -->
+        <collision name="c_0"><pose>0.0000 -2.0500 0.5000 0 0 0.000000</pose><geometry><box><size>6.2000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_0"><pose>0.0000 -2.0500 0.5000 0 0 0.000000</pose><geometry><box><size>6.2000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 西牆（大廳＋北走廊） -->
+        <collision name="c_1"><pose>-3.0500 0.5450 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 5.2900 1.0000</size></box></geometry></collision>
+        <visual name="v_1"><pose>-3.0500 0.5450 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 5.2900 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 大廳北牆 西段　x -3.0~-1.0 -->
+        <collision name="c_2"><pose>-2.0000 2.0500 0.5000 0 0 0.000000</pose><geometry><box><size>2.0000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_2"><pose>-2.0000 2.0500 0.5000 0 0 0.000000</pose><geometry><box><size>2.0000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 大廳北牆 東段　x -0.033~3.0　★ 中間就是 0.967 m 窄門口（x -1.0~-0.033） -->
+        <collision name="c_3"><pose>1.4835 2.0500 0.5000 0 0 0.000000</pose><geometry><box><size>3.0330 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_3"><pose>1.4835 2.0500 0.5000 0 0 0.000000</pose><geometry><box><size>3.0330 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 北走廊北牆　北走廊淨寬 0.99（y 2.10~3.09）★ 出門口要立刻 90 度轉彎＝實車四版沒過的窄轉角 -->
+        <collision name="c_4"><pose>0.0000 3.1400 0.5000 0 0 0.000000</pose><geometry><box><size>6.2000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_4"><pose>0.0000 3.1400 0.5000 0 0 0.000000</pose><geometry><box><size>6.2000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 大廳東牆 南段　y -2.1~-0.495 -->
+        <collision name="c_5"><pose>3.0500 -1.2975 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 1.6050 1.0000</size></box></geometry></collision>
+        <visual name="v_5"><pose>3.0500 -1.2975 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 1.6050 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 大廳東牆 北段　y 0.495~3.19（也封住北走廊東端） -->
+        <collision name="c_6"><pose>3.0500 1.8425 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 2.6950 1.0000</size></box></geometry></collision>
+        <visual name="v_6"><pose>3.0500 1.8425 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 2.6950 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 東走廊北牆　東走廊淨寬 0.99（y ±0.495），直進直出＝實車「貼牆但到得了」 -->
+        <collision name="c_7"><pose>5.5500 0.5450 0.5000 0 0 0.000000</pose><geometry><box><size>4.9000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_7"><pose>5.5500 0.5450 0.5000 0 0 0.000000</pose><geometry><box><size>4.9000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 東走廊南牆 -->
+        <collision name="c_8"><pose>5.5500 -0.5450 0.5000 0 0 0.000000</pose><geometry><box><size>4.9000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_8"><pose>5.5500 -0.5450 0.5000 0 0 0.000000</pose><geometry><box><size>4.9000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 盡頭房 西牆 南段 -->
+        <collision name="c_9"><pose>8.0500 -1.0475 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 1.1050 1.0000</size></box></geometry></collision>
+        <visual name="v_9"><pose>8.0500 -1.0475 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 1.1050 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 盡頭房 西牆 北段 -->
+        <collision name="c_10"><pose>8.0500 1.0475 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 1.1050 1.0000</size></box></geometry></collision>
+        <visual name="v_10"><pose>8.0500 1.0475 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 1.1050 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 盡頭房 南牆　房內 x 8.1~11.1、y -1.5~1.5（3×3 m，迴轉要三點轉向） -->
+        <collision name="c_11"><pose>9.6000 -1.5500 0.5000 0 0 0.000000</pose><geometry><box><size>3.2000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_11"><pose>9.6000 -1.5500 0.5000 0 0 0.000000</pose><geometry><box><size>3.2000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 盡頭房 北牆 -->
+        <collision name="c_12"><pose>9.6000 1.5500 0.5000 0 0 0.000000</pose><geometry><box><size>3.2000 0.1000 1.0000</size></box></geometry></collision>
+        <visual name="v_12"><pose>9.6000 1.5500 0.5000 0 0 0.000000</pose><geometry><box><size>3.2000 0.1000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 盡頭房 東牆 -->
+        <collision name="c_13"><pose>11.1500 0.0000 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 3.2000 1.0000</size></box></geometry></collision>
+        <visual name="v_13"><pose>11.1500 0.0000 0.5000 0 0 0.000000</pose><geometry><box><size>0.1000 3.2000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 家具：銀行櫃檯 -->
+        <collision name="c_14"><pose>-1.6000 -1.3000 0.4500 0 0 0.000000</pose><geometry><box><size>1.6000 0.5000 0.9000</size></box></geometry></collision>
+        <visual name="v_14"><pose>-1.6000 -1.3000 0.4500 0 0 0.000000</pose><geometry><box><size>1.6000 0.5000 0.9000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 家具：柱子 -->
+        <collision name="c_15"><pose>1.2000 -1.1000 0.5000 0 0 0.000000</pose><geometry><box><size>0.4000 0.4000 1.0000</size></box></geometry></collision>
+        <visual name="v_15"><pose>1.2000 -1.1000 0.5000 0 0 0.000000</pose><geometry><box><size>0.4000 0.4000 1.0000</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 家具：沙發 -->
+        <collision name="c_16"><pose>-2.3500 1.1000 0.2250 0 0 0.000000</pose><geometry><box><size>0.6000 1.2000 0.4500</size></box></geometry></collision>
+        <visual name="v_16"><pose>-2.3500 1.1000 0.2250 0 0 0.000000</pose><geometry><box><size>0.6000 1.2000 0.4500</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+        <!-- 家具：盡頭房的桌子（讓迴轉更難） -->
+        <collision name="c_17"><pose>10.3000 0.9000 0.3750 0 0 0.000000</pose><geometry><box><size>0.8000 0.5000 0.7500</size></box></geometry></collision>
+        <visual name="v_17"><pose>10.3000 0.9000 0.3750 0 0 0.000000</pose><geometry><box><size>0.8000 0.5000 0.7500</size></box></geometry><material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+      </link>
+    </model>
+  </world>
+</sdf>

@@ -3,9 +3,8 @@
 在筆電的 WSL2 裡裝 Ubuntu 24.04 + ROS 2 Jazzy + Gazebo Harmonic，用來模擬 senior_akm 的自動建圖（frontier 探索）。
 **全部裝在 D 槽，C 槽幾乎不佔。**
 
-> ★ **目前進度（2026-09-25）**：這裡的腳本只負責把**環境**裝好（ROS 2、Gazebo、nav2、我們的導航套件都建得起來）。
-> 自動建圖的**模擬套件本體**（車子模型、有窄處的場景、啟動檔）還在寫，所以第 3 步最後一行現在會說找不到套件。
-> 先把環境裝好；套件寫好後 `git pull`，再跑一次 `setup_ubuntu.sh`（重跑不會壞）就會一起建進去。
+> 這裡只講**安裝**。裝好之後怎麼跑模擬、怎麼看結果 → [`../README.md`](../README.md)。
+> 2026-09-26 起模擬套件本體已經寫好；之前裝過環境的人 `git pull` 後再跑一次 `setup_ubuntu.sh`（重跑不會壞）就會一起建進去。
 
 | 步驟 | 誰做 | 時間 | 佔用 |
 |---|---|---|---|
@@ -78,11 +77,11 @@ BIOS 的虛擬化已經開了，缺的只是 Windows 的一個元件。
 ```
 gz sim -v4 -r shapes.sdf                       # ① 應該跳出一個有幾個方塊的 3D 畫面，關掉視窗就結束
 sudo apt install -y mesa-utils && glxinfo -B | grep -i renderer   # ② 看到 D3D12 (NVIDIA...) = 顯卡有用上
-ros2 pkg list | grep -E "smartnav|frontier"    # ③ 應該列出 smartnav_msgs、smartnav_navigation_cc、frontier_exploration_ros2
-ros2 launch smartnav_sim sim_explore.launch.py # ④ 自動建圖模擬（★ 套件還在寫，現在會說找不到，正常）
+ros2 pkg list | grep -E "smartnav|frontier"    # ③ 應該列出 smartnav_msgs、smartnav_navigation_cc、smartnav_sim、frontier_exploration_ros2
+ros2 launch smartnav_sim sim_explore.launch.py # ④ 自動建圖模擬（用法見 ../README.md）
 ```
 
-①②③ 都過，環境就裝好了。
+①②③ 都過，環境就裝好了；④ 能跑，模擬就可以用了。
 
 ---
 

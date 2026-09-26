@@ -108,10 +108,10 @@ LINKED=()   # 實際連結到的套件；colcon 指定不存在的套件會直�
 for p in "${PKGS[@]}"; do
   src="$REPO/src/$p"
   dst="$WS/src/$p"
-  # 看 package.xml 不看目錄：smartnav_sim/ 目前只有 setup/，目錄在但還不是套件，
+  # 看 package.xml 不看目錄：目錄在但不是套件（例如 repo 太舊、smartnav_sim 只有 setup/）時，
   # 連進 --packages-up-to 會讓 colcon 直接報「找不到套件」
   if [ ! -f "$src/package.xml" ]; then
-    warn "$p 還不是 ROS 套件（沒有 package.xml），跳過（smartnav_sim 還沒寫好的話是正常的）"
+    warn "$p 還不是 ROS 套件（沒有 package.xml），跳過 —— 若是 smartnav_sim，先在 Windows 的 車子/ 跑 git pull"
     continue
   fi
   if [ -L "$dst" ]; then
