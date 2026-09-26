@@ -205,7 +205,7 @@ ros2 launch smartnav_sim sim_explore.launch.py gui:=false 2>&1 | tee ~/base1.log
 |---|---|---|
 | 修補前（A～D 平均） | 28.4 m²，東走廊一次都沒進去 | 23.0 m²（E） |
 | 只加修補 0002 | 39.6、31.1 m²（I、L） | 33.0 m²（H），205 秒到盡頭房 |
-| **修補＋Smac `cost_penalty` 2.0（現行設定）** | **38.7、37.5 m²（O、O2），兩次都到盡頭房** | — |
+| **修補＋Smac `cost_penalty` 2.0（現行設定）** | **38.7、37.5、38.8 m²（O、O2、Q），三次都到盡頭房** | — |
 
 - 試過沒採用：行為樹放行 START_OCCUPIED、迴轉半徑 1.20、`footprint_padding` 0.06、搜尋半徑 0.5（都沒比較好）
 - `cost_penalty` 1.4 時路徑貼著家具走，4 組在同一個櫃檯角卡死；2.0 兩次都沒卡在家具邊
