@@ -57,10 +57,14 @@ rec "分析的 log" INFO "$(basename "$LOG")" "$(du -h "$LOG" | cut -f1)"
 # 找最新的 CPU 記錄（watch 可能是另一次 verify 的 STAMP 目錄）
 CPU_FILE=$(ls -t "$HOME"/maprun/verify_out/*/explore_cpu.csv 2>/dev/null | head -1)
 
-python3 - "$LOG" "$RESULT" "${CPU_FILE:-}" <<'PY'
+# 車上 explorer 的原始碼有沒有我們的修補（看門狗濾 0）。只看原始碼、看不到 binary —— V0 修正11 同理
+SUPP="$HOME/welcoming_robot_ws/src/frontier_exploration_ros2/src/frontier_suppression.cpp"
+if [ -f "$SUPP" ]; then grep -q "smartnav patch" "$SUPP" && PATCHED=1 || PATCHED=0; else PATCHED=unknown; fi
+
+python3 - "$LOG" "$RESULT" "${CPU_FILE:-}" "$PATCHED" <<'PY'
 import re, sys, statistics
 
-log_path, result_path, cpu_path = sys.argv[1], sys.argv[2], sys.argv[3]
+log_path, result_path, cpu_path, patched = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(log_path, encoding="utf-8", errors="replace").read()
 
 # 只看「最後一次探索」那一段：從最後一個「自動探索已啟動」起算。
@@ -86,8 +90,13 @@ C = {
     "fail_other":  n(r"frontier finished with status (?!STATUS_ABORTED)"),
     "suppressed":  n(r"frontiers (are|remain) (temporarily )?suppressed"),
     "no_more":     n(r"No more frontiers found"),
+    "accepted":    n(r"Frontier goal accepted"),
+    "rejected":    n(r"Frontier goal was rejected"),      # 會記失敗
     "stuck":       n(r"偵測到卡住"),
     "deferred":    n(r"自動探索中：不取消目標"),
+    "grace_cancel": n(r"照舊取消，先讓車停下來"),          # 探索開始 30 秒寬限期內，照舊取消（9/25）
+    "backstop":    n(r"後備取消"),                        # 讓步約 20 秒（卡住後約 24 秒）車仍沒動 -> 照舊取消（9/25）
+    "budget":      n(r"探索中卡住第 \d+ 次"),             # map_service 的卡住預算計數
     "extrap":      n2(r"extrapolation into the future"),
     "no_path":     n2(r"no valid path|Failed to create plan|No path found"),
     "start_occ":   n2(r"Start occupied|START_OCCUPIED"),
@@ -97,6 +106,49 @@ C = {
 end = re.findall(r"探索結束（(\w+)）", seg)
 end = end[-1] if end else ("cancel" if "已被系統或使用者取消" in seg else "未知")
 saved = "地圖建立成功" in seg
+
+# ── 被取消的目標與「看門狗誤判」特徵（審查 upstream#1，9/25 查證 Jazzy 原始碼確認）──
+# explorer 的看門狗取消、被擋取消都只印 DEBUG，INFO log 看不到原因。只能推算：
+# 一個目標 accepted 之後，下一件事是另一個「Sending … frontier goal」而不是 reached／finished／rejected
+# = 它被取消或搶佔了。nav2（Jazzy）每個新目標的第一筆 distance_remaining 都是 0.0，
+# 看門狗拿 0 當基準後再怎麼前進都不算進展 -> 取消時間會集中在「逾時 + 約 1~5 秒（沉澱＋重選）」。
+# ★ 9/25 審查更正：這個區間在**修補後**也會有正常的取消 —— 近距完成（complete_if_within 0.6 m，
+#   地圖一更新就算到、不記失敗）、一開始就規劃不出路（接受後 15 秒被看門狗正確取消）。
+#   所以區間內有 nav2「規劃不出路」或「偵測到卡住」的先排除；原始碼已修補時只當參考（INFO），
+#   而且不再算進「主要卡住類型」—— 以前會讓人以為修補沒生效，去追一個已經修好的 bug。
+TS = re.compile(r"\[(\d{10}\.\d+)\]")
+ev = []
+for line in seg.splitlines():
+    m = TS.search(line)
+    if not m:
+        continue
+    t = float(m.group(1))
+    if "Frontier goal accepted" in line:
+        ev.append((t, "acc"))
+    elif re.search(r"Sending (updated )?frontier goal", line):
+        ev.append((t, "send"))
+    elif re.search(r"Frontier goal reached|frontier finished with status|Frontier goal was rejected", line):
+        ev.append((t, "end"))
+    elif re.search(r"no valid path|Failed to create plan|No path found|Start occupied|START_OCCUPIED", line, re.I):
+        ev.append((t, "geo"))
+    elif re.search(r"偵測到卡住|自動探索中：不取消目標", line):
+        ev.append((t, "stuck"))
+cancel_durs = []   # (accepted 到下一個送出的秒數, 期間有沒有「規劃不出路／卡住」可以解釋)
+for i, (t, k) in enumerate(ev):
+    if k != "acc":
+        continue
+    explained = False
+    for t2, k2 in ev[i + 1:]:
+        if k2 in ("geo", "stuck"):
+            explained = True
+        elif k2 == "end":
+            break
+        elif k2 == "send":
+            cancel_durs.append((t2 - t, explained))
+            break
+m = re.search(r"no_progress_timeout=([\d.]+)s", text)
+wd_timeout = float(m.group(1)) if m else None
+wd_hits = [d for d, expl in cancel_durs if wd_timeout and wd_timeout <= d <= wd_timeout + 6 and not expl]
 
 rows = []
 def rec(item, verdict, value, basis=""):
@@ -112,13 +164,37 @@ if not explored:
         "情境要選「建圖（自動探索）」，而且要在遙控建圖分頁按「開始建圖」")
 else:
     rec("結束方式", "INFO", {"done": "探索完成", "stalled": "停滯（地圖很久沒長大，原因看下面的分類）",
+                              "stuck": "同一處卡住多次（疑似低於雷達的障礙，清場後再建）",
                               "timeout": "30 分鐘逾時", "cancel": "被取消", "未知": "未知（log 截斷？）"}.get(end, end))
     rec("地圖有沒有存下來", "PASS" if saved else "FAIL",
         "有" if saved else "沒有", "" if saved else "9/24 起逾時與停滯都會存圖；沒存多半是被取消或中途當掉")
     ok_rate = C["reached"] / C["sent"] if C["sent"] else 0
     rec("frontier 目標", "INFO",
-        f"送出 {C['sent']}、抵達 {C['reached']}（{ok_rate:.0%}）、nav2 放棄 {C['aborted']}、其他結束 {C['fail_other']}")
+        f"送出 {C['sent']}、抵達 {C['reached']}（{ok_rate:.0%}）、nav2 放棄 {C['aborted']}、"
+        f"被拒 {C['rejected']}、其他結束 {C['fail_other']}")
+    rec("被取消／被搶佔（推算）", "INFO", f"{len(cancel_durs)} 個",
+        "INFO log 看不到取消原因；推算方式：accepted 之後下一件事是另一個送出")
+    rec("車上 explorer 原始碼", "PASS" if patched == "1" else ("FAIL" if patched == "0" else "INFO"),
+        {"1": "有修補", "0": "上游原版（沒修補）", "unknown": "找不到原始碼"}.get(patched, patched),
+        "" if patched == "1" else "沒修補的話看門狗會把開超過 15 秒的目標誤判失敗 —— 看 V0 修正11，重新打包部署並 colcon build")
+    win = f"{wd_timeout:.0f}~{wd_timeout + 6:.0f} 秒" if wd_timeout else ""
+    if wd_timeout is None:
+        rec("看門狗取消時間", "INFO", "log 裡找不到 no_progress_timeout（explorer 啟動那行）", "")
+    elif len(cancel_durs) < 3:
+        rec("看門狗取消時間", "INFO", f"取消只有 {len(cancel_durs)} 個，樣本太少不判", "")
+    elif patched == "1":
+        rec("看門狗取消時間", "INFO",
+            f"{len(wd_hits)}/{len(cancel_durs)} 個取消落在 {win}（已排除期間有規劃不出路、卡住的）",
+            "修補後落在這裡的多半是正常機制：近距完成（0.6 m 內就算到）、一開始就沒進展。"
+            "要確認有沒有鎖死，對 explorer 開 debug，看 'Distance remaining: 0.000' 之後 15 秒被取消")
+    else:
+        frac = len(wd_hits) / len(cancel_durs)
+        rec("看門狗誤判特徵", "WARN" if frac >= 0.5 else "INFO",
+            f"{len(wd_hits)}/{len(cancel_durs)} 個取消落在 {win}（已排除期間有規劃不出路、卡住的）",
+            "集中在這裡**可能**是上游看門狗被 nav2 第一筆 distance_remaining=0 鎖死、"
+            "正常前進的目標也被判失敗（審查 upstream#1）；也可能是近距完成")
     rec("全部被抑制的次數", "INFO", str(C["suppressed"]), "多 = 很多地方到不了，停滯看門狗會在 4 分鐘後結束")
+    rec("explorer 宣告沒有 frontier", "INFO", str(C["no_more"]), "有 = 真的探索完了（阿克曼車上很少見）")
 
 print("\n══ 卡住分類 ══")
 classes = {}
@@ -150,11 +226,20 @@ rec("幾何類（規劃不出路）", "WARN" if geo > 3 else "INFO",
 classes["幾何（可以帶回模擬器調）"] = geo
 
 rec("實體卡住（矮障礙）", "WARN" if C["stuck"] else "PASS",
-    f"偵測到卡住 {C['stuck']} 次，其中探索中讓步 {C['deferred']} 次",
-    "讓步次數 = 9/24 的修正有生效（交給 explorer 記失敗，不會再無限重試同一點）")
-if explored and C["stuck"] and C["deferred"] == 0:
-    rec("卡住偵測器讓步", "FAIL", "探索中卡住卻沒有讓步", "車上可能還是舊版 stuck_detector —— 檢查有沒有重新 colcon build")
+    f"偵測到卡住 {C['stuck']} 次：探索中讓步 {C['deferred']} 次、寬限期內照舊取消 {C['grace_cancel']} 次、"
+    f"讓步逾時後備取消 {C['backstop']} 次；map_service 記到 {C['budget']} 次",
+    "讓步 = 交給 explorer 記失敗；寬限期（探索開始 30 秒）內 explorer 的看門狗不動作，所以照舊取消；"
+    "後備取消多 = explorer 沒在接手（當掉、卡在長計算），或換了目標又頂上同一個障礙")
+# 探索開始前的一般導航也可能卡住，所以「卡住次數 > 讓步＋寬限期取消」不一定是錯；
+# 只有「探索中卡住、三種處理都沒出現」才代表車上是舊版 stuck_detector
+if explored and C["stuck"] and C["deferred"] == 0 and C["grace_cancel"] == 0 and C["backstop"] == 0:
+    rec("卡住偵測器讓步", "FAIL", "探索中卡住，卻沒有讓步、寬限期取消、後備取消任何一種",
+        "車上可能還是舊版 stuck_detector —— 檢查有沒有重新 colcon build")
+if explored and C["stuck"] and C["budget"] == 0:
+    rec("卡住預算", "WARN", "探索中卡住，map_service 卻沒記到",
+        "車上可能還是舊版 map_service（沒有 exploration_stuck_* 參數）—— 檢查有沒有重新 colcon build")
 classes["實體（清場或加感測）"] = C["stuck"] * 3
+# 「看門狗取消時間」刻意不算進來：它是推算、分不出近距完成，修補後會把正常的一趟排成主要問題
 
 rec("nav2 無進展", "INFO", f"{C['no_progress']} 次",
     "多 = 在 BT 恢復裡來回倒車。9/24 起 explorer 看門狗 15 秒會先於 nav2 的 20 秒取消")

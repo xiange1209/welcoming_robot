@@ -51,14 +51,18 @@ def build_router(node, admin_only) -> APIRouter:
         而那期間車子還在開。展示時評審站在旁邊，這個延遲不能接受。
 
         這裡一次處理三個來源，而且**順序有意義**：
-          1. 先送零速（最快讓輪子停下，不必等任何服務回應）
-          2. 再取消所有進行中的作業（導航、建圖、教導路徑重播）
-          3. 最後回報哪些被取消了
+          1. 先送零速（遙控中最快讓輪子停下，不必等任何服務回應）
+          2. 對 nav2 本體與各動作送「取消全部」（★ 9/25 移到第 2 步：nav2 驅動中零速會被
+             controller 下一拍蓋掉，真正讓車停的是這一步）
+          3. 再取消登記簿裡的作業（導航、建圖、教導路徑重播），並回報
 
-        即使取消服務沒回應，第 1 步的零速加上遙控看門狗（0.6 秒）
-        也會讓車停住——安全動作不可以依賴任何一個會失敗的呼叫。
+        ★ 9/25 更正：舊說明寫「零速加遙控看門狗也會讓車停住」—— 只在遙控時成立。
+          nav2 在跑時它以 10~20 Hz 發指令，零速一拍就被蓋掉，所以第 2 步不能省。
         """
         node.teleop.apply(0.0, 0.0)
+
+        # ★ 登記簿之外的目標也要停（語音發起的導航、自動探索的 nav2 目標就在這裡）
+        broadcast = node.jobs.cancel_all_action_goals()
 
         cancelled, failed = [], []
         for job in node.state.jobs_copy():
@@ -67,9 +71,6 @@ def build_router(node, admin_only) -> APIRouter:
                 (cancelled if node.jobs.cancel_job(jid) else failed).append(
                     job.get("label") or jid
                 )
-
-        # ★ 登記簿之外的目標也要停（語音發起的導航就在這裡）
-        broadcast = node.jobs.cancel_all_action_goals()
 
         node.get_logger().warn(
             f"緊急停止：已送零速，取消 {len(cancelled)} 個作業"

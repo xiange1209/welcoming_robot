@@ -31,6 +31,7 @@ import hashlib
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tarfile
 import time
@@ -64,6 +65,14 @@ SECRET = re.compile(
     r"|api[_-]?key\s*[:=]\s*['\"][^'\"]{8,}"
     r"|token\s*[:=]\s*['\"][A-Za-z0-9:_-]{20,})", re.I)
 
+# 2026-09-25 起子模組指向我們的 fork（smartnav-patches 分支，修補已 commit 進去）。
+# 還停在上游原版的，多半是 9/25 以前 clone 的：先 git pull，再同步一次 .gitmodules 的新網址。
+# ★ 分兩行印、不用 &&：Windows PowerShell 5.1 不認 &&，整行貼上會語法錯誤、兩個指令都沒跑（審查）
+PATCH_APPLY = ("先 git pull，再依序執行這兩行：\n"
+               "        git submodule sync\n"
+               "        git submodule update --init src/frontier_exploration_ros2")
+UPSTREAM_PIN = "ec530d2"   # 上游原版（沒有我們的修補）
+
 TEXT = (".py", ".sh", ".yaml", ".yml", ".md", ".xml", ".cfg", ".html", ".js")
 EXEC_TEXT = (".py", ".sh", ".yaml", ".yml", ".xml", ".cfg")   # CRLF 對這些致命
 
@@ -96,10 +105,20 @@ def collect():
     return sorted(set(targets))
 
 
+def _patched_files() -> set:
+    """patches/frontier_exploration_ros2/*.patch 改到的檔案（包內路徑）。打包時把它們的時間設成現在"""
+    out = set()
+    for pf in pathlib.Path("patches/frontier_exploration_ros2").glob("*.patch"):
+        for line in pf.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("diff --git a/"):
+                out.add("src/frontier_exploration_ros2/" + line.split()[2][2:])
+    return out
+
+
 def preflight() -> list:
     """打包前的硬性檢查。回傳錯誤訊息清單，空的代表可以打包。
 
-    兩項都是「漏了不會報錯、上車才發現」的靜默失效，所以在這裡擋。
+    每一項都是「漏了不會報錯、上車才發現」的靜默失效，所以在這裡擋。
     """
     errs = []
 
@@ -124,6 +143,28 @@ def preflight() -> list:
                         "        git -C src/frontier_exploration_ros2 config core.autocrlf false\n"
                         "        git -C src/frontier_exploration_ros2 rm -rq --cached .\n"
                         "        git -C src/frontier_exploration_ros2 reset -q --hard")
+
+        # 修補：上游看門狗在 Jazzy 上會被 nav2 每個新目標第一筆 distance_remaining=0.0 鎖死，
+        #   於是每個開超過 15 秒的目標都被判失敗、抑制掉（2026-09-25 查證 nav2 原始碼＋編譯實測）。
+        #   修補已 commit 進我們的 fork，但 9/25 以前 clone 的子模組還指著上游原版 ——
+        #   包照樣打得出來，車上的 explorer 卻是沒修的版本。
+        supp = sub / "src" / "frontier_suppression.cpp"
+        if supp.exists() and "[smartnav patch]" not in supp.read_text(encoding="utf-8", errors="replace"):
+            errs.append("frontier 子模組還是上游原版，沒有我們的修補（看門狗會把每個開超過 15 秒的目標誤判失敗）\n"
+                        f"      修法：{PATCH_APPLY}")
+
+        # 父 repo 記錄的子模組指標（gitlink）。還指著上游原版的話，別人 clone --recurse-submodules
+        # 拿到的就是沒修補的版本 —— 自己電腦上的工作區是好的、打包照過，要到別台才發現，
+        # 而且照上面的修法做 update 也只會再簽出原版（2026-09-25 審查）
+        try:
+            ls = subprocess.run(["git", "ls-tree", "HEAD", "src/frontier_exploration_ros2"],
+                                capture_output=True, text=True, timeout=10).stdout.split()
+            if len(ls) >= 3 and ls[2].startswith(UPSTREAM_PIN):
+                errs.append(f"repo 記錄的 frontier 子模組指標還是上游原版（{UPSTREAM_PIN}）—— 別人 clone 下來會沒有修補\n"
+                            f"      修法：{PATCH_APPLY}\n"
+                            "      （改子模組的人：把 src/frontier_exploration_ros2 跟 .gitmodules 一起 git add 再 commit）")
+        except (OSError, subprocess.SubprocessError):
+            pass   # 沒有 git（例如從壓縮檔解出來的）就不查
 
     # 2) 前端是 React，dist/ 被 gitignore。setup.py 把 frontend/dist/** 裝進 share，
     #    沒建置的話 HMI 後端照跑、平板打開是一片空白。
@@ -192,11 +233,18 @@ def main() -> int:
             print("   ", f, "->", h)
         return 1
 
+    bump, now = _patched_files(), int(time.time())
+
     def _mode(ti: tarfile.TarInfo) -> tarfile.TarInfo:
         # ★ Windows 檔案系統沒有執行權限位元，tarfile 會把 .sh 記成 0644，
         #   解壓到車上就是 Permission denied。直接在包裡寫成 0755，
         #   不靠人記得上車後 chmod +x。
         ti.mode = 0o755 if ti.name.endswith(".sh") else 0o644
+        # ★ 2026-09-25（審查）：tar 會還原筆電上的檔案時間。車上若已經有比它新的 .o
+        #   （例如之前用沒修補的原始碼編過），colcon／make 判定不用重編 —— 車上跑的還是沒修補的
+        #   explorer，V0 只查原始碼卻顯示 PASS。修補過的 C++ 檔一律標成打包當下，保證會重編。
+        if ti.name in bump:
+            ti.mtime = now
         return ti
 
     with tarfile.open(out, "w:gz") as t:

@@ -104,6 +104,22 @@ chk "修正7 探索中卡住讓步"   "$NCC/stuck_detector_cc_node.py"          
 chk "修正8 停滯存圖＋STOP 後備" "$NCC/map_service_cc_node.py"                             "_cancel_all_nav_goals"
 chk "修正9 換情境先停導航"   "$HMI_SC/manager.py"                                          '"localization", "false"'
 chk "修正10 LLM 建圖等 1920 秒" "$SRC/smartnav_llm/smartnav_llm/llm_service_node.py"         "1920.0"
+# ★ 上游 explorer 的修補（C++，要重新 colcon build 才生效）。沒修補的話看門狗會把每個
+#   開超過 15 秒的目標誤判失敗 —— 自動建圖「常常卡住」很可能就是這個
+chk "修正11 frontier 看門狗濾 0" "$SRC/frontier_exploration_ros2/src/frontier_suppression.cpp" "smartnav patch"
+# 上面只證明「原始碼」是修補版。C++ 要重新編譯才生效，而 make 看的是檔案時間：
+# 編出來的 .o 比原始碼舊 = 解壓後還沒重新 colcon build，車上跑的仍是舊的 explorer（2026-09-25 審查）
+SUPP_SRC="$SRC/frontier_exploration_ros2/src/frontier_suppression.cpp"
+SUPP_OBJ=$(find "$WS/build/frontier_exploration_ros2" -name 'frontier_suppression.cpp.o' 2>/dev/null | head -1)
+if [ -z "$SUPP_OBJ" ]; then
+  rec "修正11b frontier 已重新編譯" WARN "找不到編譯產物" "還沒 colcon build？（第一次升新結構會整個重建）"
+elif [ -f "$SUPP_SRC" ] && [ "$(stat -c %Y "$SUPP_OBJ")" -lt "$(stat -c %Y "$SUPP_SRC")" ]; then
+  rec "修正11b frontier 已重新編譯" FAIL "原始碼比編出來的新" \
+      "解壓後沒重新建置 —— cd ~/welcoming_robot_ws && colcon build --symlink-install --packages-select frontier_exploration_ros2"
+else
+  rec "修正11b frontier 已重新編譯" PASS "已用目前的原始碼編譯" ""
+fi
+chk "修正12 卡住預算與後備"   "$NCC/map_service_cc_node.py"                             "exploration_stuck_repeat_limit"
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"

@@ -196,15 +196,25 @@ frontier_explorer:
     #   計數跟著歸零**，於是門檻 2 常常永遠到不了，同一個到不了的點一試再試。
     #   阿克曼車的失敗幾乎都是幾何性的（轉不過、掉不了頭），第二次也不會成功，
     #   第一次失敗就抑制。偶發的失敗也只是抑制一段時間，之後還會再試。
+    #   （9/25 更正：目標點移動的主因是**車子的位置** —— 它是「離車 ≥0.9 m 的格子」
+    #    （frontier_search.cpp:456-514），不只是地圖更新。所以門檻 1 也擋不住同一個開口被試約 3 次，
+    #    次數有上限，可以接受。）
+    # ★★ 門檻 1 能用的前提是看門狗不會誤判：上游原版會被 nav2（Jazzy）每個新目標第一筆
+    #   distance_remaining=0.0 鎖死，「開超過 15 秒」的正常目標全部判失敗 —— 9/25 查 nav2 原始碼
+    #   並編譯實測確認（6 m 路徑、0.2 m/s 前進中，第 16 秒被取消）。修補已 commit 進子模組指向的 fork
+    #   （xiange1209/frontier_exploration_ros2 的 smartnav-patches，說明在 patches/），
+    #   pack_car_code.py 發現子模組還是上游原版會拒絕打包。
     frontier_suppression_attempt_threshold: 1
     frontier_suppression_base_size_m: 1.0
     frontier_suppression_expansion_size_m: 0.5
     # ★ 2026-09-24：90 -> 300。90 秒一到抑制就過期，同一個到不了的點會被再拿出來試，
-    #   每次又耗掉一輪「開過去＋無進展逾時」。改長之後，全部都被抑制的情況改由
-    #   map_service_cc 的停滯看門狗（exploration_stall_timeout_sec 240 秒）判定
-    #   「剩下的都到不了」並存圖結束 —— explorer 自己在全部被抑制時只會原地等
-    #   （stay），永遠不會發完成事件（上游 README:1525）。
-    frontier_suppression_timeout_s: 300.0
+    #   每次又耗掉一輪「開過去＋無進展逾時」。
+    # ★ 2026-09-25：300 -> 150（審查 upstream#2）。300 大於停滯看門狗的 240 秒：最後一個 frontier
+    #   只要**偶發**失敗一次（TF 空窗、一次規劃逾時），在它重試之前停滯就收尾了，還宣稱到不了。
+    #   150 ＋ 開過去（≤60 秒）＋ 無進展逾時（16 秒）≈ 226 秒 < 240，偶發失敗有一次重試的機會；
+    #   真到不了的點重試一次會再被抑制。全部都被抑制時 explorer 只會原地等（stay），
+    #   永遠不發完成事件（上游 README:1525），由 map_service_cc 的停滯看門狗存圖結束。
+    frontier_suppression_timeout_s: 150.0
     # 窄處掉頭要來回切換好幾次，車子會有很長一段時間 distance_remaining
     # 幾乎沒變化。30 秒太短會把「正在努力掉頭」誤判成卡死而放棄這個 frontier。
     # 60 -> 25：配合關閉 goal_preemption，讓「試不動的目標」更快被放棄。

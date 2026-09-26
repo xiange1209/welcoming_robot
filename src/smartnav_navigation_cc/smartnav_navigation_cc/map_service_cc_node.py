@@ -117,13 +117,30 @@ class MapServiceCcNode(Node):
         #     - 要比「一個 frontier 目標的嘗試」長好幾倍：開過去＋無進展逾時
         #       （frontier_suppression_no_progress_timeout_s 15 秒），才不會在
         #       explorer 還在換著試別的點、或正在繞遠路時就誤判
-        #     - 要比抑制逾時（frontier_suppression_timeout_s 300 秒）短：全部都被抑制時，
-        #       由這裡先判定結束存圖，而不是等抑制過期、把到不了的點再試一輪
+        #     - ★ 9/25 改：要**大於**「抑制逾時＋一次重試」—— frontier_suppression_timeout_s 150
+        #       ＋開過去（≤60 秒）＋無進展逾時（16 秒）≈ 226 秒。舊版寫「要比抑制逾時 300 短」，
+        #       結果最後一個 frontier 只要偶發失敗一次（TF 空窗、一次規劃逾時），這裡就在它重試前
+        #       收尾，還宣稱剩下的到不了（審查 upstream#2）。真到不了的點重試一次就會再被抑制。
         #   正常探索時地圖每 3 秒更新一次（slam map_update_interval），四分鐘
         #   完全沒長大 0.5 m² 是很強的訊號。0 表示關閉。
         #   ★ 計時用哪個時鐘見 _stall_now：實車用 monotonic、模擬用 ROS 時鐘。
         self.declare_parameter("exploration_stall_timeout_sec", 240.0)
         self.declare_parameter("exploration_stall_min_gain_m2", 0.5)
+        # ★ 2026-09-25：卡住預算（審查 safety#2）。stuck_detector 發的 /robot_stuck 由 False 變 True
+        #   就是「新的一次卡住」。同一處（半徑內）卡到第 repeat_limit 次、或整趟到 total_limit 次，
+        #   就結束探索並存圖。
+        #   為什麼需要：explorer 的抑制框是以「目標點」為中心，擋不住「一條低於雷達的電線橫在唯一通道上」——
+        #   門後每個 frontier 都會各被推一輪，全部抑制後還要原地等 240 秒停滯才結束。
+        #   total 比 repeat 寬：低電量時死區上移，卡住偵測會誤判，不能因此太早收尾。0 = 關閉。
+        self.declare_parameter("exploration_stuck_radius_m", 0.6)
+        self.declare_parameter("exploration_stuck_repeat_limit", 3)
+        self.declare_parameter("exploration_stuck_total_limit", 8)
+        # 探索開始後這段時間內的卡住**不算**（只記 log）。★ 要跟 stuck_detector_cc 的 defer_grace_sec、
+        #   frontier_explore_cc.yaml 的 frontier_suppression_startup_grace_period_s 同值（2026-09-25 審查）：
+        #   寬限期內 explorer 不記失敗，卡住偵測器照舊取消 -> explorer 又選回同一點 -> 再卡住，
+        #   約 6.5 秒一輪。算進來的話，車子一開始就停在一條電線前，21 秒就以「同一處 3 次」結束，
+        #   存下幾乎是空的圖 —— 其實寬限期一過 explorer 的看門狗就會把那一點抑制、改往別處探索。
+        self.declare_parameter("exploration_stuck_grace_sec", 30.0)
         # 等 map -> base_footprint 出現的時間 (Pi 4 冷開機時 slam 第一張圖要好幾秒)
         self.declare_parameter("tf_ready_timeout_sec", 60.0)
         self.declare_parameter("lifecycle_transition_timeout_sec", 25.0)
@@ -149,6 +166,10 @@ class MapServiceCcNode(Node):
         self.exploration_stall_min_gain_m2 = float(
             self.get_parameter("exploration_stall_min_gain_m2").value
         )
+        self.exploration_stuck_radius_m = float(self.get_parameter("exploration_stuck_radius_m").value)
+        self.exploration_stuck_repeat_limit = int(self.get_parameter("exploration_stuck_repeat_limit").value)
+        self.exploration_stuck_total_limit = int(self.get_parameter("exploration_stuck_total_limit").value)
+        self.exploration_stuck_grace_sec = float(self.get_parameter("exploration_stuck_grace_sec").value)
         self.tf_ready_timeout_sec = float(self.get_parameter("tf_ready_timeout_sec").value)
         self.save_map_timeout_sec = float(self.get_parameter("save_map_timeout_sec").value)
         self.amcl_refresh_period_sec = float(self.get_parameter("amcl_refresh_period_sec").value)
@@ -243,6 +264,10 @@ class MapServiceCcNode(Node):
             latched,
             callback_group=self.client_cb_group,
         )
+        # 卡住預算（見 exploration_stuck_* 參數）
+        self.create_subscription(
+            Bool, "robot_stuck", self._robot_stuck_callback, 10, callback_group=self.client_cb_group
+        )
 
         # TF 訂閱的 QoS depth 從預設 100 降到 20。
         #
@@ -330,6 +355,10 @@ class MapServiceCcNode(Node):
         self._known_area_m2 = 0.0
         self._area_at_last_gain_m2 = 0.0
         self._last_gain_time = None
+        self._stuck_prev = False     # 上一則 /robot_stuck 的值（只數 False -> True）
+        self._stuck_events = []      # 本輪探索每次卡住時的 (x, y)；拿不到位置時是 None
+        self._stuck_end = None       # 預算用完時的 (此處次數, 總次數, (x, y) 或 None)
+        self._explore_started_mono = None   # 發 exploration_active=True 的時間（寬限期從這裡算）
 
         self._load_maps_db()
         self.current_map_pub.publish(String(data=""))
@@ -810,6 +839,7 @@ class MapServiceCcNode(Node):
             note = {
                 "timeout": f"（探索逾時 {self.exploration_timeout_sec:.0f} 秒，已存下目前進度，可能有區域沒走到）",
                 "stalled": f"（探索停滯：地圖 {self.exploration_stall_timeout_sec:.0f} 秒沒有長大，已存下目前的地圖）",
+                "stuck": self._stuck_note(),
             }.get(outcome, "")
 
             # ---- 探索結束（完成／逾時／停滯），開始存檔 ----
@@ -842,6 +872,14 @@ class MapServiceCcNode(Node):
             self._restore_after_failed_mapping()
             return self._abort(goal_handle, result, "系統出現異常，地圖建立失敗")
 
+    def _stuck_note(self) -> str:
+        if self._stuck_end is None:
+            return ""
+        same, total, xy = self._stuck_end
+        where = f"，約在 ({xy[0]:.1f}, {xy[1]:.1f})" if xy else ""
+        return (f"（探索中卡住 {total} 次、同一處 {same} 次{where}，疑似有低於雷達的障礙；"
+                "已停止探索並存下目前的地圖，清掉障礙後可以再建一次）")
+
     def _abort(self, goal_handle, result, message: str):
         result.success = False
         result.message = message
@@ -864,7 +902,7 @@ class MapServiceCcNode(Node):
             self._enter_mapping_mode()
 
     def _wait_for_mapping_done(self, goal_handle, deadline=None) -> str:
-        """等建圖結束，回傳 'done' / 'cancel' / 'timeout' / 'stalled'
+        """等建圖結束，回傳 'done' / 'cancel' / 'timeout' / 'stalled' / 'stuck'
 
         deadline：time.monotonic() 的絕對時間；沒給就從現在起算 exploration_timeout_sec
         """
@@ -883,6 +921,12 @@ class MapServiceCcNode(Node):
             if self.use_exploration and self._exploration_done_epoch == epoch:
                 self.get_logger().info("收到 /exploration_complete，探索完成")
                 return "done"
+
+            # 卡住預算用完（見 exploration_stuck_* 參數）：再探下去只是一再頂同一個看不到的障礙
+            if self.use_exploration and self._stuck_end is not None:
+                same, total, _ = self._stuck_end
+                self.get_logger().warning(f"探索中卡住 {total} 次（同一處 {same} 次），結束探索並存下目前的地圖")
+                return "stuck"
 
             # 停滯：explorer 沒有宣告完成，但地圖已經很久沒長大。
             # ★ 2026-09-25：只陳述現象，不下原因 —— 最常見的是剩下的 frontier 這台阿克曼車
@@ -915,6 +959,8 @@ class MapServiceCcNode(Node):
             self._known_area_m2 = 0.0
             self._area_at_last_gain_m2 = 0.0
             self._last_gain_time = None
+            self._stuck_events = []
+            self._stuck_end = None
 
         if not self.use_exploration:
             self.get_logger().info("未啟用自動探索，請用遙控把環境走一遍，完成後呼叫 /finish_map")
@@ -949,6 +995,7 @@ class MapServiceCcNode(Node):
             return False
 
         # 只有 explorer 真的在跑才叫卡住偵測器讓步；遙控建圖沒有導航目標，不必
+        self._explore_started_mono = time.monotonic()
         self.exploration_active_pub.publish(Bool(data=True))
         self.get_logger().info("✓ 自動探索已啟動")
         return True
@@ -1190,6 +1237,35 @@ class MapServiceCcNode(Node):
                 return None
             return self._stall_now() - self._last_gain_time
 
+    def _robot_stuck_callback(self, msg: Bool) -> None:
+        """卡住預算：只數 False -> True（stuck_detector 對同一次卡住會每 5 秒重發 True）"""
+        rising = bool(msg.data) and not self._stuck_prev
+        self._stuck_prev = bool(msg.data)
+        if not rising or not (self._exploration_active and self.use_exploration):
+            return
+        started = self._explore_started_mono
+        if started is not None and time.monotonic() - started < self.exploration_stuck_grace_sec:
+            self.get_logger().info(
+                f"探索開始 {time.monotonic() - started:.0f} 秒內卡住（寬限期，explorer 還不記失敗）：不算入卡住預算"
+            )
+            return
+        pose = self._current_robot_pose()
+        xy = (pose[0], pose[1]) if pose else None
+        r = self.exploration_stuck_radius_m
+        with self._stall_lock:
+            # 拿不到位置時只算總數，不算「同一處」
+            same = 1 + sum(
+                1 for p in self._stuck_events
+                if p is not None and xy is not None and math.hypot(p[0] - xy[0], p[1] - xy[1]) <= r
+            ) if xy is not None else 1
+            self._stuck_events.append(xy)
+            total = len(self._stuck_events)
+            hit = (0 < self.exploration_stuck_repeat_limit <= same) or (0 < self.exploration_stuck_total_limit <= total)
+            if hit and self._stuck_end is None:
+                self._stuck_end = (same, total, xy)
+        where = f"，約在 ({xy[0]:.2f}, {xy[1]:.2f})" if xy else ""
+        self.get_logger().warning(f"探索中卡住第 {total} 次（此處第 {same} 次{where}）")
+
     def _scan_callback(self, msg: LaserScan) -> None:
         self._last_scan = msg
 
@@ -1237,6 +1313,7 @@ class MapServiceCcNode(Node):
         self.use_exploration = True
         # ★ 2026-09-25（審查 safety#8／upstream#5）：這條手動交接路徑以前沒發 True，
         #   卡住偵測器照舊取消 -> explorer 不記失敗 -> 選回同一點的迴圈在這裡原封不動
+        self._explore_started_mono = time.monotonic()
         self.exploration_active_pub.publish(Bool(data=True))
         self.get_logger().info("✓ 已手動啟動自動探索")
         response.success = True

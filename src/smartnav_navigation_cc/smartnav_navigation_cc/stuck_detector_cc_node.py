@@ -28,7 +28,7 @@ Nav2 會持續下前進指令，馬達空轉、輪子空滑，系統卻以為一
   2. 取消目前的 navigate_to_pose 目標 —— 讓 Nav2 停止硬推
      ★ 自動探索進行中（map_service_cc 發的 /exploration_active 為 true）時**不取消**，
        見下方「探索期間讓步」
-  3. 冷卻一段時間避免反覆觸發
+  3. 同一次卡住每 cooldown_sec 秒重複提醒一次（再發一次 /robot_stuck）；新的一次卡住照常判定
 
 ## 探索期間讓步（2026-09-24）
 
@@ -48,6 +48,14 @@ explorer 的控制服務只有 START/STOP，沒有「把這個點標成到不了
 ★ 例外（2026-09-25）：探索開始後的前 defer_grace_sec 秒**照舊取消**。
 那段是 explorer 的啟動寬限期，它的看門狗不動作 —— 這裡再讓步就沒有人會停車。
 
+★ 後備（2026-09-25）：從第一次讓步起，車子 defer_max_sec 秒都沒真的動起來，就不再等，照舊取消
+（實際約在讓步後 20 秒、卡住後約 24 秒生效，原因見 defer_max_sec 的註解）。
+讓步的前提是「explorer 的看門狗會在約 16 秒內接手」，explorer 當掉或卡在長計算時這個前提不成立。
+
+★ 看門狗本身也修過（2026-09-25）：上游會被 nav2（Jazzy）每個新目標第一筆 distance_remaining=0.0
+鎖死，變成「每個開超過 15 秒的目標都判失敗」，跟有沒有在前進無關。修補已 commit 進子模組指向的
+fork（說明在 patches/frontier_exploration_ros2/），讓步的設計是建立在修補過的看門狗上。
+
 ## 注意
 
 倒車脫困、窄處來回修正時，車子本來就會短暫停頓，所以 stuck_time_sec
@@ -59,14 +67,13 @@ import threading
 import time
 
 import rclpy
+from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
@@ -111,8 +118,11 @@ class StuckDetectorCcNode(Node):
         # 上述狀態持續多久才判定卡住。
         # 不能太短：阿克曼車在窄處來回修正、倒車脫困時本來就會短暫停頓。
         self.declare_parameter("stuck_time_sec", 4.0)
-        # 判定後的冷卻時間，避免同一次卡住反覆觸發
-        self.declare_parameter("cooldown_sec", 10.0)
+        # 「同一次卡住」重複提醒的間隔。★ 2026-09-25：10 -> 5，而且只管同一次。
+        #   舊版是全域冷卻：取消後 explorer 1 秒就重選、車又頂上同一個障礙時，
+        #   第二次卡住要等滿 10 秒才觸發 —— 實際推了約 8 秒而不是 4 秒。
+        #   現在新的一次卡住（中間有恢復過）一律照 stuck_time_sec 判定。
+        self.declare_parameter("cooldown_sec", 5.0)
         self.declare_parameter("cancel_navigation", True)
         # 自動探索進行中就不取消，交給 frontier explorer 自己的看門狗（原因見檔頭）
         self.declare_parameter("defer_to_explorer", True)
@@ -123,6 +133,21 @@ class StuckDetectorCcNode(Node):
         # 真卡住時要硬推到寬限期結束再加 15 秒。寬限期內取消造成的重選迴圈，
         # 最多也只持續到寬限期結束，比硬推安全。
         self.declare_parameter("defer_grace_sec", 30.0)
+        # 讓步的後備上限（2026-09-25，審查 safety#1）：從第一次讓步起算，車子一直沒真的動起來
+        # 超過這麼久，就不再等 explorer，照舊取消。
+        #   正常情況 explorer 的看門狗在卡住後約 16 秒取消（frontier_explore_cc.yaml 的
+        #   no_progress_timeout 15 秒＋1 秒檢查週期），第一次讓步是卡住後 4 秒，所以約 12 秒就解決，
+        #   18 秒碰不到。會走到後備的是：explorer 當掉或卡在長計算（Pi 滿載時單執行緒 executor），
+        #   或 explorer 換了目標卻又頂上同一個障礙。以前這些情況要推到 240 秒停滯才停。
+        #   只有「車子實測真的動了」才重新起算 —— 指令中斷（nav2 恢復、換目標）不算，
+        #   不然 nav2 每 20 秒一次的恢復會讓它永遠碰不到上限。
+        self.declare_parameter("defer_max_sec", 18.0)
+        # ★ 實際生效點（2026-09-25 審查更正）：只在「觸發」時檢查，同一次卡住每 cooldown_sec（5 秒）才觸發一次，
+        #   所以是讓步後 ceil(18/5)×5 = **20 秒**、卡住後約 24 秒。若 nav2 的 progress_checker（20 秒）先放棄、
+        #   清 costmap 重試，就在重試後第一次觸發（再 4 秒）—— 兩條路都落在卡住後約 24~25 秒。
+        #   不要為了對齊 18 秒去改成 15：那會把對 explorer 看門狗（約 16 秒）的餘裕從 8 秒壓到 3 秒。
+        # 「脫困」要連續幾筆（0.5 秒一筆）才算，見 _check
+        self.declare_parameter("recover_samples", 2)
         self.declare_parameter("exploration_active_topic", "exploration_active")
 
         self.cmd_threshold = float(self.get_parameter("cmd_threshold").value)
@@ -132,6 +157,8 @@ class StuckDetectorCcNode(Node):
         self.cancel_navigation = bool(self.get_parameter("cancel_navigation").value)
         self.defer_to_explorer = bool(self.get_parameter("defer_to_explorer").value)
         self.defer_grace_sec = float(self.get_parameter("defer_grace_sec").value)
+        self.defer_max_sec = float(self.get_parameter("defer_max_sec").value)
+        self.recover_samples = max(1, int(self.get_parameter("recover_samples").value))
         # map_service_cc 用 latched 發布，這裡也要 transient_local 才收得到晚起來之前的狀態
         latched = QoSProfile(
             depth=1,
@@ -156,7 +183,12 @@ class StuckDetectorCcNode(Node):
         self.stuck_pub = self.create_publisher(Bool, "robot_stuck", 10)
         self.create_service(Trigger, "get_stuck_status", self._status_cb, callback_group=cb)
 
-        self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose", callback_group=cb)
+        # ★ 2026-09-25：取消用的 client 在這裡建一次。舊版每次取消都新建 client 再 wait_for_service ——
+        #   新 client 的端點可能還沒配對好，第一個請求有機會遺失，還多一段 discovery 延遲，
+        #   而這正好是停車的路徑。
+        self._cancel_client = self.create_client(
+            CancelGoal, "/navigate_to_pose/_action/cancel_goal", callback_group=cb
+        )
 
         self._lock = threading.Lock()
         self._cmd_speed = 0.0
@@ -166,6 +198,10 @@ class StuckDetectorCcNode(Node):
         self._odom_time = 0.0
         self._suspect_since = None
         self._last_trigger = 0.0
+        self._episode_triggered = False  # 這一次卡住已經觸發過（之後只是重複提醒）
+        self._defer_since = None         # 第一次讓步的時間；車子真的動了才清掉
+        self._recover_streak = 0         # 連續幾筆「不像卡住」（見 recover_samples）
+        self._moving_streak = 0          # 連續幾筆實測在動
         self._stuck = False
         # 沒收到過就當作「沒在探索」—— 維持舊行為（會取消），不會因為少一個話題就失去保護
         self._exploring = False
@@ -195,6 +231,8 @@ class StuckDetectorCcNode(Node):
             self._exploring = msg.data
             if changed and msg.data:
                 self._explore_since = time.monotonic()
+            if changed:
+                self._defer_since = None
         if changed:
             self.get_logger().info(
                 "自動探索開始：卡住時不取消目標，交給 frontier explorer 的看門狗"
@@ -234,6 +272,7 @@ class StuckDetectorCcNode(Node):
                 self.get_logger().warn(
                     f"⚠ odom 已 {odom_age:.1f} 秒沒更新 —— 卡住偵測暫停",
                     throttle_duration_sec=10.0)
+            self._moving_streak = 0
             self._reset()
             return
 
@@ -245,9 +284,23 @@ class StuckDetectorCcNode(Node):
         moving_requested = cmd > self.cmd_threshold
         actually_moving = actual > self.motion_threshold
 
-        if not moving_requested or actually_moving:
+        # ★ 2026-09-25（審查）：「脫困」要連續 recover_samples 筆才算。堵轉時輪速編碼器會抖、
+        #   MPPI 輸出也會短暫掉到門檻下，單筆就重置的話，一次實體卡住會被切成好幾次 ——
+        #   map_service 的卡住預算被灌大、後備計時也永遠湊不滿。
+        #   但「明確停車」（指令歸零：nav2 取消、目標結束、換目標）是目標邊界，照舊立刻結束。
+        self._moving_streak = self._moving_streak + 1 if actually_moving else 0
+        if self._moving_streak >= self.recover_samples:
+            # 車子真的動了：讓步的後備計時重新起算（指令中斷不算，見 defer_max_sec）
+            self._defer_since = None
+        if cmd <= 1e-3:
             self._reset()
             return
+        if not moving_requested or actually_moving:
+            self._recover_streak += 1
+            if self._suspect_since is None or self._recover_streak >= self.recover_samples:
+                self._reset()
+            return
+        self._recover_streak = 0
 
         # 要求動、但沒在動
         if self._suspect_since is None:
@@ -257,39 +310,58 @@ class StuckDetectorCcNode(Node):
         if now - self._suspect_since < self.stuck_time_sec:
             return
 
-        if now - self._last_trigger < self.cooldown_sec:
+        # 冷卻只管同一次卡住的重複提醒（見 cooldown_sec）
+        if self._episode_triggered and now - self._last_trigger < self.cooldown_sec:
             return
 
+        repeat = self._episode_triggered
+        self._episode_triggered = True
         self._last_trigger = now
         self._stuck = True
+        stuck_for = now - self._suspect_since
         self.stuck_pub.publish(Bool(data=True))
-        self.get_logger().error(
-            f"偵測到卡住：指令 {cmd:.3f} m/s 但實測 {actual:.3f} m/s，"
-            f"持續 {now - self._suspect_since:.1f} 秒。"
-            "可能是低於雷達高度 (0.11 m) 的雜物卡住輪子 —— costmap 上看不到這種障礙。"
-        )
+        if repeat:
+            # 刻意不用「偵測到卡住」開頭：verify_5 與 map_service 只數新的一次卡住
+            self.get_logger().error(f"仍然卡住（同一次，已 {stuck_for:.1f} 秒）：指令 {cmd:.3f} m/s 但實測 {actual:.3f} m/s")
+        else:
+            self.get_logger().error(
+                f"偵測到卡住：指令 {cmd:.3f} m/s 但實測 {actual:.3f} m/s，"
+                f"持續 {stuck_for:.1f} 秒。"
+                "可能是低於雷達高度 (0.11 m) 的雜物卡住輪子 —— costmap 上看不到這種障礙。"
+            )
         if not self.cancel_navigation:
             return
         with self._lock:
             exploring = self._exploring
             explored_for = now - self._explore_since
         if exploring and self.defer_to_explorer:
-            if explored_for >= self.defer_grace_sec:
-                # 仍然發了 /robot_stuck 並記 log（上面），只是不取消 —— 取消了 explorer
-                # 不會記失敗，只會又選回這一點（見檔頭「探索期間讓步」）
+            if explored_for < self.defer_grace_sec:
                 self.get_logger().warn(
-                    "自動探索中：不取消目標，交給 frontier explorer 的無進展看門狗處理"
-                    "（它取消時才會把這一點記成到不了、換下一個目標）"
+                    f"自動探索才開始 {explored_for:.0f} 秒（explorer 看門狗寬限期 "
+                    f"{self.defer_grace_sec:.0f} 秒內不動作）：照舊取消，先讓車停下來"
                 )
-                return
-            self.get_logger().warn(
-                f"自動探索才開始 {explored_for:.0f} 秒（explorer 看門狗寬限期 "
-                f"{self.defer_grace_sec:.0f} 秒內不動作）：照舊取消，先讓車停下來"
-            )
+            else:
+                if self._defer_since is None:
+                    self._defer_since = now
+                deferred_for = now - self._defer_since
+                if deferred_for < self.defer_max_sec:
+                    # 仍然發了 /robot_stuck 並記 log（上面），只是不取消 —— 取消了 explorer
+                    # 不會記失敗，只會又選回這一點（見檔頭「探索期間讓步」）
+                    self.get_logger().warn(
+                        "自動探索中：不取消目標，交給 frontier explorer 的無進展看門狗處理"
+                        "（它取消時才會把這一點記成到不了、換下一個目標）"
+                    )
+                    return
+                self.get_logger().warn(
+                    f"讓步已 {deferred_for:.0f} 秒車子仍沒動起來（explorer 可能當掉、卡在長計算，"
+                    f"或換了目標又頂上同一個障礙）：後備取消"
+                )
         threading.Thread(target=self._cancel_nav, daemon=True).start()
 
     def _reset(self) -> None:
         self._suspect_since = None
+        self._episode_triggered = False
+        self._recover_streak = 0
         if self._stuck:
             self._stuck = False
             self.stuck_pub.publish(Bool(data=False))
@@ -302,22 +374,15 @@ class StuckDetectorCcNode(Node):
 
         ★ 2026-09-24 更正：這裡原本寫「順帶讓 frontier explorer 收到失敗、把這個
           到不了的地方記起來」—— 錯的。explorer 不把外部取消當失敗（見檔頭），
-          所以自動探索期間 _check 根本不會呼叫這裡。
+          所以自動探索期間只有寬限期內與後備上限才會走到這裡。
         """
         try:
-            if not self.nav_client.wait_for_server(timeout_sec=2.0):
-                return
-            fut = self.nav_client._cancel_goal_async  # noqa: SLF001
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            from action_msgs.srv import CancelGoal
-
-            client = self.create_client(CancelGoal, "/navigate_to_pose/_action/cancel_goal")
-            if not client.wait_for_service(timeout_sec=2.0):
+            if not self._cancel_client.service_is_ready() and not self._cancel_client.wait_for_service(
+                timeout_sec=1.0
+            ):
                 self.get_logger().warn("找不到 cancel_goal 服務，無法取消導航")
                 return
-            client.call_async(CancelGoal.Request())  # 空的 goal_info = 取消全部
+            self._cancel_client.call_async(CancelGoal.Request())  # 空的 goal_info = 取消全部
             self.get_logger().warn("已請求取消目前的導航目標")
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"取消導航失敗: {exc}")

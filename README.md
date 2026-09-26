@@ -10,7 +10,7 @@
 
 > **`master` 是唯一的開發主線**（2026-09-24 起，原本的 `車子` 分支已併入並刪除），兩位組員都在這裡開發。
 > 車上要跑還需要 **`wheeltec` 分支**：17 個 WHEELTEC 廠商驅動（底盤、光達、相機），
-> clone 到 `src/wheeltec_ws/` 跟我們的套件一起建置（見「部署到 Pi」）。兩個分支歷史各自獨立，**不合併**。
+> 另外 clone 成 `~/wheeltec_ws` 當底層 workspace，我們的疊在上面（見「部署到 Pi」）。兩個分支歷史各自獨立，**不合併**。
 
 ---
 
@@ -31,8 +31,7 @@ repo 根目錄**就是** ROS 2 workspace（在這裡 `colcon build`）。
 │   ├── smartnav_hmi/            平板網頁介面（React 前端＋FastAPI）＋ 瀏覽器 TTS 出聲
 │   ├── smartnav_bringup/        demo.launch.py（311 行，五階段延遲啟動）＋ systemd
 │   ├── smartnav_sim/            （開發中）筆電 WSL 的 Gazebo 建圖模擬，不上車
-│   ├── frontier_exploration_ros2/  ★ git 子模組（上游 frontier 探索）
-│   └── wheeltec_ws/             ← wheeltec 分支 clone 到這裡（已 gitignore，不進 master）
+│   └── frontier_exploration_ros2/  ★ git 子模組（上游 frontier 探索的 fork，含我們的修補）
 ├── maprun/                      操作腳本（Pi 上位於 ~/maprun）
 ├── cyclonedds.xml               DDS 設定（env.sh 先找 ~/，再找 repo 根目錄）
 ├── pack_car_code.py             打包上車（實機更新的正式途徑）
@@ -252,40 +251,53 @@ ros2 action send_goal /follow_taught_path smartnav_msgs/action/FollowTaughtPath 
 ## 部署到 Pi
 
 **已經在跑的車：用打包更新**（在筆電跑 `python pack_car_code.py`，它會印出完整的 Pi 端步驟）。
-打包只帶我們自己的程式；車上的 `src/wheeltec_ws/` 解壓時不會被動到。
+打包只帶我們自己的程式，不含廠商驅動；車上現有的廠商驅動解壓時不會被動到。
 
-**全新的 Pi（或換新 SD 卡）：clone 兩份。**`~/welcoming_robot_ws` 已經存在時 clone 會失敗。
+**全新的 Pi（或換新 SD 卡）：clone 兩份、建兩個 workspace。**廠商驅動（`wheeltec` 分支）自成一個
+底層 workspace，我們的疊在它上面——這是 ROS 的標準 underlay／overlay 做法，repo 裡也就不會出現巢狀的
+`*_ws/`（本 repo 的 `CLAUDE.md` 明文禁止）。
 
 ```bash
+source /opt/ros/jazzy/setup.bash
 # 0. astra 相機驅動要的系統套件（rosdep 蓋不到）
 sudo apt install -y libuvc-dev libgoogle-glog-dev
-# 1. 主線。★ --recurse-submodules：frontier 探索是子模組，漏掉它 src/frontier_exploration_ros2 是空的
+
+# 1. 底層：廠商驅動（wheeltec 分支），先建
+git clone -b wheeltec --single-branch https://github.com/xiange1209/welcoming_robot.git ~/wheeltec_ws
+cd ~/wheeltec_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build                                    # 廠商的 C++ 驅動，第一次要一段時間
+source install/setup.bash                       # ★ 先 source 底層再建主線，主線才疊得上去
+
+# 2. 主線。★ --recurse-submodules：frontier 探索是子模組，漏掉它 src/frontier_exploration_ros2 是空的
 git clone --recurse-submodules https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws
-# 2. 廠商驅動（wheeltec 分支）放進 src/wheeltec_ws —— 跟車上現在的結構一樣，一次 colcon build 全部建好
-git clone -b wheeltec --single-branch https://github.com/xiange1209/welcoming_robot.git ~/welcoming_robot_ws/src/wheeltec_ws
 cd ~/welcoming_robot_ws
 ln -s ~/welcoming_robot_ws/maprun ~/maprun      # 所有腳本都寫死 ~/maprun
-# 3. 平板網頁的前端要先建置（dist/ 不進 git，沒建 = 平板白畫面）。
-#    Pi 上沒有 Node.js 的話，在筆電建好再 scp 整個 dist/ 過來
+# 平板網頁的前端要先建置（dist/ 不進 git，沒建 = 平板白畫面）。
+# Pi 上沒有 Node.js 的話，在筆電建好再 scp 整個 dist/ 過來
 (cd src/smartnav_hmi/frontend && npm ci && npm run build)
-# 4. 建置（第一次會比較久：廠商的 C++ 驅動要編譯）
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install                  # ★ 一律從 workspace 頂層建置
-source install/setup.bash                       # 之後用 maprun/env.sh（會設好 CycloneDDS）
+source install/setup.bash                       # 之後用 maprun/env.sh；主線的 setup.bash 會自動帶上 ~/wheeltec_ws
 ```
 
 17 個廠商套件裡我們直接用到的是底盤 `turn_on_wheeltec_robot`、光達 `lslidar_driver`、相機 `astra_camera`
 （連同它們依賴的 `serial`、`wheeltec_robot_msg`、`wheeltec_robot_urdf`、`lslidar_msgs`、`astra_camera_msgs`），
 其餘照車上現況一起建，不影響執行。
 
+> 現在車上的放法不一樣：廠商驅動在 `~/welcoming_robot_ws/src/wheeltec_ws/`，跟我們的套件同一次 build
+> （2026-09-25 查 Pi 備份確認，與 `wheeltec` 分支 528 個檔案逐一相同）。那樣也能跑，**不用搬**；
+> 只是新裝的一律照上面分兩個 workspace。
+
 ## 兩人協作（都在 master 上）
 
 | 要做的事 | 怎麼做 |
 |---|---|
 | 開始工作前 | `git pull --rebase`；子模組有更新時再 `git submodule update --init` |
+| frontier 子模組 | 指向我們的 fork [`xiange1209/frontier_exploration_ros2`](https://github.com/xiange1209/frontier_exploration_ros2/tree/smartnav-patches) 的 `smartnav-patches` 分支（上游 + 看門狗修補，說明見 `patches/`）。**2026-09-25 以前 clone 的要做一次**：`git pull` 之後依序執行 `git submodule sync`、`git submodule update --init`（分兩行打：Windows PowerShell 5.1 不認 `&&`），否則還是上游原版（`pack_car_code.py` 會擋） |
 | 推上去 | `git push origin master`。被拒絕＝對方先推了 → 先 `git pull --rebase` 再推。**不要 `--force`** |
 | 大一點的改動 | 開**英文名**的分支（例 `feature/auto-mapping`），做完跟對方說一聲再合進 master；分支**不刪** |
-| 改廠商驅動 | 到 `src/wheeltec_ws/` 裡改、在那裡 commit、`git push origin wheeltec`。**廠商碼不要進 master** |
+| 改廠商驅動 | 到 `~/wheeltec_ws/`（`wheeltec` 分支的 clone）裡改、commit、`git push origin wheeltec`。**廠商碼不要進 master** |
 | 不進 git（已 gitignore） | `build/ install/ log/`、`frontend/dist/`、`node_modules/`、`.smartnav/secrets/`（Telegram token）、`.smartnav/face_database/` |
 | 在 Windows 上 | 子模組會被系統的 `autocrlf` 改成 CRLF，上車就壞 → `git -C src/frontier_exploration_ros2 config core.autocrlf false` 後重新簽出（`pack_car_code.py` 會擋並給完整指令） |
 

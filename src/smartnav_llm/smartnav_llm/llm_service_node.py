@@ -547,6 +547,22 @@ class LLMServiceNode(Node):
                 self.get_logger().error(f"✗ {what}逾時後送取消指令失敗: {exc}")
             raise TimeoutError(f"{what}超過 {timeout_sec:.0f} 秒未完成，已中止本次請求")
 
+    @staticmethod
+    def _nav_failure_text(action_result) -> str:
+        """導航／帶位沒成功時給模型看的結果文字
+
+        ★ 2026-09-25（審查）：「取消」與「被外部停止」一定要跟「失敗」分開，而且要寫明不可重試。
+          以前 ABORTED 一律回「導航過程中發生錯誤」、帶位的取消也回「失敗」——
+          提示詞 §3 叫模型「失敗先自動重試」，平板按了緊急停止，模型卻再叫一次導航，車子又開出去。
+          navigation_action_cc 在「nav2 被別人取消、外層沒收到取消」時會回「導航被外部停止…請勿自動重試」。
+        """
+        msg = getattr(action_result.result, "message", "") or ""
+        if action_result.status == GoalStatus.STATUS_CANCELED:
+            return f"執行結果: 取消（不可重試）, 詳細信息: {msg or '導航請求被系統或使用者取消'}"
+        if "外部停止" in msg:
+            return f"執行結果: 已被停止（不可重試）, 詳細信息: {msg}"
+        return f"執行結果: 失敗, 詳細信息: {msg or '導航過程中發生錯誤'}"
+
     def _init_modern_llm_tools(self) -> None:
         """定義工具對照表"""
 
@@ -709,12 +725,7 @@ class LLMServiceNode(Node):
 
                 if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                     return f"執行結果: 成功, 詳細信息: {action_result.result.message}"
-                elif action_result.status == GoalStatus.STATUS_CANCELED:
-                    return "執行結果: 取消, 詳細信息: 導航請求被系統或使用者取消"
-                elif action_result.status == GoalStatus.STATUS_ABORTED:
-                    return f"執行結果: 失敗, 詳細信息: 導航過程中發生錯誤"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {action_result.result.message}"
+                return self._nav_failure_text(action_result)
             except Exception as e:
                 return f"執行結果: 失敗, 詳細信息: {str(e)}"
 
