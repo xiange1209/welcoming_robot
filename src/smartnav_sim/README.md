@@ -67,7 +67,7 @@ ros2 launch smartnav_sim sim_explore.launch.py use_rviz:=true
 | `Failed to get result for follow_path in node halt!`（bt_navigator 的 ERROR） | **可以不理**。每次目標被取消都會印一次，是 nav2 的已知雜訊 |
 | `[compute_path_to_pose] [ActionServer] Aborting handle.` | **可以不理**，同上 |
 | `XML Element[gz_frame_id] … not defined in SDF` | **可以不理**，Gazebo 其實有讀這個欄位 |
-| `cmd_vel_floor: ⚠ 不抬：防撞狀態超過 10.0 秒沒更新` | ★ **目前的疑點**（2026-09-26 第一次模擬抓到）：這時速度沒被抬過死區，車子會停在原地。見第 5 節實驗 0 |
+| `cmd_vel_floor: ⚠ 不抬：…沒有發布端` | collision_monitor 不在了，速度不會被抬過死區。**9/26 以前的版本**在防撞狀態 10 秒沒變時也會印這行（誤擋），見第 5 節實驗 0 |
 
 把整趟 log 存下來事後查：`ros2 launch smartnav_sim sim_explore.launch.py 2>&1 | tee ~/run1.log`，之後 `grep -c "no valid path" ~/run1.log` 這樣數。
 
@@ -175,13 +175,13 @@ ros2 run smartnav_sim map_area --watch 30     # 每 30 秒印一次「已知空�
 
 ## 5. 建議先做的實驗
 
-### 實驗 0：確認死區守門員的疑點（★ 先做這個）
+### 實驗 0：死區守門員（9/26 已修，模擬找到的第一個實車 bug）
 
-2026-09-26 第一次整合模擬（12 分鐘、預設參數）裡，`cmd_vel_floor` 多次印出「防撞狀態超過 10 秒沒更新，不抬」，
-同一段時間 akm_realism 報告一個 10 秒窗口內 206 筆指令有 200 筆被死區吃掉。
-推測原因：`collision_monitor_state` 只在**狀態改變時**才發布，狀態維持 10 秒不變，守門員就誤判成「不知道狀態」而停止抬速度
-（`cmd_vel_floor_cc_node.py:242`；8/27 修過「一則都沒收到」的情況，這條路徑沒一起修）。**實車應該也會發生。**
-驗證：跑一趟，數 `grep -c "不抬：防撞狀態超過" ~/run.log`，對照 akm_realism 的「死區吃掉」。
+2026-09-26 第一次整合模擬（12 分鐘、預設參數）裡，`cmd_vel_floor` 關閉時的總結是
+「9284 則指令，抬過死區 817 則，**因不知道防撞狀態而不抬 3084 則**」，akm_realism 同時報告一個 10 秒窗口 206 筆被死區吃掉 200 筆。
+原因：`collision_monitor_state` 只在**狀態改變時**才發布，狀態 10 秒不變，守門員就誤判成「不知道狀態」而停止抬速度
+（8/27 修過「一則都沒收到」的情況，「收到過之後很久沒變」這條沒一起修）。**實車也會發生**，已修並列入 V0 檢查「修正13」。
+確認方式：看 Ctrl+C 時 `cmd_vel_floor` 印的「總結」，「因不知道防撞狀態而不抬」應該是 0。
 
 ### 實驗 1：基準
 

@@ -120,6 +120,8 @@ else
   rec "修正11b frontier 已重新編譯" PASS "已用目前的原始碼編譯" ""
 fi
 chk "修正12 卡住預算與後備"   "$NCC/map_service_cc_node.py"                             "exploration_stuck_repeat_limit"
+# 9/26：防撞狀態 10 秒沒變就停止抬速度 → 指令被死區吃掉、車子停住（模擬實測誤擋 3084 則）
+chk "修正13 死區守門員不誤擋" "$NCC/cmd_vel_floor_cc_node.py"                            "_state_publisher_alive"
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"
