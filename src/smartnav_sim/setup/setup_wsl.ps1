@@ -60,7 +60,14 @@ if ($existing -contains $Distro) {
     Write-Host "  設定完輸入 exit 回到這裡。"
     # WSL 2.5.9 的 --install 支援 --location（本機 wsl --help 確認過）
     & wsl.exe --install $Distro --location $Location
-    if ($LASTEXITCODE -ne 0) {
+    $rc = $LASTEXITCODE
+    # ★ 2026-09-26：不能只看結束碼。安裝完會直接進 Ubuntu 讓你設帳號，輸入 exit 離開時，
+    #   wsl.exe 回傳的是「Ubuntu 裡最後一個指令」的結束碼（打錯一個指令就是 127），不是安裝結果。
+    #   實際發生過：明明裝好了，這裡卻說失敗。所以改成直接看清單裡有沒有它。
+    $after = (WslOut @("--list", "--quiet")) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+    if ($after -contains $Distro) {
+        if ($rc -ne 0) { Ok "（wsl 回傳 $rc，但 $Distro 已經在清單裡 —— 那是離開 Ubuntu 前最後一個指令的結束碼，不影響）" }
+    } else {
         Warn "wsl --install 回傳 $LASTEXITCODE。若訊息提到 --location 不支援，可改用："
         Warn "  wsl --install $Distro   （先裝到預設位置）"
         Warn "  wsl --export $Distro D:\WSL\ubuntu.tar"
