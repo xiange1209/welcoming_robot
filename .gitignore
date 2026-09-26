@@ -2,6 +2,7 @@
 build/
 install/
 log/
+models/
 node_modules/
 dist/
 __pycache__/

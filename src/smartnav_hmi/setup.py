@@ -33,6 +33,7 @@ setup(
     entry_points={
         "console_scripts": [
             "hmi_server = smartnav_hmi.hmi_server_node:main",
+            "system_control = smartnav_hmi.system_control_cli:main",
         ],
     },
 )

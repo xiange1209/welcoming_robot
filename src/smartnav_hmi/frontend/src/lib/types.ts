@@ -168,6 +168,14 @@ export interface SysVariant {
   warn?: string;
 }
 
+export interface SysTransition {
+  operation_id: string;
+  action: "start" | "stop" | string;
+  phase: "launching" | "sigint" | "sigterm" | "sigkill" | string;
+  started_at: number;
+  message?: string;
+}
+
 export interface SysUnit {
   key: string;
   label: string;
@@ -178,6 +186,7 @@ export interface SysUnit {
   /** 前置條件不足的說明。有值代表現在按下去一定失敗 */
   blocked?: string;
   variants?: SysVariant[];
+  transition?: SysTransition | null;
 }
 
 export interface HealthNode {

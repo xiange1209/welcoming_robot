@@ -27,7 +27,7 @@
   **不要**把整支 launch 殺掉重來（會連感測器一起重啟，等 8 秒）。
 """
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, ExecuteProcess, GroupAction,
+from launch.actions import (DeclareLaunchArgument, GroupAction,
                             IncludeLaunchDescription, LogInfo, OpaqueFunction,
                             TimerAction)
 from launch.conditions import IfCondition
@@ -216,7 +216,7 @@ def generate_launch_description():
     #   後者只是訂閱它發出來的音訊。反過來不會壞，只是 log 會先噴一堆等待。
     stage_audio = TimerAction(period=18.0, actions=[
         LogInfo(msg="[bringup] 4/6 語音（雙麥克風 cancel 模式）…"),
-        # ★★ 2026-08-20：改成呼叫 run_asr_cc.sh，不要直接起 Node ★★
+        # ASR preflight（Astra S 裝置、增益與 retry）集中在 package 化 launch。
         #
         # 直接起兩個 Node 看起來乾淨，但**啟動起來是啞的**，因為
         # 語音鏈有兩件事 launch 檔天生做不到，而那兩件事都是必要的：
@@ -235,10 +235,8 @@ def generate_launch_description():
         # ★ 它用 nohup 背景起節點後自己結束，這在 launch 裡是正常的；
         #   nohup 不會離開 cgroup，所以 systemd 的 KillMode=control-group
         #   停機時照樣整棵殺乾淨。
-        ExecuteProcess(
-            cmd=["/home/user/maprun/run_asr_cc.sh"],
-            output="screen",
-            condition=IfCondition(LaunchConfiguration("audio"))),
+        _inc("smartnav_audio", "launch/asr_chain.launch.py", {},
+             IfCondition(LaunchConfiguration("audio"))),
     ])
 
     # ── 21 s：LLM + HMI ──
@@ -275,7 +273,7 @@ def generate_launch_description():
              name="camera_manager_cc_node", output="screen",
              parameters=[{
                  "camera_launch_cmd":
-                     "ros2 launch /home/user/maprun/camera_face_only.launch.py",
+                     "ros2 launch smartnav_navigation_cc camera_face_cc.launch.py",
                  "start_with_camera": True,
                  # ★★ 2026-08-27：True -> False ★★
                  #

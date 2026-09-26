@@ -7,6 +7,7 @@
 
 import math
 import threading
+import time
 import sherpa_onnx
 import numpy as np
 from enum import Enum
@@ -70,6 +71,11 @@ class VoiceTriggerNode(Node):
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("chunk_size", 512)
         self.declare_parameter("device", -1)
+        self.declare_parameter(
+            "device_name_match", "",
+            ParameterDescriptor(description="非空時每次開啟輸入串流前重新依裝置名稱解析 index"),
+        )
+        self.declare_parameter("device_open_retries", 1)
         self.declare_parameter("dtype", "float32")
         self.declare_parameter("output_format", "pcm_s16le")
 
@@ -132,6 +138,8 @@ class VoiceTriggerNode(Node):
         self.sample_rate: int = self.get_parameter("sample_rate").get_parameter_value().integer_value
         self.chunk_size: int = self.get_parameter("chunk_size").get_parameter_value().integer_value
         self.device: int = self.get_parameter("device").get_parameter_value().integer_value
+        self.device_name_match = self.get_parameter("device_name_match").get_parameter_value().string_value
+        self.device_open_retries = max(1, self.get_parameter("device_open_retries").get_parameter_value().integer_value)
         self.dtype: str = self.get_parameter("dtype").get_parameter_value().string_value
         self.output_format: str = self.get_parameter("output_format").get_parameter_value().string_value
 
@@ -323,21 +331,48 @@ class VoiceTriggerNode(Node):
 
         建立 AudioRecorder 實例並啟動音訊捕獲
         """
-        try:
-            channels, mixer = self._build_mic_mixer()
-            self._recorder = AudioRecorder(
-                sample_rate=self.sample_rate,
-                chunk_size=self.chunk_size,
-                device=self.device,
-                audio_callback=self.process_audio_chunk,
-                logger=self.get_logger(),
-                channels=channels,
-                mono_mixer=mixer,
-            )
-            self._recorder.start()
-            self.get_logger().info("✓ 麥克風錄製已啟動")
-        except Exception as e:
-            self.get_logger().error(f"✗ 初始化麥克風錄製器失敗: {e}")
+        last_error = None
+        for attempt in range(self.device_open_retries):
+            try:
+                device = self.device
+                if self.device_name_match:
+                    import sounddevice as sd
+                    match = next(
+                        (
+                            index for index, item in enumerate(sd.query_devices())
+                            if item["max_input_channels"] > 0
+                            and self.device_name_match.upper() in item["name"].upper()
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        raise RuntimeError(f"找不到輸入裝置：{self.device_name_match}")
+                    device = match
+                    self.device = device
+                channels, mixer = self._build_mic_mixer()
+                self._recorder = AudioRecorder(
+                    sample_rate=self.sample_rate,
+                    chunk_size=self.chunk_size,
+                    device=device,
+                    audio_callback=self.process_audio_chunk,
+                    logger=self.get_logger(),
+                    channels=channels,
+                    mono_mixer=mixer,
+                )
+                self._recorder.start()
+                self.get_logger().info(f"✓ 麥克風錄製已啟動（device={device}）")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                self._recorder = None
+                if attempt + 1 < self.device_open_retries:
+                    delay = 0.25 * (2 ** attempt)
+                    self.get_logger().warning(
+                        f"麥克風開啟失敗，{delay:.2f} 秒後重試 ({attempt + 1}/{self.device_open_retries})：{exc}"
+                    )
+                    time.sleep(delay)
+        # 不能只寫 log 後繼續：那會讓 HMI 顯示 ASR 已啟動，但其實完全沒有收音。
+        raise RuntimeError(f"初始化麥克風錄製器失敗（重試耗盡）：{last_error}")
 
     def _stop_recorder(self) -> None:
         """停止麥克風錄製

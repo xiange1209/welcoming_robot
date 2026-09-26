@@ -10,8 +10,6 @@
   這裡把它接回真正在用的 router，恢復成可用狀態。
 """
 
-import asyncio
-
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
@@ -25,12 +23,21 @@ def build_router(node, admin_only) -> APIRouter:
     async def api_system_status() -> JSONResponse:
         return JSONResponse({"units": node.system_control.system_status()})
 
+    @router.get("/api/system/operations/{operation_id}", dependencies=admin_only)
+    async def api_system_operation(operation_id: str) -> JSONResponse:
+        operation = node.system_control.operation(operation_id)
+        if operation is None:
+            return JSONResponse({"success": False, "message": "找不到操作"}, status_code=404)
+        return JSONResponse({"success": True, "operation": operation})
+
     @router.post("/api/system/{unit}/{action:path}", dependencies=admin_only)
     async def api_system_control(unit: str, action: str) -> JSONResponse:
         # action 可能是 "start"、"stop"，或 "start:mapping" 這種帶啟動方式的形式。
         # 用 {action:path} 而不是 {action}，冒號才不會被路由切掉。
-        ok, msg = node.system_control.system_control(unit, action)
-        return JSONResponse({"success": ok, "message": msg}, status_code=200 if ok else 400)
+        ok, result = node.system_control.system_control(unit, action)
+        return JSONResponse(
+            {"success": ok, **result}, status_code=202 if ok else 400
+        )
 
     # ── 測試情境 ─────────────────────────────────────
     # 用 /api/scenarios 而不是 /api/system/scenario/... ——上面那條是
@@ -42,13 +49,7 @@ def build_router(node, admin_only) -> APIRouter:
 
     @router.post("/api/scenarios/{key}", dependencies=admin_only)
     async def api_scenario_apply(key: str) -> JSONResponse:
-        # ★ 一定要丟到執行緒：停止走的是 subprocess.run(timeout=60)，
-        #   一個情境最多停 6 個單元 = 最壞 6 分鐘。在事件迴圈裡跑會把整個 HMI 凍住，
-        #   而平板那端看起來就像網頁當掉。
-        ok, steps = await asyncio.to_thread(node.system_control.scenario_apply, key)
-        return JSONResponse(
-            {"success": ok, "steps": steps, "message": "\n".join(steps)},
-            status_code=200 if ok else 400,
-        )
+        ok, result = node.system_control.scenario_request(key)
+        return JSONResponse({"success": ok, **result}, status_code=202 if ok else 400)
 
     return router

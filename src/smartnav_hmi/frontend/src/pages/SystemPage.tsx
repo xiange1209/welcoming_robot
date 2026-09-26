@@ -23,55 +23,38 @@ const SYS_GROUPS = [
 
 /** 導航堆疊要 60 秒才會全部起來，沒有這個回饋操作者只會看到一顆沒反應的
  *  按鈕，然後再按一次——曾經就這樣同時跑起兩套 Nav2。 */
-const PENDING_TIMEOUT_MS = 90_000;
-
-interface Pending {
-  since: number;
-  action: "start" | "stop";
-}
-
 export function SystemPage({ active }: { active: boolean }) {
   const [units, setUnits] = useState<SysUnit[]>([]);
   const [message, setMessage] = useState("");
-  const [pending, setPending] = useState<Record<string, Pending>>({});
   // 「已等 N 秒」要有個純粹的時間來源。算繪期間直接呼叫 Date.now()
   // 會讓同一份狀態算出不同結果（非純函式），把它收成 state。
   const [now, setNow] = useState(() => Date.now());
 
   const warnedKeys = useRef(false);
   const warnedUngrouped = useRef(false);
+  const refreshInFlight = useRef(false);
 
   const refresh = useCallback(async () => {
-    const r = await api<{ units?: SysUnit[] }>("/api/system/status");
-    const all = r.units || [];
-    setUnits(all);
-
-    // 等待中的單元：狀態已經變成期望值就結束等待，超時也結束（免得永遠轉圈）
-    setPending((prev) => {
-      const next = { ...prev };
-      let changed = false;
-      for (const key of Object.keys(next)) {
-        const p = next[key];
-        const u = all.find((x) => x.key === key);
-        const done = u && (p.action === "stop" ? !u.running && !u.partial : u.running);
-        if (done || Date.now() - p.since > PENDING_TIMEOUT_MS) {
-          delete next[key];
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    try {
+      const r = await api<{ units?: SysUnit[] }>("/api/system/status");
+      const all = r.units || [];
+      setUnits(all);
 
     /* 後端改了單元 key、這裡忘了跟著改時，舊 key 會被靜默丟掉，畫面上看起來
        就是「那個功能不見了」，而且不會有任何錯誤。已經發生過兩次，
        所以主動喊一聲。只印一次，免得輪詢把 console 洗版。 */
-    if (!warnedKeys.current && all.length) {
-      warnedKeys.current = true;
-      const known = new Set(all.map((u) => u.key));
-      const missing = SYS_GROUPS.flatMap((g) => g.keys).filter((k) => !known.has(k));
-      if (missing.length) {
-        console.warn("[HMI] SYS_GROUPS 裡有後端不認得的單元 key（會被靜默略過）:", missing);
+      if (!warnedKeys.current && all.length) {
+        warnedKeys.current = true;
+        const known = new Set(all.map((u) => u.key));
+        const missing = SYS_GROUPS.flatMap((g) => g.keys).filter((k) => !known.has(k));
+        if (missing.length) {
+          console.warn("[HMI] SYS_GROUPS 裡有後端不認得的單元 key（會被靜默略過）:", missing);
+        }
       }
+    } finally {
+      refreshInFlight.current = false;
     }
   }, []);
 
@@ -82,25 +65,18 @@ export function SystemPage({ active }: { active: boolean }) {
        是 2.0 秒，跟 2000 ms 的輪詢打平，加上網路來回一定超過——那個快取
        **每一次都 miss**，等於沒有。4 秒讓它真的擋得住，而節點上下線這種事
        延遲 4 秒看到完全不影響操作。 */
-  useVisibleInterval(refresh, 4000, active);
+  const hasTransition = units.some((unit) => !!unit.transition);
+  useVisibleInterval(refresh, hasTransition ? 1000 : 4000, active);
 
   // 「已等 N 秒」要自己跳，不能等下一輪輪詢（那是 4 秒一次，看起來像卡住）
-  const hasPending = Object.keys(pending).length > 0;
   // immediate 必須是 true：等待一開始就要把 now 對齊到現在，否則第一秒內
   //（now 還停在上一次的值）算出來的「已等 N 秒」會是負數。
-  useVisibleInterval(() => setNow(Date.now()), 1000, active && hasPending, true);
+  useVisibleInterval(() => setNow(Date.now()), 1000, active && hasTransition, true);
 
   const fire = async (unit: SysUnit, action: string, label: string) => {
     setMessage(`${label} 執行中…`);
     const r = await post(`/api/system/${unit.key}/${action}`);
     setMessage(r.message || "操作失敗");
-    // 只有真的送出去才進「等待中」；被防呆擋下來（已在執行中）就不要等
-    if (r.success) {
-      setPending((prev) => ({
-        ...prev,
-        [unit.key]: { since: Date.now(), action: action.startsWith("stop") ? "stop" : "start" },
-      }));
-    }
     void refresh();
   };
 
@@ -160,8 +136,8 @@ export function SystemPage({ active }: { active: boolean }) {
           }
 
           const u = row;
-          const p = pending[u.key];
-          const waited = p ? Math.round((now - p.since) / 1000) : 0;
+          const p = u.transition;
+          const waited = p ? Math.max(0, Math.round(now / 1000 - p.started_at)) : 0;
           const dot = p ? "bg-blue" : u.running ? "bg-green" : u.partial ? "bg-orange" : "bg-[var(--color-label-3)]";
 
           return (
@@ -173,8 +149,12 @@ export function SystemPage({ active }: { active: boolean }) {
                 {u.hint && <div className="text-[12px] text-label-3">{u.hint}</div>}
                 {p && (
                   <div className="tnum text-[12px] text-blue">
-                    {p.action === "stop" ? "停止" : "啟動"}中… 已等 {waited} 秒
-                    {p.action !== "stop" && "（導航堆疊約需 60 秒，請不要重複按）"}
+                    {p.action === "stop" ? "正在關閉中" : "正在啟動中"}… 已等 {waited} 秒
+                    {p.action === "stop"
+                      ? p.phase === "sigint"
+                        ? "（正在優雅關閉，通常需 20–25 秒）"
+                        : "（正在收斂殘留程序）"
+                      : "（請不要重複按）"}
                   </div>
                 )}
                 {u.partial && !p && (
@@ -186,7 +166,11 @@ export function SystemPage({ active }: { active: boolean }) {
 
               <div className="flex flex-none flex-wrap justify-end gap-1.5">
                 {/* 執行中或半死狀態都給「停止」：卡在一半時最需要的就是能把它收乾淨 */}
-                {u.running || u.partial ? (
+                {p ? (
+                  <Button variant="danger" disabled>
+                    {p.action === "stop" ? "關閉中…" : "啟動中…"}
+                  </Button>
+                ) : u.running || u.partial ? (
                   <Button variant="danger" disabled={!!p} onClick={() => void fire(u, "stop", `停止 ${u.label}`)}>
                     停止
                   </Button>
