@@ -126,7 +126,9 @@ def _preflight(context):
 def generate_launch_description():
     return LaunchDescription(
         [
-            DeclareLaunchArgument("mic_gain", default_value=EnvironmentVariable("ASR_MIC_GAIN", default_value="80")),
+            # ★ 2026-09-29：80 → 60。amixer 檔位 0~120、實測 1.38 dB/格；9/17 新實驗室 66 就削波
+            #   581 點，60 才正確觸發（驗證結果_20260917.md §8-1，run_asr_cc.sh 的預設也是 60）。
+            DeclareLaunchArgument("mic_gain", default_value=EnvironmentVariable("ASR_MIC_GAIN", default_value="60")),
             DeclareLaunchArgument("mic_mode", default_value=EnvironmentVariable("ASR_MIC_MODE", default_value="left")),
             OpaqueFunction(function=_preflight),
         ]

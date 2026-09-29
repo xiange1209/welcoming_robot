@@ -31,7 +31,9 @@ def _actions(context):
         modes = {
             "mapping": ("mapping", "false"),
             "explore": ("mapping", "true"),
-            "localization": ("localization", "true"),
+            # ★ 2026-09-29：true → false。定位模式一定要關探索，否則 explorer 帶 auto_start 一起起來，
+            #   教導路徑／迎賓故事線的情境裡按「開始建圖」車子就自己開走（manager.py 9/25 註解）。
+            "localization": ("localization", "false"),
         }
         if variant in modes:
             mode, explore = modes[variant]

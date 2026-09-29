@@ -840,7 +840,9 @@ class LLMServiceNode(Node):
         # 也讓 brain 沒啟動時工具仍可執行（會回報提示而不是拋例外）。
         if self.enable_bank_tools:
             try:
-                from smartnav_ws.src.smartnav_llm.smartnav_llm.bank_tools import make_bank_tools
+                # ★ 2026-09-29：9/23 重構誤改成 smartnav_ws.src.… 的路徑（攤平後不存在），
+                #   ImportError 被下面吞成 warning，帶位／通報行員／FAQ 三個工具靜默消失。
+                from smartnav_llm.bank_tools import make_bank_tools
 
                 self.tools_map.update(make_bank_tools(self))
             except ImportError as exc:

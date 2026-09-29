@@ -10,6 +10,8 @@
   這裡把它接回真正在用的 router，恢復成可用狀態。
 """
 
+import asyncio
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
