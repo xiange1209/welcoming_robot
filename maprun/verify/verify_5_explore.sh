@@ -46,13 +46,20 @@ fi
 # ════════════════════════════════════════════════════════════════
 # report：解析這趟的 nav log，分類卡住原因
 # ════════════════════════════════════════════════════════════════
-LOG="${2:-$(ls -t "$LOGDIR"/nav_cc_*.log 2>/dev/null | head -1)}"
+# ★ 2026-09-29：9/26 起平板改用 LaunchSupervisor 起導航，log 寫到 ~/.smartnav/logs/system_control/nav_*.log，
+#   不再經過 run_nav_cc.sh。只找 ~/maprun/logs 的話會「成功」分析到上一次（例如 9/17）的舊 log —— 兩邊一起比新舊。
+SC_LOGDIR="$HOME/.smartnav/logs/system_control"
+LOG="${2:-$(ls -t "$LOGDIR"/nav_cc_*.log "$SC_LOGDIR"/nav_*.log 2>/dev/null | head -1)}"
 echo "V5 自動探索報告   $(date '+%Y-%m-%d %H:%M:%S')"
 if [ -z "$LOG" ] || [ ! -f "$LOG" ]; then
-  rec "nav log" FAIL "找不到 ~/maprun/logs/nav_cc_*.log" "導航堆疊要用 run_nav_cc.sh（或平板的測試情境）啟動才會寫 log"
+  rec "nav log" FAIL "找不到 nav log" "平板起的在 ~/.smartnav/logs/system_control/nav_*.log；run_nav_cc.sh 起的在 ~/maprun/logs/nav_cc_*.log"
   banner_done; exit 1
 fi
-rec "分析的 log" INFO "$(basename "$LOG")" "$(du -h "$LOG" | cut -f1)"
+rec "分析的 log" INFO "$LOG" "$(du -h "$LOG" | cut -f1)"
+AGE_H=$(( ( $(date +%s) - $(stat -c %Y "$LOG") ) / 3600 ))
+if [ "$AGE_H" -ge 6 ]; then
+  rec "log 新舊" WARN "最後寫入是 ${AGE_H} 小時前" "可能不是這一趟 —— 用 report <log 路徑> 指定這趟的 log"
+fi
 
 # 找最新的 CPU 記錄（watch 可能是另一次 verify 的 STAMP 目錄）
 CPU_FILE=$(ls -t "$HOME"/maprun/verify_out/*/explore_cpu.csv 2>/dev/null | head -1)

@@ -131,6 +131,14 @@ fi
 chk "修正12 卡住預算與後備"   "$NCC/map_service_cc_node.py"                             "exploration_stuck_repeat_limit"
 # 9/26：防撞狀態 10 秒沒變就停止抬速度 → 指令被死區吃掉、車子停住（模擬實測誤擋 3084 則）
 chk "修正13 死區守門員不誤擋" "$NCC/cmd_vel_floor_cc_node.py"                            "_state_publisher_alive"
+# 9/29：9/23 重構與 e56f49b 帶進來的回歸（筆電 b87dfe8）。四個都「不報錯」：工具靜默消失、
+#   削波、按鈕回 500、定位模式偷開 explorer
+chk "修正15 LLM 銀行工具 import"    "$SRC/smartnav_llm/smartnav_llm/llm_service_node.py"      "from smartnav_llm.bank_tools import"
+chk "修正16 ASR 增益預設 60"        "$SRC/smartnav_audio/launch/asr_chain.launch.py"           'ASR_MIC_GAIN", default_value="60"'
+chk "修正17 一鍵驗證 import asyncio" "$HMI_SC/router.py"                                        "^import asyncio"
+# ★ 修正9 查的是 manager.py 的 cmd 欄位 —— 9/26 起沒有程式讀它（改走 LaunchSupervisor），
+#   真正決定定位模式開不開 explorer 的是 system_control.launch.py
+chk "修正18 定位模式不開探索"       "$SRC/smartnav_hmi/launch/system_control.launch.py"        '"localization": ("localization", "false")'
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"

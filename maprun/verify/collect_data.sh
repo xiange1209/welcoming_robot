@@ -27,6 +27,13 @@ fi
 # 2) 今天的 CSV 與 log（研究數據要留著寫報告，全部帶走）
 find "$HOME/maprun/logs" -maxdepth 1 \( -name "*${DAY}*.csv" -o -name "*.log" \) \
      -newermt '-24 hours' -exec cp {} "$STAGE/logs/" \; 2>/dev/null
+# 2b) ★ 2026-09-29：9/26 起平板（LaunchSupervisor）起的單元，輸出寫在 ~/.smartnav/logs/system_control/，
+#     不在 ~/maprun/logs —— 導航、語音、人臉等當天的 log 都在這裡，不收的話 V5 要的 nav log 帶不回來
+if [ -d "$HOME/.smartnav/logs/system_control" ]; then
+  mkdir -p "$STAGE/logs/system_control"
+  find "$HOME/.smartnav/logs/system_control" -maxdepth 1 -name "*.log" \
+       -newermt '-24 hours' -exec cp {} "$STAGE/logs/system_control/" \; 2>/dev/null
+fi
 
 # 3) .smartnav 的設定與資料庫 —— 白名單，不是黑名單
 for f in steering_trim.json nav_state.json \
