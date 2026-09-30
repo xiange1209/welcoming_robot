@@ -6,7 +6,8 @@
 #   不隔離的話 map_service 可能會呼叫到遠端的 /control_exploration。
 
 source /opt/ros/jazzy/setup.bash
-source /home/user/welcoming_robot_ws/install/setup.bash
+# 遷移後、第一次建置完成前 install/ 不存在 —— 不要每開一個 shell 就印一次 No such file（9/29 車子端）
+[ -f /home/user/welcoming_robot_ws/install/setup.bash ] && source /home/user/welcoming_robot_ws/install/setup.bash
 
 export CYCLONEDDS_URI=file:///home/user/cyclonedds.xml
 # git clone 部署時 ~/cyclonedds.xml 不存在，但 repo 根目錄（= workspace）有一份一樣的

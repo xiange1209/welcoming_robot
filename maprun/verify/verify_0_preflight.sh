@@ -12,7 +12,10 @@ echo "V0 開工前檢查   $(date '+%Y-%m-%d %H:%M:%S')"
 # ★ 低壓保護在 20 V，但 20 V 只切馬達不切舵機
 #   症狀是「方向舵會轉但車不走」，很容易誤判成程式壞掉。
 hdr "電池"
-V=$(timeout 8 ros2 topic echo /PowerVoltage --once --field data 2>/dev/null | head -1)
+# ★★ 2026-09-30（車子端 9/29 抓到）：底盤沒開時 ros2 topic echo 把「WARNING: topic … not published」
+#    印到 **stdout**，原本 head -1 就把它當電壓，awk 對非數字做**字串比較**（"W" > "2"）→ 判 PASS。
+#    鐵則「電池 ≥ 23 V 才開始」這道關卡在底盤沒開時會自己放行。只接受整行是數字的輸出。
+V=$(timeout 8 ros2 topic echo /PowerVoltage --once --field data 2>/dev/null | grep -Eo '^[0-9]+([.][0-9]+)?$' | head -1)
 if [ -z "$V" ]; then
   rec "電池電壓" WARN "讀不到" "底盤節點沒起來？先跑 run_sensors_cc.sh 再回來"
 else
@@ -55,6 +58,43 @@ fi
 hdr "車上程式版本"
 BUILT=$(stat -c %y "$HOME/welcoming_robot_ws/install/setup.bash" 2>/dev/null | cut -d. -f1)
 rec "install 建置時間" INFO "${BUILT:-找不到}" "要晚於你 scp 上來的時間，否則是舊版在跑"
+
+# ★ 2026-09-30（車子端 9/22 發現）：車上 HMI 是 systemd 服務 smartnav-hmi（ros2 run smartnav_hmi hmi_server），
+#   colcon build 之後**不會自己重啟**。前端 index.html 是軟連結所以是新的，後端卻是舊程式 ——
+#   卡片畫得出來、內容抓不到，看起來像「功能沒做」。服務的啟動時間必須晚於最後一次建置。
+HMI_PID=$(systemctl show -p MainPID --value smartnav-hmi 2>/dev/null)
+if [ -z "$HMI_PID" ] || [ "$HMI_PID" = 0 ]; then
+  HMI_PID=$(ps -eo pid,args --no-headers | grep '[h]mi_server' | awk 'NR==1{print $1}')
+fi
+if [ -z "$HMI_PID" ]; then
+  rec "HMI 跑的是新程式" INFO "HMI 沒在跑" ""
+else
+  HMI_START=$(date -d "$(ps -o lstart= -p "$HMI_PID" 2>/dev/null)" +%s 2>/dev/null)
+  BUILT_S=$(stat -c %Y "$HOME/welcoming_robot_ws/install/setup.bash" 2>/dev/null)
+  if [ -n "$HMI_START" ] && [ -n "$BUILT_S" ] && [ "$HMI_START" -lt "$BUILT_S" ]; then
+    rec "HMI 跑的是新程式" FAIL "HMI 啟動早於最後一次建置" "sudo systemctl restart smartnav-hmi（重啟後平板要重新登入）"
+  else
+    rec "HMI 跑的是新程式" PASS "啟動晚於最後一次建置" ""
+  fi
+fi
+
+# ── 語音模型 ────────────────────────────────────────────────
+# ★ 2026-09-30：找不到模型時語音節點照跑、燈號照亮，只是**永遠不出字**。9/17 是靠 install/ 底下的
+#   暫時軟連結才找到，重建就沒了；~/models/asr 是 9/22 在車上手動建的，部署包不含。
+#   搜尋順序照 voice_utils.model_path_candidates：環境變數 > 套件 share > ~/models/<type>
+hdr "語音模型（找不到時節點照跑、只是不出字）"
+SHARE_M="$HOME/welcoming_robot_ws/install/smartnav_audio/share/smartnav_audio/models"
+for t in asr:tokens.txt vad:silero_vad.onnx; do
+  typ=${t%%:*}; f=${t#*:}; hit=""
+  for d in "${SMARTNAV_AUDIO_MODELS_DIR:+$SMARTNAV_AUDIO_MODELS_DIR/$typ}" "$SHARE_M/$typ" "$HOME/models/$typ"; do
+    if [ -n "$d" ] && [ -f "$d/$f" ]; then hit="$d"; break; fi
+  done
+  if [ -n "$hit" ]; then
+    rec "$typ 模型" PASS "$hit" ""
+  else
+    rec "$typ 模型" FAIL "三個位置都沒有 $f" "建 ~/models/$typ 指向模型目錄（見 HANDOFF_car_agent 第 4.5 節）"
+  fi
+done
 
 # ── 目錄結構（2026-09-23 攤平之後）─────────────────────────
 # ★ 套件直接放在 ~/welcoming_robot_ws/src/<套件>，不再有 src/smartnav_ws/src/ 這層。

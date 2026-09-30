@@ -16,6 +16,12 @@ trap 'rm -rf "$STAGE"' EXIT
 
 echo "打包 $DAY 的資料"
 echo
+# ★ 2026-09-30（車子端 9/29 發現）：Pi 沒有 RTC，開機後到 NTP 同步前時鐘是錯的（實測 00:54 → 10:02）。
+#   下面 log 用 -newermt '-24 hours' 篩，同步前跑會漏檔；預設日期過了午夜也會變成隔天 —— 那時請明寫日期。
+if ! timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+  echo "⚠ 時鐘還沒同步（timedatectl）：「近 24 小時」的 log 可能漏收。等同步後再跑，或事後手動補。"
+  echo
+fi
 
 mkdir -p "$STAGE/verify" "$STAGE/logs" "$STAGE/smartnav"
 
@@ -45,9 +51,14 @@ for f in steering_trim.json nav_state.json \
   fi
 done
 
-# 4) 今天建的地圖
-find "$HOME/.smartnav/map_database" -maxdepth 1 \( -name '*.pgm' -o -name '*.yaml' \) \
-     -newermt '-24 hours' -exec cp {} "$STAGE/smartnav/map_database/" \; 2>/dev/null
+# 4) 地圖
+# ★ 2026-09-30（車子端 9/29 發現）：地圖實際存在 map_database/data/，原本 -maxdepth 1 **永遠**打包不到。
+#   也不再用「近 24 小時」篩：一張圖約 40 KB，全帶最保險（時鐘沒同步也不會漏）；路徑照 repo 的 .smartnav/ 結構放
+if [ -d "$HOME/.smartnav/map_database/data" ]; then
+  mkdir -p "$STAGE/smartnav/map_database/data"
+  find "$HOME/.smartnav/map_database/data" -maxdepth 1 \( -name '*.pgm' -o -name '*.yaml' \) \
+       -exec cp {} "$STAGE/smartnav/map_database/data/" \; 2>/dev/null
+fi
 
 # ── 資安複查：確認排除項真的不在包裡 ────────────────────────
 echo "── 資安複查 ──"

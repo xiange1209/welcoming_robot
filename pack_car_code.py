@@ -241,12 +241,21 @@ def main() -> int:
         return 1
 
     bump, now = _patched_files(), int(time.time())
+    # ★ 2026-09-30：只看 .sh 不夠 —— maprun 的 *_cc.py、tools_*/*.py 等帶 #! 的腳本也要能直接執行。
+    #   車子端回報每次部署都要再跑一次 fix_perms_cc.sh 補 16 個執行權限（9/29 已是第五次）。
+    shebang = set()
+    for p in targets:
+        try:
+            if p.suffix != ".sh" and p.read_bytes()[:2] == b"#!":
+                shebang.add(str(p).replace("\\", "/"))
+        except Exception:                       # noqa: BLE001
+            pass
 
     def _mode(ti: tarfile.TarInfo) -> tarfile.TarInfo:
         # ★ Windows 檔案系統沒有執行權限位元，tarfile 會把 .sh 記成 0644，
         #   解壓到車上就是 Permission denied。直接在包裡寫成 0755，
         #   不靠人記得上車後 chmod +x。
-        ti.mode = 0o755 if ti.name.endswith(".sh") else 0o644
+        ti.mode = 0o755 if ti.name.endswith(".sh") or ti.name in shebang else 0o644
         # ★ 2026-09-25（審查）：tar 會還原筆電上的檔案時間。車上若已經有比它新的 .o
         #   （例如之前用沒修補的原始碼編過），colcon／make 判定不用重編 —— 車上跑的還是沒修補的
         #   explorer，V0 只查原始碼卻顯示 PASS。修補過的 C++ 檔一律標成打包當下，保證會重編。

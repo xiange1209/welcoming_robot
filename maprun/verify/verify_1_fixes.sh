@@ -48,9 +48,16 @@ rec "系統 1 分鐘負載" INFO "$LOAD" "四核心，9/17 預設值飽和時是
 
 # ── 3. 語音模型路徑：找不到現在會印 error ────────────────────
 hdr "語音模型路徑（原本靜默失效）"
-ALOG="$HOME/maprun/logs/asr.log"
-if [ ! -f "$ALOG" ]; then
-  rec "ASR 模型載入" WARN "還沒有 asr.log" "先跑 run_asr_cc.sh 再回來驗"
+# ★★ 2026-09-22 車子端修正（9/30 併回）：原本寫 ~/maprun/logs/asr.log、vad.log，但**沒有任何程式
+#    會產生那兩個檔** —— run_asr_cc.sh 的 LOGDIR 是 logs_0814（名字會騙人：裝的是**現在**的 ASR log），
+#    檔名是 asr_recognizer.log／asr_voice_trigger.log。照原路徑這兩項永遠 WARN，等於驗不到。
+# ★ 2026-09-30：9/26 起平板改用 LaunchSupervisor 起語音鏈，recognizer 與 trigger 的輸出都寫在
+#    ~/.smartnav/logs/system_control/asr_chain_<時間>.log（每次啟動一個新檔）—— 兩邊一起找、取最新
+SC_LOGDIR="$HOME/.smartnav/logs/system_control"
+ALOG=$(ls -t "$HOME/maprun/logs_0814/asr_recognizer.log" "$SC_LOGDIR"/asr_chain_*.log 2>/dev/null | head -1)
+VLOG=$(ls -t "$HOME/maprun/logs_0814/asr_voice_trigger.log" "$SC_LOGDIR"/asr_chain_*.log 2>/dev/null | head -1)
+if [ -z "$ALOG" ]; then
+  rec "ASR 模型載入" WARN "找不到語音鏈的 log" "先在平板開「語音輸入」（或跑 run_asr_cc.sh）再回來驗"
 elif grep -q "找不到 asr 模型目錄" "$ALOG"; then
   rec "ASR 模型載入" FAIL "找不到模型" "$(grep -A6 '找不到 asr 模型目錄' "$ALOG" | tail -5 | tr '\n' ' ')"
 elif grep -q "找到 asr 模型目錄" "$ALOG"; then
@@ -59,22 +66,36 @@ else
   rec "ASR 模型載入" WARN "log 裡沒有相關訊息" "確認跑的是新版"
 fi
 
-VLOG="$HOME/maprun/logs/vad.log"
-if [ -f "$VLOG" ] && grep -q "找到 vad 模型目錄" "$VLOG"; then
+if [ -n "$ALOG" ]; then
+  rec "（分析的語音 log）" INFO "$ALOG" "要是這一次的啟動；舊的就先重開語音鏈"
+fi
+if [ -n "$VLOG" ] && grep -q "找到 vad 模型目錄" "$VLOG"; then
   rec "VAD 模型載入" PASS "已找到" ""
-elif [ -f "$VLOG" ]; then
-  rec "VAD 模型載入" FAIL "未找到" "VAD 不觸發 = 講話完全沒反應"
+elif [ -n "$VLOG" ]; then
+  rec "VAD 模型載入" FAIL "未找到" "VAD 不觸發 = 講話完全沒反應；~/models/vad 底下要有 silero_vad.onnx"
 fi
 
 # ── 4. 麥克風增益預設值 ──────────────────────────────────────
 hdr "麥克風增益（家裡 66 → 實驗室 60 + left）"
 G=$(grep -o 'ASR_MIC_GAIN:-[0-9]*' "$HOME/maprun/run_asr_cc.sh" 2>/dev/null | grep -o '[0-9]*$')
-M=$(grep -o 'ASR_MIC_MODE:-[a-z]*' "$HOME/maprun/run_asr_cc.sh" 2>/dev/null | cut -d- -f3)
+# ★★ 2026-09-22 車子端修正（9/30 併回）：`ASR_MIC_MODE:-left` 只有**一個**減號，原本的
+#    `cut -d- -f3` 恆為空 → 這項永遠 FAIL 並印「增益 60、?」，其實設定是對的。改成 f2。
+M=$(grep -o 'ASR_MIC_MODE:-[a-z]*' "$HOME/maprun/run_asr_cc.sh" 2>/dev/null | cut -d- -f2)
 if [ "$G" = "60" ] && [ "$M" = "left" ]; then
-  rec "啟動腳本預設" PASS "增益 $G、$M" "刻度實測 1.38 dB/單位；66 會削波 581 個取樣"
+  rec "啟動腳本預設（run_asr_cc.sh）" PASS "增益 $G、$M" "刻度實測 1.38 dB/單位；66 會削波 581 個取樣"
 else
-  rec "啟動腳本預設" FAIL "增益 ${G:-?}、${M:-?}" "應為 60 + left"
+  rec "啟動腳本預設（run_asr_cc.sh）" FAIL "增益 ${G:-?}、${M:-?}" "應為 60 + left"
 fi
+# ★ 2026-09-30：9/26 起平板與 demo 走 asr_chain.launch.py，它有自己的預設（9/29 前是 80，會削波）
+AC="$HOME/welcoming_robot_ws/src/smartnav_audio/launch/asr_chain.launch.py"
+AG=$(grep -o 'ASR_MIC_GAIN", default_value="[0-9]*' "$AC" 2>/dev/null | grep -o '[0-9]*$')
+AM=$(grep -o 'ASR_MIC_MODE", default_value="[a-z]*' "$AC" 2>/dev/null | grep -o '[a-z]*$')
+if [ "$AG" = "60" ] && [ "$AM" = "left" ]; then
+  rec "平板語音鏈預設（asr_chain）" PASS "增益 $AG、$AM" ""
+else
+  rec "平板語音鏈預設（asr_chain）" FAIL "增益 ${AG:-?}、${AM:-?}" "應為 60 + left；80 會削波（b87dfe8 已修，車上是舊版？）"
+fi
+[ -n "${ASR_MIC_GAIN:-}" ] && rec "ASR_MIC_GAIN 環境變數" WARN "$ASR_MIC_GAIN" "會蓋過上面兩個預設值"
 
 banner_done
 echo "★ 這四項只要有一項 FAIL，後面的實驗數字就不要拿去寫報告。"
