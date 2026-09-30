@@ -12,6 +12,7 @@ __pycache__/
 
 # 打包檔 —— 內容與 welcoming_robot_ws/ 重複，留著會讓 repo 白白肥一倍
 car_code_*.tar.gz
+car_code_*.tar.gz.md5
 
 # 執行時期記錄
 logs/
