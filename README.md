@@ -1,4 +1,4 @@
-# 基於ROS2與LLM之智慧迎賓機器人系統 — 實機開發主線
+# 基於 ROS2 與 LLM 之智慧迎賓機器人系統 — 實機開發主線
 
 ![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)
 ![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-orange)
