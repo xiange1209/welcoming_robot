@@ -263,9 +263,21 @@ def main() -> int:
             ti.mtime = now
         return ti
 
+    def _arcname(p: pathlib.Path) -> str:
+        # ★ 2026-09-30（車子端 9/29 回報）：根目錄的 .md 原本解到車上 ~/，每次部署都把 34 份
+        #   舊文件重放回家目錄；其中 CLAUDE.md 是「以 repo 根目錄為視角」的規範（禁止
+        #   ./welcoming_robot_ws/src/…），落在 ~ 時字面上正好禁掉車上真正的 workspace 路徑，
+        #   在 ~ 開的 Claude session 會自動載入它。
+        #   → CLAUDE.md 放 ~/welcoming_robot_ws/（那裡的 ./src 就是 workspace 的 src，規則一致）；
+        #     其餘文件放 ~/car_docs/。
+        name = str(p).replace("\\", "/")
+        if "/" not in name and name.endswith(".md"):
+            return "welcoming_robot_ws/CLAUDE.md" if name == "CLAUDE.md" else f"car_docs/{name}"
+        return name
+
     with tarfile.open(out, "w:gz") as t:
         for p in targets:
-            t.add(p, arcname=str(p).replace("\\", "/"), filter=_mode)
+            t.add(p, arcname=_arcname(p), filter=_mode)
 
     md5 = hashlib.md5(pathlib.Path(out).read_bytes()).hexdigest()
     print(f"✓ {out}")
@@ -284,9 +296,13 @@ def main() -> int:
     print("  2) ~/maprun/verify/migrate_layout.sh            # ★ 只有第一次升結構要跑")
     print(f"  3) cd ~/welcoming_robot_ws && tar -xzf ~/{out} src")
     print("  4) colcon build --symlink-install && source install/setup.bash")
+    print("  5) sudo systemctl restart smartnav-hmi             # ★ HMI 不會自己重啟，後端會一直跑舊程式")
+    print("  6) ~/maprun/verify/verify_0_preflight.sh")
     print()
     print("  第 2 步漏掉的話，新舊兩份套件會同時在 src/ 底下，")
     print("  colcon 報 Duplicate package names。")
+    print("  文件在 ~/car_docs/（出發清單、交接）；CLAUDE.md 在 ~/welcoming_robot_ws/。")
+    print("  ⚠ 9/29 以前的部署把舊文件解在 ~/ 根目錄 —— 要搬要刪先列清單給使用者確認，不要自己刪。")
     return 0
 
 
