@@ -35,7 +35,8 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
 PKG = "smartnav_sim"
-PASS_THROUGH = ["world", "map_yaml", "gui", "render_engine", "realism", "x", "y", "yaw", "lidar_x_actual"]
+PASS_THROUGH = ["world", "map_yaml", "gui", "render_engine", "realism", "x", "y", "yaw", "lidar_x_actual",
+                "self_echo_bars"]
 
 
 def generate_launch_description():
@@ -81,6 +82,7 @@ def generate_launch_description():
             DeclareLaunchArgument("y", default_value="auto"),
             DeclareLaunchArgument("yaw", default_value="0.0"),
             DeclareLaunchArgument("lidar_x_actual", default_value=""),
+            DeclareLaunchArgument("self_echo_bars", default_value="false"),
             DeclareLaunchArgument("use_rviz", default_value="false"),
             DeclareLaunchArgument("auto_explore", default_value="true"),
             DeclareLaunchArgument("nav_delay", default_value="5.0"),

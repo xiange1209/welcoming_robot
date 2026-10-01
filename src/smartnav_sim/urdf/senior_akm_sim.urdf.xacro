@@ -185,6 +185,37 @@
     </visual>
   </link>
 
+  <!-- ─── 自身回波重現（2026-09-30）────────────────────────────
+       實車 9/23 起光達兩側有架高攝影機的鋁擠條：原始 /scan 在約 87~114、252~272 度看到 0.15~0.17 m 的回波。
+       path_teach／局部成本地圖／collision_monitor 吃原始 /scan，9/29 四條重播因此全在 5 秒內進脫困
+       （車身矩形半寬 0.185 m，這些點落在車身內 → 0 cm 硬停 → 卡住偵測 → 脫困）。
+       self_echo_bars:=true 在模擬光達兩側放一對同位置的薄板重現它，用來驗證 /scan_nav 遮罩路由。
+       預設關：9/26 以前的模擬結果都沒有它，開了才能跟實車比。
+       板子近面離雷達 0.16 m（> range_min 0.15，模擬裡每幀都有有效回波 —— 比實車「八成無效、邊緣漏」更嚴苛），
+       前後長 0.05 m → 掃到約 88~106 度與 254~272 度，落在實車量到的範圍與預設遮罩 [84,118,249,275] 內。 -->
+  <xacro:arg name="self_echo_bars" default="false"/>
+  <xacro:macro name="echo_bar" params="side sign">
+    <joint name="echo_bar_${side}_joint" type="fixed">
+      <parent link="base_footprint"/>
+      <child link="echo_bar_${side}"/>
+      <origin xyz="${lidar_x - 0.020} ${0.00067 + sign * 0.17} ${lidar_z}"/>
+    </joint>
+    <link name="echo_bar_${side}">
+      <inertial>
+        <mass value="0.05"/>
+        <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+      </inertial>
+      <visual>
+        <geometry><box size="0.05 0.02 0.24"/></geometry>
+        <material name="alu_${side}"><color rgba="0.75 0.75 0.78 1"/></material>
+      </visual>
+    </link>
+  </xacro:macro>
+  <xacro:if value="$(arg self_echo_bars)">
+    <xacro:echo_bar side="left" sign="1"/>
+    <xacro:echo_bar side="right" sign="-1"/>
+  </xacro:if>
+
   <gazebo reference="laser">
     <sensor name="lidar" type="gpu_lidar">
       <!-- 感測器相對 laser 連結的位移 = 實際位置 − TF 位置（預設 0） -->

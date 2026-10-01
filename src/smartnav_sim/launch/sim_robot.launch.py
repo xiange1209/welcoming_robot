@@ -82,7 +82,8 @@ def _setup(context):
         launch_arguments={"gz_args": gz_args, "on_exit_shutdown": "true"}.items(),
     )
 
-    mappings = {"lidar_x_actual": arg("lidar_x_actual") or "same"}
+    mappings = {"lidar_x_actual": arg("lidar_x_actual") or "same",
+                "self_echo_bars": "true" if _truthy(arg("self_echo_bars")) else "false"}
     robot_description = xacro.process_file(
         os.path.join(share, "urdf", "senior_akm_sim.urdf.xacro"), mappings=mappings).toxml()
 
@@ -131,5 +132,7 @@ def generate_launch_description():
         DeclareLaunchArgument("y", default_value="auto"),
         DeclareLaunchArgument("yaw", default_value="0.0"),
         DeclareLaunchArgument("lidar_x_actual", default_value=""),
+        # 2026-09-30：在光達兩側放一對薄板，重現實車鋁擠條的自身回波（見 urdf 註解）
+        DeclareLaunchArgument("self_echo_bars", default_value="false"),
         OpaqueFunction(function=_setup),
     ])

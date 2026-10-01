@@ -170,6 +170,9 @@ ros2 run smartnav_sim map_area --watch 30     # 每 30 秒印一次「已知空�
 | `auto_explore` | true | false = 不自動開始，自己送 `/create_map` |
 | `render_engine` | （空） | Gazebo 視窗一開就崩時設 `ogre` |
 | `lidar_x_actual` | （空） | 模擬光達的**實際** x 位置（TF 仍是 0.0887），用來看 TF 量錯對建圖的影響 |
+| `self_echo_bars` | false | true = 在光達兩側放一對薄板，重現實車 9/23 起的鋁擠條自身回波（見實驗 5） |
+| `self_echo_filter` | true | **只有 `sim_nav`**：false = path_teach 不過濾自身回波（重現 9/29 實車重播卡住） |
+| `start_mode` | localization | **只有 `sim_nav`**：載入 `~/.smartnav/nav_state.json` 記的地圖做定位（見實驗 5） |
 
 實車不對稱的細部數字（死區 0.085、半徑 1.030／1.183、偏移 +0.235）在
 [`smartnav_sim/akm_realism_node.py`](smartnav_sim/akm_realism_node.py) 的預設值裡。
@@ -234,6 +237,47 @@ ros2 launch smartnav_sim sim_explore.launch.py \
 ### 實驗 4：`occ_threshold`（檔頭列的第一順位）
 
 75 → 60 → 50 各跑兩趟，比較 `no valid path` 次數與最後面積。降太多會一開始就 `No more frontiers`，那就是下限。
+
+### 實驗 5：定位模式重播與鋁擠條自身回波（9/30）
+
+9/29 實車四條重播全在 5 秒內進脫困，追到光達兩側（9/23 加的架高攝影機鋁擠條）約 0.165 m 的回波
+落在車身矩形裡。`self_echo_bars:=true` 在模擬光達兩側放一對同位置的薄板重現它。
+
+**準備（一次）**：用 `sim_explore` 建過圖之後，把起始位姿設回原點（模擬車預設就在建圖時的起點出生）：
+
+```bash
+python3 -c "import json,pathlib; p=pathlib.Path.home()/'.smartnav/nav_state.json'; d=json.loads(p.read_text()); d['last_pose']={'x':0.0,'y':0.0,'yaw':0.0}; p.write_text(json.dumps(d,indent=4))"
+```
+
+**跑**（`sim_nav` = 模擬車＋定位模式導航，不開自動探索）：
+
+```bash
+ros2 launch smartnav_sim sim_nav.launch.py gui:=false self_echo_bars:=true
+# 另開視窗，等 `ros2 lifecycle get /bt_navigator` 顯示 active（約 15 秒）之後：
+ros2 action send_goal /navigate smartnav_msgs/action/Navigate \
+  "{use_target_pose: true, target_pose: {position: {x: 2.0, y: 0.5}, orientation: {w: 1.0}}, target_name: '測試'}"
+```
+
+跟實車點地圖導航同一條路：先規劃一條教導路徑（`_auto_測試_N`），再交給 path_teach 純追蹤重播。
+
+**9/30 結果**（`bottlenecks.sdf`，目標 (2.0, 0.5)，規劃路徑約 2.05 m）：
+
+| 組 | 薄板 | path_teach 過濾（`self_echo_filter`） | 防撞雷射（`collision_scan_topic`） | 結果 |
+|---|---|---|---|---|
+| C0 | 無 | （修改前） | `/scan` | 成功，17 秒，終點誤差 0.18 m |
+| A1 | 有 | 關 | `/scan` | **失敗**：完全沒動，外緣 −31 cm 硬停 161 次（＝9/29 的症狀） |
+| B1 | 有 | 開 | `/scan` | **失敗**：path_teach 硬停 0 次，但 FootprintApproach 一直煞車，脫困 6 次、150 秒逾時 |
+| **B2** | 有 | 開 | **`/scan_nav`** | **成功，16 秒，0.18 m**（跟沒有薄板一樣） |
+| C1／C2 | 無 | 開 | `/scan`／`/scan_nav` | 成功，16 秒，0.19／0.17 m（沒有副作用） |
+
+**判讀**：卡住是**兩層煞車疊在一起** —— path_teach 自己的車身檢查，加上 collision_monitor 的
+FootprintApproach（車身外框內湊滿 `min_points` 6 點就判定「0 秒後撞上」）。實車 9/29 防撞 0 次，
+是因為 path_teach 先把速度煞成 0，防撞沒有東西可以投影 —— 不代表它不會中。
+
+**預設**：`self_echo_filter` 開（path_teach 在節點內過濾，零延遲）；`collision_scan_topic` 維持 `/scan`。
+`/scan_nav` 是 Python 的 scan_filter 轉發的，9/29 建圖時它的輸出斷訊過 1~5 秒，而防撞 2 秒沒資料就停車；
+模擬的薄板每幀都是完整回波（約 38 點），比實車「八成無效、邊緣漏」嚴苛。所以要不要切，先用
+`~/maprun/tools_0930/scan_self_echo.py` 在實車上量 —— 它會直接印出「防撞維持 /scan／建議切／必須切」。
 
 ---
 
@@ -314,6 +358,7 @@ TF `odom_combined → base_footprint → {base_link, laser}`，吃 `/cmd_vel`。
 |---|---|
 | `launch/sim_explore.launch.py` | 一行跑完整趟自動建圖 |
 | `launch/sim_robot.launch.py` | 只有世界＋車（取代實車的 `sensors_cc.launch.py`） |
+| `launch/sim_nav.launch.py` | 世界＋車＋定位模式導航（測教導重播、點地圖導航；見實驗 5） |
 | `urdf/senior_akm_sim.urdf.xacro` | 模擬車（阿克曼外掛＋gpu_lidar） |
 | `smartnav_sim/akm_realism_node.py` | 實車不對稱（死區、左右半徑、機械偏移、看門狗） |
 | `smartnav_sim/pgm_to_world.py` | 地圖 → Gazebo 世界 |
