@@ -36,7 +36,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 PKG = "smartnav_navigation_cc"
@@ -54,6 +54,14 @@ NAV2_LIFECYCLE_NODES = [
     "velocity_smoother",
     "collision_monitor",
 ]
+
+# ★ 2026-09-30：光達自身遮罩（9/23 起兩側架高攝影機的鋁擠條）只在這裡維護一份，
+#   scan_filter_cc（/scan_slam：整段扇區遮掉）與 path_teach_cc（原始 /scan：只丟扇區內 0.25 m 以內的點）共用。
+#   上車用 ~/maprun/tools_0930/scan_self_echo.py 量出實際扇區後改這裡，兩邊一起生效。
+#   格式：[起1, 迄1, 起2, 迄2, ...]，0 = 車頭、逆時針為正；scan_filter 不支援跨 0 度，跨 0 要拆成兩段。
+SELF_MASK_SECTORS_DEG = [84.0, 118.0, 249.0, 275.0]
+# path_teach 在上述扇區內只丟比這個近的點（車身半寬 0.185 m —— 這麼近只可能是車體本身）
+SELF_MASK_MAX_RANGE_M = 0.25
 
 
 def generate_launch_description():
@@ -106,6 +114,22 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument("log_level", default_value="info"),
+        DeclareLaunchArgument(
+            "self_echo_filter",
+            default_value="true",
+            description=(
+                "path_teach 是否丟掉自身扇區（鋁擠條）0.25 m 內的回波。"
+                "false = 回到 9/29 以前的行為 —— 現場懷疑過濾出問題時用，不必改程式"
+            ),
+        ),
+        DeclareLaunchArgument(
+            "collision_scan_topic",
+            default_value="/scan",
+            description=(
+                "collision_monitor 的雷射來源。/scan_nav = 去掉鋁擠條自身回波（scan_filter_cc 發）。"
+                "預設原始 /scan；scan_self_echo.py 量到每幀車身內點數常 >= 6 時再切"
+            ),
+        ),
     ]
 
     common_ros_args = ["--ros-args", "--log-level", log_level]
@@ -196,7 +220,9 @@ def generate_launch_description():
             output="screen",
             parameters=[params_file, {"use_sim_time": use_sim_time}],
             arguments=common_ros_args,
-            remappings=tf_remap,
+            # ★ 2026-09-30：雷射來源可切到 /scan_nav（去掉鋁擠條自身回波）。預設仍是原始 /scan ——
+            #   要不要切看上車量測：鋁擠條漏出的點每幀湊滿 FootprintApproach 的 min_points 6 才需要
+            remappings=tf_remap + [("/scan", LaunchConfiguration("collision_scan_topic"))],
         ),
         Node(
             package="nav2_lifecycle_manager",
@@ -273,7 +299,8 @@ def generate_launch_description():
             executable="scan_filter_cc",
             name="scan_filter_cc_node",
             output="screen",
-            parameters=[{"use_sim_time": use_sim_time}],
+            parameters=[{"use_sim_time": use_sim_time, "self_mask_sectors_deg": SELF_MASK_SECTORS_DEG,
+                         "nav_self_mask_max_range_m": SELF_MASK_MAX_RANGE_M}],
             arguments=common_ros_args,
         ),
         Node(
@@ -355,6 +382,12 @@ def generate_launch_description():
             # 建圖用的雷達已經被 scan_filter_cc 遮掉車尾，但避障要看得到人，
             # 所以這裡訂原始的 /scan 而不是 /scan_slam
             "scan_topic": "scan",
+            # ★ 2026-09-30：但原始 /scan 也帶著鋁擠條的回波（落在車身矩形內 → 0 cm 硬停），
+            #   9/29 四條重播因此全在 5 秒內進脫困。節點內只丟自身扇區 0.25 m 以內的點（見節點註解）
+            "self_mask_sectors_deg": SELF_MASK_SECTORS_DEG,
+            "self_mask_max_range_m": PythonExpression([
+                f"{SELF_MASK_MAX_RANGE_M} if '", LaunchConfiguration("self_echo_filter"),
+                "'.lower() in ('true', '1') else 0.0"]),
         }],
     )
 

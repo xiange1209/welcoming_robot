@@ -177,6 +177,22 @@ class PathTeachNode(Node):
         # 掃描超過幾秒沒更新就當作「沒有掃描」（→ 障礙檢查一律保守側 → 煞停）。
         # 見 _get_scan()。設 0 可停用這道守衛（不建議，只留給除錯）。
         self.declare_parameter("scan_stale_sec", 2.0)
+        # ★★ 2026-09-30：自身回波過濾 ★★
+        #
+        # 9/23 起光達兩側有架高攝影機的鋁擠條。scan_filter_cc 只把它們從 /scan_slam 遮掉，
+        # 本節點吃原始 /scan（要看得到跟在車後的人，見 2026-08-20 那段），於是鋁擠條約 0.165 m 的
+        # 回波落在車身矩形裡（半寬 0.185）：側面「0 cm」、外緣負值硬停 → 車沒動 → 卡住偵測 →
+        # 脫困又被負淨空中止。9/29 實車四條重播全在 5 秒內進脫困（nav_20260929_160257.log:675-681）；
+        # 模擬在同位置加薄板可重現（外緣 −31 cm 硬停 161 次、車子完全沒動）。
+        #
+        # 只丟「自身扇區內、近於 self_mask_max_range_m」的點：這麼近只可能是車體本身
+        # （真的障礙不可能進到車殼裡而不碰到車），扇區外、更遠的點照樣保留。
+        # ★ 不改成訂 Python 中繼的遮罩話題：建圖時 CPU 吃緊，scan_filter 的輸出斷訊過 1~5 秒
+        #   （9/29 log 41 次），本節點的 stale 守衛 2 秒一到就煞停 —— 等於把一個問題換成另一個。
+        # 扇區由 nav_bringup_cc.launch.py 的 SELF_MASK_SECTORS_DEG 統一傳入（與 scan_filter 同一份）；
+        # self_mask_max_range_m 設 0 = 停用過濾（除錯用）。
+        self.declare_parameter("self_mask_sectors_deg", [84.0, 118.0, 249.0, 275.0])
+        self.declare_parameter("self_mask_max_range_m", 0.25)
         # 錄製時要「聽」哪個話題判斷行進方向。
         # 這跟 cmd_topic 是**不同的東西**：cmd_topic 是重播時本節點自己
         # 發布的位置（cmd_vel_smoothed，之後還會經過 steering_trim 與
@@ -778,6 +794,15 @@ class PathTeachNode(Node):
         self.scan_still_m = float(p("scan_still_m").value)
         self.laser_x = float(p("laser_x_offset_m").value)
         self.scan_stale_sec = float(p("scan_stale_sec").value)
+        _flat = [float(v) for v in p("self_mask_sectors_deg").value]
+        self.self_sectors = [(_flat[i], _flat[i + 1]) for i in range(0, len(_flat) - 1, 2)]
+        self.self_mask_max_range = float(p("self_mask_max_range_m").value)
+        self._self_idx_key = None     # (angle_min, angle_increment, 點數) —— 變了才重算哪些索引在扇區內
+        self._self_idx: List[int] = []
+        if self.self_sectors and self.self_mask_max_range > 0.0:
+            self.get_logger().info(
+                f"自身回波過濾：{', '.join(f'{a:.0f}~{b:.0f}' for a, b in self.self_sectors)} 度內、"
+                f"近於 {self.self_mask_max_range:.2f} m 的點不算障礙（鋁擠條，見 self_mask_sectors_deg）")
         self.wall_keepout = float(p("wall_keepout_m").value)
         self.wall_push_max = float(p("wall_push_max_m").value)
 
@@ -1044,7 +1069,35 @@ class PathTeachNode(Node):
             self._cmd_dir = 1 if msg.linear.x > 0 else -1
             self._cmd_dir_t = time.monotonic()
 
+    def _drop_self_echo(self, msg: LaserScan) -> None:
+        """自身扇區內、近於 self_mask_max_range 的回波改成 inf（理由見 self_mask_sectors_deg 的註解）。
+
+        在回呼裡就地改，所以 _body_margin／_side_clearance／_forward_clearance／_arc_clearance
+        與打滑偵測的掃描簽章全部吃到同一份過濾後的資料。
+        """
+        if not self.self_sectors or self.self_mask_max_range <= 0.0:
+            return
+        n = len(msg.ranges)
+        key = (msg.angle_min, msg.angle_increment, n)
+        if key != self._self_idx_key:
+            self._self_idx = [
+                i for i in range(n)
+                if any(lo <= math.degrees(msg.angle_min + i * msg.angle_increment) % 360.0 <= hi
+                       for lo, hi in self.self_sectors)
+            ]
+            self._self_idx_key = key
+        lim = self.self_mask_max_range
+        ranges = None
+        for i in self._self_idx:
+            if msg.ranges[i] < lim:              # nan 的比較恆為 False，inf 也不會進來
+                if ranges is None:
+                    ranges = list(msg.ranges)
+                ranges[i] = float("inf")
+        if ranges is not None:
+            msg.ranges = ranges
+
     def _scan_cb(self, msg: LaserScan) -> None:
+        self._drop_self_echo(msg)
         with self._scan_lock:
             self._scan = msg
             self._scan_time = time.monotonic()

@@ -179,6 +179,11 @@ chk "修正17 一鍵驗證 import asyncio" "$HMI_SC/router.py"                  
 # ★ 修正9 查的是 manager.py 的 cmd 欄位 —— 9/26 起沒有程式讀它（改走 LaunchSupervisor），
 #   真正決定定位模式開不開 explorer 的是 system_control.launch.py
 chk "修正18 定位模式不開探索"       "$SRC/smartnav_hmi/launch/system_control.launch.py"        '"localization": ("localization", "false")'
+# 9/30：path_teach 丟掉自身扇區 0.25 m 內的回波（9/29 四條重播全因鋁擠條回波在 5 秒內進脫困；
+#   模擬 A/B 驗過）。現場懷疑它出問題可帶 self_echo_filter:=false 退回舊行為，不必改程式
+chk "修正19 重播過濾鋁擠條回波"     "$NCC/path_teach_cc_node.py"                               "_drop_self_echo"
+# 9/30：人臉間隔 1.0→2.0 的連動（只改間隔的話註冊會在 20 秒逾時、把剛建的使用者刪掉）
+chk "修正20 人臉間隔 2.0 連動"      "$SRC/smartnav_brain/smartnav_brain/user_auth_node.py"     "face_registration_timeout_sec"
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"

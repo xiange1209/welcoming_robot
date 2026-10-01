@@ -16,10 +16,17 @@
 ## 架構決定：只過濾 SLAM 的輸入，不動 /scan 本身
 
     /scan ──┬── costmap / collision_monitor（看得到人 -> 不會撞到人）
-            └── scan_filter_cc ── /scan_slam ── slam_toolbox（看不到人 -> 地圖乾淨）
+            └── scan_filter_cc ─┬─ /scan_slam ── slam_toolbox／AMCL／全域成本地圖（看不到人 -> 地圖乾淨）
+                                └─ /scan_nav  ── （選用）collision_monitor：只去掉車體自身回波，人照樣看得到
 
 避障必須看得到人，建圖必須看不到人 —— 這是同一份資料的兩種需求，
 所以分成兩個話題，而不是在驅動端把資料弄掉。
+
+★ 2026-09-30 /scan_nav：只套「自身遮罩」（鋁擠條），而且只丟扇區內近於 nav_self_mask_max_range_m
+  的點，**不套車尾遮罩**。給 collision_monitor 選用（nav_bringup_cc 的 collision_scan_topic:=/scan_nav），
+  預設不啟用：模擬的實心薄板會讓 FootprintApproach（min_points 6）每幀都煞車，但實車鋁擠條的回波
+  「八成無效、邊緣漏」，會不會湊滿 6 點要先用 maprun/tools_0930/scan_self_echo.py 量。
+  path_teach 不吃它，自己在節點內過濾（這個節點是 Python，CPU 吃緊時輸出斷訊過 1~5 秒）。
 
 ## 失效模式
 
@@ -61,6 +68,15 @@ class ScanFilterCcNode(Node):
         self.declare_parameter("self_mask_sectors_deg", [84.0, 118.0, 249.0, 275.0])
         flat = list(self.get_parameter("self_mask_sectors_deg").value)
         self.self_sectors = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)]
+        # ★ 2026-09-30：給導航用的第二份輸出（見檔頭）。空字串 = 不發。
+        #   nav_self_mask_max_range_m > 0：自身扇區內只丟比它近的點（車身半寬 0.185 m，這麼近只可能是車體）；
+        #   <= 0：整段扇區都丟（跟 /scan_slam 一樣）。
+        self.declare_parameter("nav_output_topic", "/scan_nav")
+        self.declare_parameter("nav_self_mask_max_range_m", 0.25)
+        self.nav_self_max_range = float(self.get_parameter("nav_self_mask_max_range_m").value)
+        self._idx_key = None       # (angle_min, angle_increment, 點數)：變了才重算每個索引落在哪個扇區
+        self._self_idx = []
+        self._rear_idx = []
 
         # ★★ 2026-08-19：遮蔽改成可即時開關 ★★
         #
@@ -88,6 +104,9 @@ class ScanFilterCcNode(Node):
         self.pub = self.create_publisher(
             LaserScan, self.get_parameter("output_topic").value, qos_profile_sensor_data
         )
+        nav_topic = self.get_parameter("nav_output_topic").value
+        self.nav_pub = (self.create_publisher(LaserScan, nav_topic, qos_profile_sensor_data)
+                        if nav_topic else None)
         self.create_subscription(
             LaserScan, self.get_parameter("input_topic").value,
             self._cb, qos_profile_sensor_data
@@ -101,12 +120,11 @@ class ScanFilterCcNode(Node):
             f"車尾 {math.degrees(self.mask_min):.0f}~{math.degrees(self.mask_max):.0f} 度"
             f"{'啟用' if self.mask_enabled else '關閉'}"
         )
-
-    def _masked(self, a: float) -> bool:
-        """a 是 0~360 度。鋁擠條扇區永遠遮；車尾扇區看 mask_enabled。"""
-        if any(lo <= a <= hi for lo, hi in self.self_sectors):
-            return True
-        return self.mask_enabled and math.degrees(self.mask_min) <= a <= math.degrees(self.mask_max)
+        if self.nav_pub is not None:
+            self.get_logger().info(
+                f"導航用: {self.get_parameter('input_topic').value} -> {nav_topic}，只去掉自身扇區"
+                + (f"內近於 {self.nav_self_max_range:.2f} m 的點" if self.nav_self_max_range > 0 else "（整段）")
+                + "，不遮車尾")
 
     def _set_mask_cb(self, request, response):
         """開關車尾遮蔽。data=True 遮（錄製），False 不遮車尾（鋁擠條扇區不受影響）。"""
@@ -119,7 +137,9 @@ class ScanFilterCcNode(Node):
         response.message = "masked" if self.mask_enabled else "full_360"
         return response
 
-    def _cb(self, msg: LaserScan):
+    @staticmethod
+    def _copy_masked(msg: LaserScan, idx) -> LaserScan:
+        """複製一份掃描，把 idx 裡的光束改成「沒有回波」。"""
         out = LaserScan()
         out.header = msg.header
         out.angle_min = msg.angle_min
@@ -129,29 +149,43 @@ class ScanFilterCcNode(Node):
         out.scan_time = msg.scan_time
         out.range_min = msg.range_min
         out.range_max = msg.range_max
-
         ranges = list(msg.ranges)
-        masked = 0
-        for i in range(len(ranges)):
-            # 這顆雷達的 angle_min 是 -180 度，先轉成 0~360 再比
-            a = math.degrees(msg.angle_min + i * msg.angle_increment) % 360.0
-            if self._masked(a):
-                # inf = 「這個方向沒有回波」。slam_toolbox 會直接忽略，
-                # 不會把它當成 range_max 處有一面牆。
-                ranges[i] = float("inf")
-                masked += 1
+        for i in idx:
+            # inf = 「這個方向沒有回波」。slam_toolbox 會直接忽略，
+            # 不會把它當成 range_max 處有一面牆。
+            ranges[i] = float("inf")
         out.ranges = ranges
         # intensities 有的驅動不填；長度對不上會讓下游丟掉整筆掃描
         if len(msg.intensities) == len(msg.ranges):
             ints = list(msg.intensities)
-            for i in range(len(ints)):
-                a = math.degrees(msg.angle_min + i * msg.angle_increment) % 360.0
-                if self._masked(a):
-                    ints[i] = 0.0
+            for i in idx:
+                ints[i] = 0.0
             out.intensities = ints
+        return out
 
-        self._masked_last = masked
-        self.pub.publish(out)
+    def _cb(self, msg: LaserScan):
+        n = len(msg.ranges)
+        key = (msg.angle_min, msg.angle_increment, n)
+        if key != self._idx_key:
+            # 這顆雷達的 angle_min 是 -180 度，先轉成 0~360 再比。每個索引的角度只在格式變了才重算
+            degs = [math.degrees(msg.angle_min + i * msg.angle_increment) % 360.0 for i in range(n)]
+            self._self_idx = [i for i, a in enumerate(degs) if any(lo <= a <= hi for lo, hi in self.self_sectors)]
+            lo, hi = math.degrees(self.mask_min), math.degrees(self.mask_max)
+            self._rear_idx = [i for i, a in enumerate(degs) if lo <= a <= hi]
+            self._idx_key = key
+
+        # /scan_slam：自身扇區整段＋（錄製時）車尾
+        slam_idx = set(self._self_idx)
+        if self.mask_enabled:
+            slam_idx.update(self._rear_idx)
+        self._masked_last = len(slam_idx)
+        self.pub.publish(self._copy_masked(msg, slam_idx))
+
+        # /scan_nav：只有自身扇區，預設只丟近於 nav_self_max_range 的點；車尾永遠不遮（要看得到人）
+        if self.nav_pub is not None:
+            lim = self.nav_self_max_range
+            nav_idx = self._self_idx if lim <= 0.0 else [i for i in self._self_idx if msg.ranges[i] < lim]
+            self.nav_pub.publish(self._copy_masked(msg, nav_idx))
 
     def _report(self):
         self.get_logger().debug(f"上一筆掃描遮蔽 {self._masked_last} 根光束")
