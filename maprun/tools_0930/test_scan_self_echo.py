@@ -76,6 +76,17 @@ check(not s.covered(0, mask), "正前方只佔兩成的幀 → 不進遮罩建�
 check(br[0] > 0 and br[359] > 0, "正前方仍列入「會讓 path_teach 硬停」")
 check("會讓 path_teach 印「0 cm」" in text and "0~1°" in text.replace("359~360°＋0~1°", "0~1°"), "摘要有列出正前方")
 check("沒蓋到的自身回波角度" not in text, "兩側都在現行預設 [84,118,249,275] 內")
+fc = st.fp_counts
+check(len(fc) == 100 and max(fc) >= s.CM_MIN_POINTS and min(fc) == 0,
+      f"防撞預測：有鋁擠條的幀點數 ≥ 6、沒有的幀 0（最多 {max(fc)}、最少 {min(fc)}）")
+check("必須 collision_scan_topic:=/scan_nav" in text, "八成的幀湊滿 min_points → 判定必須切 /scan_nav")
+st_sparse = s.EchoStats()
+for k in range(100):                 # 只有正前方偶發一點：湊不滿 6 點 → 不必切
+    st_sparse.add(*frame(bar_on=False, front_on=(k % 10 == 0)))
+text2, _, _ = s.summarize(st_sparse, 0.5, 3.0, "/scan", "合成")
+check("維持 /scan" in text2, "稀疏回波（每幀 < 6 點）→ 防撞維持原始 /scan")
+check(s.footprint_inside(0.165, math.radians(90)) and not s.footprint_inside(0.30, math.radians(90)),
+      "外框半寬 0.205：側面 0.165 m 在框內、0.30 m 在框外")
 
 print("原始幀存檔 → 離線重算要得到同樣結果")
 with tempfile.TemporaryDirectory() as td:

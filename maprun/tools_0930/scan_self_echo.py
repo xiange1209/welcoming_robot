@@ -45,7 +45,18 @@ BODY_FRONT_BASE = 0.40
 BODY_REAR_BASE = 0.09
 BODY_HALF_W = 0.185
 LASER_X = 0.089            # path_teach 的 laser_x_offset_m 預設（9/29 車上 TF 實測 0.08874）
-CURRENT_MASK = [84.0, 118.0, 249.0, 275.0]   # scan_filter_cc_node 的 self_mask_sectors_deg 預設
+CURRENT_MASK = [84.0, 118.0, 249.0, 275.0]   # nav_bringup_cc.launch.py 的 SELF_MASK_SECTORS_DEG
+# collision_monitor FootprintApproach 用的是局部成本地圖發布的 footprint（nav2 yaml footprint＋padding 0.02），
+# 框內湊滿 min_points 6 個點就判定「0 秒後撞上」而煞車（9/30 模擬：實心薄板每幀約 38 點 → 每次都煞）
+FOOTPRINT_PAD = 0.02
+CM_MIN_POINTS = 6
+
+
+def footprint_inside(r, a_rad, laser_x=LASER_X, pad=FOOTPRINT_PAD):
+    """點是否落在 collision_monitor 用的（加 padding 的）車身外框內。"""
+    x, y = r * math.cos(a_rad), r * math.sin(a_rad)
+    return (-(BODY_REAR_BASE + pad + laser_x) <= x <= BODY_FRONT_BASE + pad - laser_x
+            and abs(y) <= BODY_HALF_W + pad)
 
 
 def body_distance(r, a_rad, laser_x=LASER_X):
@@ -69,6 +80,7 @@ class EchoStats:
         self.body = [0] * 360      # 點在車身矩形內（0 cm）
         self.close = [0] * 360     # 離車身 < close_m（path_teach 外緣硬停門檻 6 cm）
         self.near_r = [[] for _ in range(360)]   # 每幀這一度最近的 near 距離
+        self.fp_counts = []        # 每幀落在 collision_monitor footprint 內的點數
         self.meta = None
 
     def add(self, angle_min, inc, rmin, rmax, ranges):
@@ -76,12 +88,15 @@ class EchoStats:
         if self.meta is None:
             self.meta = (angle_min, inc, rmin, rmax, len(ranges))
         v, n, b, c = set(), {}, set(), set()
+        fp = 0
         for i, r in enumerate(ranges):
             if r != r or not (rmin <= r <= rmax):     # nan、inf、量程外 = 沒有回波
                 continue
             a = angle_min + i * inc
             d = int(math.degrees(a) % 360.0) % 360
             v.add(d)
+            if footprint_inside(r, a, self.laser_x):
+                fp += 1
             if r < self.near_m:
                 n[d] = min(r, n.get(d, r))
             bd = body_distance(r, a, self.laser_x)
@@ -89,6 +104,7 @@ class EchoStats:
                 b.add(d)
             if bd < self.close_m:
                 c.add(d)
+        self.fp_counts.append(fp)
         for d in v:
             self.valid[d] += 1
         for d, r in n.items():
@@ -189,6 +205,14 @@ def summarize(st, thresh, pad, topic, source):
             L.append(f"  {fmt_run(s, e):<16} 最高 {max(body_ratio[d] for d in degs):.0%} 的幀{tag}")
     else:
         L.append("沒有任何點落在車身矩形內 —— 靜止時 path_teach 不會因自身回波硬停。")
+    if st.fp_counts:
+        fc = st.fp_counts
+        ge = sum(1 for x in fc if x >= CM_MIN_POINTS) / len(fc)
+        verdict = ("防撞不會因自身回波煞車 → collision_scan_topic 維持 /scan" if ge == 0 else
+                   "偶發煞車 → 建議 collision_scan_topic:=/scan_nav" if ge < 0.2 else
+                   "★ 會頻繁煞車 → 必須 collision_scan_topic:=/scan_nav")
+        L.append(f"collision_monitor 預測：每幀落在（加 padding 的）車身外框內 平均 {statistics.mean(fc):.1f} 點、"
+                 f"最多 {max(fc)} 點；≥ {CM_MIN_POINTS} 點（FootprintApproach 的 min_points）的幀 {ge:.0%} —— {verdict}")
     near_body = [d for d in range(360) if close_ratio[d] > 0 and body_ratio[d] == 0]
     if near_body:
         L.append(f"離車身 < {st.close_m * 100:.0f} cm（外緣硬停門檻）但不在車身內的角度：{_compact(near_body)}")
