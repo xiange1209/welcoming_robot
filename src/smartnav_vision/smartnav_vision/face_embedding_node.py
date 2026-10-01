@@ -103,9 +103,22 @@ class FaceEmbeddingNode(Node):
         # 而飽和是有代價的：同日 ASR 錄到 703 次 `input overflow`，
         # 直接死因就是人臉推論吃光 CPU、音訊執行緒排不進去。
         # 也就是說舊預設值是用「語音鏈壞掉」換「人臉快 0.03 Hz」。
+        #
+        # ★★ 2026-09-30：1.0 -> 2.0。上面那個「127%」是**量測假象** ★★
+        #
+        # verify 的 cpu_of 原本用 `ps` 的 pcpu —— 那是「行程啟動以來的平均」，不是瞬時值。
+        # 9/17 是節點啟動約 90 秒時量的，其中約 35 秒在載模型，平均被拉低。
+        # 車子端 9/22 改用 /proc 差分量瞬時值（process_interval_sec 1.0）：
+        #   本節點 203%、全機 363%、**idle 只剩 37%** —— 正是 9/17 餓死音訊（703 次 input overflow）的狀態
+        #   2.0 -> 本節點 114%、全機 282%、idle 118%
+        # 203% 不是巧合：face_engine.py 把推論綁在 2 顆核心，1.0 秒間隔 ≈ 推論時間，兩顆就一直滿著。
+        # 所以回到本段開頭「每 2 秒一幀 ✓ 採用」的原始設計。
+        # 連動（別只改這裡）：user_auth 的 identity_timeout_sec 5→10（維持約 5 幀容錯）、
+        #   identity_publish_interval 2.0→1.5（每一幀結果都發得出去，平板 3.5 秒新鮮度不會閃）、
+        #   註冊逾時 20→45 秒（10 張 × 2 秒 ≈ 20 秒，原本會剛好撞上逾時、把剛建的使用者刪掉）。
         self.declare_parameter(
             "process_interval_sec",
-            1.0,
+            2.0,
             ParameterDescriptor(description="待機時兩幀之間最少間隔幾秒。0 = 不限制（★ 會吃滿 CPU 並餓死音訊）"),
         )
         self.declare_parameter(

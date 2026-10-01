@@ -28,19 +28,21 @@ else
 fi
 
 # ── 2. 人臉節點 CPU：驗 process_interval_sec 預設值改了沒 ────
-hdr "人臉辨識 CPU（process_interval_sec 預設 0.0→1.0）"
-FCPU=$(cpu_of "face_embedding")
+# ★ 2026-09-30：cpu_of 改量瞬時值（/proc 差分，取樣 5 秒）。舊版 ps pcpu 是生涯平均，
+#   9/17 的「127%」是假象；車子端 9/22 瞬時量到 1.0 → 203%、2.0 → 114%。預設已改 2.0。
+hdr "人臉辨識 CPU（process_interval_sec 預設 2.0，量瞬時值）"
+FCPU=$(cpu_of "face_embedding" 5)
 if [ "$(awk -v c="$FCPU" 'BEGIN{print (c<1)?1:0}')" = 1 ]; then
   rec "face_embedding CPU" WARN "${FCPU}%" "節點沒在跑，這項跳過"
 elif [ "$(awk -v c="$FCPU" 'BEGIN{print (c<160)?1:0}')" = 1 ]; then
-  rec "face_embedding CPU" PASS "${FCPU}%" "9/17 預設 0.0 時是 198%，改 1.0 後應降到 127% 附近"
+  rec "face_embedding CPU" PASS "${FCPU}%" "預設 2.0 約 114%（9/22 瞬時量測）；1.0 約 203%＝綁定的 2 核吃滿"
 else
-  rec "face_embedding CPU" FAIL "${FCPU}%" "仍接近 198% —— 參數回呼或預設值沒生效，語音鏈會被餓死"
+  rec "face_embedding CPU" FAIL "${FCPU}%" "≥160% = 還在用 1.0 或 0.0（約 200%），語音鏈會被餓死；車上是 9/30 之後的版本嗎？有人 param set 過嗎？"
 fi
 
-# 偵測輸出頻率：CPU 降了但產出不該掉（單幀推論本來就要約 1004 ms，上限就在 1 Hz）
-EHZ=$(hz_of /face_embedding 10)
-rec "人臉偵測輸出" INFO "${EHZ} Hz" "預期 0.9~1.0 Hz；降 CPU 不該讓產出變少"
+# 偵測輸出頻率：每 2 秒處理一幀 → 有臉時約 0.5 Hz（單幀推論約 1004 ms，所以 1.0 秒間隔幾乎等於不限制）
+EHZ=$(hz_of /face_embedding 12)
+rec "人臉偵測輸出" INFO "${EHZ} Hz" "鏡頭前有人時預期約 0.5 Hz；沒人時 0（只在偵測到臉時才發布）"
 
 # 全機負載
 LOAD=$(cut -d' ' -f1 /proc/loadavg)

@@ -51,10 +51,22 @@ hz_of() {
   echo "${out:-0}"
 }
 
-# 某個執行檔目前吃多少 CPU（%）。用 ps 的完整指令欄比對，不用 pgrep -f。
+# 某個執行檔「現在」吃多少 CPU（%，多核相加，四核全滿 = 400%）。用 ps 的完整指令欄比對，不用 pgrep -f。
+# cpu_of <指令關鍵字> [取樣秒數，預設 3]
+# ★★ 2026-09-30：原本用 ps 的 pcpu —— 那是「行程啟動以來的平均」，**不是瞬時值**。
+#    9/17 的「127%」就是節點啟動約 90 秒時量的（其中約 35 秒在載模型，平均被拉低），
+#    車子端 9/22 改用 /proc 差分量到瞬時 203%。現在取兩次 /proc/<pid>/stat 的 utime+stime 差。
+#    （欄位從最後一個 ')' 之後算：指令名稱在括號裡、可能含空白，直接數欄位會錯位。）
 cpu_of() {
-  ps -eo pcpu,args --no-headers 2>/dev/null \
-    | awk -v pat="$1" '$0 ~ pat && $0 !~ /awk/ {s += $1} END {printf "%.1f", s+0}'
+  local pat="$1" secs="${2:-3}" pids hz p v t0=0 t1=0
+  # -ww：不截斷指令列（節點的完整路徑很長，被截掉就比對不到）
+  pids=$(ps -ww -eo pid,args --no-headers 2>/dev/null | awk -v pat="$pat" '$0 ~ pat && $0 !~ /awk/ {print $1}')
+  if [ -z "$pids" ]; then echo "0.0"; return; fi
+  hz=$(getconf CLK_TCK 2>/dev/null); hz=${hz:-100}
+  for p in $pids; do v=$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $12 + $13}'); t0=$((t0 + ${v:-0})); done
+  sleep "$secs"
+  for p in $pids; do v=$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $12 + $13}'); t1=$((t1 + ${v:-0})); done
+  awk -v d=$((t1 - t0)) -v hz="$hz" -v s="$secs" 'BEGIN{ if (d < 0) d = 0; printf "%.1f", d / hz / s * 100 }'
 }
 
 banner_done() {

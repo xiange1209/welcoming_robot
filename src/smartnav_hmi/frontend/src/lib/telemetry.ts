@@ -22,8 +22,10 @@ export const telemetryStore = createStore<Telemetry>(
    所以狀態會一直留著上一個人的資料——不能用 user_name 有沒有值來判斷
    （未認出時它是字串 "Unknown"，永遠非空）。只能看時戳夠不夠新。
 
-   3.5 秒必須大於 user_auth_node 的 identity_publish_interval（預設 2.0 秒），
-   否則同一個人被節流不發布的空檔會被誤判成人走了。 */
+   3.5 秒必須大於「兩則身份訊息之間最長的空檔」，否則同一個人的空檔會被誤判成人走了。
+   ★ 2026-09-30：face_embedding 改成每 2 秒一幀（約 ±0.2 秒抖動），user_auth 的
+   identity_publish_interval 跟著從 2.0 降到 1.5，讓每一幀都發得出去 —— 空檔約 2 秒 < 3.5。
+   兩邊任一個再往上調，這裡要一起看（舊值 2.0／2.0 會偶發 4 秒空檔、身份卡閃爍）。 */
 const FACE_FRESH_SEC = 3.5;
 
 let identityAgeAtRecv = Infinity;

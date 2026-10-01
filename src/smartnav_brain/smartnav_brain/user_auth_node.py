@@ -95,10 +95,14 @@ class UserAuthNode(Node):
             0.70,
             ParameterDescriptor(description="人臉辨識相似度閾值（2026-08-19 由實測決定，見上方註解）"),
         )
+        # ★ 2026-09-30：2.0 -> 1.5。face_embedding 預設改成每 2 秒一幀之後，「同一人 2 秒內不重發」
+        #   會把推論時間抖動（約 ±0.2 秒）造成的 1.9 秒間隔吃掉，下一則要等到約 4 秒才發 ——
+        #   超過平板 telemetry.ts 的 FACE_FRESH_SEC 3.5 秒，身份卡會間歇閃成「沒人」。
+        #   1.5 < 幀間隔，每一幀的結果都發得出去；人臉若再調快，它仍會擋掉重複。
         self.declare_parameter(
             "identity_publish_interval",
-            2.0,
-            ParameterDescriptor(description="身份辨識結果發布的最小間隔秒數"),
+            1.5,
+            ParameterDescriptor(description="身份辨識結果發布的最小間隔秒數（要小於 face_embedding 的 process_interval_sec）"),
         )
         # ★★ 2026-08-19：人離開之後把身份清掉 ★★
         #
@@ -134,12 +138,29 @@ class UserAuthNode(Node):
         #
         # ⚠ 導航中另當別論：`skip_while_navigating` 預設 true，
         #   導航期間本來就完全不推論，身份必然逾時。那是刻意的（帶位時不認人）。
+        #
+        # ★★ 2026-09-30：5.0 -> 10.0。face_embedding 預設改成每 2 秒一幀（0.5 Hz，見該檔 9/30 註解），
+        #   照上面同一個原則（約 5 幀才清身份）重新換算。5 秒在 0.5 Hz 下只剩 2.5 幀 ——
+        #   又回到「連續漏兩次就清掉」的 9/18 症狀。代價：人走掉後平板約 10 秒才清空。
         self.declare_parameter(
             "identity_timeout_sec",
-            5.0,
+            10.0,
             ParameterDescriptor(
                 description="超過這麼久沒收到人臉向量就發布『無人』身份；0 = 關閉。★ 要配合 face_embedding 的 process_interval_sec，別讓它小於幾個幀間隔"
             ),
+        )
+        # ★★ 2026-09-30：註冊逾時原本寫死 20 秒。註冊是「每收到一個人臉向量收一張樣本」，
+        #   face_embedding 每 2 秒一幀 → 10 張約 20 秒，**剛好撞上逾時**，
+        #   `_face_registration_timeout` 會把剛建好的使用者刪掉（8/14 同步佇列事故的同一個症狀）。
+        self.declare_parameter(
+            "face_registration_timeout_sec",
+            45.0,
+            ParameterDescriptor(
+                description="人臉註冊收樣本的時限（秒）。要 > 樣本數 × face_embedding 的 process_interval_sec，再留漏偵測的餘裕"
+            ),
+        )
+        self.face_registration_timeout = float(
+            self.get_parameter("face_registration_timeout_sec").get_parameter_value().double_value
         )
 
         # 讀取與驗證參數
@@ -321,7 +342,7 @@ class UserAuthNode(Node):
 
             if self.face_reg_timer:
                 self.face_reg_timer.cancel()
-            self.face_reg_timer = threading.Timer(20.0, self._face_registration_timeout)
+            self.face_reg_timer = threading.Timer(self.face_registration_timeout, self._face_registration_timeout)
             self.face_reg_timer.start()
 
             self._publish_progress(
@@ -659,8 +680,9 @@ class UserAuthNode(Node):
                 # ★ 一併更新 _last_face_time：那個欄位只在 _publish_identity 裡
                 #   更新（見該函式），提早 return 會讓 _identity_timeout_tick 以為
                 #   鏡頭前沒人，在使用者正對著鏡頭配合採樣時發一則「無人」。
-                #   目前取樣沒有間隔（每一幀都收），10 張約 0.67 秒 < 2 秒門檻，
-                #   實務上來不及觸發；但採樣張數調大或相機掉幀時就會，所以補上。
+                #   取樣沒有額外間隔（每個人臉向量都收），但向量本身每 2 秒才一個
+                #   （face_embedding process_interval_sec 2.0；舊註解的「10 張約 0.67 秒」是 7/29
+                #   已刪架構的 15 FPS），10 張約 20 秒，遠超過任何逾時門檻 —— 這行一定要在。
                 self._last_face_time = self.get_clock().now().nanoseconds / 1e9
                 self._identity_cleared = False
                 return

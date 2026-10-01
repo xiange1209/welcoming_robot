@@ -14,9 +14,11 @@ from smartnav_msgs.srv import RegisterFace
 
 
 class RegistrationRunner:
-    # 對齊 user_auth_node._register_face_callback 裡的 threading.Timer(20.0)。
+    # 對齊 user_auth_node 的 face_registration_timeout_sec（註冊計時器）。
     # 那支計時器一到就會把樣本不足的使用者刪掉，這裡不能等得比它久。
-    REG_TIMEOUT_SEC = 20.0
+    # ★ 2026-09-30：20 -> 45。人臉向量改成每 2 秒一個之後，10 張約 20 秒 ——
+    #   原本 20＋5 秒的看門狗會在 user_auth 還在收樣本時就把畫面判成「註冊逾時」。
+    REG_TIMEOUT_SEC = 45.0
     # 輪詢註冊進度的間隔。1 秒足以看到張數跳動，又不會把 list_users 打爆。
     REG_POLL_SEC = 1.0
 
