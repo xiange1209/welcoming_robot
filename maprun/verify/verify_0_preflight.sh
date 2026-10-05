@@ -184,6 +184,14 @@ chk "修正18 定位模式不開探索"       "$SRC/smartnav_hmi/launch/system_c
 chk "修正19 重播過濾鋁擠條回波"     "$NCC/path_teach_cc_node.py"                               "_drop_self_echo"
 # 9/30：人臉間隔 1.0→2.0 的連動（只改間隔的話註冊會在 20 秒逾時、把剛建的使用者刪掉）
 chk "修正20 人臉間隔 2.0 連動"      "$SRC/smartnav_brain/smartnav_brain/user_auth_node.py"     "face_registration_timeout_sec"
+# 10/01：探索中自己脫困（家具旁 Start occupied／推不動 → 靜音 nav2 → /unwedge）。兩半都要在
+chk "修正21 探索中自己脫困"         "$NCC/map_service_cc_node.py"                              "_maybe_unwedge"
+chk "修正22 脫困時 nav2 指令靜音"   "$NCC/cmd_vel_floor_cc_node.py"                            "mute_nav_cmd"
+chk "修正23 防撞狀態不再 1 秒過期"   "$NCC/path_teach_cc_node.py"                               "notifyActionState"
+chk "修正24 新障礙不脫困、交回上層" "$NCC/path_teach_cc_node.py"                               "_classify_blocker"
+chk "修正25 通道被擋住就等它淨空"   "$NCC/navigation_action_cc_node.py"                        "_wait_for_passage"
+chk "修正26 規劃前等障礙標回去"     "$NCC/path_teach_cc_node.py"                               "plan_clear_settle_sec"
+chk "修正27 車頭車尾貼住直線拉開"   "$NCC/path_teach_cc_node.py"                               "_unwedge_straight"
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"

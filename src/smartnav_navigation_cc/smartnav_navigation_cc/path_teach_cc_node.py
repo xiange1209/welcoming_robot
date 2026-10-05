@@ -68,7 +68,7 @@ from typing import List, Optional, Tuple
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose, PoseStamped, Twist
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 from nav2_msgs.action import ComputePathToPose
 from nav2_msgs.srv import ClearEntireCostmap
 
@@ -97,6 +97,10 @@ from smartnav_msgs.srv import (
     PlanTaughtPath,
     RecordPath,
 )
+
+# 重播被「地圖上沒有的障礙」擋住而交回導航層時，失敗訊息的開頭。
+# ★ navigation_action_cc_node.py 用同一個字串辨認（改這裡要一起改那邊）
+NEW_OBSTACLE_TAG = "[新障礙]"
 
 
 def yaw_from_quat(q) -> float:
@@ -569,6 +573,34 @@ class PathTeachNode(Node):
         self.declare_parameter("avoid_step_m", 0.05)
         self.declare_parameter("avoid_clearance_m", 0.10)
         self.declare_parameter("wait_timeout_sec", 20.0)
+        # ── 新障礙（地圖上沒有的東西：人、剛放的箱子）2026-10-01 ──────────
+        #
+        # 下面的「等 escape_after 秒就脫困」是為**牆**設計的：牆不會走開，
+        # 三點轉向繞過去是對的。但擋路的若是人或剛放下的東西，倒車打轉
+        # （而且繞過防撞）是錯的招式。模擬 DYN_BASE：人站在車前，車子倒車
+        # 打轉 72 度、偏離 71 cm 才停，接著重新規劃又從那個人身上穿過去。
+        #
+        # 判斷：把擋路的掃描點換到地圖座標，看**靜態地圖**那一格（含周圍 tol）
+        # 是不是佔據／未知。多數點落在地圖的空地上 = 地圖上沒有的新東西。
+        #   新東西 -> 不脫困，停車等它走開（請借過）；等滿 new_obstacle_wait_sec
+        #             還在，就用「[新障礙]」開頭的訊息結束，交回導航層 ——
+        #             由它重新規劃繞過去，繞不過就原地等通道淨空。
+        #   判斷不了（沒地圖、沒定位、擋路的點太少）-> 走原本的流程，一行都不變。
+        # tol 0.15 m = AMCL 誤差（收斂後數公分）＋牆厚＋格子量化；
+        # 寧可把靠牆的人當成牆（走原流程），不要把牆當成人（傻等）。
+        self.declare_parameter("new_obstacle_enabled", True)
+        self.declare_parameter("new_obstacle_wait_sec", 8.0)
+        self.declare_parameter("new_obstacle_map_tol_m", 0.15)
+        self.declare_parameter("new_obstacle_min_ratio", 0.6)
+        self.declare_parameter("new_obstacle_map_topic", "/map")
+        self.declare_parameter("new_obstacle_speech", "不好意思，請借過")
+        # 規劃前清空成本地圖之後，等這麼久才規劃（2026-10-01）。
+        # 清空是為了掃掉**殘影**（操作者跟車留下的標記，8/04），但它同時也把
+        # **現在就站在路上的人**一起擦掉了 —— 規劃器看到一張乾淨的地圖，
+        # 重新規劃永遠從那個人身上穿過去（模擬 DYN_BASE 實測）。
+        # global_costmap 的 update_frequency 是 1.0 Hz：等 2 秒，下一次更新就會把
+        # 雷達「現在看得到」的東西重新標回去，看不到的殘影則不會回來。
+        self.declare_parameter("plan_clear_settle_sec", 2.0)
         # ── 脫困（2026-08-03 加）─────────────────────────────
         #
         # 原本擋住就只會等，等滿 wait_timeout 才放棄。**障礙是牆的時候，
@@ -773,6 +805,14 @@ class PathTeachNode(Node):
         self.avoid_step = float(p("avoid_step_m").value)
         self.avoid_clear = float(p("avoid_clearance_m").value)
         self.wait_timeout = float(p("wait_timeout_sec").value)
+        self.new_obstacle_enabled = bool(p("new_obstacle_enabled").value)
+        self.new_obstacle_wait = float(p("new_obstacle_wait_sec").value)
+        self.new_obstacle_map_tol = float(p("new_obstacle_map_tol_m").value)
+        self.new_obstacle_min_ratio = float(p("new_obstacle_min_ratio").value)
+        self.new_obstacle_speech = str(p("new_obstacle_speech").value)
+        self.plan_clear_settle = float(p("plan_clear_settle_sec").value)
+        self._occ = None              # 靜態地圖（只給新障礙判斷用）
+        self._last_speech_t = 0.0
         self.escape_after = float(p("escape_after_sec").value)
         self.escape_dist = float(p("escape_distance_m").value)
         self.max_escapes = int(p("max_escapes").value)
@@ -940,6 +980,11 @@ class PathTeachNode(Node):
                                  self._scan_cb, scan_qos, callback_group=cb)
         self.create_subscription(String, "current_map", self._map_cb, latched,
                                  callback_group=cb)
+        # 靜態地圖：判斷擋路的是不是「地圖上沒有的新東西」（見 new_obstacle_* 參數）
+        self.create_subscription(OccupancyGrid, p("new_obstacle_map_topic").value,
+                                 self._occ_cb, latched, callback_group=cb)
+        # 請借過：走平板 HMI 的瀏覽器語音（車上沒有喇叭）
+        self.speech_pub = self.create_publisher(String, "speech_text", 10)
 
         # ★★★ 2026-08-25：防撞煞車 ≠ 卡住 ★★★
         #
@@ -1197,6 +1242,129 @@ class PathTeachNode(Node):
 
     def _map_cb(self, msg: String) -> None:
         self.current_map = msg.data
+
+    def _occ_cb(self, msg: OccupancyGrid) -> None:
+        self._occ = msg
+
+    def _say(self, text: str, min_gap_sec: float = 15.0) -> None:
+        """講一句話（平板 HMI 會唸出來）。同一段時間內不重複唸。"""
+        now = time.monotonic()
+        if not text or now - self._last_speech_t < min_gap_sec:
+            return
+        self._last_speech_t = now
+        self.speech_pub.publish(String(data=text))
+
+    def _blocking_points(self, direction: int, curvature: float,
+                         upto: float) -> List[Tuple[float, float]]:
+        """沿弧線走到 `upto` 公尺為止，會落進車身矩形的掃描點（雷達座標系）。
+
+        跟 `_arc_clearance` 同一套運動學，差別是它找到第一個點就回傳距離，
+        這支把「擋路的那些點」整批收集起來 —— 給 `_classify_blocker` 判斷是什麼。
+        只在停車等待的那一刻算一次，不在每個控制週期跑（Pi 的 CPU）。
+        """
+        scan = self._get_scan()
+        if scan is None:
+            return []
+        pts = []
+        ang = scan.angle_min
+        for r in scan.ranges:
+            a = ang
+            ang += scan.angle_increment
+            if not (scan.range_min <= r <= scan.range_max) or r != r:
+                continue
+            if r > upto + 1.0:
+                continue
+            pts.append((r * math.cos(a), r * math.sin(a)))
+        if not pts:
+            return []
+        half_w = self.obs_half_w
+        laser_dx = 0.089                 # 與 _arc_clearance 相同（判斷「擋到」的是同一個模型）
+        front = 0.40 - laser_dx
+        rear = -(0.09 + laser_dx)
+        hit = set()
+        step = 0.05
+        for k in range(1, max(1, int(upto / step)) + 1):
+            arc = k * step
+            th = curvature * arc
+            if abs(curvature) < 1e-6:
+                cx, cy = arc * (1.0 if direction >= 0 else -1.0), 0.0
+            else:
+                R = 1.0 / curvature
+                sgn = 1.0 if direction >= 0 else -1.0
+                cx = sgn * R * math.sin(arc * curvature)
+                cy = sgn * R * (1.0 - math.cos(arc * curvature))
+            c, sn = math.cos(-th), math.sin(-th)
+            for i, (px, py) in enumerate(pts):
+                if i in hit:
+                    continue
+                dx, dy = px - cx, py - cy
+                bx = dx * c - dy * sn
+                by = dx * sn + dy * c
+                if rear <= bx <= front and abs(by) <= half_w:
+                    hit.add(i)
+        return [pts[i] for i in sorted(hit)]
+
+    def _classify_blocker(self, direction: int, curvature: float,
+                          clearance: float) -> Tuple[Optional[bool], str]:
+        """擋路的是「地圖上沒有的新東西」（人、剛放的箱子）嗎？
+
+        回傳 (True, 說明)  = 新障礙：不要脫困，等它走開或交回上層繞過去
+             (False, 說明) = 地圖上本來就有（牆、家具；或定位偏了看起來像）
+             (None, 原因)  = 判斷不了 —— 呼叫端照原本的流程走
+
+        ★ 未知格（-1）也算「地圖上有」：沒探索過的地方不能說它是新的。
+        ★ 地圖外的點同理。兩者都讓判斷偏向「走原流程」—— 寧可多脫困一次，
+          不要對著一面牆傻等。
+        """
+        if not self.new_obstacle_enabled:
+            return None, ""
+        occ = self._occ
+        if occ is None:
+            return None, "沒有靜態地圖"
+        pose = self._robot_pose()
+        if pose is None:
+            return None, "取不到定位"
+        pts = self._blocking_points(direction, curvature, max(clearance, 0.0) + 0.15)
+        if len(pts) < 3:
+            return None, f"擋路的掃描點只有 {len(pts)} 個"
+        info = occ.info
+        res = info.resolution
+        if res <= 0.0:
+            return None, "地圖解析度異常"
+        ox, oy = info.origin.position.x, info.origin.position.y
+        w, h = info.width, info.height
+        data = occ.data
+        tol = max(1, int(math.ceil(self.new_obstacle_map_tol / res)))
+        x0, y0, yaw = pose
+        cy_, sy_ = math.cos(yaw), math.sin(yaw)
+        new = known = 0
+        for lx, ly in pts:
+            bx, by = lx + self.laser_x, ly          # 雷達 -> base_footprint
+            mx = x0 + bx * cy_ - by * sy_
+            my = y0 + bx * sy_ + by * cy_
+            ci = int(math.floor((mx - ox) / res))
+            ri = int(math.floor((my - oy) / res))
+            if not (0 <= ci < w and 0 <= ri < h):
+                known += 1
+                continue
+            on_map = False
+            for rr in range(max(0, ri - tol), min(h, ri + tol + 1)):
+                base = rr * w
+                for cc in range(max(0, ci - tol), min(w, ci + tol + 1)):
+                    v = data[base + cc]
+                    if v >= 50 or v < 0:
+                        on_map = True
+                        break
+                if on_map:
+                    break
+            if on_map:
+                known += 1
+            else:
+                new += 1
+        total = new + known
+        ratio = new / total
+        why = f"擋路 {total} 點中 {new} 點落在地圖的空地上（{ratio * 100:.0f}%）"
+        return ratio >= self.new_obstacle_min_ratio, why
 
     def _robot_pose(self) -> Optional[Tuple[float, float, float]]:
         try:
@@ -1904,6 +2072,37 @@ class PathTeachNode(Node):
                 right = min(right, -y - half_w)
         return left, right
 
+    def _end_gaps(self) -> Tuple[float, float]:
+        """車頭、車尾到最近障礙的距離 (前, 後)，單位公尺。沒看到就回 inf。
+
+        跟 `_side_clearance` 互補（2026-10-01 加）：那支只收與車身縱向重疊的點（左右），
+        這支只收**車頭之前／車尾之後**、橫向在車寬 +10 cm 以內的點，
+        用點到矩形的距離 —— 斜前方、斜後方的角落也算進來。
+        """
+        scan = self._get_scan()
+        if scan is None:
+            return 0.0, 0.0                     # 沒資料時當作貼牆，寧可保守
+        front, rear, half_w = 0.40, -0.09, 0.185    # 車身矩形（base_footprint 在後輪軸心）
+        f_gap = r_gap = float("inf")
+        ang = scan.angle_min
+        for r in scan.ranges:
+            a = ang
+            ang += scan.angle_increment
+            if not (scan.range_min <= r <= scan.range_max) or r != r:
+                continue
+            if r > 2.0:
+                continue
+            x = self.laser_x + r * math.cos(a)
+            y = r * math.sin(a)
+            oy = max(abs(y) - half_w, 0.0)
+            if oy > 0.10:
+                continue                        # 側面的點交給 _side_clearance
+            if x > front:
+                f_gap = min(f_gap, math.hypot(x - front, oy))
+            elif x < rear:
+                r_gap = min(r_gap, math.hypot(rear - x, oy))
+        return f_gap, r_gap
+
     def _arc_clearance(self, direction: int, curvature: float, max_dist: float = 1.2,
                        lateral_offset: float = 0.0) -> float:
         """沿著「打舵之後實際會走的弧線」檢查淨空，而不是正前方的直帶。
@@ -2366,9 +2565,17 @@ class PathTeachNode(Node):
         """
         if CollisionMonitorState is None or self._cm_action is None:
             return False
-        # 狀態是每個控制週期發一次的；超過 1 秒沒來就當作不知道。
-        if time.monotonic() - self._cm_action_t > 1.0:
-            return False
+        # ★★ 2026-10-01：拿掉「超過 1 秒沒來就當作不知道」★★
+        #
+        # 原本假設狀態「每個控制週期發一次」—— **錯的**。nav2 Jazzy（1.3.13，車上同版）
+        # collision_monitor_node.cpp:510-513 只在**動作的多邊形換了**才呼叫
+        # notifyActionState 發這則訊息：持續煞車 3 秒 = 只有開頭那 1 則。
+        # 於是煞車滿 1 秒後這裡就回 False -> 卡住判定復活 -> 「有下指令卻沒動」
+        # -> 脫困（繞過防撞）。模擬 DYN_BASE 實測：人在車前 1.5 秒距離、防撞正在
+        # APPROACH，2.7 秒後就判定卡住，倒車打轉 72 度、偏離 71 cm 才停。
+        # 狀態一變（SLOWDOWN / DO_NOTHING）一定會再發一則，所以「最後一則」就是現況。
+        # 防撞節點死掉時最後狀態會一直留著 -> 卡住判定被壓住；那時指令本來就到不了
+        # 底盤（它在指令鏈上），車子是停的，最後由導航總逾時收尾 —— 是安全的方向。
         approach = getattr(CollisionMonitorState, "APPROACH", 3)
         stop = getattr(CollisionMonitorState, "STOP", 1)
         return self._cm_action in (approach, stop)
@@ -2494,6 +2701,8 @@ class PathTeachNode(Node):
         idx = 0
         cur_dir = pts[0].direction
         wait_started = 0.0
+        blocker_new: Optional[bool] = None   # 這次停車等的是不是「地圖上沒有的新東西」
+        blocker_why = ""
         avoid_offset = 0.0
         state = "following"
         last_fb = 0.0
@@ -2827,6 +3036,16 @@ class PathTeachNode(Node):
                     f"暫停卡住判定 —— 被煞停不是卡住")
             elif not _cm_braking:
                 self._cm_warned = False
+            if _cm_braking:
+                # ★ 2026-10-01：煞車期間把三個判準的觀察窗一起歸零，不只是「暫停」。
+                #   只暫停的話，煞車一結束（切到 PolygonSlow）第一個週期就拿
+                #   「含煞車期間」的 no_progress 秒窗來判 —— 那段車子當然沒動 ->
+                #   立刻判定卡住。人站在車前時防撞會在 APPROACH 與 PolygonSlow 之間切換，
+                #   每切一次就是一次誤判的機會。歸零後要在**沒有煞車**的情況下
+                #   重新累積滿 no_progress 秒才算卡住。
+                move_hist.clear()
+                sig_hist.clear()
+                prog_t = now_t
 
             if (not _cm_braking) and len(move_hist) >= 2 \
                     and now_t - move_hist[0][0] >= self.no_progress * 0.8:
@@ -3240,8 +3459,38 @@ class PathTeachNode(Node):
                     self._stop()
                     if wait_started == 0.0:
                         wait_started = time.monotonic()
-                        self.get_logger().info("前方障礙且無法繞過，停車等待")
+                        # ★ 2026-10-01：先問擋路的是什麼（見 new_obstacle_* 參數的說明）
+                        blocker_new, blocker_why = self._classify_blocker(
+                            cur_dir, preview_curv, clearance)
+                        if blocker_new:
+                            self.get_logger().info(
+                                f"前方有地圖上沒有的障礙（{blocker_why}）—— 像是人或剛放的東西："
+                                f"不脫困，停車等它移開（最多 {self.new_obstacle_wait:.0f} 秒）")
+                            self._say(self.new_obstacle_speech)
+                        else:
+                            self.get_logger().info(
+                                "前方障礙且無法繞過，停車等待"
+                                + (f"（{blocker_why}）" if blocker_why else ""))
                     waited = time.monotonic() - wait_started
+
+                    if blocker_new:
+                        # 新障礙：不脫困。等它自己走開（下一圈淨空就會回到 following），
+                        # 等滿還在就交回導航層去繞、或去等通道淨空。
+                        if waited > self.new_obstacle_wait:
+                            self._stop()
+                            goal_handle.abort()
+                            result.success = False
+                            result.message = (
+                                f"{NEW_OBSTACLE_TAG} 前方被地圖上沒有的障礙擋住 {waited:.0f} 秒"
+                                f"（{blocker_why}）—— 交回導航層：重新規劃繞過，或等通道淨空")
+                            self.get_logger().warn(result.message)
+                            return result
+                        state = "waiting"
+                        self._send_feedback(
+                            goal_handle, idx, len(pts), xte, state,
+                            f"等前方的人／物移開（{waited:.0f}/{self.new_obstacle_wait:.0f} 秒）")
+                        time.sleep(self.control_dt)
+                        continue
 
                     # 等一下下還沒通 -> 試著脫困。
                     # 人擋路通常幾秒內就讓開，牆不會；兩者從單幀掃描分不出來，
@@ -3540,11 +3789,21 @@ class PathTeachNode(Node):
     UNWEDGE_MAX_LEGS = 8
     UNWEDGE_TARGET_M = 0.20
     UNWEDGE_SAFE_M = 0.35          # 行進方向要留的裕度
+    UNWEDGE_END_TARGET_M = 0.20    # 車頭／車尾到障礙至少要有這麼多（2026-10-01）
+    UNWEDGE_STRAIGHT_MAX_LEGS = 3  # 直線拉開最多幾段（3 x 0.12 = 0.36 m）
 
     def _unwedge_run(self) -> Tuple[bool, str]:
         left, right = self._side_clearance()
         if left >= self.UNWEDGE_TARGET_M and right >= self.UNWEDGE_TARGET_M:
-            return True, f"兩側已有裕度（左 {left:.2f} / 右 {right:.2f} m），不需要脫困"
+            # ★★ 2026-10-01：兩側有空間 ≠ 不需要脫困 ★★
+            #   模擬 E3／E4（實驗室家具旁）：車頭或車尾離家具 10~12 cm、兩側卻各有
+            #   0.8~1.8 m —— 規劃器回「Start occupied」，探索的前沿全部被抑制、
+            #   原地乾等 150 秒；而這裡只看兩側，回「不需要脫困」，6 次呼叫 6 次什麼都沒做。
+            f_gap, r_gap = self._end_gaps()
+            if min(f_gap, r_gap) >= self.UNWEDGE_END_TARGET_M:
+                return True, (f"四周都有裕度（左 {left:.2f} / 右 {right:.2f} / "
+                              f"前 {f_gap:.2f} / 後 {r_gap:.2f} m），不需要脫困")
+            return self._unwedge_straight(f_gap, r_gap)
 
         moved_total = 0.0
         for leg in range(1, self.UNWEDGE_MAX_LEGS + 1):
@@ -3601,6 +3860,40 @@ class PathTeachNode(Node):
         ok = left >= self.UNWEDGE_TARGET_M and right >= self.UNWEDGE_TARGET_M
         return ok, (f"做滿 {self.UNWEDGE_MAX_LEGS} 段、共 {moved_total:.2f} m，"
                     f"兩側 左 {left:.2f} / 右 {right:.2f} m")
+
+    def _unwedge_straight(self, f_gap: float, r_gap: float) -> Tuple[bool, str]:
+        """兩側有空間、但車頭或車尾貼著障礙 —— 直線往空的那頭拉開。
+
+        直線就夠了：要解的是「車身矩形壓到障礙的膨脹區」，不是側向空間不足，
+        打舵反而會讓車頭外甩去刮旁邊的東西。每段仍走 _unwedge_leg 的
+        20 Hz 車身外緣檢查（6 cm 收手），出發前也要求行進方向有 段長+0.35 m 的淨空。
+        """
+        direction = -1 if f_gap < r_gap else 1
+        word = "後退" if direction < 0 else "前進"
+        need = self.UNWEDGE_LEG_M + self.UNWEDGE_SAFE_M
+        moved_total = 0.0
+        for leg in range(1, self.UNWEDGE_STRAIGHT_MAX_LEGS + 1):
+            f_gap, r_gap = self._end_gaps()
+            close = f_gap if direction < 0 else r_gap        # 要拉開的那一頭
+            if close >= self.UNWEDGE_END_TARGET_M:
+                return True, (f"直線{word}拉開完成：{leg - 1} 段、共 {moved_total:.2f} m，"
+                              f"前 {f_gap:.2f} / 後 {r_gap:.2f} m")
+            room = self._arc_clearance(direction, 0.0, max_dist=1.2)
+            if room < need:
+                return False, (f"車頭／車尾貼著障礙（前 {f_gap:.2f} / 後 {r_gap:.2f} m），"
+                               f"往{word}只有 {room:.2f} m（需要 {need:.2f}）—— 要人工介入")
+            speed = self.reverse_speed if direction < 0 else self.follow_speed
+            moved = self._unwedge_leg(direction, 0.0, speed)
+            moved_total += moved
+            self.get_logger().info(
+                f"直線拉開第 {leg} 段：{word} {moved:.3f} m（前 {f_gap:.2f} / 後 {r_gap:.2f} m）")
+            if moved < 0.02:
+                return False, f"直線拉開第 {leg} 段只移動 {moved:.3f} m —— 推不動，要人工介入"
+        f_gap, r_gap = self._end_gaps()
+        close = f_gap if direction < 0 else r_gap
+        ok = close >= self.UNWEDGE_END_TARGET_M
+        return ok, (f"直線{word}做滿 {self.UNWEDGE_STRAIGHT_MAX_LEGS} 段、共 {moved_total:.2f} m，"
+                    f"前 {f_gap:.2f} / 後 {r_gap:.2f} m")
 
     def _unwedge_leg(self, direction: int, curvature: float, speed: float) -> float:
         """推一小段，回傳實際位移。速度交給 _publish_cmd 的死區地板處理。"""
@@ -4222,7 +4515,10 @@ class PathTeachNode(Node):
 
         # ★ 規劃前先清一次全域成本地圖 —— 見 __init__ 裡的說明。
         # 失敗不擋下規劃：清空是最佳化不是前提。
-        self._clear_global_costmap()
+        if self._clear_global_costmap() and self.plan_clear_settle > 0.0:
+            # ★ 2026-10-01：等障礙層把「現在看得到」的東西標回去再規劃
+            #   （站在路上的人），否則重新規劃永遠從人身上穿過（見 plan_clear_settle_sec）
+            time.sleep(self.plan_clear_settle)
 
         all_pts: List[PathPoint] = []
         cur = start

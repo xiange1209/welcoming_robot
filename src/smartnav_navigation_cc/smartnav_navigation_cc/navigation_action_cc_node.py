@@ -47,6 +47,9 @@ from smartnav_msgs.srv import DeleteTaughtPath, GetWaypoint, PlanTaughtPath
 # ★ 「請勿自動重試」是寫給 LLM 看的：它的提示詞要求失敗先自動重試，
 #   把急停回報成一般失敗，車子會在急停之後又被叫出去（2026-09-25 審查）。
 EXTERNAL_STOP_MSG = "導航被外部停止（緊急停止或卡住偵測），請勿自動重試"
+# path_teach 重播被「地圖上沒有的障礙」擋住而交回時，失敗訊息的開頭。
+# ★ 與 path_teach_cc_node.py 的 NEW_OBSTACLE_TAG 同一個字串（改那邊要一起改這裡）
+NEW_OBSTACLE_TAG = "[新障礙]"
 
 
 def wait_for_future(future, timeout_sec: float) -> Any:
@@ -138,6 +141,21 @@ class NavigationActionCcNode(Node):
         #   （`command_lost_count > RATE_100_HZ`，見 韌體限制_不可違反.md），
         #   超時底盤會自己停住。車子在空檔期間是靜止的，不會滑行。
         self.declare_parameter("replan_min_progress_m", 0.20)
+        # ★★ 2026-10-01：被「地圖上沒有的障礙」擋住（人、剛放的東西）—— 繞過去，或等通道淨空 ★★
+        #
+        # path_teach 判斷擋路的是新東西時不脫困、停車等 new_obstacle_wait_sec，
+        # 還在就用「[新障礙]」開頭的訊息交回來。這裡接手：
+        #   1. 重新規劃（path_teach 會先清殘影、再等障礙層把**現在**看得到的東西標回去）
+        #      —— 旁邊有空間，規劃器就會給一條繞過去的路
+        #   2. 規劃不出來 = 通道整個被擋住 -> 原地等，每 blocked_poll_sec 重新規劃一次，
+        #      一通就走；同一處最多等 blocked_patience_sec
+        # 這種失敗**不算**重試次數、也不算「原地失敗」—— 人走開之前車子本來就不該動。
+        # 模擬 DYN_BASE（改之前）：人站在路中 45 秒 -> 3 次重試用完、車子停在家具旁，
+        # 下一個目標 34 秒就失敗。
+        self.declare_parameter("blocked_patience_sec", 180.0)
+        self.declare_parameter("blocked_poll_sec", 4.0)
+        self.declare_parameter("blocked_speech_wait", "前面的路被擋住了，我在這裡等，通了就繼續")
+        self.declare_parameter("blocked_speech_resume", "路通了，繼續前進")
 
         self.max_covariance_norm = float(self.get_parameter("max_covariance_norm").value)
         self.navigation_timeout_sec = float(self.get_parameter("navigation_timeout_sec").value)
@@ -153,6 +171,10 @@ class NavigationActionCcNode(Node):
         self.delete_temp_taught = bool(self.get_parameter("delete_temp_taught_path").value)
         self.max_replan_attempts = max(1, int(self.get_parameter("max_replan_attempts").value))
         self.replan_min_progress_m = float(self.get_parameter("replan_min_progress_m").value)
+        self.blocked_patience_sec = float(self.get_parameter("blocked_patience_sec").value)
+        self.blocked_poll_sec = max(1.0, float(self.get_parameter("blocked_poll_sec").value))
+        self.blocked_speech_wait = str(self.get_parameter("blocked_speech_wait").value)
+        self.blocked_speech_resume = str(self.get_parameter("blocked_speech_resume").value)
         self._taught_seq = 0
         # 重試迴圈用來判斷「上一輪有沒有真的移動」。由 /amcl_pose 更新。
         self._pose_lock = threading.Lock()
@@ -455,22 +477,51 @@ class NavigationActionCcNode(Node):
         last_why = ""
         stuck_rounds = 0
         prev_xy = self._robot_xy()
+        attempt = 0              # 一般失敗用掉的重試次數（被新障礙擋住的不算）
+        runs = 0                 # 實際起跑過幾次
+        last_dyn = False         # 上一次失敗是不是「[新障礙]」
+        blocked_since = None     # 這一處被新障礙擋住的起始時間（等待耐心從這裡起算）
+        blocked_xy = None
 
-        for attempt in range(1, self.max_replan_attempts + 1):
+        while True:
             if goal_handle.is_cancel_requested:
                 return self._canceled(goal_handle, result)
             if time.monotonic() > deadline:
                 return self._abort(goal_handle, result, "導航逾時，已自動取消")
+            if not last_dyn:
+                attempt += 1
+                if attempt > self.max_replan_attempts:
+                    return self._abort(
+                        goal_handle, result,
+                        f"導航失敗：重試 {self.max_replan_attempts} 次仍未抵達（最後一次：{last_why}）")
 
-            if attempt > 1:
+            if runs > 0:
                 # 重試前先清障礙層：暫時性障礙（人走過去）是最常見的失敗原因，
                 # 不清的話重新規劃看到的還是同一張被污染的地圖，等於白試。
+                # ★ 2026-10-01：path_teach 的規劃服務清完會等障礙層把「現在」看得到的
+                #   東西標回去（plan_clear_settle_sec），站在路上的人不會被清成透明。
                 self._clear_costmap_quiet()
-                self.get_logger().warn(
-                    f"重新規劃第 {attempt}/{self.max_replan_attempts} 次"
-                    f"（上一次失敗：{last_why}）")
+                if last_dyn:
+                    self.get_logger().warn(f"被新障礙擋住，重新規劃看能不能繞過去（{last_why}）")
+                else:
+                    self.get_logger().warn(
+                        f"重新規劃第 {attempt}/{self.max_replan_attempts} 次"
+                        f"（上一次失敗：{last_why}）")
 
             plan = self._plan_taught_once(waypoint_name, target_pose)
+            if plan is None and last_dyn:
+                # 繞不過去 = 通道整個被擋住：原地等它淨空（不推車、不脫困）
+                plan, why = self._wait_for_passage(
+                    goal_handle, waypoint_name, target_pose, deadline, blocked_since)
+                if plan is None:
+                    if why == "cancel":
+                        return self._canceled(goal_handle, result)
+                    if why == "timeout":
+                        return self._abort(goal_handle, result, "導航逾時，已自動取消")
+                    return self._abort(
+                        goal_handle, result,
+                        f"導航失敗：通道被擋住超過 {self.blocked_patience_sec:.0f} 秒仍未淨空"
+                        f"（{last_why}）")
             if plan is None:
                 # ★★ 2026-08-17：規劃不出來時先試著把車子推開再規劃一次 ★★
                 #
@@ -485,13 +536,14 @@ class NavigationActionCcNode(Node):
                 if self._call_unwedge():
                     plan = self._plan_taught_once(waypoint_name, target_pose)
             if plan is None:
-                if attempt == 1:
+                if runs == 0:
                     # 一次都沒跑過 -> 車子還在原地，讓 MPPI 有機會試
                     return None
                 return self._abort(
                     goal_handle, result,
                     f"導航失敗：重新規劃不出路徑（前次失敗：{last_why}）")
 
+            runs += 1
             outcome, res, path_id = self._follow_taught_once(
                 goal_handle, plan, waypoint_name, deadline)
 
@@ -502,14 +554,14 @@ class NavigationActionCcNode(Node):
             if outcome == "timeout":
                 return self._abort(goal_handle, result, "導航逾時，已自動取消")
             if outcome == "reject":
-                if attempt == 1:
+                if runs == 1:
                     return None
                 return self._abort(goal_handle, result, "重播請求被拒絕")
 
             if outcome == "success":
                 self._delete_taught(path_id)
                 result.success = True
-                extra = f"（重新規劃 {attempt - 1} 次後）" if attempt > 1 else ""
+                extra = f"（重新規劃 {runs - 1} 次後）" if runs > 1 else ""
                 result.message = (f"導航成功{extra}（終點誤差 {res.result.final_error_m:.2f} m、"
                                   f"朝向差 {res.result.final_yaw_error_deg:.1f} 度）")
                 goal_handle.succeed()
@@ -519,16 +571,39 @@ class NavigationActionCcNode(Node):
             # ── 失敗 ──
             last_why = getattr(res.result, "message", "未知") if res is not None else "無回應"
             self.get_logger().error(
-                f"教導-重現第 {attempt} 次失敗：{last_why}"
+                f"教導-重現第 {runs} 次失敗：{last_why}"
                 f"　★ 臨時路徑 {path_id} 已保留供查驗")
             # ★ 2026-09-25：失敗之後、決定重試或放棄之前先看取消。舊版只在下一輪開頭檢查，
             #   最後一輪與「原地失敗兩次」這兩個出口會漏掉，把使用者的取消回報成失敗
             if goal_handle.is_cancel_requested:
                 return self._canceled(goal_handle, result)
 
+            now_xy = self._robot_xy()
+            last_dyn = last_why.startswith(NEW_OBSTACLE_TAG)
+            if last_dyn:
+                # 被新障礙擋住：不算重試、不算原地失敗。換了地方（離上次被擋處 > 0.5 m）
+                # 就是新的一處擋路，等待耐心重新起算。
+                d_blk = self._xy_dist(blocked_xy, now_xy)
+                if blocked_since is None or (d_blk is not None and d_blk > 0.5):
+                    blocked_since = time.monotonic()
+                    blocked_xy = now_xy
+                elif time.monotonic() - blocked_since > self.blocked_patience_sec:
+                    return self._abort(
+                        goal_handle, result,
+                        f"導航失敗：同一處被擋住超過 {self.blocked_patience_sec:.0f} 秒（{last_why}）")
+                prev_xy = now_xy
+                continue
+
+            # ★ 2026-10-01：車身外緣被硬停而失敗 = 車子貼著東西。直接重新規劃的話，
+            #   規劃器常常給一條同方向的路（它覺得過得去），車子再撞一次 6 cm 硬停。
+            #   模擬 DYN_BASE：停在桌角下 4 cm，之後兩個目標各失敗一次都卡在同一處。
+            #   先請 /unwedge 拉開（車頭／車尾貼著就直線拉開，側面貼著就打舵推開）。
+            if "車身外緣持續不足" in last_why:
+                self._call_unwedge()
+                now_xy = self._robot_xy()
+
             # 「有沒有移動」決定值不值得再試。卡在同一個地方時，重新規劃
             # 拿到的會是幾乎一樣的路徑與一樣的結果 —— 那是浪費電量與時間。
-            now_xy = self._robot_xy()
             moved = self._xy_dist(prev_xy, now_xy)
             prev_xy = now_xy
             if moved is not None and moved < self.replan_min_progress_m:
@@ -542,14 +617,55 @@ class NavigationActionCcNode(Node):
                         f"導航失敗：車子卡在原地，重新規劃無效（{last_why}）")
             else:
                 stuck_rounds = 0
+            # 重試次數用完的出口在迴圈開頭（attempt > max_replan_attempts）
 
-        return self._abort(
-            goal_handle, result,
-            f"導航失敗：重試 {self.max_replan_attempts} 次仍未抵達（最後一次：{last_why}）")
+    def _wait_for_passage(self, goal_handle, waypoint_name, target_pose, deadline, blocked_since):
+        """通道被地圖上沒有的障礙整個擋住（繞也繞不過）—— 原地等，定期重新規劃，一通就走。
+
+        回傳 (plan, 原因)：plan 不是 None = 路通了；否則原因是 cancel / timeout / patience。
+
+        ★ 等的時候車子是靜止的：沒有人發 cmd_vel，底盤的指令逾時 1.0 秒會自己停住。
+        ★ 每次重新規劃，path_teach 都會先清殘影、再等障礙層把「現在」看得到的東西
+          標回去（plan_clear_settle_sec）—— 擋路的東西一移走，下一輪就規劃得出來；
+          還在的話規劃器照樣看得到它，不會給出一條穿過它的路。
+        ★ 這就是「隨時可能恢復通道」的判斷：不是等固定秒數，而是每一輪都重新問一次地圖。
+        """
+        start = blocked_since if blocked_since is not None else time.monotonic()
+        self.speech_text_pub.publish(String(data=self.blocked_speech_wait))
+        self.get_logger().warn(
+            f"通道被擋住、也繞不過去 —— 原地等它淨空（每 {self.blocked_poll_sec:.0f} 秒"
+            f"重新規劃一次，同一處最多等 {self.blocked_patience_sec:.0f} 秒）")
+        polls = 0
+        while True:
+            next_t = time.monotonic() + self.blocked_poll_sec
+            while time.monotonic() < next_t:
+                if goal_handle.is_cancel_requested:
+                    return None, "cancel"
+                time.sleep(0.2)
+            now = time.monotonic()
+            if now > deadline:
+                return None, "timeout"
+            if now - start > self.blocked_patience_sec:
+                return None, "patience"
+            polls += 1
+            plan = self._plan_taught_once(waypoint_name, target_pose, quiet=True)
+            if plan is not None:
+                self.get_logger().info(
+                    f"✓ 通道淨空了（擋了 {time.monotonic() - start:.0f} 秒、重新規劃 {polls} 次）"
+                    f"—— 繼續前進")
+                self.speech_text_pub.publish(String(data=self.blocked_speech_resume))
+                return plan, "ok"
+            if polls % 5 == 0:
+                self.get_logger().info(
+                    f"通道仍被擋住（已等 {time.monotonic() - start:.0f}/"
+                    f"{self.blocked_patience_sec:.0f} 秒）")
 
     # ── 重試迴圈用的小工具 ────────────────────────────────────
-    def _plan_taught_once(self, waypoint_name, target_pose):
-        """從車子當下的位置規劃一條到目標的路徑。失敗回傳 None。"""
+    def _plan_taught_once(self, waypoint_name, target_pose, quiet=False):
+        """從車子當下的位置規劃一條到目標的路徑。失敗回傳 None。
+
+        quiet=True：規劃失敗只記 debug（等通道淨空時每幾秒就規劃一次，失敗是預期中的）。
+        """
         self._taught_seq += 1
         req = PlanTaughtPath.Request()
         # 名稱帶 _auto_ 前綴，一眼看得出是導航自動產生的、不是人錄的
@@ -565,7 +681,8 @@ class NavigationActionCcNode(Node):
             return None
         if plan is None or not plan.success:
             msg = plan.message if plan is not None else "無回應"
-            self.get_logger().warn(f"規劃教導路徑不成功: {msg}")
+            (self.get_logger().debug if quiet else self.get_logger().warn)(
+                f"規劃教導路徑不成功: {msg}")
             return None
 
         # 折返點數是這條路好不好走的最強預測指標：

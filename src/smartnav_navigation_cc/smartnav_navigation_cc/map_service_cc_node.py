@@ -62,7 +62,7 @@ from rcl_interfaces.srv import SetParameters
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import Bool, Empty, String
 from std_srvs.srv import Empty as EmptySrv
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from nav2_msgs.srv import LoadMap as Nav2LoadMap
@@ -141,6 +141,22 @@ class MapServiceCcNode(Node):
         #   約 6.5 秒一輪。算進來的話，車子一開始就停在一條電線前，21 秒就以「同一處 3 次」結束，
         #   存下幾乎是空的圖 —— 其實寬限期一過 explorer 的看門狗就會把那一點抑制、改往別處探索。
         self.declare_parameter("exploration_stuck_grace_sec", 30.0)
+        # ★★ 2026-10-01：探索中自己脫困（使用者：「會卡住在家具那邊，我希望能夠自己脫困」）★★
+        #   stuck_detector 只抓「有指令但沒動」。壓進家具的膨脹區時規劃器回 Start occupied、根本不下指令，
+        #   BT 的 BackUp 又被 Collision Ahead 擋住 —— 以前只能等 240 秒停滯收尾（HANDOFF 記的未解死結）。
+        #   9/30 模擬（9/29 實驗室地圖、開口擋住）在家具旁實際重現：Start occupied 兩次、靠成本地圖剛好刷新才脫身。
+        #   這裡改看結果：探索中車子 idle_sec 秒沒移動 **而且** 即時光達量到車身 tight_m 內有東西
+        #   → 靜音 nav2 指令 → 呼叫 path_teach 的 /unwedge（即時光達、繞過防撞、≤0.10 m/s）→ 解除靜音。
+        #   車身旁邊空曠時不觸發：那是前沿全部抑制後的正常待機。tight_m 0.25 ≈ nav2 內切半徑 0.205＋餘裕。
+        self.declare_parameter("exploration_unwedge_enabled", True)
+        self.declare_parameter("exploration_unwedge_idle_sec", 20.0)
+        self.declare_parameter("exploration_unwedge_tight_m", 0.25)
+        self.declare_parameter("exploration_unwedge_cooldown_sec", 30.0)
+        self.declare_parameter("exploration_unwedge_max", 6)
+        # 量「擠不擠」時要排除的車體自身回波（鋁擠條）：跟 path_teach 同一份，nav_bringup_cc 傳入
+        self.declare_parameter("self_mask_sectors_deg", [84.0, 118.0, 249.0, 275.0])
+        self.declare_parameter("self_mask_max_range_m", 0.25)
+        self.declare_parameter("laser_x_offset_m", 0.089)
         # 等 map -> base_footprint 出現的時間 (Pi 4 冷開機時 slam 第一張圖要好幾秒)
         self.declare_parameter("tf_ready_timeout_sec", 60.0)
         self.declare_parameter("lifecycle_transition_timeout_sec", 25.0)
@@ -359,6 +375,23 @@ class MapServiceCcNode(Node):
         self._stuck_events = []      # 本輪探索每次卡住時的 (x, y)；拿不到位置時是 None
         self._stuck_end = None       # 預算用完時的 (此處次數, 總次數, (x, y) 或 None)
         self._explore_started_mono = None   # 發 exploration_active=True 的時間（寬限期從這裡算）
+        # 探索中自己脫困（見 exploration_unwedge_* 參數）
+        p = self.get_parameter
+        self.exploration_unwedge_enabled = bool(p("exploration_unwedge_enabled").value)
+        self.exploration_unwedge_idle_sec = float(p("exploration_unwedge_idle_sec").value)
+        self.exploration_unwedge_tight_m = float(p("exploration_unwedge_tight_m").value)
+        self.exploration_unwedge_cooldown_sec = float(p("exploration_unwedge_cooldown_sec").value)
+        self.exploration_unwedge_max = int(p("exploration_unwedge_max").value)
+        _flat = [float(v) for v in p("self_mask_sectors_deg").value]
+        self._self_sectors = [(_flat[i], _flat[i + 1]) for i in range(0, len(_flat) - 1, 2)]
+        self._self_max_range = float(p("self_mask_max_range_m").value)
+        self._laser_x = float(p("laser_x_offset_m").value)
+        self._last_scan_mono = 0.0
+        self._motion_anchor = None     # (x, y, monotonic)：最後一次「真的移動了」的位置與時間
+        self._unwedge_last = 0.0
+        self._unwedge_count = 0
+        self.unwedge_client = self.create_client(Trigger, "/unwedge", callback_group=self.client_cb_group)
+        self.mute_client = self.create_client(SetBool, "/mute_nav_cmd", callback_group=self.client_cb_group)
 
         self._load_maps_db()
         self.current_map_pub.publish(String(data=""))
@@ -947,6 +980,8 @@ class MapServiceCcNode(Node):
             if time.monotonic() > deadline:
                 return "timeout"
 
+            # 2026-10-01：卡在家具旁（Start occupied／推不動）時自己脫困，見 _maybe_unwedge
+            self._maybe_unwedge()
             time.sleep(0.5)
 
         return "cancel"
@@ -961,6 +996,9 @@ class MapServiceCcNode(Node):
             self._last_gain_time = None
             self._stuck_events = []
             self._stuck_end = None
+        self._unwedge_count = 0
+        self._unwedge_last = 0.0
+        self._motion_anchor = None
 
         if not self.use_exploration:
             self.get_logger().info("未啟用自動探索，請用遙控把環境走一遍，完成後呼叫 /finish_map")
@@ -1268,6 +1306,106 @@ class MapServiceCcNode(Node):
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._last_scan = msg
+        self._last_scan_mono = time.monotonic()
+
+    # ==================================================================
+    # 探索中自己脫困（2026-10-01，見 exploration_unwedge_* 參數）
+    # ==================================================================
+    def _body_gap(self) -> Optional[float]:
+        """車身矩形到最近障礙的距離（公尺，0 = 已進到車身裡）；掃描太舊或沒有回 None。
+
+        幾何與 path_teach_cc._body_margin 相同（base_footprint 在後輪軸心：前 0.40、後 0.09、半寬 0.185）；
+        自身扇區內近於 self_mask_max_range 的點（鋁擠條）不算 —— 不然實車上永遠「很擠」。
+        """
+        scan = getattr(self, "_last_scan", None)
+        if scan is None or time.monotonic() - self._last_scan_mono > 2.0:
+            return None
+        front, rear, half_w = 0.40 - self._laser_x, -(0.09 + self._laser_x), 0.185
+        best = float("inf")
+        a = scan.angle_min
+        for r in scan.ranges:
+            ang = a
+            a += scan.angle_increment
+            if r != r or not (scan.range_min <= r <= scan.range_max) or r > 2.0:
+                continue
+            if r < self._self_max_range:
+                d = math.degrees(ang) % 360.0
+                if any(lo <= d <= hi for lo, hi in self._self_sectors):
+                    continue
+            x, y = r * math.cos(ang), r * math.sin(ang)
+            gap = math.hypot(max(rear - x, x - front, 0.0), max(abs(y) - half_w, 0.0))
+            best = min(best, gap)
+        return best
+
+    def _maybe_unwedge(self) -> None:
+        """探索迴圈每 0.5 秒呼叫一次：久沒移動而且車身旁邊很擠 → 脫困一次"""
+        if not (self.use_exploration and self.exploration_unwedge_enabled):
+            return
+        now = time.monotonic()
+        started = self._explore_started_mono
+        if started is None or now - started < self.exploration_stuck_grace_sec:
+            return
+        pose = self._current_robot_pose()
+        if pose is None:
+            return
+        anchor = self._motion_anchor
+        if anchor is None or math.hypot(pose[0] - anchor[0], pose[1] - anchor[1]) > 0.10:
+            self._motion_anchor = (pose[0], pose[1], now)
+            return
+        idle = now - anchor[2]
+        if idle < self.exploration_unwedge_idle_sec:
+            return
+        if now - self._unwedge_last < self.exploration_unwedge_cooldown_sec:
+            return
+        if 0 < self.exploration_unwedge_max <= self._unwedge_count:
+            return
+        gap = self._body_gap()
+        if gap is None or gap >= self.exploration_unwedge_tight_m:
+            return          # 車身旁邊空曠：前沿全部抑制後的正常待機，不是卡住
+        self._unwedge_count += 1
+        self._unwedge_last = now
+        self.get_logger().warning(
+            f"探索中脫困第 {self._unwedge_count} 次：已 {idle:.0f} 秒沒移動、車身 {gap * 100:.0f} cm 內有障礙"
+            f"（約在 ({pose[0]:.2f}, {pose[1]:.2f})）—— 靜音 nav2、呼叫 /unwedge")
+        self._run_unwedge()
+        self._motion_anchor = None      # 重新起算
+
+    def _set_nav_mute(self, on: bool) -> bool:
+        if not self.mute_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("/mute_nav_cmd 服務不在（cmd_vel_floor 沒起來？）")
+            return False
+        try:
+            req = SetBool.Request()
+            req.data = on
+            wait_for_future(self.mute_client.call_async(req), timeout_sec=5.0)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"{'靜音' if on else '解除靜音'}失敗: {exc}")
+            return False
+
+    def _run_unwedge(self) -> None:
+        """靜音 nav2 → /unwedge → 解除靜音。
+
+        不停 explorer：它的 STOP/START 會清掉抑制記憶（reset_exploration_runtime_state），
+        脫困完又選回剛剛到不了的點。也不從這裡取消 nav2 目標：外部取消 explorer 不記失敗。
+        讓 nav2 的進度檢查自己判失敗 —— explorer 收到失敗才會把那個目標抑制起來。
+        """
+        if not self.unwedge_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("/unwedge 服務不在（path_teach 沒起來？），這次無法自己脫困")
+            return
+        if not self._set_nav_mute(True):
+            # 靜音失敗就不脫困：兩個發布者搶 cmd_vel 比卡住更糟
+            self.get_logger().warn("靜音失敗，放棄這次脫困（避免脫困動作跟 nav2 搶指令）")
+            return
+        try:
+            res = wait_for_future(self.unwedge_client.call_async(Trigger.Request()), timeout_sec=40.0)
+            ok, msg = bool(res.success), str(res.message)
+        except Exception as exc:  # noqa: BLE001
+            ok, msg = False, f"呼叫失敗：{exc}"
+        finally:
+            self._set_nav_mute(False)
+        (self.get_logger().info if ok else self.get_logger().warning)(
+            f"/unwedge {'完成' if ok else '沒有成功'}：{msg}")
 
     def _exploration_complete_callback(self, _msg: Empty) -> None:
         """frontier_explorer 的完成事件

@@ -422,6 +422,9 @@ def generate_launch_description():
                     "start_mode": start_mode,
                     "use_exploration": auto_start_exploration,
                     "nav2_lifecycle_manager": "lifecycle_manager_navigation_cc",
+                    # 2026-10-01：探索中自己脫困量「車身旁擠不擠」時，排除鋁擠條自身回波（同一份遮罩）
+                    "self_mask_sectors_deg": SELF_MASK_SECTORS_DEG,
+                    "self_mask_max_range_m": SELF_MASK_MAX_RANGE_M,
                 }
             ],
         ),

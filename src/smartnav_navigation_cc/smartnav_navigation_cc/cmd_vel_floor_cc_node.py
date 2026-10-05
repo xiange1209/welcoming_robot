@@ -90,6 +90,7 @@ from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_srvs.srv import SetBool
 
 # ★ nav2_msgs 已經是本套件宣告過的依賴（package.xml:14），而且另外五個檔案
 #   都在用它。這裡仍然包 try：匯入失敗時本節點要能起來並**大聲**說明，
@@ -193,6 +194,20 @@ class CmdVelFloorNode(Node):
         self.pub = self.create_publisher(Twist, self.out_topic, qos)
         self.create_subscription(Twist, self.in_topic, self._cb, qos)
 
+        # ★★ 2026-10-01：靜音（給 map_service 的「探索中自己脫困」用）★★
+        #   脫困由 path_teach 的 /unwedge 經旁路直接發 cmd_vel；同一時間 explorer 的 nav2 目標
+        #   還在，它的指令也從這裡出去 —— 兩個發布者搶同一個話題，車子會被兩邊輪流指揮。
+        #   靜音期間本節點把 nav2 的指令丟掉（連 0 也丟：此時是旁路在控制，它自己會送停止），
+        #   **不停 explorer**：explorer 的 STOP/START 會把抑制記憶整個清掉
+        #   （frontier_explorer_core_dispatch.cpp reset_exploration_runtime_state），
+        #   脫困完它會又選回剛剛那個到不了的點。
+        #   安全：mute_max_sec 到了自動解除 —— 呼叫端當掉也不會讓 nav2 永遠失聲。
+        self.declare_parameter("mute_max_sec", 45.0)
+        self.mute_max_sec = float(self.get_parameter("mute_max_sec").value)
+        self._mute_until = 0.0
+        self._muted_drops = 0
+        self.create_service(SetBool, "mute_nav_cmd", self._mute_cb)
+
         if CollisionMonitorState is None:
             self.get_logger().error(
                 "✗ 匯入 nav2_msgs/CollisionMonitorState 失敗 —— 本節點無法知道"
@@ -281,7 +296,27 @@ class CmdVelFloorNode(Node):
             return True, f"防撞正在動作（{self._polygon or '未具名多邊形'}）"
         return False, ""
 
+    def _mute_cb(self, request, response):
+        if request.data:
+            self._mute_until = time.monotonic() + self.mute_max_sec
+            self._muted_drops = 0
+            response.message = f"nav2 指令靜音（最多 {self.mute_max_sec:.0f} 秒自動解除）"
+        else:
+            was = self._mute_until > time.monotonic()
+            self._mute_until = 0.0
+            response.message = f"解除靜音（期間丟掉 {self._muted_drops} 則 nav2 指令）" if was else "本來就沒有靜音"
+        response.success = True
+        self.get_logger().info(response.message)
+        return response
+
     def _cb(self, msg: Twist) -> None:
+        if self._mute_until:
+            if time.monotonic() < self._mute_until:
+                self._muted_drops += 1          # 脫困中：nav2 的指令不出去（見 mute_nav_cmd）
+                return
+            self._mute_until = 0.0
+            self.get_logger().warning(
+                f"靜音 {self.mute_max_sec:.0f} 秒到期自動解除（呼叫端沒有來解除 —— 檢查 map_service 的脫困流程）")
         self._passes += 1
         v = msg.linear.x
 
