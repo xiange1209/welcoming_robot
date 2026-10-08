@@ -192,6 +192,7 @@ chk "修正24 新障礙不脫困、交回上層" "$NCC/path_teach_cc_node.py"   
 chk "修正25 通道被擋住就等它淨空"   "$NCC/navigation_action_cc_node.py"                        "_wait_for_passage"
 chk "修正26 規劃前等障礙標回去"     "$NCC/path_teach_cc_node.py"                               "plan_clear_settle_sec"
 chk "修正27 車頭車尾貼住直線拉開"   "$NCC/path_teach_cc_node.py"                               "_unwedge_straight"
+chk "修正28 日誌不在同一行換等級"     "$NCC/map_service_cc_node.py"                              "Logger severity cannot be changed"
 [ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"

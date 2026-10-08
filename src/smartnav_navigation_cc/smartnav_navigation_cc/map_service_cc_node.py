@@ -1404,8 +1404,16 @@ class MapServiceCcNode(Node):
             ok, msg = False, f"呼叫失敗：{exc}"
         finally:
             self._set_nav_mute(False)
-        (self.get_logger().info if ok else self.get_logger().warning)(
-            f"/unwedge {'完成' if ok else '沒有成功'}：{msg}")
+        # ★★ 2026-10-08：不能寫成 `(info if ok else warning)(...)` ★★
+        #   rclpy 以「呼叫位置」記住日誌等級，同一行第二次換等級就丟
+        #   ValueError("Logger severity cannot be changed between calls.")。
+        #   這支例外往上穿過 _wait_for_mapping_done，整個建圖被當成例外中止
+        #   （模擬 LAB_ED1：第 1 次脫困完成、第 2 次沒成功 → 276 秒就結束，原定 33 分鐘）。
+        #   要換等級就分成兩行，各自固定等級。
+        if ok:
+            self.get_logger().info(f"/unwedge 完成：{msg}")
+        else:
+            self.get_logger().warning(f"/unwedge 沒有成功：{msg}")
 
     def _exploration_complete_callback(self, _msg: Empty) -> None:
         """frontier_explorer 的完成事件

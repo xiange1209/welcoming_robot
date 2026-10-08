@@ -681,8 +681,12 @@ class NavigationActionCcNode(Node):
             return None
         if plan is None or not plan.success:
             msg = plan.message if plan is not None else "無回應"
-            (self.get_logger().debug if quiet else self.get_logger().warn)(
-                f"規劃教導路徑不成功: {msg}")
+            # ★ 2026-10-08：兩行各自固定等級（理由見 map_service 的 _run_unwedge：
+            #   rclpy 同一個呼叫位置換等級會丟 ValueError，會把整個導航重試迴圈炸掉）
+            if quiet:
+                self.get_logger().debug(f"規劃教導路徑不成功: {msg}")
+            else:
+                self.get_logger().warn(f"規劃教導路徑不成功: {msg}")
             return None
 
         # 折返點數是這條路好不好走的最強預測指標：
