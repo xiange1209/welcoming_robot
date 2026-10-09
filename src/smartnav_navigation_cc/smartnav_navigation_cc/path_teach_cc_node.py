@@ -85,7 +85,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformListener
 
@@ -601,6 +601,23 @@ class PathTeachNode(Node):
         # global_costmap 的 update_frequency 是 1.0 Hz：等 2 秒，下一次更新就會把
         # 雷達「現在看得到」的東西重新標回去，看不到的殘影則不會回來。
         self.declare_parameter("plan_clear_settle_sec", 2.0)
+        # ── 防撞煞住太久 = 前方被擋住（2026-10-08）──────────────────────────
+        # collision_monitor（Jazzy）只在「換狀態」時發訊息，持續 APPROACH 時最後一則一直是 APPROACH。
+        # 10/01 把 `_safety_braking` 的 1 秒過期拿掉後，煞車被永久當成「被煞停、不算卡住」：
+        # 防撞在離障礙 10~15 cm 就把車煞住，path_teach 自己的停車門檻（車頭前 5 cm）又永遠輪不到，
+        # 於是車子靜止到導航總逾時（模擬 NAV_1008 的 G1：277 秒沒動、沒有任何事件）。
+        # 解法：煞車持續超過 cm_brake_wait_sec 而且車沒動 → 視為「前方被擋住」，改走
+        # 「停車等待／分類新障礙／脫困」那條有逾時的流程，並鎖定；淨空回來
+        # （> 停車門檻 + cm_brake_release_m）才解除，避免放開又衝。
+        self.declare_parameter("cm_brake_wait_sec", 4.0)
+        self.declare_parameter("cm_brake_release_m", 0.15)
+        # ★ 2026-10-08 獨立審查補洞：防撞在煞、本節點卻量到前方是空的（兩邊看到的世界不一樣，
+        #   例如防撞吃到本節點已濾掉的自身鋁擠條回波，或旁邊有東西在防撞範圍內卻不在行進帶裡）。
+        #   上面的鎖定會因「淨空夠大」在同一圈解除，而 _cm_braking 仍為真 -> 三個卡住判準全被壓住
+        #   -> 沒有任何出口，只剩導航 300 秒總逾時。這種「各說各話」要有自己的有限出口：
+        #   煞車持續超過這麼久、車子沒動、本節點又不覺得被擋 -> 直接中止並講清楚原因。
+        #   ★ 不走脫困：脫困會繞過防撞，而防撞下一拍照樣會煞，脫困救不了「兩邊看到不同東西」。
+        self.declare_parameter("cm_brake_abort_sec", 15.0)
         # ── 脫困（2026-08-03 加）─────────────────────────────
         #
         # 原本擋住就只會等，等滿 wait_timeout 才放棄。**障礙是牆的時候，
@@ -811,6 +828,9 @@ class PathTeachNode(Node):
         self.new_obstacle_min_ratio = float(p("new_obstacle_min_ratio").value)
         self.new_obstacle_speech = str(p("new_obstacle_speech").value)
         self.plan_clear_settle = float(p("plan_clear_settle_sec").value)
+        self.cm_brake_wait = float(p("cm_brake_wait_sec").value)
+        self.cm_brake_release = float(p("cm_brake_release_m").value)
+        self.cm_brake_abort = float(p("cm_brake_abort_sec").value)
         self._occ = None              # 靜態地圖（只給新障礙判斷用）
         self._last_speech_t = 0.0
         self.escape_after = float(p("escape_after_sec").value)
@@ -1017,6 +1037,24 @@ class PathTeachNode(Node):
                 "✗ 匯入 nav2_msgs/CollisionMonitorState 失敗 —— 無法分辨"
                 "「被防撞煞停」與「真的卡住」。防撞一煞車就會誤判卡住並脫困，"
                 "而脫困會繞過防撞。先修這個匯入。")
+
+        # ★★ 2026-10-08 獨立審查：緊急停止停不住 /unwedge ★★
+        #
+        # /unwedge 是同步服務：_unwedge_cb 設 _escape_bypass 後直接發 cmd_vel（繞過
+        # collision_monitor），_unwedge_leg 只看逾時、位移、6 cm 車身外緣，**沒有任何取消或急停
+        # 檢查**。HMI 的 /api/estop 做的是「遙控送零速＋取消所有 action goal＋取消作業」——
+        # 服務不在這三項之內，零速又被旁路蓋掉。最久約 40 秒車子照樣在動。
+        # 話題 unwedge_abort（Empty）由三處發布：HMI 緊急停止、導航動作在取消時、
+        # 地圖服務在取消時。回呼只設旗標（要在別的執行緒跑 —— 服務回呼正占著一條），
+        # 脫困迴圈每 50 ms 檢查，_publish_cmd 也會把指令歸零，漏掉任何出口都不會再發非零指令。
+        # 只在脫困進行中才收（_unwedge_running）：否則一次沒有脫困時的急停會留下舊旗標，
+        # 之後的 _do_escape（也走旁路）一發指令就被歸零。
+        self._unwedge_abort = threading.Event()
+        self._unwedge_running = False
+        self.create_subscription(
+            Empty, "unwedge_abort", self._unwedge_abort_cb,
+            QoSProfile(depth=10, reliability=_RP.RELIABLE, history=HistoryPolicy.KEEP_LAST),
+            callback_group=cb)
 
         self.create_service(RecordPath, "record_path", self._record_cb, callback_group=cb)
         self.create_service(ListTaughtPaths, "list_taught_paths", self._list_cb,
@@ -2523,7 +2561,16 @@ class PathTeachNode(Node):
             return None
         return norm_angle(goal_yaw - pose[2]), cycles
 
+    def _unwedge_abort_cb(self, _msg) -> None:
+        """緊急停止／取消 -> 中止進行中的脫困。沒在脫困時忽略（不留舊旗標）。"""
+        if self._unwedge_running:
+            self._unwedge_abort.set()
+            self.get_logger().warn("收到 unwedge_abort（緊急停止／取消）—— 中止進行中的脫困")
+
     def _publish_cmd(self, lin: float, ang: float) -> None:
+        # ★ 2026-10-08：脫困被緊急停止中止之後，不論哪個出口漏了檢查，都不會再發非零指令
+        if self._unwedge_running and self._unwedge_abort.is_set():
+            lin = ang = 0.0
         lin, ang = self._lift_deadband(lin, ang)
         # 卡住判定要比對「指令 vs 實際」，所以指令值必須留下來（見 _follow_loop）
         self._cmd_v_last = lin
@@ -2579,6 +2626,78 @@ class PathTeachNode(Node):
         approach = getattr(CollisionMonitorState, "APPROACH", 3)
         stop = getattr(CollisionMonitorState, "STOP", 1)
         return self._cm_action in (approach, stop)
+
+    def _brake_update(self, bs: dict, braking: bool, x: float, y: float, now_t: float) -> bool:
+        """更新「防撞煞住」狀態，回傳這一圈是不是**剛剛**鎖定為「前方被擋住」。
+
+        bs = {"anchor": None | (x, y, t), "latched": bool, "released": bool}
+        （_follow_loop 的區域狀態）
+          - 沒在煞車：錨點與 released 清掉（鎖定不動，由 _brake_release 解除）
+          - 煞車中：離錨點超過 0.10 m = 車子還在動（慢慢蹭）→ 重設錨點、不算卡住；
+            停在原地超過 cm_brake_wait 秒 → 鎖定
+          - released = 這一段煞車裡已經鎖定過、又因為本節點量到前方是空的而解除 → 不再重新鎖定。
+            ★ 2026-10-08 審查：原本解除時把錨點清掉，下一圈重新計 4 秒、再鎖、再放，
+            每 4 秒各印一行日誌什麼事都沒發生；現在改由 _brake_disagree_age 給有限出口。
+        """
+        if not braking:
+            bs["anchor"] = None
+            bs["released"] = False
+            return False
+        a = bs["anchor"]
+        if a is None or math.hypot(x - a[0], y - a[1]) > 0.10:
+            bs["anchor"] = (x, y, now_t)
+            bs["released"] = False
+            return False
+        if not bs["latched"] and not bs["released"] and now_t - a[2] > self.cm_brake_wait:
+            bs["latched"] = True
+            return True
+        return False
+
+    def _brake_release(self, bs: dict, clearance: float, stop_d: float) -> bool:
+        """前方淨空回來了（> 停車門檻 + cm_brake_release）才解除鎖定。回傳是不是剛解除。
+
+        要有餘裕（遲滯）：防撞一煞住車子就停在離障礙 10~15 cm 處，淨空剛好略過門檻就放開的話，
+        下一圈又往前衝、又被煞住，鎖定與解除會每幾秒來回一次。
+        ★ 錨點不清：車子沒動，這一段煞車還沒結束；清掉會讓「煞了多久」的計時歸零，
+          _brake_disagree_age 就永遠等不到。
+        """
+        if bs["latched"] and clearance > stop_d + self.cm_brake_release:
+            bs["latched"] = False
+            bs["released"] = True
+            bs["no_avoid"] = False       # 障礙離開了，繞障恢復可用
+            return True
+        return False
+
+    def _brake_stalled(self, bs: dict, now_t: float) -> bool:
+        """已鎖定、而且煞車停在原地又過了一個 cm_brake_wait（繞障沒有讓車子動起來）→ 別再繞。
+
+        ★ 2026-10-08 審查：鎖定後第一個動作是試著繞障，只要找得到 ≤ avoid_max 的橫向偏移
+          （偏心的柱子、箱角）就進「avoiding」——這個分支沒有計時器，卡住判定又被煞車壓住，
+          防撞若仍持續煞（它用 footprint 投影實際指令弧線，與本節點的矩形帶不同），
+          車子就停在 avoiding 狀態到總逾時。繞了一個 cm_brake_wait 車還是沒動，就別再繞了，
+          改走有逾時的等待／分類／脫困流程。
+        ★ 要「黏著」（bs["no_avoid"]）：改走等待分支會 _stop()，防撞轉回 DO_NOTHING、錨點被清掉，
+          只看錨點的話下一圈又回頭繞障，而繞障分支每圈把 wait_started 歸零 ->
+          等待的逾時永遠起不了算，變成 8 秒一輪的無限循環。直到障礙真的離開
+          （_brake_release）或脫困成功才恢復繞障。
+        """
+        if bs["no_avoid"]:
+            return True
+        a = bs["anchor"]
+        if bs["latched"] and a is not None and now_t - a[2] > 2.0 * self.cm_brake_wait:
+            bs["no_avoid"] = True
+            return True
+        return False
+
+    def _brake_disagree_age(self, bs: dict, braking: bool, now_t: float) -> Optional[float]:
+        """防撞在煞、本節點卻不覺得被擋（鎖定過又解除），且已經這樣停了 cm_brake_abort 秒。
+
+        回傳已經停了多久（呼叫端該中止）；還沒到回 None。
+        """
+        a = bs["anchor"]
+        if braking and bs["released"] and a is not None and now_t - a[2] > self.cm_brake_abort:
+            return now_t - a[2]
+        return None
 
     def _stop(self, frames: int = 3) -> None:
         for _ in range(frames):
@@ -2703,6 +2822,8 @@ class PathTeachNode(Node):
         wait_started = 0.0
         blocker_new: Optional[bool] = None   # 這次停車等的是不是「地圖上沒有的新東西」
         blocker_why = ""
+        # 防撞煞住太久的鎖定（見 _brake_update／_brake_release／_brake_stalled）
+        brake_st = {"anchor": None, "latched": False, "released": False, "no_avoid": False}
         avoid_offset = 0.0
         state = "following"
         last_fb = 0.0
@@ -3046,6 +3167,11 @@ class PathTeachNode(Node):
                 move_hist.clear()
                 sig_hist.clear()
                 prog_t = now_t
+            # ★★ 2026-10-08：煞太久不是「被煞停」，是「被擋住」（理由見 cm_brake_wait_sec）★★
+            if self._brake_update(brake_st, _cm_braking, x, y, now_t):
+                self.get_logger().warn(
+                    f"防撞已煞車超過 {self.cm_brake_wait:.0f} 秒、車子沒動 —— 前方被擋住，"
+                    f"改走「停車等待／分類障礙／脫困」流程（有逾時，不會一直卡著）")
 
             if (not _cm_braking) and len(move_hist) >= 2 \
                     and now_t - move_hist[0][0] >= self.no_progress * 0.8:
@@ -3123,6 +3249,21 @@ class PathTeachNode(Node):
                 else:
                     prog_s = path_s[idx]        # 有實質推進，重新計起
                     prog_t = now_t
+
+            # ★ 2026-10-08：正在等「新障礙（人）」移開時，卡住判定不插手 ——
+            #   否則 no_progress 5 秒就脫困，而脫困會繞過防撞，人就站在車前。
+            #   ★ 同日獨立審查補洞：光把 stuck_now 壓成 False 不夠。等待期間沒人更新
+            #   prog_t／prog_s／move_hist，而 new_obstacle_wait(8 s) > no_progress(5 s)：
+            #   人在第 5~8 秒走開的那一圈 wait_started 歸零、這道守衛失效，下一圈
+            #   判準三（沒有 want 門檻）立刻成立 -> 「判定卡住」-> 脫困（繞過防撞）。
+            #   所以等待期間**每一圈**把觀察窗歸零：人一走，要在「沒被擋」的狀態下
+            #   重新累積滿 no_progress 秒才可能判卡住（只會讓判定更晚，不會讓車多走一步）。
+            if blocker_new and wait_started != 0.0:
+                stuck_now = False
+                prog_t = now_t
+                prog_s = path_s[idx]
+                move_hist.clear()
+                sig_hist.clear()
 
             if not stuck_now:
                 prog_idx = idx
@@ -3414,13 +3555,34 @@ class PathTeachNode(Node):
                 # 把現場指向動作伺服器，而真因在這裡。
                 if time.monotonic() - margin_stop_t > self.no_progress * 2.0:
                     self._stop()
+                    # ★ 2026-10-08 獨立審查：貼到 6 cm 內的也可能是人（走到車子旁邊、伸手），
+                    #   而這個分支在下方「障礙分類」之前就 continue，永遠分不出新障礙：
+                    #   以一般失敗中止 -> navigation_action 計一次重試、還先呼叫 /unwedge 推車。
+                    #   所以逾時要中止之前先分類一次：是新障礙就用 [新障礙] 開頭的訊息交回導航層
+                    #   （不計重試、不推車，改等通道淨空）。分類失敗或判斷不了，維持原訊息。
+                    _new_blk, _why_blk = None, ""
+                    try:
+                        _clr_blk = self._arc_clearance_robust(
+                            cur_dir, preview_curv, curv_meas, max_dist=self.obs_slow + 0.30)
+                        _new_blk, _why_blk = self._classify_blocker(
+                            cur_dir, preview_curv, _clr_blk)
+                    except Exception as e:  # noqa: BLE001 —— 分類是加分項，不能讓它擋住中止
+                        self.get_logger().debug(f"硬停分類失敗（維持一般失敗訊息）：{e}")
                     goal_handle.abort()
                     result.success = False
-                    result.message = (
-                        f"車身外緣持續不足（行進方向只剩 {dir_margin * 100:.0f} cm，"
-                        f"已停 {time.monotonic() - margin_stop_t:.0f} 秒）。"
-                        f"障礙沒有移開，請人工介入。")
-                    self.get_logger().error("⛔ " + result.message)
+                    if _new_blk:
+                        result.message = (
+                            f"{NEW_OBSTACLE_TAG} 車身外緣被地圖上沒有的障礙貼住"
+                            f"（行進方向只剩 {dir_margin * 100:.0f} cm，{_why_blk}）"
+                            f"—— 交回導航層：等通道淨空或重新規劃")
+                        self._say(self.new_obstacle_speech)
+                        self.get_logger().warn("⛔ " + result.message)
+                    else:
+                        result.message = (
+                            f"車身外緣持續不足（行進方向只剩 {dir_margin * 100:.0f} cm，"
+                            f"已停 {time.monotonic() - margin_stop_t:.0f} 秒）。"
+                            f"障礙沒有移開，請人工介入。")
+                        self.get_logger().error("⛔ " + result.message)
                     return result
                 self._send_feedback(goal_handle, idx, len(pts),
                                     dir_margin, "blocked",
@@ -3444,9 +3606,26 @@ class PathTeachNode(Node):
             stop_d = (self.obs_stop if cur_dir > 0 else self.obs_stop_rev) - bumper
             slow_d = self.obs_slow - bumper
 
-            if clearance <= stop_d:
-                # 先試著繞開
-                off = self._pick_avoid_offset(cur_dir, preview_curv)
+            if self._brake_release(brake_st, clearance, stop_d):
+                self.get_logger().info("前方淨空回來了，解除防撞鎖定，繼續前進")
+            # ★ 2026-10-08 獨立審查補洞：防撞一直在煞、本節點卻量到前方是空的（已鎖定又解除）——
+            #   兩邊看到的世界不一樣，等再久也不會自己好。給有限出口：中止並講清楚。
+            _gap_age = self._brake_disagree_age(brake_st, _cm_braking, now_t)
+            if _gap_age is not None:
+                self._stop()
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f"防撞（collision_monitor）持續煞車 {_gap_age:.0f} 秒、車子沒動，"
+                    f"但本節點量到前方淨空 {clearance * 100:.0f} cm —— 兩邊看到的不一樣。"
+                    f"可能是防撞吃到本節點已濾掉的自身回波（collision_scan_topic 是否該設 /scan_nav？"
+                    f"先在車上跑 scan_self_echo.py），或有東西在防撞範圍內卻不在行進帶裡（旁邊的人／物）")
+                self.get_logger().error("⛔ " + result.message)
+                return result
+            if clearance <= stop_d or brake_st["latched"]:
+                # 先試著繞開（★ 鎖定後繞了一個 cm_brake_wait 車還是沒動就別再繞，見 _brake_stalled）
+                off = None if self._brake_stalled(brake_st, now_t) \
+                    else self._pick_avoid_offset(cur_dir, preview_curv)
                 if off is not None and abs(off) <= self.avoid_max:
                     if state != "avoiding":
                         self.get_logger().info(f"前方障礙，橫向偏移 {off * 100:+.0f} cm 繞過")
@@ -3517,6 +3696,7 @@ class PathTeachNode(Node):
                             last_escape_t = time.monotonic()   # 開始偏離寬限期
                             wait_started = 0.0
                             avoid_offset = 0.0
+                            brake_st["no_avoid"] = False       # 車子換了位置，繞障重新可用
                             state = "following"
                             move_hist.clear()
                             sig_hist.clear()
@@ -3768,6 +3948,10 @@ class PathTeachNode(Node):
     #   （見 collision-monitor-escape-deadlock），指令根本到不了底盤。
     #   用 try/finally 保證旁路一定關掉 —— 漏關的後果是正常循跡也在繞過防撞。
     def _unwedge_cb(self, _request, response):
+        # ★ 2026-10-08：先清旗標再宣告「進行中」—— 順序反過來的話，這之前殘留的舊中止
+        #   會被帶進這一次脫困（_unwedge_abort_cb 只在 _unwedge_running 時才設旗標）。
+        self._unwedge_abort.clear()
+        self._unwedge_running = True
         self._escape_bypass = True
         try:
             ok, msg = self._unwedge_run()
@@ -3782,6 +3966,7 @@ class PathTeachNode(Node):
             self._stop()
             if self.bypass_pub is not None:
                 self.bypass_pub.publish(Twist())
+            self._unwedge_running = False
         return response
 
     # 一段推多遠、最多推幾段、推到兩側各有多少就算成功
@@ -3791,6 +3976,7 @@ class PathTeachNode(Node):
     UNWEDGE_SAFE_M = 0.35          # 行進方向要留的裕度
     UNWEDGE_END_TARGET_M = 0.20    # 車頭／車尾到障礙至少要有這麼多（2026-10-01）
     UNWEDGE_STRAIGHT_MAX_LEGS = 3  # 直線拉開最多幾段（3 x 0.12 = 0.36 m）
+    UNWEDGE_ABORT_MSG = "脫困被緊急停止／取消中止"
 
     def _unwedge_run(self) -> Tuple[bool, str]:
         left, right = self._side_clearance()
@@ -3807,6 +3993,8 @@ class PathTeachNode(Node):
 
         moved_total = 0.0
         for leg in range(1, self.UNWEDGE_MAX_LEGS + 1):
+            if self._unwedge_abort.is_set():
+                return False, self.UNWEDGE_ABORT_MSG
             left, right = self._side_clearance()
             if left >= self.UNWEDGE_TARGET_M and right >= self.UNWEDGE_TARGET_M:
                 return True, (f"脫困完成：{leg - 1} 段、共 {moved_total:.2f} m，"
@@ -3853,6 +4041,8 @@ class PathTeachNode(Node):
                 f"脫困第 {leg} 段：{'前進' if direction > 0 else '後退'}、"
                 f"往{'左' if to_left else '右'}打，移動 {moved:.3f} m"
                 f"（側向 左 {left:.2f} / 右 {right:.2f} m）")
+            if self._unwedge_abort.is_set():
+                return False, self.UNWEDGE_ABORT_MSG
             if moved < 0.02:
                 return False, f"第 {leg} 段只移動 {moved:.3f} m —— 車子推不動，要人工介入"
 
@@ -3873,6 +4063,8 @@ class PathTeachNode(Node):
         need = self.UNWEDGE_LEG_M + self.UNWEDGE_SAFE_M
         moved_total = 0.0
         for leg in range(1, self.UNWEDGE_STRAIGHT_MAX_LEGS + 1):
+            if self._unwedge_abort.is_set():
+                return False, self.UNWEDGE_ABORT_MSG
             f_gap, r_gap = self._end_gaps()
             close = f_gap if direction < 0 else r_gap        # 要拉開的那一頭
             if close >= self.UNWEDGE_END_TARGET_M:
@@ -3887,6 +4079,8 @@ class PathTeachNode(Node):
             moved_total += moved
             self.get_logger().info(
                 f"直線拉開第 {leg} 段：{word} {moved:.3f} m（前 {f_gap:.2f} / 後 {r_gap:.2f} m）")
+            if self._unwedge_abort.is_set():
+                return False, self.UNWEDGE_ABORT_MSG
             if moved < 0.02:
                 return False, f"直線拉開第 {leg} 段只移動 {moved:.3f} m —— 推不動，要人工介入"
         f_gap, r_gap = self._end_gaps()
@@ -3920,6 +4114,10 @@ class PathTeachNode(Node):
         limit = self.UNWEDGE_LEG_M / max(speed, 1e-3) + 3.0
         moved = 0.0
         while time.monotonic() - t0 < limit:
+            # ★ 2026-10-08：緊急停止／取消要能中止（見 __init__ 的 unwedge_abort 說明）
+            if self._unwedge_abort.is_set():
+                self.get_logger().warn("楔住脫困：被緊急停止／取消中止，這一段收手")
+                break
             cur = self._robot_pose()
             if start and cur:
                 moved = math.hypot(cur[0] - start[0], cur[1] - start[1])
