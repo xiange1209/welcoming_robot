@@ -117,8 +117,17 @@ def _setup(context):
         output="screen",
         parameters=[{"use_sim_time": True, "realism": _truthy(arg("realism"))}],
     )
+    # ★ 2026-10-08：/clock 限流（Gazebo 每個物理步都發 /clock，575 Hz 把所有 use_sim_time 節點拖慢，
+    #   即時率掉到 0.3~0.55）。本節點自己不用 use_sim_time —— 它就是時鐘的來源。
+    clock_throttle = Node(
+        package=PKG,
+        executable="clock_throttle",
+        name="clock_throttle",
+        output="screen",
+        parameters=[{"rate_hz": float(arg("clock_rate_hz"))}],
+    )
     actions.append(LogInfo(msg=f"[smartnav_sim] 世界 {world}、起點 ({x}, {y}, yaw {yaw})"))
-    return actions + [gz, rsp, spawn, bridge, realism]
+    return actions + [gz, rsp, spawn, bridge, clock_throttle, realism]
 
 
 def generate_launch_description():
@@ -134,5 +143,7 @@ def generate_launch_description():
         DeclareLaunchArgument("lidar_x_actual", default_value=""),
         # 2026-09-30：在光達兩側放一對薄板，重現實車鋁擠條的自身回波（見 urdf 註解）
         DeclareLaunchArgument("self_echo_bars", default_value="false"),
+        # 2026-10-08：/clock 限流到這個頻率（Hz）。0 = 不限流（逐則轉發，重現 10/08 以前的實驗用）
+        DeclareLaunchArgument("clock_rate_hz", default_value="100"),
         OpaqueFunction(function=_setup),
     ])

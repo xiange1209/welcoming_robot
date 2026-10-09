@@ -22,7 +22,7 @@ from launch.substitutions import LaunchConfiguration
 
 PKG = "smartnav_sim"
 PASS_THROUGH = ["world", "map_yaml", "gui", "render_engine", "realism", "x", "y", "yaw",
-                "lidar_x_actual", "self_echo_bars"]
+                "lidar_x_actual", "self_echo_bars", "clock_rate_hz"]
 
 
 def generate_launch_description():
@@ -45,6 +45,8 @@ def generate_launch_description():
                 "use_exploration": "false",
                 "self_echo_filter": LaunchConfiguration("self_echo_filter"),
                 "collision_scan_topic": LaunchConfiguration("collision_scan_topic"),
+                # ★ 2026-10-08：掃參數（例如規劃器迴轉半徑）時指向改過的複本，不必動 repo 的 yaml
+                "params_file": LaunchConfiguration("params_file"),
             }.items(),
         )],
     )
@@ -59,6 +61,8 @@ def generate_launch_description():
         DeclareLaunchArgument("yaw", default_value="0.0"),
         DeclareLaunchArgument("lidar_x_actual", default_value=""),
         DeclareLaunchArgument("self_echo_bars", default_value="false"),
+        DeclareLaunchArgument("clock_rate_hz", default_value="100",
+                              description="/clock 限流（Hz），0 = 不限流；見 clock_throttle_node.py"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("start_mode", default_value="localization",
                               description="localization（預設，載入上次的地圖）／auto／mapping"),
@@ -67,6 +71,9 @@ def generate_launch_description():
                               description="false = path_teach 不過濾自身回波（重現 9/29 實車的卡住）"),
         DeclareLaunchArgument("collision_scan_topic", default_value="/scan",
                               description="/scan_nav = collision_monitor 也去掉自身回波"),
+        DeclareLaunchArgument("params_file",
+                              default_value=os.path.join(nav_share, "config", "nav2_senior_akm_cc.yaml"),
+                              description="nav2 參數檔（預設＝導航套件的 nav2_senior_akm_cc.yaml）"),
         sim_robot,
         nav,
     ])

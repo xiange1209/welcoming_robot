@@ -26,6 +26,7 @@ setup(
     entry_points={
         "console_scripts": [
             "akm_realism = smartnav_sim.akm_realism_node:main",
+            "clock_throttle = smartnav_sim.clock_throttle_node:main",
             "pgm_to_world = smartnav_sim.pgm_to_world:main",
             "map_area = smartnav_sim.map_area:main",
         ],

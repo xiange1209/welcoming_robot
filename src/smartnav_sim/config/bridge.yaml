@@ -12,7 +12,9 @@
 # ★ 模擬沒有 IMU 與 EKF：里程計直接由外掛的輪速積分發。實車的 IMU 零偏問題
 #   （imu_bias_corrector_cc）在模擬裡不會出現。
 
-- ros_topic_name: "/clock"
+# ★ 2026-10-08：橋成 /clock_raw，由 clock_throttle 節點限流後才發成 /clock（理由見該節點檔頭：
+#   Gazebo 的 /clock 每個物理步都發，實測 575 Hz，把約 25 個 use_sim_time 節點的 CPU 吃光）
+- ros_topic_name: "/clock_raw"
   gz_topic_name: "/clock"
   ros_type_name: "rosgraph_msgs/msg/Clock"
   gz_type_name: "gz.msgs.Clock"
