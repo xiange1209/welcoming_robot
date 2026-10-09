@@ -31,7 +31,7 @@ from action_msgs.msg import GoalStatus
 
 from smartnav_msgs.srv import ListMaps, SwitchMap, CreateWaypoint, ListWaypoints
 from smartnav_msgs.action import CreateMap, GlobalLocalization, Navigate
-from smartnav_llm.llm_utils import get_config_path, get_knowledge_dir
+from smartnav_llm.llm_utils import get_config_path, get_knowledge_dir, NAVIGATE_WAIT_SEC
 from smartnav_llm.rag_store import BankKnowledgeStore
 from smartnav_llm import web_tools
 
@@ -563,6 +563,19 @@ class LLMServiceNode(Node):
             return f"執行結果: 已被停止（不可重試）, 詳細信息: {msg}"
         return f"執行結果: 失敗, 詳細信息: {msg or '導航過程中發生錯誤'}"
 
+    @staticmethod
+    def _nav_timeout_text(msg: str) -> str:
+        """導航／帶位等到 NAVIGATE_WAIT_SEC 仍沒結果（取消指令已送出）時給模型看的結果文字
+
+        ★ 2026-10-09（審查）：跟 _nav_failure_text 的「取消／已被停止」同一種寫法，標「（不可重試）」。
+          以前逾時直接落到工具的 except，變成「執行結果: 失敗, 詳細信息: 導航超過 200 秒未完成…」，
+          跟一般失敗長得一樣；提示詞叫模型失敗先自動重試，它就再叫一次導航，新目標重新計一輪逾時，
+          路被擋住的話等於讓車子再原地等一輪。兩份提示詞「被停止或取消時絕對不可重試」那條已列入「逾時」。
+        只給 _wait_for_action_result 丟出的逾時用（車子已經出發）；送出目標那一步的 5 秒等待逾時
+        （車根本沒動）仍是一般失敗。
+        """
+        return f"執行結果: 逾時（不可重試）, 詳細信息: {msg}"
+
     def _init_modern_llm_tools(self) -> None:
         """定義工具對照表"""
 
@@ -721,7 +734,14 @@ class LLMServiceNode(Node):
                     return f"執行結果: 失敗, 詳細信息: 導航請求未被接受"
 
                 # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
-                action_result = self._wait_for_action_result(goal_handle, 200.0, "導航")
+                # ★ 2026-10-09（審查）：上限改用共用常數 NAVIGATE_WAIT_SEC（340 秒，見 llm_utils.py）——
+                #   原本的 200 秒比節點自己的 300 秒總逾時還短，LLM 會搶在節點之前宣告失敗再重試。
+                #   等到上限仍沒結果 → 回「逾時（不可重試）」，不落到下面的 except 變成一般「失敗」。
+                #   try 只包這一行：送出目標那一步的 5 秒等待逾時（車根本沒動）照舊是一般失敗。
+                try:
+                    action_result = self._wait_for_action_result(goal_handle, NAVIGATE_WAIT_SEC, "導航")
+                except TimeoutError as exc:
+                    return self._nav_timeout_text(str(exc))
 
                 if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                     return f"執行結果: 成功, 詳細信息: {action_result.result.message}"

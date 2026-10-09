@@ -8,6 +8,15 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+# ★ 2026-10-09（2026-10-08 審查）：LLM 工具（navigate_tool、帶位工具）等 Navigate 結果的上限，秒。
+#   原本兩處各寫死 200 秒，比 navigation_action_cc 自己的總逾時 navigation_timeout_sec（300）和
+#   等通道 blocked_patience_sec（180）都短：車子被擋住、在原地等人走開時，LLM 會搶在節點之前
+#   把這趟當成失敗並取消目標，而提示詞叫它失敗先自動重試，於是又導航一次。
+#   必須**大於**節點的 300 秒，節點自己的放棄訊息才會先到 LLM。
+#   與 HMI 的 smartnav_hmi/core/constants.py ACTION_TIMEOUTS["navigate"] 同值（兩邊互相指著，
+#   改一邊要同步改另一邊）；節點的 navigation_timeout_sec 若調高，這個值也要跟著調高。
+NAVIGATE_WAIT_SEC = 340.0
+
 
 def get_default_logger(module_name: str) -> logging.Logger:
     """取得預設日誌記錄器

@@ -17,7 +17,7 @@ from smartnav_msgs.srv import ListWaypoints
 from smartnav_msgs.action import Navigate
 from action_msgs.msg import GoalStatus
 
-from smartnav_llm.llm_utils import get_config_path
+from smartnav_llm.llm_utils import get_config_path, NAVIGATE_WAIT_SEC
 
 
 def make_bank_tools(node) -> dict:
@@ -63,7 +63,14 @@ def make_bank_tools(node) -> dict:
 
             # ★ 2026-08-26：逾時要主動取消 goal，否則嘴上說失敗、車還在走。
             #   見 llm_service_node._wait_for_action_result 的長註解。
-            action_result = node._wait_for_action_result(goal_handle, 200.0, "帶位")
+            # ★ 2026-10-09（審查）：上限改用共用常數 NAVIGATE_WAIT_SEC（340 秒，見 llm_utils.py，與導航工具同值）——
+            #   原本的 200 秒比節點自己的 300 秒總逾時還短，LLM 會搶在節點之前宣告失敗再重試。
+            #   等到上限仍沒結果 → 回「逾時（不可重試）」，不落到下面的 except 變成一般「失敗」。
+            #   try 只包這一行：送出目標那一步的 5 秒等待逾時（車根本沒動）照舊是一般失敗。
+            try:
+                action_result = node._wait_for_action_result(goal_handle, NAVIGATE_WAIT_SEC, "帶位")
+            except TimeoutError as exc:
+                return node._nav_timeout_text(str(exc))
             if action_result.status == GoalStatus.STATUS_SUCCEEDED:
                 return f"執行結果: 成功, 詳細信息: 已將貴賓帶到{room_name}"
             return node._nav_failure_text(action_result)

@@ -365,6 +365,11 @@ class HmiServerNode(Node):
         self.speech_text_pub = self.create_publisher(String, "speech_text", 10)
         # 通知 LLM 一併清掉對話記憶，避免畫面清空了模型卻還記得上一位客戶
         self.clear_conversation_pub = self.create_publisher(Empty, "clear_conversation", 10)
+        # ★ 2026-10-09（審查）：緊急停止用來中止進行中的 /unwedge 脫困服務（api_estop 發布）。
+        #   脫困是 service、自己直發 cmd_vel，零速與取消 action 都碰不到它，不發這一則的話
+        #   按了急停車子還會再推最久約 40 秒。訂閱者是 path_teach_cc_node（navigation_action、
+        #   map_service 取消時也發同一個話題）；Empty、相對名稱、depth 10 是三邊共用的合約。
+        self.unwedge_abort_pub = self.create_publisher(Empty, "unwedge_abort", 10)
 
         # ── 遙控建圖 ──────────────────────────────────────
         #

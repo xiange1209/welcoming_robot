@@ -7,6 +7,7 @@ teleop.py 四個檔案，搬過來合成一個 modules/navigation/ 業務模組�
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from std_msgs.msg import Empty
 
 from ...core.schemas.common import RearMaskRequest, TeleopRequest
 from . import maps as maps_routes
@@ -51,7 +52,9 @@ def build_router(node, admin_only) -> APIRouter:
         而那期間車子還在開。展示時評審站在旁邊，這個延遲不能接受。
 
         這裡一次處理三個來源，而且**順序有意義**：
-          1. 先送零速（遙控中最快讓輪子停下，不必等任何服務回應）
+          1. 先送零速（遙控中最快讓輪子停下，不必等任何服務回應），同時發 unwedge_abort
+             中止進行中的 /unwedge 脫困（★ 10/09：脫困是 service、自己直發 cmd_vel，
+             下面第 2、3 步都碰不到它，不發的話按了急停車子還會再推最久約 40 秒）
           2. 對 nav2 本體與各動作送「取消全部」（★ 9/25 移到第 2 步：nav2 驅動中零速會被
              controller 下一拍蓋掉，真正讓車停的是這一步）
           3. 再取消登記簿裡的作業（導航、建圖、教導路徑重播），並回報
@@ -60,6 +63,13 @@ def build_router(node, admin_only) -> APIRouter:
           nav2 在跑時它以 10~20 Hz 發指令，零速一拍就被蓋掉，所以第 2 步不能省。
         """
         node.teleop.apply(0.0, 0.0)
+
+        # ★ 2026-10-09（審查）：叫 path_teach 中止進行中的 /unwedge 脫困（話題合約見 hmi_server_node）。
+        #   發布失敗不能讓後面的取消跟著中斷：急停的其餘步驟照做，只記錯誤日誌。
+        try:
+            node.unwedge_abort_pub.publish(Empty())
+        except Exception as exc:  # noqa: BLE001
+            node.get_logger().error(f"緊急停止：unwedge_abort 發布失敗，進行中的脫困（/unwedge）不會被中止: {exc}")
 
         # ★ 登記簿之外的目標也要停（語音發起的導航、自動探索的 nav2 目標就在這裡）
         broadcast = node.jobs.cancel_all_action_goals()

@@ -82,6 +82,10 @@ from smartnav_navigation_cc.lifecycle_helper_cc import (
     wait_for_future,
 )
 
+# path_teach /unwedge 判定「四周都有裕度，不需要脫困」時回傳訊息的開頭（沒做任何動作）。
+# ★ 與 path_teach_cc_node.py 的 _unwedge_run 同一個字串（改那邊要一起改這裡）。
+UNWEDGE_NOOP_PREFIX = "四周都有裕度"
+
 MODE_UNKNOWN = "unknown"
 MODE_MAPPING = "mapping"
 MODE_LOCALIZATION = "localization"
@@ -150,7 +154,10 @@ class MapServiceCcNode(Node):
         #   車身旁邊空曠時不觸發：那是前沿全部抑制後的正常待機。tight_m 0.25 ≈ nav2 內切半徑 0.205＋餘裕。
         self.declare_parameter("exploration_unwedge_enabled", True)
         self.declare_parameter("exploration_unwedge_idle_sec", 20.0)
-        self.declare_parameter("exploration_unwedge_tight_m", 0.25)
+        # ★ 2026-10-09（審查 [13]）：0.25 -> 0.20，與 path_teach /unwedge 的「不需要脫困」門檻
+        #   （UNWEDGE_TARGET_M／UNWEDGE_END_TARGET_M＝0.20）對齊。0.20~0.25 m 這一帶 map_service 判「很擠」、
+        #   /unwedge 卻判「四周都有裕度」什麼都不做，白白消耗脫困額度（見 _maybe_unwedge 的退額度）。
+        self.declare_parameter("exploration_unwedge_tight_m", 0.20)
         self.declare_parameter("exploration_unwedge_cooldown_sec", 30.0)
         self.declare_parameter("exploration_unwedge_max", 6)
         # 量「擠不擠」時要排除的車體自身回波（鋁擠條）：跟 path_teach 同一份，nav_bringup_cc 傳入
@@ -388,9 +395,20 @@ class MapServiceCcNode(Node):
         self._laser_x = float(p("laser_x_offset_m").value)
         self._last_scan_mono = 0.0
         self._motion_anchor = None     # (x, y, monotonic)：最後一次「真的移動了」的位置與時間
+        # ★ 2026-10-09（審查 [12]）：「車身旁很擠」自己的計時。原本脫困的 idle 只從 _motion_anchor
+        #   （最後一次移動）起算，車身旁空曠時直接 return、錨點的時間卻一直累積 ——
+        #   一台閒置 60 秒的車，人只要在任何一刻走到 25 cm 內，下一個 0.5 秒迴圈就觸發
+        #   「繞過防撞」的脫困，而這裡分不出擠住的是牆還是人。現在要「擠」本身連續成立 idle 秒才觸發。
+        self._tight_since = None       # 這一段「擠」的起算時間（None = 現在沒有在擠）
+        self._tight_last_seen = 0.0    # 最近一次看到「擠」的時間（容忍 2 秒內的掃描抖動）
         self._unwedge_last = 0.0
         self._unwedge_count = 0
         self.unwedge_client = self.create_client(Trigger, "/unwedge", callback_group=self.client_cb_group)
+        # ★ 2026-10-09（審查）：/unwedge 是 path_teach 的同步服務、旁路直發 cmd_vel、自己沒有取消檢查。
+        #   建圖被取消（急停／使用者取消）時，等服務結果的期間要能叫它停：對 unwedge_abort 發一則 Empty
+        #   （話題合約：Empty、相對名稱、depth 10；訂閱者是 path_teach_cc）。
+        self.unwedge_abort_pub = self.create_publisher(Empty, "unwedge_abort", 10)
+        self._unwedge_goal = None      # create_map 的 goal_handle（_wait_for_mapping_done 設定），偵測取消用
         self.mute_client = self.create_client(SetBool, "/mute_nav_cmd", callback_group=self.client_cb_group)
 
         self._load_maps_db()
@@ -942,6 +960,7 @@ class MapServiceCcNode(Node):
         if deadline is None:
             deadline = time.monotonic() + self.exploration_timeout_sec
         epoch = self._exploration_epoch
+        self._unwedge_goal = goal_handle      # ★ 脫困等服務期間要看它的取消旗標（見 _run_unwedge）
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -999,6 +1018,9 @@ class MapServiceCcNode(Node):
         self._unwedge_count = 0
         self._unwedge_last = 0.0
         self._motion_anchor = None
+        self._tight_since = None
+        self._tight_last_seen = 0.0
+        self._unwedge_goal = None
 
         if not self.use_exploration:
             self.get_logger().info("未啟用自動探索，請用遙控把環境走一遍，完成後呼叫 /finish_map")
@@ -1351,23 +1373,40 @@ class MapServiceCcNode(Node):
         anchor = self._motion_anchor
         if anchor is None or math.hypot(pose[0] - anchor[0], pose[1] - anchor[1]) > 0.10:
             self._motion_anchor = (pose[0], pose[1], now)
+            self._tight_since = None        # 車子動了：「擠」的計時也歸零
             return
-        idle = now - anchor[2]
+        # ★ 2026-10-09（審查 [12]）：先判斷「擠」，再算閒置多久 —— 順序顛倒的話，閒置很久的車
+        #   一遇到人走近就立刻脫困（而脫困會繞過防撞）。
+        gap = self._body_gap()
+        if gap is None or gap >= self.exploration_unwedge_tight_m:
+            # 車身旁邊空曠（前沿全部抑制後的正常待機，不是卡住）或掃描過期。
+            # 容忍 2 秒內的抖動（gap 在門檻附近來回）；空曠超過 2 秒才把「擠」的計時清掉。
+            if self._tight_since is not None and now - self._tight_last_seen > 2.0:
+                self._tight_since = None
+            return
+        self._tight_last_seen = now
+        if self._tight_since is None:
+            self._tight_since = now
+        idle = min(now - anchor[2], now - self._tight_since)
         if idle < self.exploration_unwedge_idle_sec:
             return
         if now - self._unwedge_last < self.exploration_unwedge_cooldown_sec:
             return
         if 0 < self.exploration_unwedge_max <= self._unwedge_count:
             return
-        gap = self._body_gap()
-        if gap is None or gap >= self.exploration_unwedge_tight_m:
-            return          # 車身旁邊空曠：前沿全部抑制後的正常待機，不是卡住
         self._unwedge_count += 1
         self._unwedge_last = now
         self.get_logger().warning(
             f"探索中脫困第 {self._unwedge_count} 次：已 {idle:.0f} 秒沒移動、車身 {gap * 100:.0f} cm 內有障礙"
             f"（約在 ({pose[0]:.2f}, {pose[1]:.2f})）—— 靜音 nav2、呼叫 /unwedge")
-        self._run_unwedge()
+        outcome = self._run_unwedge()
+        # ★ 2026-10-09（審查 [13]）：/unwedge 回「四周都有裕度…不需要脫困」＝什麼動作都沒做，
+        #   不該吃掉脫困額度（6 次用完之後真正楔住時就沒有額度了）。冷卻計時照舊保留，
+        #   免得每 0.5 秒重複靜音、呼叫。服務沒回應（None）或真的有動作／失敗，照舊扣額度。
+        if (outcome is not None and outcome[0]
+                and str(outcome[1]).startswith(UNWEDGE_NOOP_PREFIX) and self._unwedge_count > 0):
+            self._unwedge_count -= 1
+            self.get_logger().info(f"/unwedge 判定不需要脫困，不扣脫困額度（已用 {self._unwedge_count} 次）")
         self._motion_anchor = None      # 重新起算
 
     def _set_nav_mute(self, on: bool) -> bool:
@@ -1383,8 +1422,8 @@ class MapServiceCcNode(Node):
             self.get_logger().warn(f"{'靜音' if on else '解除靜音'}失敗: {exc}")
             return False
 
-    def _run_unwedge(self) -> None:
-        """靜音 nav2 → /unwedge → 解除靜音。
+    def _run_unwedge(self):
+        """靜音 nav2 → /unwedge → 解除靜音。回傳 (ok, 訊息)；沒有真的呼叫（服務不在／靜音失敗）回 (False, "")。
 
         不停 explorer：它的 STOP/START 會清掉抑制記憶（reset_exploration_runtime_state），
         脫困完又選回剛剛到不了的點。也不從這裡取消 nav2 目標：外部取消 explorer 不記失敗。
@@ -1392,13 +1431,35 @@ class MapServiceCcNode(Node):
         """
         if not self.unwedge_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn("/unwedge 服務不在（path_teach 沒起來？），這次無法自己脫困")
-            return
+            return False, ""
         if not self._set_nav_mute(True):
             # 靜音失敗就不脫困：兩個發布者搶 cmd_vel 比卡住更糟
             self.get_logger().warn("靜音失敗，放棄這次脫困（避免脫困動作跟 nav2 搶指令）")
-            return
+            return False, ""
+        # ★ 2026-10-09（獨立審查）：原本是一次阻塞 40 秒的 wait_for_future，期間不看取消；
+        #   而 /unwedge 繞過 collision_monitor，建圖被取消（急停）時它還會再推最久約 37 秒。
+        #   改成每 0.2 秒一小段，每段之後看 create_map 的 goal_handle（self._unwedge_goal）：
+        #   取消 → 對 unwedge_abort 發一則 Empty（只發一次），繼續等服務自己收尾，照常回傳它的結果。
+        #   40 秒總期限不變；沒有 goal_handle（None）就退化成不偵測取消。靜音一定在 finally 解除。
+        t0 = time.monotonic()
+        gh = getattr(self, "_unwedge_goal", None)
+        sent_abort = False
         try:
-            res = wait_for_future(self.unwedge_client.call_async(Trigger.Request()), timeout_sec=40.0)
+            fut = self.unwedge_client.call_async(Trigger.Request())
+            res = None
+            while True:
+                try:
+                    res = wait_for_future(fut, timeout_sec=0.2)
+                    break
+                except TimeoutError:
+                    pass
+                if gh is not None and not sent_abort and gh.is_cancel_requested:
+                    sent_abort = True
+                    self.unwedge_abort_pub.publish(Empty())
+                    self.get_logger().warning(
+                        "建圖被取消，通知 path_teach 中止進行中的 /unwedge 脫困（unwedge_abort）")
+                if time.monotonic() - t0 >= 40.0:
+                    raise TimeoutError("等了 40 秒仍沒有回應")
             ok, msg = bool(res.success), str(res.message)
         except Exception as exc:  # noqa: BLE001
             ok, msg = False, f"呼叫失敗：{exc}"
@@ -1414,6 +1475,7 @@ class MapServiceCcNode(Node):
             self.get_logger().info(f"/unwedge 完成：{msg}")
         else:
             self.get_logger().warning(f"/unwedge 沒有成功：{msg}")
+        return ok, msg
 
     def _exploration_complete_callback(self, _msg: Empty) -> None:
         """frontier_explorer 的完成事件

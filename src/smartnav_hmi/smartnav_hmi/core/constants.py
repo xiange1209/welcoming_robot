@@ -85,5 +85,9 @@ ACTION_TIMEOUTS = {
     #   以後改 exploration_timeout_sec 要同步改這裡。
     "create_map": 1920.0,
     "global_localization": 260.0,  # 節點內建 200 秒
+    # ★ 2026-10-09：LLM 端等導航／帶位結果的上限是 smartnav_llm/llm_utils.py 的 NAVIGATE_WAIT_SEC，
+    #   與這個值同為 340 秒 —— 兩邊都必須大於節點的 navigation_timeout_sec（300）。
+    #   LLM 端原本寫死 200 秒，比節點還短，會先宣告失敗再重試（2026-10-08 審查）。
+    #   改這個值要同步改 NAVIGATE_WAIT_SEC。
     "navigate": 340.0,  # 節點內建 300 秒（navigation_timeout_sec）
 }

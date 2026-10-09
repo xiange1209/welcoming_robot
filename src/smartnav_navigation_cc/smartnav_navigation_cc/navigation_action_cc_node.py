@@ -36,7 +36,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Quaternion
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import ClearEntireCostmap
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Empty, String
 from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
 
@@ -50,6 +50,11 @@ EXTERNAL_STOP_MSG = "導航被外部停止（緊急停止或卡住偵測），�
 # path_teach 重播被「地圖上沒有的障礙」擋住而交回時，失敗訊息的開頭。
 # ★ 與 path_teach_cc_node.py 的 NEW_OBSTACLE_TAG 同一個字串（改那邊要一起改這裡）
 NEW_OBSTACLE_TAG = "[新障礙]"
+# 呼叫 /unwedge 之前，離導航總期限至少要剩這麼多秒。
+# ★ 2026-10-09（獨立審查）：/unwedge 最久約 37 秒（最多 8 段 × (0.12 m ÷ 0.10 m/s + 3 秒逾時) ＋ 每段 0.3 秒等雷射），
+#   而且不可中途收手（只能靠 unwedge_abort 叫它停）。剩不到這麼多時間還去推車，只會把總時間推過
+#   LLM／HMI 等結果的上限（340 秒），車子在使用者以為已經結束之後還在動。
+UNWEDGE_MIN_REMAINING_S = 45.0
 
 
 def wait_for_future(future, timeout_sec: float) -> Any:
@@ -213,6 +218,15 @@ class NavigationActionCcNode(Node):
         self.unwedge_client = self.create_client(
             Trigger, "/unwedge", callback_group=self.client_cb_group
         )
+        # ★ 2026-10-09（獨立審查）：/unwedge 是 path_teach 的同步服務，旁路直發 cmd_vel、
+        #   自己沒有任何取消檢查（最久約 40 秒）。急停或取消 action 碰不到它，
+        #   所以等服務結果的期間偵測到取消，就對 unwedge_abort 發一則 Empty
+        #   （話題合約：Empty、相對名稱、depth 10；訂閱者是 path_teach_cc，HMI 急停與
+        #   map_service 取消時也發同一個話題）。
+        self.unwedge_abort_pub = self.create_publisher(Empty, "unwedge_abort", 10)
+        self._unwedge_goal = None        # 目前這次 /unwedge 呼叫所屬的 goal_handle（偵測取消用）
+        self._announce_start = True      # 這一次起跑要不要播「開始導航到 X」（見 _try_taught_path）
+        self._last_plan_fail_msg = ""    # 最近一次規劃失敗的原因（_wait_for_passage 用來認「起點被占用」）
         # 導航前清全域成本地圖的 obstacle 層（見參數宣告處的說明）
         self.clear_costmap_client = self.create_client(
             ClearEntireCostmap,
@@ -522,7 +536,17 @@ class NavigationActionCcNode(Node):
                         goal_handle, result,
                         f"導航失敗：通道被擋住超過 {self.blocked_patience_sec:.0f} 秒仍未淨空"
                         f"（{last_why}）")
+                # ★ 2026-10-09（獨立審查 [8]）：通道淨空 = 這一處的擋路結束，等待計時歸零。
+                #   原本只在「換了地方（離上次被擋處 > 0.5 m）」才重算，通道通了之後車子只前進一小段、
+                #   在同處附近又被擋，會直接繼承先前已等的時間（例如已等 175 秒、這次只擋了 8 秒就判
+                #   「同一處被擋住超過 180 秒」放棄）。總逾時（navigation_timeout_sec）仍然有效，不會無限等。
+                blocked_since = None
+                blocked_xy = None
             if plan is None:
+                # ★ 2026-10-09（審查 [6]）：規劃服務最長會阻塞 30 秒（含清成本地圖後的 2 秒等待），
+                #   這段期間按急停，回來之後要先看取消再決定要不要推車、要不要退回 nav2/MPPI。
+                if goal_handle.is_cancel_requested:
+                    return self._canceled(goal_handle, result)
                 # ★★ 2026-08-17：規劃不出來時先試著把車子推開再規劃一次 ★★
                 #
                 # 8/17 實測到的死結：車子跑完一趟停在牆邊，車體壓在成本地圖的
@@ -533,8 +557,14 @@ class NavigationActionCcNode(Node):
                 #
                 # `/unwedge` 繞過規劃器直接打舵推開，是唯一有效的一條路。
                 # ★ 只試一次：推不開就是真的推不開，多試只是拖時間又耗電。
+                self._unwedge_goal = goal_handle
                 if self._call_unwedge():
+                    # 脫困（最久約 37 秒）期間才按急停：不再規劃、不再起跑
+                    if goal_handle.is_cancel_requested:
+                        return self._canceled(goal_handle, result)
                     plan = self._plan_taught_once(waypoint_name, target_pose)
+                elif goal_handle.is_cancel_requested:
+                    return self._canceled(goal_handle, result)
             if plan is None:
                 if runs == 0:
                     # 一次都沒跑過 -> 車子還在原地，讓 MPPI 有機會試
@@ -544,6 +574,12 @@ class NavigationActionCcNode(Node):
                     f"導航失敗：重新規劃不出路徑（前次失敗：{last_why}）")
 
             runs += 1
+            # ★ 2026-10-09（審查 [9]）：「開始導航到 X」只在第一次起跑與一般重試時播報。
+            #   被新障礙擋住後重新起跑，一輪只有 10~12 秒，耐心（180 秒）內可以重複十幾次，
+            #   平板每輪都重複播同一句。用屬性傳遞而不是參數：_follow_taught_once 的簽名不變。
+            #   （/navigation_active 的 True／False 發布時機刻意不動：整個迴圈維持 True 的話，
+            #   任何一個漏掉的 return 出口都會讓相機再也不恢復。）
+            self._announce_start = (runs == 1 or not last_dyn)
             outcome, res, path_id = self._follow_taught_once(
                 goal_handle, plan, waypoint_name, deadline)
 
@@ -570,16 +606,24 @@ class NavigationActionCcNode(Node):
 
             # ── 失敗 ──
             last_why = getattr(res.result, "message", "未知") if res is not None else "無回應"
-            self.get_logger().error(
-                f"教導-重現第 {runs} 次失敗：{last_why}"
-                f"　★ 臨時路徑 {path_id} 已保留供查驗")
+            last_dyn = last_why.startswith(NEW_OBSTACLE_TAG)
+            # ★ 2026-10-09（審查 [10]）：「[新障礙]」不算重試，擋路期間一輪約 10~12 秒，
+            #   180~300 秒內可以有十幾二十輪；每輪都留一條 _auto_* 臨時路徑，路徑資料庫
+            #   （每次都整份重寫的 JSON）就隨輪數線性長大。成功的路徑本來就刪；一般失敗最多 3 條，
+            #   照舊保留供查驗；[新障礙] 失敗只在「還要繼續等／繞」時刪（見下方），
+            #   **最後放棄的那一次留著**。
+            if last_dyn:
+                self.get_logger().error(f"教導-重現第 {runs} 次失敗：{last_why}")
+            else:
+                self.get_logger().error(
+                    f"教導-重現第 {runs} 次失敗：{last_why}"
+                    f"　★ 臨時路徑 {path_id} 已保留供查驗")
             # ★ 2026-09-25：失敗之後、決定重試或放棄之前先看取消。舊版只在下一輪開頭檢查，
             #   最後一輪與「原地失敗兩次」這兩個出口會漏掉，把使用者的取消回報成失敗
             if goal_handle.is_cancel_requested:
                 return self._canceled(goal_handle, result)
 
             now_xy = self._robot_xy()
-            last_dyn = last_why.startswith(NEW_OBSTACLE_TAG)
             if last_dyn:
                 # 被新障礙擋住：不算重試、不算原地失敗。換了地方（離上次被擋處 > 0.5 m）
                 # 就是新的一處擋路，等待耐心重新起算。
@@ -591,6 +635,7 @@ class NavigationActionCcNode(Node):
                     return self._abort(
                         goal_handle, result,
                         f"導航失敗：同一處被擋住超過 {self.blocked_patience_sec:.0f} 秒（{last_why}）")
+                self._delete_taught(path_id)
                 prev_xy = now_xy
                 continue
 
@@ -599,8 +644,23 @@ class NavigationActionCcNode(Node):
             #   模擬 DYN_BASE：停在桌角下 4 cm，之後兩個目標各失敗一次都卡在同一處。
             #   先請 /unwedge 拉開（車頭／車尾貼著就直線拉開，側面貼著就打舵推開）。
             if "車身外緣持續不足" in last_why:
-                self._call_unwedge()
-                now_xy = self._robot_xy()
+                # ★ 2026-10-09（審查 [6]）：推車之前的三道守門 ——
+                #   (1) 還有下一次重試可用（已是最後一次就推了也用不上，下一圈開頭就放棄）
+                #   (2) 離總期限還有 UNWEDGE_MIN_REMAINING_S 秒（/unwedge 最久約 37 秒）
+                #   (3) 沒有被取消（它繞過防撞、只能靠 unwedge_abort 中止，取消了就別再推）
+                if (attempt < self.max_replan_attempts
+                        and time.monotonic() < deadline - UNWEDGE_MIN_REMAINING_S
+                        and not goal_handle.is_cancel_requested):
+                    self._unwedge_goal = goal_handle
+                    self._call_unwedge()
+                    # 脫困期間才按急停：回報取消，不要把它算成「原地失敗」
+                    if goal_handle.is_cancel_requested:
+                        return self._canceled(goal_handle, result)
+                    now_xy = self._robot_xy()
+                else:
+                    self.get_logger().info(
+                        "車身外緣持續不足，但不請 /unwedge 推車（已是最後一次重試、離總期限不到 "
+                        f"{UNWEDGE_MIN_REMAINING_S:.0f} 秒、或已被取消）")
 
             # 「有沒有移動」決定值不值得再試。卡在同一個地方時，重新規劃
             # 拿到的會是幾乎一樣的路徑與一樣的結果 —— 那是浪費電量與時間。
@@ -636,6 +696,9 @@ class NavigationActionCcNode(Node):
             f"通道被擋住、也繞不過去 —— 原地等它淨空（每 {self.blocked_poll_sec:.0f} 秒"
             f"重新規劃一次，同一處最多等 {self.blocked_patience_sec:.0f} 秒）")
         polls = 0
+        fails_in_row = 0
+        tried_unwedge = False        # ★ 每次進入等通道最多脫困一次（區域旗標：下一次被擋可以再試一次）
+        noted_occupied = False
         while True:
             next_t = time.monotonic() + self.blocked_poll_sec
             while time.monotonic() < next_t:
@@ -650,15 +713,50 @@ class NavigationActionCcNode(Node):
             polls += 1
             plan = self._plan_taught_once(waypoint_name, target_pose, quiet=True)
             if plan is not None:
-                self.get_logger().info(
-                    f"✓ 通道淨空了（擋了 {time.monotonic() - start:.0f} 秒、重新規劃 {polls} 次）"
-                    f"—— 繼續前進")
-                self.speech_text_pub.publish(String(data=self.blocked_speech_resume))
-                return plan, "ok"
+                return self._passage_cleared(goal_handle, plan, start, polls)
+            fails_in_row += 1
+            # ★ 2026-10-09（審查 [7]）：車子停在障礙前 10~15 cm（collision_monitor 把車煞在那裡）時，
+            #   規劃器多半回「Start occupied」—— 起點落在成本地圖的膨脹區裡，規劃器不肯出手。
+            #   這時再等多久都一樣（模擬 E4 的 log 就是這樣），而障礙旁邊其實有繞行空間。
+            #   所以連續兩輪（約 8 秒；先給擋路的人走開的時間窗）規劃失敗，請 /unwedge 往空的那頭
+            #   拉開一次、拉開了立刻再規劃。/unwedge 自己有保護：四周有裕度就不動、只走直線、
+            #   行進方向要有 0.47 m 淨空、6 cm 車身外緣硬停；而且可以被 unwedge_abort 中止。
+            msg_l = (getattr(self, "_last_plan_fail_msg", "") or "").lower()
+            if (not noted_occupied) and "occupied" in msg_l:
+                noted_occupied = True
+                self.get_logger().warn(
+                    "規劃回「起點被占用」：車子停在障礙前面（防撞煞住的位置），起點落在成本地圖的膨脹區裡，"
+                    "規劃器不肯出手 —— 不是通道真的被堵死。等人走開的時間窗過後，會先請 /unwedge 拉開再規劃")
+            if (fails_in_row >= 2 and not tried_unwedge
+                    and deadline - time.monotonic() >= UNWEDGE_MIN_REMAINING_S
+                    and not goal_handle.is_cancel_requested):
+                tried_unwedge = True
+                self._unwedge_goal = goal_handle
+                moved = self._call_unwedge()
+                if goal_handle.is_cancel_requested:
+                    return None, "cancel"
+                if moved:
+                    plan = self._plan_taught_once(waypoint_name, target_pose, quiet=True)
+                    if plan is not None:
+                        return self._passage_cleared(goal_handle, plan, start, polls)
             if polls % 5 == 0:
                 self.get_logger().info(
                     f"通道仍被擋住（已等 {time.monotonic() - start:.0f}/"
                     f"{self.blocked_patience_sec:.0f} 秒）")
+
+    def _passage_cleared(self, goal_handle, plan, start, polls):
+        """等通道時規劃得出路徑了 -> (plan, "ok")；但規劃的當下已被取消就不要起跑。
+
+        ★ 2026-10-09（審查 [5]）：規劃最長會阻塞 30 秒（不可取消），急停恰好落在這段時，
+          以前會對旁邊的人說「路通了，繼續前進」然後起跑。
+        """
+        if goal_handle.is_cancel_requested:
+            return None, "cancel"
+        self.get_logger().info(
+            f"✓ 通道淨空了（擋了 {time.monotonic() - start:.0f} 秒、重新規劃 {polls} 次）"
+            f"—— 繼續前進")
+        self.speech_text_pub.publish(String(data=self.blocked_speech_resume))
+        return plan, "ok"
 
     # ── 重試迴圈用的小工具 ────────────────────────────────────
     def _plan_taught_once(self, waypoint_name, target_pose, quiet=False):
@@ -677,10 +775,12 @@ class NavigationActionCcNode(Node):
                 self.plan_taught_client.call_async(req), timeout_sec=self.taught_plan_timeout
             )
         except Exception as exc:  # noqa: BLE001
+            self._last_plan_fail_msg = str(exc)
             self.get_logger().warn(f"規劃教導路徑失敗: {exc}")
             return None
         if plan is None or not plan.success:
             msg = plan.message if plan is not None else "無回應"
+            self._last_plan_fail_msg = msg      # 給 _wait_for_passage 認「Start occupied」用
             # ★ 2026-10-08：兩行各自固定等級（理由見 map_service 的 _run_unwedge：
             #   rclpy 同一個呼叫位置換等級會丟 ValueError，會把整個導航重試迴圈炸掉）
             if quiet:
@@ -689,6 +789,7 @@ class NavigationActionCcNode(Node):
                 self.get_logger().warn(f"規劃教導路徑不成功: {msg}")
             return None
 
+        self._last_plan_fail_msg = ""
         # 折返點數是這條路好不好走的最強預測指標：
         # 2026-08-10 十趟實測「0 折返 6 勝（誤差 11~12 cm）／多折返 5 敗」。
         # 不因為有折返就放棄（它仍然比 MPPI 好），但要讓 log 說得出來。
@@ -702,6 +803,12 @@ class NavigationActionCcNode(Node):
 
         outcome：success / fail / cancel / timeout / reject
         """
+        # ★ 2026-10-09（獨立審查 [5]）：起跑前先看取消。規劃（最長 30 秒、不可取消）、
+        #   等通道的規劃、脫困之後的重新規劃，三個出口都會走到這裡；急停恰好落在那段時，
+        #   以前車子會先動一下才在 _wait_taught_result 的第一圈看到取消。
+        #   送出重播請求之前就返回：不送 goal、不說「開始導航」、不動 /navigation_active。
+        if goal_handle.is_cancel_requested:
+            return "cancel", None, plan.path_id
         follow = FollowTaughtPath.Goal()
         follow.path_id = plan.path_id
         follow.reverse = False
@@ -716,7 +823,8 @@ class NavigationActionCcNode(Node):
             self.get_logger().warn("重播請求被拒絕")
             return "reject", None, plan.path_id
 
-        self.speech_text_pub.publish(String(data=f"開始導航到 {waypoint_name}"))
+        if getattr(self, "_announce_start", True):
+            self.speech_text_pub.publish(String(data=f"開始導航到 {waypoint_name}"))
         self.get_logger().info(f"開始導航到 {waypoint_name}（純追蹤執行）")
         self.nav_active_pub.publish(Bool(data=True))
         try:
@@ -757,12 +865,33 @@ class NavigationActionCcNode(Node):
         if not self.unwedge_client.service_is_ready():
             self.get_logger().warn("規劃失敗，但 /unwedge 服務不在，無法自救")
             return False
-        try:
-            res = wait_for_future(
-                self.unwedge_client.call_async(Trigger.Request()), timeout_sec=60.0)
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f"呼叫 /unwedge 失敗: {exc}")
-            return False
+        # ★ 2026-10-09（獨立審查 [6]）：原本是一次阻塞 60 秒的 wait_for_future，期間完全不看取消，
+        #   而 /unwedge 繞過 collision_monitor、最久約 37 秒，HMI 的急停（零速＋取消 action）碰不到它。
+        #   改成每 0.2 秒一小段、每段後看一次 self._unwedge_goal（呼叫端設定）的取消旗標：
+        #   取消 → 對 unwedge_abort 發一則 Empty（只發一次，path_teach 的脫困迴圈每 50 ms 檢查），
+        #   然後繼續等服務自己收尾（它收到中止會很快回來，並把 cmd_vel 歸零），最後照常回傳服務的結果；
+        #   由呼叫端看到取消旗標走取消流程。60 秒總期限不變。_unwedge_goal 是 None 時退化成不偵測取消。
+        t0 = time.monotonic()
+        gh = getattr(self, "_unwedge_goal", None)
+        sent_abort = False
+        fut = self.unwedge_client.call_async(Trigger.Request())
+        res = None
+        while True:
+            try:
+                res = wait_for_future(fut, timeout_sec=0.2)
+                break
+            except TimeoutError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"呼叫 /unwedge 失敗: {exc}")
+                return False
+            if gh is not None and not sent_abort and gh.is_cancel_requested:
+                sent_abort = True
+                self.unwedge_abort_pub.publish(Empty())
+                self.get_logger().warn("導航被取消，通知 path_teach 中止進行中的 /unwedge 脫困（unwedge_abort）")
+            if time.monotonic() - t0 >= 60.0:
+                self.get_logger().warn("呼叫 /unwedge 失敗: 等了 60 秒仍沒有回應")
+                return False
         if res is None:
             self.get_logger().warn("/unwedge 沒有回應")
             return False
