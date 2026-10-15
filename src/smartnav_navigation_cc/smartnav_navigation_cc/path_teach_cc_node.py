@@ -634,6 +634,18 @@ class PathTeachNode(Node):
         # 但三次前後退太少」。窄轉角的三點轉向本來就要來回好幾趟才轉得夠，
         # 每次只轉 20 度，要轉過 60~90 度的彎需要 4~6 次。
         self.declare_parameter("max_escapes", 10)
+        # ★★ 2026-10-15（T2：G5 回程逾時）：同一處反覆「判定卡住→脫困→又回到原處」就交回導航層 ★★
+        #
+        # 模擬獨立試驗矩陣（evidence/matrix/）：G5 在走廊盡頭掉頭，脫困成功（轉 35 度、移 0.6 m）
+        # 但路徑追蹤又在**同一個路徑索引**（6~12）卡住，每輪約 28 秒，一輪接一輪直到 240 秒逾時
+        # （HEAD／R120／R105 共 9 趟中 7 趟卡了 3 輪以上；6 趟成功的裡有 4 趟是靠「第一次重播失敗 -> 重新規劃出另一條路」才通。
+        #   詳見 docs/cloud/reports/T2_g5_regression.md；N 很小，這是假設不是定論）。
+        # `_escape_stalled` 管的是「脫困本身零進展」，這裡管的是「脫困有進展、路徑沒進展」，兩者不同。
+        # 同一處（索引相差 <= stall_site_idx_tol）累計第 N 次判定卡住時不再脫困，放棄這條路徑，
+        # 由導航層清成本地圖後重新規劃（照一般失敗計一次重試）。0 = 關閉（回到只受 max_escapes 限制）。
+        # ★ 只改「卡住之後要不要再試同一招」，不碰任何煞車／停車／硬停判定。
+        self.declare_parameter("stall_site_replan_after", 4)
+        self.declare_parameter("stall_site_idx_tol", 2)
         # ★★ 2026-08-29：同一個地方零進展的脫困，最多容忍幾次 ★★
         #
         # 8/29 三趟 CSV（replay_path_75c58190328b_*.csv）量到的病：
@@ -836,6 +848,8 @@ class PathTeachNode(Node):
         self.escape_after = float(p("escape_after_sec").value)
         self.escape_dist = float(p("escape_distance_m").value)
         self.max_escapes = int(p("max_escapes").value)
+        self.stall_site_limit = int(p("stall_site_replan_after").value)
+        self.stall_site_idx_tol = int(p("stall_site_idx_tol").value)
         self.escape_stall_max = int(p("escape_stall_max").value)
         self.escape_legs_max = int(p("escape_legs_max").value)
         self.escape_total_dyaw = math.radians(float(p("escape_total_dyaw_deg").value))
@@ -2828,6 +2842,7 @@ class PathTeachNode(Node):
         state = "following"
         last_fb = 0.0
         escapes = 0
+        stall_site = {"idx": None, "n": 0}   # 同一處反覆卡住的計數（見 _stall_site_exhausted）
         sig_hist: List[Tuple[float, List[float]]] = []   # 打滑偵測用的掃描簽章歷史
         prog_idx = -1
         last_escape_t = 0.0        # 上次脫困結束的時刻（偏離寬限期用）
@@ -3346,6 +3361,14 @@ class PathTeachNode(Node):
                     self.get_logger().warn(result.message)
                     return result
 
+                if self._stall_site_exhausted(stall_site, idx):
+                    self._stop()
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = self._stall_site_msg(stall_site, idx, len(pts))
+                    self.get_logger().warn(result.message)
+                    return result
+
                 if escapes < self.max_escapes:
                     escapes += 1
                     self.get_logger().warn(
@@ -3675,6 +3698,13 @@ class PathTeachNode(Node):
                     # 人擋路通常幾秒內就讓開，牆不會；兩者從單幀掃描分不出來，
                     # 所以用「等了多久」當判準。
                     if waited > self.escape_after and escapes < self.max_escapes:
+                        if self._stall_site_exhausted(stall_site, idx):
+                            self._stop()
+                            goal_handle.abort()
+                            result.success = False
+                            result.message = self._stall_site_msg(stall_site, idx, len(pts))
+                            self.get_logger().warn(result.message)
+                            return result
                         escapes += 1
                         self.get_logger().info(
                             f"等了 {waited:.0f} 秒仍不通，嘗試脫困（第 {escapes}/{self.max_escapes} 次）")
@@ -3853,6 +3883,29 @@ class PathTeachNode(Node):
         result.success = False
         result.message = "節點關閉"
         return result
+
+    def _stall_site_exhausted(self, site: dict, idx: int) -> bool:
+        """這是同一處的第幾次「要脫困了」？達到 stall_site_replan_after 就回 True（呼叫端該放棄這條路徑）。
+
+        site = {"idx": 上次卡住的路徑索引, "n": 同一處累計次數}（_follow_loop 的區域狀態）。
+        索引離上次卡住處超過 stall_site_idx_tol = 換了地方（路徑有往前／往後推進）-> 重新從 1 起算。
+        每次呼叫就是一次「判定卡住」，所以呼叫端只在**真的要脫困之前**呼叫一次。
+        """
+        if self.stall_site_limit <= 0:
+            return False
+        last = site.get("idx")
+        if last is not None and abs(idx - last) <= self.stall_site_idx_tol:
+            site["n"] += 1
+        else:
+            site["n"] = 1
+        site["idx"] = idx
+        return site["n"] >= self.stall_site_limit
+
+    def _stall_site_msg(self, site: dict, idx: int, total: int) -> str:
+        # ★ 刻意不以 NEW_OBSTACLE_TAG 開頭、也不含「車身外緣持續不足」：
+        #   導航層要把它當一般失敗（計一次重試、清成本地圖、重新規劃），不是等通道，也不是推車。
+        return (f"卡在第 {idx}/{total} 點附近，同一處已連續 {site['n']} 次判定卡住"
+                f"（脫困後又回到原處），放棄這條路徑，交回導航層重新規劃")
 
     def _escape_stalled(self, idx: int, cancelled: bool = False) -> bool:
         """剛結束的那次脫困有沒有「零進展」？記帳並回傳是否該止損。
