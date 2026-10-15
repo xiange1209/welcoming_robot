@@ -28,6 +28,7 @@
 地圖（`.pgm` / `maps_backup/` / `*.json`）則**照舊收進來** —— 那是既有行為。
 """
 import hashlib
+import io
 import os
 import pathlib
 import re
@@ -191,6 +192,57 @@ def preflight() -> list:
     return errs
 
 
+VERSION_KEY_FILES = (
+    "src/smartnav_navigation_cc/smartnav_navigation_cc/path_teach_cc_node.py",
+    "src/smartnav_navigation_cc/smartnav_navigation_cc/navigation_action_cc_node.py",
+    "src/smartnav_navigation_cc/smartnav_navigation_cc/cmd_vel_floor_cc_node.py",
+    "src/smartnav_navigation_cc/smartnav_navigation_cc/steering_trim_cc_node.py",
+    "src/smartnav_navigation_cc/config/nav2_senior_akm_cc.yaml",
+    "src/smartnav_llm/smartnav_llm/llm_service_node.py",
+    "src/smartnav_llm/config/bank_faq.txt",
+    "src/smartnav_llm/knowledge/bank_faq.md",
+    "src/smartnav_vision/smartnav_vision/face_embedding_node.py",
+    "src/smartnav_audio/launch/asr_chain.launch.py",
+)
+
+
+def _version_stamp(targets, now: int) -> bytes:
+    """★ 2026-10-15：包內附一張「版本章」maprun/PACKAGE_VERSION.txt。
+
+    為什麼：車上跑出來的資料（log／CSV）事後分析時，必須知道是哪一版程式跑的。
+    9/29 與 10/05 的上車都沒留下這個資訊，後來只能靠打包時間與 tar 檔反推
+    （10/05「方案 A」為什麼還原，至今查不到）。collect_data.sh 會把它收進回傳包。
+    """
+    def git(*a):
+        try:
+            r = subprocess.run(["git", *a], capture_output=True, text=True, timeout=15)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    dirty = [ln for ln in git("status", "--porcelain").splitlines() if ln.strip()]
+    lines = [
+        "# 套件版本章（pack_car_code.py 在打包時寫入；collect_data.sh 會把它收進回傳包）",
+        f"打包時間: {time.strftime('%Y-%m-%d %H:%M:%S %z', time.localtime(now))}",
+        f"分支: {git('branch', '--show-current') or '（不明，沒有 git 或在 detached HEAD）'}",
+        f"commit: {git('rev-parse', 'HEAD') or '（不明）'}",
+        f"子模組 frontier: {(git('submodule', 'status', 'src/frontier_exploration_ros2') or '（不明）')[:60]}",
+        f"工作樹有未提交變更: {'是（%d 項，見下）' % len(dirty) if dirty else '否'}",
+        f"包內檔案數: {len(targets)}",
+        "",
+        "最近 8 個 commit:",
+        *[f"  {ln}" for ln in git("log", "--oneline", "-8").splitlines()],
+    ]
+    if dirty:
+        lines += ["", "未提交的變更（git status --porcelain，最多 40 行）:", *[f"  {ln}" for ln in dirty[:40]]]
+    lines += ["", "關鍵檔案（sha256 前 12 碼，算的是打包當下磁碟上的內容）:"]
+    for rel in VERSION_KEY_FILES:
+        p = pathlib.Path(rel)
+        h = hashlib.sha256(p.read_bytes()).hexdigest()[:12] if p.is_file() else "（不存在）"
+        lines.append(f"  {h}  {rel}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def main() -> int:
     stamp = sys.argv[1] if len(sys.argv) > 1 else time.strftime("%Y%m%d")
     out = f"car_code_{stamp}.tar.gz"
@@ -275,13 +327,17 @@ def main() -> int:
             return "welcoming_robot_ws/CLAUDE.md" if name == "CLAUDE.md" else f"car_docs/{name}"
         return name
 
+    stamp_bytes = _version_stamp(targets, now)
     with tarfile.open(out, "w:gz") as t:
         for p in targets:
             t.add(p, arcname=_arcname(p), filter=_mode)
+        ti = tarfile.TarInfo("maprun/PACKAGE_VERSION.txt")   # ★ 版本章：只放包裡，不寫進工作樹（不弄髒 git）
+        ti.size, ti.mtime, ti.mode = len(stamp_bytes), now, 0o644
+        t.addfile(ti, io.BytesIO(stamp_bytes))
 
     md5 = hashlib.md5(pathlib.Path(out).read_bytes()).hexdigest()
     print(f"✓ {out}")
-    print(f"  檔案數 {len(targets)}")
+    print(f"  檔案數 {len(targets)}（另有版本章 maprun/PACKAGE_VERSION.txt）")
     print(f"  大小   {os.path.getsize(out) / 1024 / 1024:.2f} MB")
     print(f"  MD5    {md5}")
     print(f"  腳本 CRLF 0 / 疑似機密 0")
