@@ -214,9 +214,12 @@ def _version_stamp(targets, now: int) -> bytes:
     （10/05「方案 A」為什麼還原，至今查不到）。collect_data.sh 會把它收進回傳包。
     """
     def git(*a):
+        # ★ 必須明確用 UTF-8：Windows 預設 cp950 解不了 git 輸出的中文 commit 訊息（2026-10-15 實際踩到）；
+        #   core.quotepath=false 讓中文檔名不被轉成 \345\… 八進位。
         try:
-            r = subprocess.run(["git", *a], capture_output=True, text=True, timeout=15)
-            return r.stdout.strip() if r.returncode == 0 else ""
+            r = subprocess.run(["git", "-c", "core.quotepath=false", *a], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=15)
+            return (r.stdout or "").strip() if r.returncode == 0 else ""
         except (OSError, subprocess.SubprocessError):
             return ""
 
