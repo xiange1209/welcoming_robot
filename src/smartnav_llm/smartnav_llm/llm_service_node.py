@@ -271,6 +271,17 @@ class LLMServiceNode(Node):
         # 系統提示詞裡那條「40 字 / 最多兩句」的規則，這個只是保險。
         # ★ 下面迴圈裡加了截斷偵測，真的撞到上限會 WARN，不會再靜默。
         self.num_predict = self.declare_parameter("num_predict", 256).get_parameter_value().integer_value
+        # ★★ 2026-10-15：明確設定上下文長度 num_ctx（原本沒設，吃 Ollama 的預設）★★
+        #
+        # 筆電的 Ollama 日誌（2026-10-15 17:11）寫著 `vram-based default context total_vram="4.0 GiB"
+        # default_num_ctx=4096`：4 GB 顯存的預設上下文只有 4096 tokens。而銀行模式光是系統提示詞
+        # （約 2,524 tokens）加 13 個工具描述（約 1,275 tokens）就約 3,800 tokens（T5 報告 §6.3，
+        # Qwen tokenizer 估算、誤差約 ±5%），再加歷史、工具結果與 256 的生成上限，一定超過 4096。
+        # 超過時 Ollama 會截掉輸入；被截掉的若是系統提示詞的規則（例如「查不到就說查不到」），
+        # 規則就靜默失效。截斷只會印在 Ollama 的伺服器日誌（truncating input prompt），這個節點看不到。
+        # 8192 的 KV cache 對 qwen2.5:3b 約 0.3 GB，4 GB 顯存放得下【推算，未實測】。
+        # 若改用 gemma3:4b 等更大的模型，可能擠出顯存而卸載到 CPU（變慢數倍），要把這個值降回 4096。
+        self.num_ctx = self.declare_parameter("num_ctx", 8192).get_parameter_value().integer_value
 
         # ── 簡體轉繁體 ───────────────────────────────────
         # 系統提示詞早就寫了「回覆一律使用繁體中文」，但小模型會忽略它：
@@ -878,9 +889,11 @@ class LLMServiceNode(Node):
             model=self.model_name,
             temperature=self.temperature,
             num_predict=self.num_predict,  # ★ 生成長度硬上限，見宣告處
+            num_ctx=self.num_ctx,  # ★ 上下文長度，見宣告處（Ollama 在 4 GB 顯存的預設只有 4096）
             callbacks=[stream_handler],
         )
         self.llm_with_tools = raw_llm.bind_tools(list(self.tools_map.values()))
+        self.get_logger().info(f"✓ Ollama 上下文 num_ctx={self.num_ctx}（Ollama 在 4 GB 顯存的預設是 4096；見 num_ctx 參數說明）")
 
         # 定義對話提示模板，包含系統提示、歷史消息和工具調用結果
         self.prompt_template = ChatPromptTemplate.from_messages(
