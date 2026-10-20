@@ -34,6 +34,7 @@ from smartnav_msgs.action import CreateMap, GlobalLocalization, Navigate
 from smartnav_llm.llm_utils import get_config_path, get_knowledge_dir, NAVIGATE_WAIT_SEC
 from smartnav_llm.rag_store import BankKnowledgeStore
 from smartnav_llm import web_tools
+from smartnav_llm import nav_intent
 
 
 class RosStreamHandler(BaseCallbackHandler):
@@ -282,6 +283,16 @@ class LLMServiceNode(Node):
         # 8192 的 KV cache 對 qwen2.5:3b 約 0.3 GB，4 GB 顯存放得下【推算，未實測】。
         # 若改用 gemma3:4b 等更大的模型，可能擠出顯存而卸載到 CPU（變慢數倍），要把這個值降回 4096。
         self.num_ctx = self.declare_parameter("num_ctx", 8192).get_parameter_value().integer_value
+        # ★★ 2026-10-21：模型常駐顯存（keep_alive）與啟動暖機 ★★
+        #
+        # 筆電 Ollama 日誌（server-1.log，10/20）：當天第一次載入 46.83 秒（14:13，從硬碟讀模型），
+        # 之後每次閒置超過 5 分鐘就被卸載、下一題重載 2.3~3.8 秒——共 9 次，正好對上車上 log 裡
+        # 「閒置 >5 分後的第一題 5.1~8.2 秒」那 9 輪（間隔 <5 分的一律 <3.2 秒）。Ollama 預設 keep_alive 5 分鐘。
+        # "-1" = 常駐到 Ollama 重啟（測試／展示日筆電專門跑這個）；也可給 "60m" 這類時間；"" = 用 Ollama 預設。
+        # 要釋放顯存：筆電執行 `ollama stop qwen2.5:3b`。
+        self.keep_alive = self.declare_parameter("keep_alive", "-1").get_parameter_value().string_value
+        # 節點啟動後在背景先問一次（結果丟掉），把模型與系統提示載進顯存，第一位客人不用等 47 秒。
+        self.warmup_on_start = self.declare_parameter("warmup_on_start", True).get_parameter_value().bool_value
 
         # ── 簡體轉繁體 ───────────────────────────────────
         # 系統提示詞早就寫了「回覆一律使用繁體中文」，但小模型會忽略它：
@@ -327,6 +338,23 @@ class LLMServiceNode(Node):
 
         # ── 銀行場景（2026-08-01 復原）────────────────────────
         self.enable_bank_tools = self.declare_parameter("enable_bank_tools", True).get_parameter_value().bool_value
+        # ★★ 2026-10-21：銀行模式的收斂（10/20 銀行十題：對 2／部分 1／錯 7，工具呼叫 5/10）★★
+        # (1) inline_bank_faq：FAQ 全文（26 行）直接附在系統提示最後，模型不必先「決定要不要查」——
+        #     10/20 沒呼叫工具的題目全部答錯或答偏（貴賓室、洗手間、ATM、換美金、信用卡）。
+        #     附上之後 query_bank_faq_tool 用不到，從工具表拿掉。
+        # (2) bank_hide_map_tools：建圖／切圖／建點／列地圖不是迎賓會用的，卻暴露在語音雜訊下
+        #     （10/20 15:32 雜訊「錯哦沒錯哦 M」讓模型呼叫了股價工具）。銀行模式預設拿掉。
+        # (3) direct_nav：明確的帶路要求由程式直接導航（見 nav_intent.py）；
+        #     nav_guard：模型嘴上答應帶路、這一輪卻沒呼叫導航時攔下來。
+        self.inline_bank_faq = self.declare_parameter("inline_bank_faq", True).get_parameter_value().bool_value
+        self.bank_hide_map_tools = self.declare_parameter("bank_hide_map_tools", True).get_parameter_value().bool_value
+        self.direct_nav = self.declare_parameter("direct_nav", True).get_parameter_value().bool_value
+        self.nav_guard = self.declare_parameter("nav_guard", True).get_parameter_value().bool_value
+        # 機器人最近講過的話（含導航節點的播報），擋被麥克風收回來的回音；0 = 關閉
+        self.robot_echo_sec = float(self.declare_parameter("robot_echo_sec", 20.0).get_parameter_value().double_value)
+        self._robot_said = deque(maxlen=20)  # (monotonic 時刻, 文字)
+        self._robot_said_lock = threading.Lock()
+        self._faq_cache = None
         # ── 系統提示詞要用哪一份 ────────────────────────────────
         # ★ 2026-08-14：這裡原本寫死讀 system_prompt.txt。
         #
@@ -385,6 +413,11 @@ class LLMServiceNode(Node):
         self.clear_history_sub = self.create_subscription(
             Empty, "clear_conversation", self.clear_conversation_callback, 10, callback_group=self.cb_group
         )
+        # ★ 2026-10-21：記下機器人講過的話（10/20 14:59 LLM 收到「開始導航到 廁所」——
+        #   那是導航節點自己的播報被麥克風收回來）
+        self.robot_speech_sub = self.create_subscription(
+            String, "speech_text", self._robot_speech_cb, 10, callback_group=self.cb_group
+        )
 
         # 模型名稱以 TRANSIENT_LOCAL 發布，讓後啟動的 HMI 也能取得並顯示
         model_info_qos = QoSProfile(
@@ -409,6 +442,12 @@ class LLMServiceNode(Node):
             f"✓ 系統提示詞: {prompt_name} " f"({'已找到' if prompt_path else '★找不到，會用內建預設'})"
         )
         self.get_logger().info(f"✓ LLM 對話服務節點已初始化 (模型: {self.model_name})")
+        self.get_logger().info(
+            f"✓ 銀行模式設定：FAQ 併入提示={self.inline_bank_faq and bool(self._bank_faq_text())}、"
+            f"程式端帶位={self.direct_nav}、帶位防呆={self.nav_guard}、回音擋 {self.robot_echo_sec:.0f} 秒"
+        )
+        if self.warmup_on_start:
+            threading.Thread(target=self._warmup_llm, daemon=True).start()
 
     def _init_knowledge_store(self):
         """初始化銀行知識庫
@@ -827,8 +866,9 @@ class LLMServiceNode(Node):
         # 匯兌等」——兩個工具對同一批問題都宣稱自己是正解，機率被劈成兩半，
         # 3B 模型挑哪個變成擲骰子。（兩者的資料來源其實還是同一份 FAQ。）
         #
-        # 銀行場景下統一走 query_bank_faq_tool，它內部會優先用 RAG 檢索
-        # （見 bank_tools.py），所以知識庫的檢索能力沒有損失，只是入口收斂成一個。
+        # 銀行場景下統一走 query_bank_faq_tool。★ 2026-10-21 更正：它**不**走 RAG，
+        # 直接讀 config/bank_faq.txt 整份回傳（bank_tools.py 的註解與 10/20 log 都證實）；
+        # 而 inline_bank_faq（預設開）會把同一份 FAQ 附在系統提示裡，並把這個工具拿掉。
         if self.knowledge_store and not self.enable_bank_tools:
             self.tools_map["search_bank_knowledge_tool"] = search_bank_knowledge_tool
 
@@ -852,7 +892,12 @@ class LLMServiceNode(Node):
             #   彩排時若觀察到選錯工具，用
             #       -p enable_stock_weather_tools:=false
             #   一行就能收斂到 11 個工具，不必改程式。
-            if self.declare_parameter("enable_stock_weather_tools", True).get_parameter_value().bool_value:
+            # ★ 2026-10-21：銀行模式預設改成 False。10/20 實車 15:32，語音雜訊「錯哦沒錯哦 M」
+            #   讓模型呼叫了股價工具、回了一筆真實股價（llm_20261020_153116.log）。上面「悄悄拿掉
+            #   比較危險」的顧慮，這次以交接檔與 README 明寫的方式處理。非銀行模式維持 True。
+            if self.declare_parameter(
+                "enable_stock_weather_tools", not self.enable_bank_tools
+            ).get_parameter_value().bool_value:
                 self.tools_map.update(
                     {
                         "query_stock_price_tool": query_stock_price_tool,
@@ -879,21 +924,30 @@ class LLMServiceNode(Node):
             except ImportError as exc:
                 self.get_logger().warning(f"✗ 銀行工具載入失敗（略過）: {exc}")
 
+        # ★ 2026-10-21：銀行模式收斂工具（理由見 inline_bank_faq／bank_hide_map_tools 的宣告處）
+        if self.enable_bank_tools:
+            dropped = []
+            if self.bank_hide_map_tools:
+                for name in ("create_map_tool", "list_maps_tool", "switch_map_tool", "create_waypoint_tool"):
+                    if self.tools_map.pop(name, None) is not None:
+                        dropped.append(name)
+            if self.inline_bank_faq and self._bank_faq_text():
+                if self.tools_map.pop("query_bank_faq_tool", None) is not None:
+                    dropped.append("query_bank_faq_tool")
+            if dropped:
+                self.get_logger().info(f"✓ 銀行模式拿掉 {len(dropped)} 個用不到的工具: {', '.join(dropped)}")
+
         self.get_logger().info(f"✓ 已載入 {len(self.tools_map)} 個工具: {', '.join(self.tools_map)}")
 
         # 初始化模型並綁定工具
         self.stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub, self._to_traditional)
         stream_handler = self.stream_handler
-        raw_llm = ChatOllama(
-            base_url=self.ollama_base_url,
-            model=self.model_name,
-            temperature=self.temperature,
-            num_predict=self.num_predict,  # ★ 生成長度硬上限，見宣告處
-            num_ctx=self.num_ctx,  # ★ 上下文長度，見宣告處（Ollama 在 4 GB 顯存的預設只有 4096）
-            callbacks=[stream_handler],
-        )
+        raw_llm = self._make_chat_llm([stream_handler])
         self.llm_with_tools = raw_llm.bind_tools(list(self.tools_map.values()))
-        self.get_logger().info(f"✓ Ollama 上下文 num_ctx={self.num_ctx}（Ollama 在 4 GB 顯存的預設是 4096；見 num_ctx 參數說明）")
+        self.get_logger().info(
+            f"✓ Ollama 上下文 num_ctx={self.num_ctx}（Ollama 在 4 GB 顯存的預設是 4096；見 num_ctx 參數說明）、"
+            f"keep_alive={self.keep_alive or '（Ollama 預設 5 分鐘）'}"
+        )
 
         # 定義對話提示模板，包含系統提示、歷史消息和工具調用結果
         self.prompt_template = ChatPromptTemplate.from_messages(
@@ -908,6 +962,137 @@ class LLMServiceNode(Node):
         # 定義整合工具的 Agent Chain，將提示模板與工具調用結合起來
         self.agent_chain = RunnablePassthrough() | self.prompt_template | self.llm_with_tools
 
+    # ── ★ 2026-10-21：Ollama 連線、暖機、FAQ、回音與程式端帶位 ─────────────────
+    def _ollama_extra_kwargs(self) -> dict:
+        """keep_alive 只在這版 langchain_ollama 支援時才帶（舊版多帶未知欄位會讓節點起不來）"""
+        ka = (self.keep_alive or "").strip()
+        if not ka:
+            return {}
+        fields = getattr(ChatOllama, "model_fields", None) or getattr(ChatOllama, "__fields__", None) or {}
+        if "keep_alive" not in fields:
+            self.get_logger().warning("這版 langchain_ollama 的 ChatOllama 沒有 keep_alive 欄位，略過——模型閒置 5 分鐘仍會被卸載")
+            return {}
+        try:
+            return {"keep_alive": int(ka)}
+        except ValueError:
+            return {"keep_alive": ka}
+
+    def _make_chat_llm(self, callbacks: list):
+        """唯一的 ChatOllama 建構處（主迴圈與暖機共用：參數一致，暖機才會把同一份提示載進去）"""
+        return ChatOllama(
+            base_url=self.ollama_base_url,
+            model=self.model_name,
+            temperature=self.temperature,
+            num_predict=self.num_predict,  # ★ 生成長度硬上限，見宣告處
+            num_ctx=self.num_ctx,  # ★ 上下文長度，見宣告處（Ollama 在 4 GB 顯存的預設只有 4096）
+            callbacks=callbacks,
+            **self._ollama_extra_kwargs(),
+        )
+
+    def _warmup_llm(self) -> None:
+        """背景暖機：用跟主迴圈一模一樣的提示與工具問一次，結果丟掉（不發布、不進記憶、不掛串流）"""
+        try:
+            time.sleep(2.0)  # 讓節點其他部分先起來
+            t0 = time.monotonic()
+            llm = self._make_chat_llm([]).bind_tools(list(self.tools_map.values()))
+            chain = RunnablePassthrough() | self.prompt_template | llm
+            chain.invoke(
+                {"system_prompt": self._load_system_prompt(), "history": [], "input": "你好", "agent_scratchpad": []}
+            )
+            self.get_logger().info(f"✓ Ollama 暖機完成（{time.monotonic() - t0:.1f} 秒）——第一位客人不用再等模型載入")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"Ollama 暖機失敗（不影響對話，只是第一題會比較慢）: {exc}")
+
+    def _bank_faq_text(self) -> str:
+        """bank_faq.txt 全文（讀一次就快取；讀不到回空字串 = 退回用工具查）"""
+        if self._faq_cache is None:
+            self._faq_cache = ""
+            try:
+                p = get_config_path("bank_faq.txt")
+                if p:
+                    with open(p, "r", encoding="utf-8") as f:
+                        self._faq_cache = f.read().strip()
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(f"讀不到 bank_faq.txt（改回用工具查）: {exc}")
+        return self._faq_cache
+
+    def _robot_speech_cb(self, msg: String) -> None:
+        self._remember_robot_said(msg.data)
+
+    def _remember_robot_said(self, text: str) -> None:
+        if text and text.strip():
+            with self._robot_said_lock:
+                self._robot_said.append((time.monotonic(), text))
+
+    def _is_robot_echo(self, text: str) -> bool:
+        if self.robot_echo_sec <= 0:
+            return False
+        now = time.monotonic()
+        with self._robot_said_lock:
+            recent = [t for ts, t in self._robot_said if now - ts <= self.robot_echo_sec]
+        return nav_intent.is_robot_echo(text, recent)
+
+    def _publish_reply(self, text: str) -> None:
+        """發 /llm_response（平板會顯示並唸出來），同時記進「機器人講過的話」"""
+        self._remember_robot_said(text)
+        self.llm_response_pub.publish(String(data=text))
+
+    def _waypoint_name_map(self) -> dict:
+        """目前地圖的 {地點名稱: 地點ID}；查不到回空 dict（交給模型處理）"""
+        try:
+            if not self.list_waypoints_client.service_is_ready():
+                return {}
+            res = self._wait_for_future(self.list_waypoints_client.call_async(ListWaypoints.Request()), 3.0)
+            if res is None or not res.success:
+                return {}
+            return {wp.waypoint_name: wp.waypoint_id for wp in res.waypoints_info if wp.waypoint_name}
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"帶位判斷：查地點失敗（交給模型）: {exc}")
+            return {}
+
+    def _try_direct_navigation(self, user_input: str, force_intent: bool = False) -> bool:
+        """明確的帶路要求、又對得到唯一地點 → 程式直接導航並回話。回 True 表示已處理完這一輪。
+
+        force_intent=True（模型已經答應帶路時用）：不再要求句子裡有「帶我去」這類字，只看地點。
+        """
+        if "navigate_tool" not in self.tools_map:
+            return False
+        names = self._waypoint_name_map()
+        if not names:
+            return False
+        if force_intent:
+            name = nav_intent.match_waypoint(user_input, names)
+        else:
+            name = nav_intent.detect_nav_request(user_input, names)
+        if not name:
+            return False
+        wid = names[name]
+        self.get_logger().info(f"🧭 帶位直達（程式判斷，不經模型）：'{user_input}' -> {name}（{wid}）")
+        ack = "好的，請跟我來。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
+        self._publish_reply(ack)
+        try:
+            if name == self.vip_room_waypoint_name and "guide_to_vip_room_tool" in self.tools_map:
+                result = str(self.tools_map["guide_to_vip_room_tool"].invoke({}))
+            else:
+                result = str(self.tools_map["navigate_tool"].invoke({"waypoint_id": wid}))
+        except Exception as exc:  # noqa: BLE001
+            result = f"執行結果: 失敗, 詳細信息: {exc}"
+        self.get_logger().info(f"📥 帶位結果: {result}")
+        reply = f"{name}到了。" if result.startswith("執行結果: 成功") else self._nav_fail_reply(name, result)
+        self.get_logger().info(f"🤖 Agent 最終決策回應: {reply}")
+        with self.memory_lock:
+            self.memory.add_message(HumanMessage(content=user_input))
+            self.memory.add_message(AIMessage(content=f"{ack}{reply}"))
+        self._publish_reply(reply)
+        return True
+
+    @staticmethod
+    def _nav_fail_reply(name: str, result: str) -> str:
+        """導航失敗時對客人講的話（完整原因已寫進 log）"""
+        if any(k in result for k in ("取消", "停止", "急停", "逾時")):
+            return "車子已經停下來了。需要的話，請再說一次要去哪裡。"
+        return f"抱歉，這次沒辦法帶您到{name}，請洽詢櫃檯人員協助。"
+
     def _to_traditional(self, text: str) -> str:
         """把模型吐出來的簡體字轉成台灣正體。轉換器不可用時原樣回傳。"""
         if not self._cc or not text:
@@ -921,11 +1106,16 @@ class LLMServiceNode(Node):
         """處理使用者輸入"""
         user_input = msg.data
 
+        # ★ 2026-10-21：機器人自己的話被麥克風收回來，不處理（見 nav_intent.is_robot_echo）
+        if self._is_robot_echo(user_input):
+            self.get_logger().info(f"🔁 忽略疑似回音（機器人 {self.robot_echo_sec:.0f} 秒內講過）: {user_input}")
+            return
+
         with self.agent_busy_lock:
             if self.is_agent_running:
                 warning_msg = "系統目前正在處理上一個指令，請稍後再試..."
                 self.get_logger().warn(warning_msg)
-                self.llm_response_pub.publish(String(data=warning_msg))
+                self._publish_reply(warning_msg)
                 return
             self.is_agent_running = True
 
@@ -963,7 +1153,13 @@ class LLMServiceNode(Node):
         path = get_config_path(name)
         if path:
             with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+                text = f.read()
+            # ★ 2026-10-21：銀行模式把 FAQ 全文附在最後（見 inline_bank_faq 的宣告處）
+            if self.enable_bank_tools and self.inline_bank_faq and name == "system_prompt_bank.txt":
+                faq = self._bank_faq_text()
+                if faq:
+                    text += "\n\n---\n\n# 本行知識庫（全文；回答本行業務問題只能依據這一節）\n\n" + faq
+            return text
 
         self.get_logger().warning(f"✗ 無法找到 {name}，使用內建預設提示語")
         return (
@@ -980,9 +1176,14 @@ class LLMServiceNode(Node):
 
         agent_scratchpad: List[BaseMessage] = []
         max_iterations = 10
+        nav_called = False  # 這一輪有沒有呼叫過會讓車移動的工具（給帶位防呆用）
         self.get_logger().info("🧠 LLM 開始進入多步驟決策鏈...")
 
         try:
+            # ★ 2026-10-21：明確的帶路要求交給程式（10/20「帶我去門口」×5，模型零次呼叫導航）
+            if self.direct_nav and self._try_direct_navigation(user_input):
+                return
+
             for iteration in range(max_iterations):
                 # ★ 2026-08-17：每一輪都扣。8/17 log 證實 iteration 1 也會
                 #   「先講一段旁白、再去呼叫工具」（見 begin_turn 的 docstring）。
@@ -1018,15 +1219,29 @@ class LLMServiceNode(Node):
                 # 檢查 LLM 是否需要叫工具
                 if not response.tool_calls:
                     # 沒有工具呼叫 = 這是要講給客戶聽的最終答案
-                    self.stream_handler.flush_held()
                     final_reply = self._to_traditional(str(response.content))
+                    # ★★ 2026-10-21：兩道防呆（10/20 實車：全天 75 輪有 4 次空白回應；
+                    #   「帶我去門口」被回「請跟我來，我會帶您去門口」卻沒呼叫導航，車不會動）★★
+                    #   要在 flush_held() 之前判斷：換掉的句子不能先被送去唸。
+                    if not final_reply.strip():
+                        self.stream_handler.drop_held()
+                        self.get_logger().warning("⚠️ 模型回了空白，改用預設句")
+                        final_reply = "不好意思，我沒有聽清楚，可以再說一次嗎？"
+                    elif self.nav_guard and not nav_called and nav_intent.promises_navigation(final_reply):
+                        self.stream_handler.drop_held()
+                        self.get_logger().warning(f"⚠️ 模型答應帶路、這一輪卻沒呼叫導航：{final_reply}")
+                        if self._try_direct_navigation(user_input, force_intent=True):
+                            return
+                        final_reply = "抱歉，我現在沒辦法帶您過去，請洽詢櫃檯人員協助。"
+                    else:
+                        self.stream_handler.flush_held()
                     self.get_logger().info(f"🤖 Agent 最終決策回應: {final_reply}")
 
                     with self.memory_lock:
                         self.memory.add_message(HumanMessage(content=user_input))
                         self.memory.add_message(AIMessage(content=final_reply))
 
-                    self.llm_response_pub.publish(String(data=final_reply))
+                    self._publish_reply(final_reply)
                     return
 
                 # 這一輪是去呼叫工具，模型講的旁白不要唸出去
@@ -1048,6 +1263,8 @@ class LLMServiceNode(Node):
                 # 處理工具調用
                 for tool_call in response.tool_calls:
                     tool_name = tool_call["name"]
+                    if tool_name in nav_intent.NAV_TOOL_NAMES:
+                        nav_called = True
                     tool_args = tool_call["args"]
                     tool_id = tool_call["id"]
 
@@ -1096,12 +1313,12 @@ class LLMServiceNode(Node):
 
             # 超過最大步數
             timeout_msg = "任務執行步驟過多，已強制中止防止機器人發生異常"
-            self.llm_response_pub.publish(String(data=timeout_msg))
+            self._publish_reply(timeout_msg)
 
         except Exception as e:
             error_msg = f"✗ Agent 執行時發生異常: {str(e)}"
             self.get_logger().error(error_msg)
-            self.llm_response_pub.publish(String(data=error_msg))
+            self._publish_reply(error_msg)
         finally:
             with self.agent_busy_lock:
                 self.is_agent_running = False
