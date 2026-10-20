@@ -498,8 +498,13 @@ class NavigationActionCcNode(Node):
 
         deadline = time.monotonic() + self.navigation_timeout_sec
         # ★ 2026-10-20：每次導航重讀（ros2 param set 不必重啟就能 A/B）
-        self.replan_fail_retry_sec = max(
-            0.0, float(self.get_parameter("replan_fail_retry_sec").value))
+        # ★ 2026-10-21：讀不到參數（例如沒有參數伺服器的替身測試）就沿用現值，沒有現值＝0＝舊行為；
+        #   讀參數失敗不該讓整趟導航丟例外。
+        try:
+            self.replan_fail_retry_sec = max(
+                0.0, float(self.get_parameter("replan_fail_retry_sec").value))
+        except Exception:  # noqa: BLE001
+            self.replan_fail_retry_sec = float(getattr(self, "replan_fail_retry_sec", 0.0))
         last_why = ""
         stuck_rounds = 0
         prev_xy = self._robot_xy()
