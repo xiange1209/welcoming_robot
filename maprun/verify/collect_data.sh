@@ -73,6 +73,14 @@ fi
 # 2c) ★ 2026-10-15：轉向實驗（record_steering_chain.py）預設輸出在家目錄 ~/steer_diag_*.csv
 find "$HOME" -maxdepth 1 -name 'steer_diag_*' \( -name '*.csv' -o -name '*.json' -o -name '*.md' \) \
      "${TF[@]}" -exec cp {} "$STAGE/steer_diag/" \; 2>/dev/null
+# 2d) ★ 2026-10-21：語音除錯錄音（speech_recognizer 的 debug_wav_dir；交接檔用 ~/maprun/logs/asr_wav）。
+#     10/20 只有辨識文字、沒有聲音，疊字與句首遺失的根因查不下去。每段約 30~200 KB。
+#     導航修補的逐拍紀錄 ~/maprun/logs/replay_*_live_<日期>.csv 已經被上面 2) 的 *.csv 收到。
+if [ -d "$HOME/maprun/logs/asr_wav" ]; then
+  mkdir -p "$STAGE/logs/asr_wav"
+  find "$HOME/maprun/logs/asr_wav" -maxdepth 1 -name '*.wav' "${TF[@]}" \
+       -exec cp {} "$STAGE/logs/asr_wav/" \; 2>/dev/null
+fi
 
 # 3) .smartnav 的設定與資料庫 —— 白名單，不是黑名單
 for f in steering_trim.json nav_state.json \
@@ -100,7 +108,14 @@ fi
   echo "hostname: $(hostname)"; uname -a
   echo "--- 時鐘 ---"; timedatectl 2>/dev/null | head -8
   echo "--- 溫度／降頻旗標（get_throttled：0x0＝沒有欠壓或降頻；bit0 目前欠壓、bit16 曾欠壓、bit2 目前降頻、bit18 曾降頻）---"
-  (vcgencmd measure_temp; vcgencmd get_throttled) 2>/dev/null || echo "vcgencmd 不可用"
+  # ★ 2026-10-21：使用者帳號不在 video 群組，vcgencmd 讀不到 /dev/vcio（10/20 收尾快照就這樣漏掉）。
+  #   依序試：vcgencmd → sudo -n（免密碼才成功、不會卡住）→ 韌體 sysfs（不需權限，車上 agent 10/20 驗證過）
+  tv=$(vcgencmd get_throttled 2>/dev/null | grep -o '0x[0-9a-fA-F]*')
+  [ -z "$tv" ] && tv=$(sudo -n vcgencmd get_throttled 2>/dev/null | grep -o '0x[0-9a-fA-F]*')
+  [ -z "$tv" ] && [ -r /sys/devices/platform/soc/soc:firmware/get_throttled ] && \
+      tv="0x$(cat /sys/devices/platform/soc/soc:firmware/get_throttled 2>/dev/null)"
+  echo "throttled=${tv:-讀不到}"
+  tz=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null) && echo "溫度 $((tz / 1000)).$(( (tz % 1000) / 100 )) °C"
   echo "--- load ---"; cat /proc/loadavg
   echo "--- 記憶體 ---"; free -m
   echo "--- 磁碟 ---"; df -h / | tail -2

@@ -10,7 +10,8 @@
 
 檢查項目（找不到測試檔會標「缺」並視為失敗，避免因為檔案搬走而靜默變成「全過」）：
   1. 探索基準 206／審查基準 100／知識庫 122（測試檔放在 cloud_workspace/tests/nav_stub 或 專題/scripts/explore_watchdog）
-  2. maprun/tools_1015 的測試（G5 同處卡住修補、num_ctx 接線、轉向診斷分析、曲率）與 tools_0930 的 scan_self_echo
+  2. maprun/tools_1015 的測試（G5 同處卡住修補、num_ctx 接線、轉向診斷分析、曲率）與 tools_0930 的 scan_self_echo；
+     tools_1021（10/21：帶位判斷、LLM 接線、導航修補、ASR 修補）
   3. 全部 .py 語法（ast.parse）與 maprun 內全部 .sh 語法（bash -n）
 
 ⚠ 這些都是替身測試（沒有 ROS、沒有硬體）：全過 ≠ 上車一定正常，只代表「沒有已知的靜默失效回歸」。
@@ -51,6 +52,11 @@ CHECKS = [
     ("轉向診斷分析（52）", REPO / "maprun/tools_1015/test_analyze.py"),
     ("曲率分析（車子版，第 8 節跳過）", REPO / "maprun/tools_1015/curvature/test_curvature.py"),
     ("scan_self_echo", REPO / "maprun/tools_0930/test_scan_self_echo.py"),
+    # ★ 2026-10-21：10/20 實車之後的修補
+    ("帶位判斷 nav_intent（39）", REPO / "maprun/tools_1021/test_nav_intent.py"),
+    ("LLM 接線：常駐／FAQ 併入／工具精簡／帶位防呆（27）", REPO / "maprun/tools_1021/test_llm_wiring.py"),
+    ("導航修補：硬停事件／重規劃重試／逐拍紀錄（23）", REPO / "maprun/tools_1021/test_nav_replan.py"),
+    ("ASR 修補：觸發塊重送／收音緩衝／除錯錄音／launch", REPO / "maprun/tools_1021/test_asr_fixes.py"),
 ]
 
 
