@@ -201,7 +201,9 @@ export function MapPage({ active }: { active: boolean }) {
       </Card>
 
       <Card title="地點" className="overflow-y-auto" bodyClassName="gap-4">
-        <div className="flex min-h-[120px] flex-col gap-1.5">
+        {/* ★ 2026-10-21：補 shrink-0（10/20 車上直接改過 dist，這裡補回原始碼）——min-h 取代了 flex 子項的
+            min-height:auto，清單被壓到 120 px、地點卡溢出蓋到「地圖管理」（平板截圖「破圖」） */}
+        <div className="flex min-h-[120px] shrink-0 flex-col gap-1.5">
           {waypoints.length === 0 && (
             <Empty>
               尚無地點。切到「建立地點」模式後在地圖上點一下即可新增。
