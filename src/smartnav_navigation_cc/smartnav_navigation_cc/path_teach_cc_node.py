@@ -565,6 +565,29 @@ class PathTeachNode(Node):
         # ★ 這是「能不能通過門口」與「留多少餘裕」的取捨，不是安全被拿掉：
         #   FootprintApproach、collision_monitor、弧線預測三層都還在。
         self.declare_parameter("body_margin_stop_m", 0.06)
+        # ★★ 2026-10-20：硬停逾時要撐得過「硬停／放行逐拍交錯」（遲滯 + 推進才算恢復）★★
+        #
+        # 10/20 門口→起點（nav_20261020_144647.log 14:50:17~14:52:58）：161 秒內硬停 1040 次
+        # （累計 41 -> 1081，迴圈 9~14 Hz），約一半以上的週期在硬停，車子只從索引約 9 爬到 14。
+        # 原本只要有**一拍** margin > 6 cm 就把 margin_stop_t 歸零，於是「連續硬停 10 秒」
+        # 永遠湊不滿 —— 設計好的「分類 -> 交回導航層重新規劃」一次都沒跑到
+        # （當天 log 裡「車身外緣持續不足」0 次）。
+        # 改成「硬停事件」：第一次硬停起算；要**連續** margin_resume_sec 秒都大於
+        # 「門檻 + margin_resume_m」，或沿路徑推進 >= stall_progress_m，才算恢復。
+        # 逾時（事件中沒硬停的那幾拍也算）照舊先分類、再交回導航層。
+        # margin_resume_m 與 margin_resume_sec 都設 0 = 回到舊行為（一拍就歸零）。
+        # 下面四個參數每趟重播開始時重讀（_refresh_margin_params），ros2 param set 不必重啟就能 A/B。
+        self.declare_parameter("margin_resume_m", 0.03)
+        self.declare_parameter("margin_resume_sec", 1.0)
+        # 硬停事件多久沒恢復就交回導航層。0 = 沿用舊值 no_progress_sec x 2（預設 10 秒）。
+        self.declare_parameter("margin_stop_timeout_sec", 0.0)
+        # 硬停事件期間，三個卡住判準都不叫脫困（理由見 _follow_loop 卡住判定的說明）。
+        # false = 回到舊行為（只有判準三受 margin_stop_t 守門）。
+        self.declare_parameter("margin_block_suppress_stuck", True)
+        # ★ 2026-10-20：每一趟重播逐拍存 CSV（專案規定逐筆保存）。log 的硬停警告每 20 次才印一次，
+        #   看不到逐拍的 margin —— 10/20 的交錯只能從累計次數反推。每趟開始時才讀（不快取），
+        #   可以用 ros2 param set 臨時改；"" = 不存。檔名含日期，collect_data.sh 會一起收。
+        self.declare_parameter("trace_csv_dir", "~/maprun/logs")
         # ★ 2026-08-20：重播時是否關閉車尾遮罩。預設 false（**不要關**）。
         #   理由見 _execute_follow 裡的長註解 —— 本節點避障本來就吃原始
         #   /scan，關遮罩對避障零幫助，卻會讓 AMCL 看到跟在車後的人。
@@ -858,6 +881,10 @@ class PathTeachNode(Node):
         self.stuck_min_advance = float(p("stuck_min_advance_m").value)
         self.stuck_speed_ratio = float(p("stuck_speed_ratio").value)
         self.stall_progress = float(p("stall_progress_m").value)
+        # ★ 2026-10-20：硬停事件的遲滯與逾時（見 margin_resume_m 的宣告說明）
+        self._refresh_margin_params()
+        self._trace_fh = None         # 逐拍紀錄（見 trace_csv_dir）
+        self._trace_t0 = 0.0
         self.wall_veto_m = float(p("wall_veto_m").value)
         self.centre_enable = bool(p("centre_enable").value)
         self.centre_trigger_m = float(p("centre_trigger_m").value)
@@ -2819,8 +2846,17 @@ class PathTeachNode(Node):
         )
 
         try:
+            # ★ 2026-10-20：硬停事件參數每趟重讀（ros2 param set 不必重啟就能 A/B），並印出這趟用的值
+            self._refresh_margin_params()
+            self.get_logger().info(
+                f"硬停事件：恢復要 > {(self.body_margin_stop + self.margin_resume_m) * 100:.0f} cm "
+                f"連續 {self.margin_resume_sec:.1f} 秒或推進 {self.stall_progress:.2f} m、"
+                f"逾時 {self.margin_stop_timeout:.0f} 秒交回導航層、"
+                f"事件中{'不' if self.margin_block_suppress_stuck else '仍會'}脫困")
+            self._trace_open(req.path_id)      # ★ 2026-10-20：逐拍紀錄（見 trace_csv_dir）
             return self._follow_loop(goal_handle, pts, scale, result)
         finally:
+            self._trace_close()
             self._following = False
             self._active_path_id = ""
             self._stop(5)
@@ -2889,7 +2925,11 @@ class PathTeachNode(Node):
         #   起步視為「剛折返完」，給一樣的寬限。
         last_cusp_t = time.monotonic()
         # 車身外緣硬停的起始時刻（0 = 現在沒有在硬停）。見硬停分支的說明。
+        # ★ 2026-10-20：改成「硬停事件」的起始時刻 —— 有遲滯，不再一拍放行就歸零（見 margin_resume_m）
         margin_stop_t = 0.0
+        margin_stop_s = 0.0        # 事件開始時的路徑弧長（推進 >= stall_progress 就算恢復）
+        margin_stop_n = 0          # 事件內硬停了幾拍（訊息與逐拍紀錄用）
+        margin_clear_t = 0.0       # margin 連續高於「門檻 + margin_resume_m」的起始時刻
         prog_t = time.monotonic()
         # 每個路徑點的累計弧長，給進度檢查用（見迴圈裡的說明）
         path_s = [0.0] * len(pts)
@@ -3256,6 +3296,8 @@ class PathTeachNode(Node):
             # 障礙移開就恢復，不移開就講清楚請人工介入，而不是硬推過去。
             # `margin_stop_t` 在上一個週期的硬停分支設定，這裡讀到的是
             # 「上一輪是不是還在硬停」，正是需要的資訊。
+            # ★ 2026-10-20：現在它代表「硬停事件還沒解除」（有遲滯），不再是「上一拍有沒有硬停」——
+            #   10/20 逐拍交錯時，舊語意讓這道守門每放行一拍就打開一次。判準一、二見下方的同類守門。
             if not stuck_now and not _cm_braking \
                     and self.stall_progress > 0 and margin_stop_t <= 0.0:
                 if path_s[idx] - prog_s < self.stall_progress:
@@ -3274,6 +3316,22 @@ class PathTeachNode(Node):
             #   所以等待期間**每一圈**把觀察窗歸零：人一走，要在「沒被擋」的狀態下
             #   重新累積滿 no_progress 秒才可能判卡住（只會讓判定更晚，不會讓車多走一步）。
             if blocker_new and wait_started != 0.0:
+                stuck_now = False
+                prog_t = now_t
+                prog_s = path_s[idx]
+                move_hist.clear()
+                sig_hist.clear()
+
+            # ★★ 2026-10-20：硬停事件（含遲滯的「待解除」期）期間，三個判準都不叫脫困 ★★
+            #   理由與 8/24 給判準三的守門相同：硬停 = 行進方向 6 cm 內有東西，該走硬停自己的
+            #   逾時出口（分類 -> 交回導航層重新規劃），不是脫困（脫困繞過防撞、也不看 _body_margin）。
+            #   8/24 只擋判準三，因為判準一、二「有 want > 0.02 門檻、硬停時 _cmd_v_last = 0」——
+            #   那只在**連續**硬停時成立。10/20 硬停與放行逐拍交錯，放行那幾拍照樣下 0.10 的指令，
+            #   視窗平均 want 仍 > 0.02；14:52:59 判定卡住 -> 兩輪脫困（共 6 段，有量到的 4 段各移
+            #   0.61~0.71 m）把車帶離路徑約 1.2 m、車頭差 109 度，最後楔在右牆（右 0.02 m、前後都不通）止損。
+            #   觀察窗一起歸零（同上面兩段的作法）：事件解除後要在沒被擋的情況下重新累積滿 no_progress 秒。
+            #   ★ 最後 3 點不擋：那裡的卡住分支本來就不脫困，而是「放寬容差收下／講清楚失敗」，要保留。
+            if self.margin_block_suppress_stuck and margin_stop_t > 0.0 and idx < len(pts) - 3:
                 stuck_now = False
                 prog_t = now_t
                 prog_s = path_s[idx]
@@ -3552,16 +3610,40 @@ class PathTeachNode(Node):
                         f"（轉彎外甩風險，僅警告不煞停；第 {self._side_warns} 次）")
             else:
                 self._side_warns = 0
-            if dir_margin <= self.body_margin_stop:
+            _hard_stop = dir_margin <= self.body_margin_stop
+            if _hard_stop:
                 self._stop()
                 self._margin_stops += 1
                 if margin_stop_t <= 0.0:
                     margin_stop_t = time.monotonic()
+                    margin_stop_s = path_s[idx]
+                    margin_stop_n = 0
+                margin_stop_n += 1
+                margin_clear_t = 0.0
                 if self._margin_stops % 20 == 1:
                     self.get_logger().warning(
                         f"⚠ 行進方向車身外緣只剩 {dir_margin * 100:.0f} cm"
                         f"（門檻 {self.body_margin_stop * 100:.0f} cm），"
-                        f"已煞停（累計 {self._margin_stops} 次）")
+                        f"已煞停（累計 {self._margin_stops} 次；這次事件 "
+                        f"{time.monotonic() - margin_stop_t:.0f} 秒、{margin_stop_n} 次）")
+            elif margin_stop_t > 0.0:
+                # ★★ 2026-10-20：放行一拍不等於恢復（遲滯，見 margin_resume_m 的說明）★★
+                margin_clear_t, _why_rel = self._margin_release(
+                    time.monotonic(), margin_clear_t, dir_margin, self.body_margin_stop,
+                    self.margin_resume_m, self.margin_resume_sec,
+                    path_s[idx] - margin_stop_s, self.stall_progress)
+                if _why_rel:
+                    self.get_logger().info(
+                        f"車身外緣硬停解除（{_why_rel}；這次事件 "
+                        f"{time.monotonic() - margin_stop_t:.1f} 秒、硬停 {margin_stop_n} 次）")
+                    margin_stop_t, margin_clear_t, margin_stop_n = 0.0, 0.0, 0
+            self._trace_row(
+                time.time(), time.monotonic() - self._trace_t0, idx, len(pts), cur_dir, x, y,
+                math.degrees(yaw), dir_margin, any_margin, int(_hard_stop),
+                (time.monotonic() - margin_stop_t) if margin_stop_t > 0.0 else 0.0,
+                margin_stop_n, (path_s[idx] - margin_stop_s) if margin_stop_t > 0.0 else 0.0,
+                int(_cm_braking), state, self._cmd_v_last, xte)
+            if margin_stop_t > 0.0:
                 # ★★ 2026-08-20：硬停必須自己管逾時，不能指望卡住偵測 ★★
                 #
                 # 原本這裡寫「下面既有的卡住偵測會在 stuck_timeout 之後接手」。
@@ -3576,7 +3658,9 @@ class PathTeachNode(Node):
                 # 結果是硬停之後永遠不 abort、不脫困，一路掛到 HMI 端
                 # 300 秒 client timeout，訊息顯示「等待結果逾時」——
                 # 把現場指向動作伺服器，而真因在這裡。
-                if time.monotonic() - margin_stop_t > self.no_progress * 2.0:
+                # ★ 2026-10-20：逾時改看「硬停事件」多久（含事件中沒硬停的那幾拍），
+                #   不再要求連續硬停 —— 見 margin_resume_m 的說明。
+                if time.monotonic() - margin_stop_t > self.margin_stop_timeout:
                     self._stop()
                     # ★ 2026-10-08 獨立審查：貼到 6 cm 內的也可能是人（走到車子旁邊、伸手），
                     #   而這個分支在下方「障礙分類」之前就 continue，永遠分不出新障礙：
@@ -3601,18 +3685,22 @@ class PathTeachNode(Node):
                         self._say(self.new_obstacle_speech)
                         self.get_logger().warn("⛔ " + result.message)
                     else:
+                        # ★ 「車身外緣持續不足」這幾個字 navigation_action 用來認「先 /unwedge 再重新規劃」，不要改
                         result.message = (
                             f"車身外緣持續不足（行進方向只剩 {dir_margin * 100:.0f} cm，"
-                            f"已停 {time.monotonic() - margin_stop_t:.0f} 秒）。"
-                            f"障礙沒有移開，請人工介入。")
+                            f"{time.monotonic() - margin_stop_t:.0f} 秒內硬停 {margin_stop_n} 次、"
+                            f"沿路徑只推進 {(path_s[idx] - margin_stop_s) * 100:.0f} cm）。"
+                            f"障礙沒有移開 —— 交回導航層：先拉開再重新規劃")
                         self.get_logger().error("⛔ " + result.message)
                     return result
+            if _hard_stop:
                 self._send_feedback(goal_handle, idx, len(pts),
                                     dir_margin, "blocked",
                                     f"車身外緣 {dir_margin * 100:.0f} cm")
                 time.sleep(self.control_dt)
                 continue
-            margin_stop_t = 0.0        # 恢復了，計時歸零
+            # ★ 2026-10-20：拿掉「margin_stop_t = 0.0  # 恢復了，計時歸零」——
+            #   一拍放行就歸零正是 10/20 逾時永遠湊不滿的原因；歸零改由上面的 _margin_release 決定。
 
             # ★ 用穩健版：涵蓋舵機延遲與欠轉（見 _arc_clearance_robust 的長註解）
             clearance = self._arc_clearance_robust(cur_dir, preview_curv, curv_meas,
@@ -3883,6 +3971,82 @@ class PathTeachNode(Node):
         result.success = False
         result.message = "節點關閉"
         return result
+
+    def _refresh_margin_params(self) -> None:
+        """硬停事件的四個參數（★ 2026-10-20，見 margin_resume_m）。__init__ 與每趟重播開始時讀。"""
+        p = self.get_parameter
+        self.margin_resume_m = max(0.0, float(p("margin_resume_m").value))
+        self.margin_resume_sec = max(0.0, float(p("margin_resume_sec").value))
+        self.margin_stop_timeout = float(p("margin_stop_timeout_sec").value)
+        if self.margin_stop_timeout <= 0.0:
+            self.margin_stop_timeout = self.no_progress * 2.0
+        self.margin_block_suppress_stuck = bool(p("margin_block_suppress_stuck").value)
+
+    @staticmethod
+    def _margin_release(now: float, clear_t: float, margin: float, stop_m: float,
+                        resume_m: float, resume_sec: float,
+                        advanced: float, need_adv: float) -> Tuple[float, str]:
+        """硬停事件中、這一拍沒硬停：可以算「恢復」了嗎？（★ 2026-10-20，見 margin_resume_m）
+
+        回傳 (新的 clear_t, 解除原因)；原因是空字串 = 還不能解除，事件繼續計時。
+          - margin 要**連續** resume_sec 秒都大於 stop_m + resume_m（clear_t 記連續的起點，
+            中間任何一拍不夠就歸零重來）
+          - 或沿路徑已推進 >= need_adv（need_adv <= 0 = 不用這條）
+        resume_m 與 resume_sec 都是 0 時，第一拍 margin > stop_m 就解除 = 舊行為。
+        純函式（不碰節點狀態），方便離線重放 log 的情境驗證。
+        """
+        if margin > stop_m + resume_m:
+            if clear_t <= 0.0:
+                clear_t = now
+        else:
+            clear_t = 0.0
+        if clear_t > 0.0 and now - clear_t >= resume_sec:
+            return clear_t, (f"行進方向 > {(stop_m + resume_m) * 100:.0f} cm "
+                             f"已連續 {now - clear_t:.1f} 秒")
+        if need_adv > 0.0 and advanced >= need_adv:
+            return clear_t, f"沿路徑推進 {advanced * 100:.0f} cm"
+        return clear_t, ""
+
+    # ── 逐拍紀錄（★ 2026-10-20，見 trace_csv_dir）──────────────────────
+    # epoch 跟 nav log 的 [1792478988.45] 同一個時鐘（牆鐘），對時用；t 是這趟開始後的秒數
+    _TRACE_COLS = ("epoch", "t", "idx", "n", "dir", "x", "y", "yaw_deg",
+                   "dir_margin_m", "any_margin_m", "hard_stop", "episode_s", "episode_stops",
+                   "episode_adv_m", "cm_braking", "state", "cmd_v_last", "xte_m")
+
+    def _trace_open(self, path_id: str) -> None:
+        self._trace_fh = None
+        d = str(self.get_parameter("trace_csv_dir").value or "").strip()
+        if not d:
+            return
+        try:
+            d = os.path.expanduser(d)
+            os.makedirs(d, exist_ok=True)
+            fn = os.path.join(d, f"replay_{path_id}_live_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+            self._trace_fh = open(fn, "w", encoding="utf-8")
+            self._trace_fh.write(",".join(self._TRACE_COLS) + "\n")
+            self._trace_t0 = time.monotonic()
+            self.get_logger().info(f"逐拍紀錄：{fn}")
+        except Exception as e:  # noqa: BLE001 —— 紀錄是附加功能，不能擋住重播
+            self._trace_fh = None
+            self.get_logger().warn(f"逐拍紀錄開不起來（重播照常）：{e}")
+
+    def _trace_row(self, *vals) -> None:
+        fh = self._trace_fh
+        if fh is None:
+            return
+        try:
+            fh.write(",".join(f"{v:.4f}" if isinstance(v, float) else str(v) for v in vals) + "\n")
+        except Exception as e:  # noqa: BLE001
+            self._trace_fh = None
+            self.get_logger().warn(f"逐拍紀錄寫入失敗，這一趟不再紀錄：{e}")
+
+    def _trace_close(self) -> None:
+        fh, self._trace_fh = self._trace_fh, None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _stall_site_exhausted(self, site: dict, idx: int) -> bool:
         """這是同一處的第幾次「要脫困了」？達到 stall_site_replan_after 就回 True（呼叫端該放棄這條路徑）。

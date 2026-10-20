@@ -146,6 +146,14 @@ class NavigationActionCcNode(Node):
         #   （`command_lost_count > RATE_100_HZ`，見 韌體限制_不可違反.md），
         #   超時底盤會自己停住。車子在空檔期間是靜止的，不會滑行。
         self.declare_parameter("replan_min_progress_m", 0.20)
+        # ★★ 2026-10-20：重新規劃不出路徑時，還有重試次數就等一下再試，不要第一次就放棄 ★★
+        #
+        # 10/20 14:53:58（nav_20261020_144647.log）：第 1 次重播止損 -> 重新規劃第 2/3 次回
+        # 「Start occupied」-> /unwedge 推不開 -> 直接「導航失敗：重新規劃不出路徑」，第 3 次根本沒用到。
+        # 起點被占用常是暫時的（跟車的人站在車旁、剛走開的人還在障礙層上），而 /unwedge 一次只推
+        # 一小段 —— 下一輪再清一次成本地圖、再拉開一次、再規劃一次，才有機會出來。
+        # 每輪照樣用掉一次重試、受總期限與取消約束。0 = 回到舊行為（第一次重新規劃失敗就放棄）。
+        self.declare_parameter("replan_fail_retry_sec", 4.0)
         # ★★ 2026-10-01：被「地圖上沒有的障礙」擋住（人、剛放的東西）—— 繞過去，或等通道淨空 ★★
         #
         # path_teach 判斷擋路的是新東西時不脫困、停車等 new_obstacle_wait_sec，
@@ -176,6 +184,7 @@ class NavigationActionCcNode(Node):
         self.delete_temp_taught = bool(self.get_parameter("delete_temp_taught_path").value)
         self.max_replan_attempts = max(1, int(self.get_parameter("max_replan_attempts").value))
         self.replan_min_progress_m = float(self.get_parameter("replan_min_progress_m").value)
+        self.replan_fail_retry_sec = max(0.0, float(self.get_parameter("replan_fail_retry_sec").value))
         self.blocked_patience_sec = float(self.get_parameter("blocked_patience_sec").value)
         self.blocked_poll_sec = max(1.0, float(self.get_parameter("blocked_poll_sec").value))
         self.blocked_speech_wait = str(self.get_parameter("blocked_speech_wait").value)
@@ -488,6 +497,9 @@ class NavigationActionCcNode(Node):
             return None
 
         deadline = time.monotonic() + self.navigation_timeout_sec
+        # ★ 2026-10-20：每次導航重讀（ros2 param set 不必重啟就能 A/B）
+        self.replan_fail_retry_sec = max(
+            0.0, float(self.get_parameter("replan_fail_retry_sec").value))
         last_why = ""
         stuck_rounds = 0
         prev_xy = self._robot_xy()
@@ -557,8 +569,13 @@ class NavigationActionCcNode(Node):
                 #
                 # `/unwedge` 繞過規劃器直接打舵推開，是唯一有效的一條路。
                 # ★ 只試一次：推不開就是真的推不開，多試只是拖時間又耗電。
+                # ★ 2026-10-20：「一次」是指這一輪重試裡一次；下面加了「還有次數就再試一輪」，
+                #   /unwedge 可能被叫不只一次，所以推車前也守總期限（同「車身外緣持續不足」那條的守門）。
                 self._unwedge_goal = goal_handle
-                if self._call_unwedge():
+                if deadline - time.monotonic() < UNWEDGE_MIN_REMAINING_S:
+                    self.get_logger().info(
+                        f"規劃不出路徑，但離總期限不到 {UNWEDGE_MIN_REMAINING_S:.0f} 秒，不請 /unwedge 推車")
+                elif self._call_unwedge():
                     # 脫困（最久約 37 秒）期間才按急停：不再規劃、不再起跑
                     if goal_handle.is_cancel_requested:
                         return self._canceled(goal_handle, result)
@@ -569,9 +586,25 @@ class NavigationActionCcNode(Node):
                 if runs == 0:
                     # 一次都沒跑過 -> 車子還在原地，讓 MPPI 有機會試
                     return None
+                # ★ 2026-10-20：還有重試次數 -> 等一下、從當下位置再規劃一輪（見 replan_fail_retry_sec）。
+                #   回到迴圈開頭會 attempt += 1、清成本地圖，次數用完就由那裡的出口結束。
+                if (self.replan_fail_retry_sec > 0.0
+                        and attempt < self.max_replan_attempts
+                        and time.monotonic() + self.replan_fail_retry_sec < deadline):
+                    self.get_logger().warn(
+                        f"重新規劃不出路徑（第 {attempt}/{self.max_replan_attempts} 次）—— "
+                        f"{self.replan_fail_retry_sec:.0f} 秒後從當下位置再試一輪"
+                        f"（前次失敗：{last_why}）")
+                    t_end = time.monotonic() + self.replan_fail_retry_sec
+                    while time.monotonic() < t_end:
+                        if goal_handle.is_cancel_requested:
+                            return self._canceled(goal_handle, result)
+                        time.sleep(0.2)
+                    continue
                 return self._abort(
                     goal_handle, result,
-                    f"導航失敗：重新規劃不出路徑（前次失敗：{last_why}）")
+                    f"導航失敗：重新規劃不出路徑（已試 {attempt}/{self.max_replan_attempts} 次；"
+                    f"前次失敗：{last_why}）")
 
             runs += 1
             # ★ 2026-10-09（審查 [9]）：「開始導航到 X」只在第一次起跑與一般重試時播報。
