@@ -98,13 +98,18 @@ export function MapPage({ active }: { active: boolean }) {
 
   const waypoints = useStoreValue(waypointsStore);
   const maps = useStoreValue(mapsStore);
+  const currentMapId = useStoreSelector(telemetryStore, (t) => t.snap.system?.map_id);
 
-  /* 清單是非同步載入的，所以「還沒選」與「選了但那張圖被刪了」都要退回第一張。
-     用衍生值而不是 effect：effect 會先繪一次空的下拉選單再補上。 */
+  /* 清單是非同步載入的，所以「還沒選」與「選了但那張圖被刪了」都要退回預設。
+     用衍生值而不是 effect：effect 會先繪一次空的下拉選單再補上。
+     ★ 2026-10-21：預設改成「使用中的地圖」（上方狀態列同一個來源），找不到才退回第一張。
+       10/20 車上回報：原本預設是清單第一張（測試20260731），沒重選就按「切換」會切到舊圖。 */
   const selectedMap =
     pickedMap && maps.some((m) => m.map_id === pickedMap)
       ? pickedMap
-      : (maps[0]?.map_id ?? "");
+      : currentMapId && maps.some((m) => m.map_id === currentMapId)
+        ? currentMapId
+        : (maps[0]?.map_id ?? "");
 
   useEffect(() => {
     if (!active) return;
@@ -275,11 +280,23 @@ export function MapPage({ active }: { active: boolean }) {
                 ))}
               </Select>
               <Button
-                onClick={() => {
+                onClick={async () => {
                   if (!selectedMap) {
                     toast.error("沒有可切換的地圖");
                     return;
                   }
+                  // ★ 2026-10-21：切換前確認（10/20 車上回報沒有確認框，按錯就切到別張圖、地點與路徑跟著換）
+                  const name = maps.find((m) => m.map_id === selectedMap)?.map_name || selectedMap;
+                  if (selectedMap === currentMapId) {
+                    toast.error(`「${name}」已經是使用中的地圖`);
+                    return;
+                  }
+                  const ok = await confirmDialog({
+                    title: `切換到地圖「${name}」？`,
+                    message: "地點與教導路徑會跟著換成這張圖的；切換後請確認定位。",
+                    confirmLabel: "切換",
+                  });
+                  if (!ok) return;
                   void run(
                     post("/api/maps/switch", { map_id: selectedMap }),
                     () => void refreshWaypoints(),
