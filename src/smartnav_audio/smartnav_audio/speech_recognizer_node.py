@@ -5,9 +5,11 @@
 訂閱音訊話題，將音訊轉換為文字
 """
 
+import os
 import time
 import queue
 import threading
+import wave
 from typing import Optional
 from opencc import OpenCC
 import numpy as np
@@ -23,6 +25,23 @@ from std_msgs.msg import String, Bool
 
 from smartnav_msgs.msg import AudioData
 from smartnav_audio.voice_utils import AudioCodec, get_model_path, validate_audio_data
+
+
+def write_wav_int16(path, audio, sample_rate: int) -> float:
+    """★ 2026-10-21：把 float 音訊（-1~1）寫成 16-bit 單聲道 WAV（標準庫 wave），回傳秒數。
+
+    量化與 voice_utils.AudioCodec.encode_pcm_s16le 相同（x32768、四捨五入），
+    所以 /audio_in 上的 s16 樣本寫進檔案是逐點相同的 —— 聽到的就是辨識器吃到的。
+    超出 ±1 的值先削波：+1.0 -> 32767，不會溢位繞回 -32768 變成爆音。
+    """
+    pcm = np.nan_to_num(np.asarray(audio, dtype=np.float32).reshape(-1), nan=0.0, posinf=1.0, neginf=-1.0)
+    pcm = np.clip(np.round(pcm * 32768.0), -32768.0, 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(pcm.tobytes())
+    return len(pcm) / float(sample_rate)
 
 
 class SpeechRecognizerNode(Node):
@@ -142,6 +161,10 @@ class SpeechRecognizerNode(Node):
         #
         # 預設走 (B)。(A) 保留成參數 `mute_during_tts`，若實機發現回音過濾
         # 擋不住（例如客人與機器人同時講話產生的混合亂碼），再打開它。
+        # ★ 2026-10-21：擋不住的情況出現了 —— 10/20 實車文字層回音過濾 0/2（辨識太亂、比對不上），
+        #   LLM 自己跟自己對話。asr_chain.launch.py（平板按鈕與 demo 走的路）改成預設 true
+        #   （環境變數 ASR_MUTE_DURING_TTS=false 可退回）。節點本身的預設仍是 False，
+        #   ros2 run／run_asr_cc.sh 的行為不變。
         self.declare_parameter(
             "mute_during_tts",
             False,
@@ -237,6 +260,26 @@ class SpeechRecognizerNode(Node):
             ),
         )
 
+        # ── ★★ 2026-10-21：除錯錄音 —— 把每一段送進辨識器的音訊原樣存成 WAV ★★ ──
+        #
+        # 10/20 實車 10 句參考稿、單一說話者，五輪 CER 42.1~51.3%：
+        #   句首 2 字錯誤率 68.8% vs 句尾 2 字 33.3%（48 句）；疊字（「信信用卡」「在在哪裡」）遍布整句。
+        # voice_trigger 觸發那一塊被送兩次已修，但那只解釋得了段首 ——
+        # 其他位置每對相鄰字仍有 11.0% 疊字。是收音（溢位丟塊、重複塊）還是解碼器，
+        # 只看文字分不出來，要拿「辨識器實際吃到的音訊」對照著聽。
+        #
+        # 每次重設 stream（VAD 斷句、sherpa 端點斷句）寫一個檔，**沒有辨識結果也寫**——
+        # 被吞掉的句子最需要聽。目錄裡 asr_*.wav 達到上限就停止再寫（只 log 一次），**絕不刪檔**。
+        # 預設關；asr_chain.launch.py 用環境變數 ASR_DEBUG_WAV_DIR 打開。
+        self.declare_parameter(
+            "debug_wav_dir", "", ParameterDescriptor(description="除錯錄音目錄；空字串 = 關閉")
+        )
+        self.declare_parameter(
+            "debug_wav_max_files",
+            1000,
+            ParameterDescriptor(description="目錄裡的 asr_*.wav 達到這個數就停止再寫（不會刪任何檔）"),
+        )
+
         self.max_utterance_sec = self.get_parameter("max_utterance_sec").get_parameter_value().double_value
         self.queue_warn_depth = self.get_parameter("queue_warn_depth").get_parameter_value().integer_value
         self._stream_samples = 0  # 目前這個 stream 已經吃進多少取樣點
@@ -276,6 +319,35 @@ class SpeechRecognizerNode(Node):
         self.user_text_topic = self.get_parameter("user_text_topic").get_parameter_value().string_value
         self.partial_text_topic = self.get_parameter("partial_text_topic").get_parameter_value().string_value
         audio_topic = self.get_parameter("audio_topic").get_parameter_value().string_value
+
+        # ★ 2026-10-21：除錯錄音（說明見參數宣告處）。一定要在背景辨識執行緒啟動之前建好。
+        self._dbg_chunks = []  # 目前這個 stream 從上次重設到現在吃進去的音訊
+        self._dbg_enabled = False
+        self._dbg_count = 0
+        self.debug_wav_dir = os.path.expanduser(
+            self.get_parameter("debug_wav_dir").get_parameter_value().string_value.strip()
+        )
+        self.debug_wav_max_files = self.get_parameter("debug_wav_max_files").get_parameter_value().integer_value
+        if self.debug_wav_dir:
+            try:
+                os.makedirs(self.debug_wav_dir, exist_ok=True)
+                # 上限算整個目錄：重開語音鏈不會每次又多寫一輪
+                self._dbg_count = sum(
+                    1 for f in os.listdir(self.debug_wav_dir) if f.startswith("asr_") and f.endswith(".wav")
+                )
+                if self._dbg_count >= self.debug_wav_max_files:
+                    self.get_logger().warning(
+                        f"🎙 除錯錄音目錄已有 {self._dbg_count} 個檔（上限 {self.debug_wav_max_files}），本次不錄。"
+                        f"不會刪任何檔；要錄請換目錄或把舊檔搬走：{self.debug_wav_dir}"
+                    )
+                else:
+                    self._dbg_enabled = True
+                    self.get_logger().info(
+                        f"🎙 除錯錄音已開啟：{self.debug_wav_dir}"
+                        f"（目錄已有 {self._dbg_count} 個，上限 {self.debug_wav_max_files}）"
+                    )
+            except OSError as e:
+                self.get_logger().warning(f"除錯錄音目錄無法使用，本次不錄（辨識不受影響）: {e}")
 
         # 初始化 OpenCC 轉換器 (簡體中文 -> 繁體中文)
         self.opencc = None
@@ -714,6 +786,9 @@ class SpeechRecognizerNode(Node):
         try:
             # 接受波形數據
             self.stream.accept_waveform(self.sample_rate, audio)
+            # ★ 2026-10-21：除錯錄音 —— 累積「辨識器實際吃到的」音訊，重設 stream 時寫成 WAV
+            if self._dbg_enabled:
+                self._dbg_chunks.append(audio)
 
             # ★ 2026-08-14 防記憶體無界成長：VAD 一直不說結束時強制收尾。
             #   `is_final` 來自 voice_trigger 的 VAD，不是 sherpa 自己判斷的，
@@ -757,8 +832,10 @@ class SpeechRecognizerNode(Node):
                     self.get_logger().warning(f"sherpa 端點偵測不可用，改由 VAD 單獨斷句（辨識不受影響）: {exc}")
 
             result = self.recognizer.get_result(self.stream)
+            heard = ""  # ★ 2026-10-21：除錯錄音的 log 用 —— 後處理之前的原始結果（疊字要看沒摺疊過的）
             if result and result.strip():
                 converted_text = self._convert_simplified_to_traditional(result)
+                heard = converted_text or ""
                 if converted_text:
                     if is_final or endpoint:
                         src = "VAD" if is_final else "sherpa 端點"
@@ -791,6 +868,7 @@ class SpeechRecognizerNode(Node):
                 # 立即重置流，準備下一句識別
                 self.stream = self.recognizer.create_stream()
                 self._stream_samples = 0  # ★ 重建 stream 一定要歸零，否則計時器會一路累加
+                self._dump_debug_wav("VAD", heard)  # ★ 2026-10-21：除錯錄音（關閉時什麼都不做）
             elif endpoint:
                 # ★ sherpa 斷句用 `reset()` 而**不是** `create_stream()`：
                 #   VAD 還在說「人在講話」，音訊會繼續進來。reset 只清掉解碼假設與
@@ -798,10 +876,13 @@ class SpeechRecognizerNode(Node):
                 #   create_stream 則會把 accept_waveform 之後尚未消化的內部緩衝丟掉，
                 #   造成句與句交界處漏字 —— 這正是我們想修的症狀。
                 self._reset_stream_for_endpoint()
+                self._dump_debug_wav("sherpa", heard)  # ★ 2026-10-21：除錯錄音
         except Exception as e:
             self.get_logger().error(f"✗ 語音辨識失敗: {e}")
             # 重置流
             self.stream = self.recognizer.create_stream()
+            # ★ 2026-10-21：stream 重建了，累積的除錯錄音跟著清掉，下一個檔才對得上辨識器吃到的東西
+            self._dbg_chunks = []
 
     @staticmethod
     def _norm_for_echo(text: str) -> str:
@@ -905,6 +986,32 @@ class SpeechRecognizerNode(Node):
         #   該回頭調 voice_trigger 的門檻，而不是繼續在 ASR 這端加工。
         if self._endpoint_hits % 10 == 0:
             self.get_logger().info(f"（sherpa 端點已接手斷句 {self._endpoint_hits} 句）")
+
+    def _dump_debug_wav(self, src: str, text: str) -> None:
+        """★ 2026-10-21：把這個 stream 從上次重設到現在吃進去的音訊寫成一個 WAV，然後清空累積。
+
+        在兩個重設點呼叫（VAD 斷句 -> create_stream；sherpa 端點 -> _reset_stream_for_endpoint），
+        **沒有辨識結果也寫**。寫檔失敗只警告 —— 除錯功能絕不能拖垮辨識。
+        """
+        chunks, self._dbg_chunks = self._dbg_chunks, []
+        if not self._dbg_enabled or not chunks:
+            return
+        if self._dbg_count >= self.debug_wav_max_files:
+            self._dbg_enabled = False  # 之後連累積都停掉，這行 log 只會出現一次
+            self.get_logger().warning(
+                f"🎙 除錯錄音已達上限 {self.debug_wav_max_files} 個（{self.debug_wav_dir}），之後不再寫。"
+                "不會刪任何檔；要繼續錄請換目錄（ASR_DEBUG_WAV_DIR）或把舊檔搬走後重啟語音鏈"
+            )
+            return
+        self._dbg_count += 1
+        path = os.path.join(
+            self.debug_wav_dir, f"asr_{time.strftime('%Y%m%d_%H%M%S')}_{self._dbg_count:04d}_{src}.wav"
+        )
+        try:
+            secs = write_wav_int16(path, np.concatenate(chunks), self.sample_rate)
+            self.get_logger().info(f"🎙 除錯錄音 {path}（{secs:.2f} 秒，{src} 斷句）辨識：'{text}'")
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f"除錯錄音寫入失敗（不影響辨識）: {path}: {e}")
 
     # ── 後處理 ────────────────────────────────────────────────
     #
@@ -1134,6 +1241,8 @@ class SpeechRecognizerNode(Node):
             if self.recognizer and self.stream:
                 self.stream = self.recognizer.create_stream()
                 self._stream_samples = 0  # ★ 重建 stream 一定要歸零，否則計時器會一路累加
+                # ★ 2026-10-21：除錯錄音的累積跟著 stream 一起清（launch 預設開 mute 之後這條路會常走）
+                self._dbg_chunks = []
 
             self.last_partial_result = None
 

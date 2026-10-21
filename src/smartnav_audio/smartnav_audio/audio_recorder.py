@@ -30,6 +30,7 @@ class AudioRecorder:
         logger: Optional[Any] = None,
         channels: int = 1,
         mono_mixer: Optional[Callable] = None,
+        latency: Any = "high",
     ):
         """初始化麥克風錄製器
 
@@ -47,6 +48,9 @@ class AudioRecorder:
             mono_mixer: channels>1 時，把 (frames, channels) 縮成
                 (frames,) 的處理函式。在背景執行緒呼叫，不在音訊
                 回呼裡，所以不會拖累即時性。
+            latency: 收音緩衝，原樣交給 sd.InputStream。"low"／"high" 是 PortAudio
+                依裝置給的預設值，也可直接給秒數（float）。
+                ★ 2026-10-21：原本寫死 "low"，預設改 "high"，原因見 start()。
         """
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
@@ -55,6 +59,7 @@ class AudioRecorder:
         self.audio_callback = audio_callback
         self.channels = max(1, int(channels))
         self.mono_mixer = mono_mixer
+        self.latency = latency
         self.logger = logger or get_default_logger(__name__)
 
         self._recording = False
@@ -78,6 +83,13 @@ class AudioRecorder:
                 self._clear_queue()
 
                 # 建立音訊輸入串流（雙聲道時由 mono_mixer 縮成單聲道再往下送）
+                #
+                # ★★ 2026-10-21：latency 原本寫死 "low"（PortAudio 最小緩衝）★★
+                #   10/20 實車 "input overflow"：全開 74 次/分、閒置也有 1~2 次/分。
+                #   緩衝太小，CPU 一忙（導航＋相機＋人臉）音訊執行緒沒被及時排到就溢位，
+                #   每次溢位就丟一段音訊 —— 丟在句子中間就是漏字。
+                #   （回呼本身有 .copy()，不是共用記憶體的問題。）
+                #   改成可設定、預設 "high"：代價是多幾十毫秒延遲，對「講完一句才出結果」沒有感覺。
                 self._stream = sd.InputStream(
                     device=self.device,
                     samplerate=self.sample_rate,
@@ -85,7 +97,7 @@ class AudioRecorder:
                     blocksize=self.chunk_size,
                     dtype=self.dtype,
                     callback=self._audio_callback,
-                    latency="low",
+                    latency=self.latency,
                 )
                 self._stream.start()
                 self._recording = True
@@ -93,6 +105,17 @@ class AudioRecorder:
                 # 啟動執行緒以消耗佇列中的音訊數據
                 self._thread = threading.Thread(target=self._worker_loop, daemon=True)
                 self._thread.start()
+
+                # ★ 2026-10-21：印出 PortAudio 實際給的緩衝。"high" 對應幾毫秒是驅動決定的，
+                #   這行是確認設定真的生效的唯一憑據（ros2 param get 不算）。
+                #   溢位若仍多，比對這個數字再加大（例 audio_latency:=0.2）。
+                try:
+                    self.logger.info(
+                        f"  收音緩衝 latency={self.latency!r} -> 實際 {float(self._stream.latency) * 1000.0:.1f} ms"
+                        f"（每塊 {self.chunk_size} 取樣 = {self.chunk_size * 1000.0 / self.sample_rate:.0f} ms）"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    self.logger.warning(f"讀不到實際收音延遲（不影響錄音）: {e}")
                 return True
             except Exception as e:
                 self._recording = False

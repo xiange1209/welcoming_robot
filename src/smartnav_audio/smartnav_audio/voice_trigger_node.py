@@ -39,6 +39,27 @@ class TriggerState(Enum):
     COMMAND = "command"  # 第三階段：指令解析
 
 
+def parse_audio_latency(value):
+    """★ 2026-10-21：audio_latency 參數值 -> sd.InputStream 的 latency 引數。
+
+    "low"／"high"（不分大小寫）原樣回傳；數字或數字字串 -> 秒數 float；
+    其他（空字串、負數、NaN、打錯字）回 None，由呼叫端退回 "high" 並警告。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        secs = float(value)
+    else:
+        text = str(value).strip().lower()
+        if text in ("low", "high"):
+            return text
+        try:
+            secs = float(text)
+        except ValueError:
+            return None
+    return secs if math.isfinite(secs) and secs > 0 else None
+
+
 class VoiceTriggerNode(Node):
     """語音喚醒觸發節點
 
@@ -70,6 +91,19 @@ class VoiceTriggerNode(Node):
         )
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("chunk_size", 512)
+        # ★ 2026-10-21：收音緩衝。audio_recorder 原本寫死 latency="low"（PortAudio 最小緩衝），
+        #   10/20 實車 input overflow 全開 74 次/分、連閒置都有 1~2 次/分 —— 每次溢位就丟一段音訊，
+        #   丟在句子中間就是漏字。預設改 "high"；也可直接給秒數（例 0.2）。"low" = 10/20 以前的行為。
+        #   ★ dynamic_typing：launch_ros 會把 "0.2" 這種字串自動轉成 double（命令列 -p audio_latency:=0.2 也是），
+        #     宣告成純字串的話，型別不符會在宣告當下丟例外 -> voice_trigger 起不來 -> 整條 ASR 鏈跟著關。
+        self.declare_parameter(
+            "audio_latency",
+            "high",
+            ParameterDescriptor(
+                description="收音緩衝：low／high（PortAudio 依裝置給的預設）或秒數如 0.2；low = 2026-10-20 以前的行為",
+                dynamic_typing=True,
+            ),
+        )
         self.declare_parameter("device", -1)
         self.declare_parameter(
             "device_name_match", "",
@@ -142,6 +176,12 @@ class VoiceTriggerNode(Node):
         self.device_open_retries = max(1, self.get_parameter("device_open_retries").get_parameter_value().integer_value)
         self.dtype: str = self.get_parameter("dtype").get_parameter_value().string_value
         self.output_format: str = self.get_parameter("output_format").get_parameter_value().string_value
+        # ★ 2026-10-21：收音緩衝（見宣告處）。看不懂的值退回 high —— 不能讓一個打錯字的參數害麥克風開不起來。
+        raw_latency = self.get_parameter("audio_latency").value
+        self.audio_latency = parse_audio_latency(raw_latency)
+        if self.audio_latency is None:
+            self.get_logger().warning(f"✗ audio_latency={raw_latency!r} 無法辨識（要 low／high／正的秒數），改用 high")
+            self.audio_latency = "high"
 
         # VAD 參數
         self.vad_num_threads: int = self.get_parameter("vad_num_threads").get_parameter_value().integer_value
@@ -358,6 +398,7 @@ class VoiceTriggerNode(Node):
                     logger=self.get_logger(),
                     channels=channels,
                     mono_mixer=mixer,
+                    latency=self.audio_latency,  # ★ 2026-10-21：原本 recorder 內寫死 "low"
                 )
                 self._recorder.start()
                 self.get_logger().info(f"✓ 麥克風錄製已啟動（device={device}）")
@@ -496,6 +537,8 @@ class VoiceTriggerNode(Node):
             bool: 是否觸發喚醒
         """
         triggered = False
+        # ★ 2026-10-21：這一塊是不是「觸發的那一塊」—— 它已經隨緩衝送出，COMMAND 分支不能再送（見下方）
+        just_triggered = False
 
         # 確保 audio 為 float32
         if audio.dtype != np.float32:
@@ -533,6 +576,7 @@ class VoiceTriggerNode(Node):
                     for buffered_audio in self._audio_buffer:
                         self._publish_audio(buffered_audio)
                     self._audio_buffer.clear()
+                    just_triggered = True  # 目前這塊在上面 append 進緩衝、已經送出了
 
                     self.get_logger().info(f"語音起點檢測 (連續 {self._vad_positive_frames} 幀語音)")
             else:
@@ -548,7 +592,16 @@ class VoiceTriggerNode(Node):
             if self._in_command_initial_wait:
                 # 初始等待期：累積幀數直到超過初始等待時長
                 self._command_wait_frames += 1
-                self._publish_audio(audio)
+                # ★★ 2026-10-21：觸發的那一塊不能再送一次 ★★
+                #   IDLE 分支先把目前這塊 append 進 _audio_buffer、達門檻時整批送出；
+                #   同一次呼叫往下走到這裡，原本又 _publish_audio(audio) 一次
+                #   -> 同一段 32 ms 進辨識器兩次 = 段首疊字的來源之一。
+                #   10/20 實車：段首就疊字的段 14.3%，其他位置每對相鄰字也有 11.0% ——
+                #   所以這只修得到段首這一份，其餘疊字的根因要靠除錯錄音
+                #   （speech_recognizer 的 debug_wav_dir）查。
+                #   計數照加：初始等待的長度跟以前一模一樣。
+                if not just_triggered:
+                    self._publish_audio(audio)
                 if self._command_wait_frames >= self.command_initial_wait_frames:
                     # 初始等待期結束，開始監測說話結束
                     self._in_command_initial_wait = False
