@@ -53,8 +53,8 @@ CHECKS = [
     ("曲率分析（車子版，第 8 節跳過）", REPO / "maprun/tools_1015/curvature/test_curvature.py"),
     ("scan_self_echo", REPO / "maprun/tools_0930/test_scan_self_echo.py"),
     # ★ 2026-10-21：10/20 實車之後的修補
-    ("帶位判斷 nav_intent（39）", REPO / "maprun/tools_1021/test_nav_intent.py"),
-    ("LLM 接線：常駐／FAQ 併入／工具精簡／帶位防呆（27）", REPO / "maprun/tools_1021/test_llm_wiring.py"),
+    ("帶位判斷 nav_intent（56）", REPO / "maprun/tools_1021/test_nav_intent.py"),
+    ("LLM 接線：常駐／FAQ 併入／工具精簡／帶位防呆（31）", REPO / "maprun/tools_1021/test_llm_wiring.py"),
     ("導航修補：硬停事件／重規劃重試／逐拍紀錄（23）", REPO / "maprun/tools_1021/test_nav_replan.py"),
     ("ASR 修補：觸發塊重送／收音緩衝／除錯錄音／launch", REPO / "maprun/tools_1021/test_asr_fixes.py"),
 ]

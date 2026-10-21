@@ -1055,17 +1055,28 @@ class LLMServiceNode(Node):
 
         force_intent=True（模型已經答應帶路時用）：不再要求句子裡有「帶我去」這類字，只看地點。
         """
-        if "navigate_tool" not in self.tools_map:
-            return False
         names = self._waypoint_name_map()
-        if not names:
-            return False
-        if force_intent:
-            name = nav_intent.match_waypoint(user_input, names)
-        else:
-            name = nav_intent.detect_nav_request(user_input, names)
+        name = None
+        if names and "navigate_tool" in self.tools_map:
+            if force_intent:
+                name = nav_intent.match_waypoint(user_input, names)
+            else:
+                name = nav_intent.detect_nav_request(user_input, names)
         if not name:
-            return False
+            # ★ 2026-10-21：問的是 FAQ 列為「示範場地沒有設定」的地點（洗手間、ATM…）、地圖上也沒有 →
+            #   答案是固定的，由程式回答（筆電評估：模型會反問樓層或叫人「呼叫查詢地點工具」）。
+            #   不需要導航堆疊，導航沒開時也照樣答對。
+            place = None if force_intent else nav_intent.unconfigured_place(user_input, names)
+            if not place:
+                return False
+            reply = f"示範場地沒有設定{place}，我沒辦法帶您過去；需要的話請洽詢櫃檯行員。"
+            self.get_logger().info(f"🧭 未設定地點（程式回答，不經模型）：'{user_input}' -> {place}")
+            self.get_logger().info(f"🤖 Agent 最終決策回應: {reply}")
+            with self.memory_lock:
+                self.memory.add_message(HumanMessage(content=user_input))
+                self.memory.add_message(AIMessage(content=reply))
+            self._publish_reply(reply)
+            return True
         wid = names[name]
         self.get_logger().info(f"🧭 帶位直達（程式判斷，不經模型）：'{user_input}' -> {name}（{wid}）")
         ack = "好的，請跟我來。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
@@ -1263,14 +1274,27 @@ class LLMServiceNode(Node):
                 # 處理工具調用
                 for tool_call in response.tool_calls:
                     tool_name = tool_call["name"]
-                    if tool_name in nav_intent.NAV_TOOL_NAMES:
-                        nav_called = True
                     tool_args = tool_call["args"]
                     tool_id = tool_call["id"]
 
                     self.get_logger().info(f"🛠️ LLM 決定呼叫服務: {tool_name}, 參數: {tool_args}")
 
-                    if tool_name in self.tools_map:
+                    # ★★ 2026-10-21：叫錯帶位工具防呆 ★★
+                    #   筆電 Ollama 評估（backups/研究數據/LLM評估_20261021/）：程式端帶位沒攔到的時候，
+                    #   模型會把「帶我去門口／櫃檯／大廳」叫成去貴賓室的工具——車會開錯地方，舊版還回過
+                    #   「已成功帶您走到大廳」的假成功。客人沒提到貴賓室就不執行：句子裡有別的地點就改帶去那裡，
+                    #   沒有就回失敗讓模型改口。被擋下的不算 nav_called，所以後面「答應帶路」的防呆照樣有效。
+                    if (tool_name == "guide_to_vip_room_tool" and self.nav_guard
+                            and not nav_intent.mentions_place(user_input, self.vip_room_waypoint_name)):
+                        self.get_logger().warning(
+                            f"⚠️ 模型要帶去{self.vip_room_waypoint_name}，但客人沒提到：{user_input}")
+                        if self._try_direct_navigation(user_input, force_intent=True):
+                            return
+                        tool_result = (f"執行結果: 失敗, 詳細信息: 客戶沒有提到{self.vip_room_waypoint_name}，"
+                                       "不可以帶去那裡；請直接問客戶要去哪裡")
+                    elif tool_name in self.tools_map:
+                        if tool_name in nav_intent.NAV_TOOL_NAMES:
+                            nav_called = True
                         # ★★ 2026-08-26：工具呼叫要包起來 ★★
                         #
                         # LangChain 的 BaseTool.invoke() 會先用 args_schema

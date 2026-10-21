@@ -45,13 +45,16 @@ cases = [
     ("你帶我去貴桂賓吃到大大去貴賓貴貴", "貴賓室"),  # 10/20 15:33 ASR 原文
     ("我想去起點", "起點"),
     ("廁所在哪", "廁所"),                         # 地圖上真的有「廁所」——與 FAQ「洗手間沒設定」衝突，明天要決定
+    ("請問洗手間在哪裡？", "廁所"),               # 同一個地方的不同說法：地圖有「廁所」就帶過去
 ]
 for text, want in cases:
     got = ni.detect_nav_request(text, NAMES)
     check(got == want, f"「{text}」→ {got}（預期 {want}）")
 
 print("── 2. 不該帶路 ──")
-for text in ["請問洗手間在哪裡？", "請問 ATM 在哪裡？", "我不要去門口", "先不用帶我去貴賓室",
+NO_WC = [n for n in NAMES if n != "廁所"]  # 今天建議的新地圖：不建「廁所」（與 FAQ 一致）
+check(ni.detect_nav_request("請問洗手間在哪裡？", NO_WC) is None, "新地圖沒有廁所：「請問洗手間在哪裡？」→ None")
+for text in ["請問 ATM 在哪裡？", "我不要去門口", "先不用帶我去貴賓室",
              "門口有人在等嗎", "我去年在櫃檯開戶", "帶我去", "請問銀行幾點營業？", "你好",
              "跟他女人左左裡左逼利誘URU"]:
     got = ni.detect_nav_request(text, NAMES)
@@ -84,6 +87,27 @@ check(not ni.is_robot_echo("帶我去門口", ["好的，請跟我來。", "開�
 check(not ni.is_robot_echo("我要辦理業務", ["請問您要辦理什麼業務呢"]), "用了機器人的詞造新句子不算（bigram 0.6 < 0.8）")
 check(not ni.is_robot_echo("你好", ["你好"]), "太短（<4 字）不判")
 check("navigate_tool" in ni.NAV_TOOL_NAMES and "guide_to_vip_room_tool" in ni.NAV_TOOL_NAMES, "會讓車移動的兩個工具都在清單")
+
+print("── 6. FAQ 列為「示範場地沒有設定」的地點（程式直接回答） ──")
+for text, names, want in [
+    ("請問洗手間在哪裡？", NO_WC, "洗手間"),   # 題 ④（筆電評估：模型仍反問樓層）
+    ("廁所在哪", NO_WC, "洗手間"),
+    ("請問 ATM 在哪裡？", NO_WC, "ATM"),        # 題 ⑤（模型叫人「呼叫查詢地點工具」）
+    ("提款機怎麼走", NO_WC, "ATM"),
+    ("電梯在哪", NO_WC, "電梯"),
+    ("停車場在哪裡", NO_WC, "停車場"),
+    ("請問洗手間在哪裡？", NAMES, None),       # 地圖上有廁所 → 不是未設定（交給帶位）
+    ("我的號碼牌是一百二十八號", NO_WC, None),  # ASR 參考稿：沒有問位置／帶路的意圖
+    ("帶我去門口", NO_WC, None),
+    ("ATM 開到幾點", NO_WC, None),              # 問時間不是問位置
+]:
+    got = ni.unconfigured_place(text, names)
+    check(got == want, f"「{text}」（{'有' if '廁所' in names else '無'}廁所）→ {got}（預期 {want}）")
+
+print("── 7. 有沒有提到某個地點（給「叫錯貴賓室帶位」防呆用） ──")
+for text, want in [("帶我去門口", False), ("請帶我去大廳。", False), ("我要去VIP室", True),
+                   ("帶我去貴賓市", True), ("貴賓室要怎麼去？", True), ("帶帶我去乖乖貴貴賓賓去", True)]:
+    check(ni.mentions_place(text, "貴賓室") == want, f"{want!s:5}「{text}」提到貴賓室")
 
 print(f"\n{sum(results)}/{len(results)} 通過")
 sys.exit(0 if all(results) else 1)

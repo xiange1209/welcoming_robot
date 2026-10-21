@@ -95,6 +95,17 @@ check(0 <= i_empty < i_flush and 0 <= i_prom < i_flush, "空白與「答應帶�
 check("force_intent=True" in lsrc, "答應帶路卻沒導航 → 改由程式依地點直接帶（force_intent）")
 check("nav_intent.NAV_TOOL_NAMES" in lsrc and "nav_called = True" in lsrc, "工具迴圈記錄這一輪有沒有呼叫導航")
 
+i_vip = lsrc.find('tool_name == "guide_to_vip_room_tool" and self.nav_guard')
+i_exec = lsrc.find("elif tool_name in self.tools_map:")
+check(0 <= i_vip < i_exec and "nav_intent.mentions_place(user_input, self.vip_room_waypoint_name)" in lsrc,
+      "叫錯帶位工具防呆：客人沒提到貴賓室就不執行（在真正執行工具之前）")
+i_nc = lsrc.find("nav_called = True")
+check(i_exec < i_nc, "nav_called 只在真的執行導航工具時才設（被擋下的不算，答應帶路防呆照樣有效）")
+dn = func("_try_direct_navigation")
+dsrc = ast.get_source_segment(SRC, dn) if dn else ""
+check("nav_intent.unconfigured_place(user_input, names)" in dsrc and "示範場地沒有設定" in dsrc,
+      "FAQ 列為未設定的地點（洗手間、ATM…）由程式直接回答")
+
 print("── 4. /llm_response 的出口 ──")
 pub = func("_publish_reply")
 outside = [n for n in ast.walk(tree)
@@ -112,6 +123,8 @@ check("本行知識庫的全文附在這份提示的最後" in P, "改成依附�
 check("你**必須先呼叫「查詢本行業務規定」工具**" not in P, "不再無條件要求先呼叫 FAQ 工具（工具已拿掉）")
 check("帶路一定要真的呼叫工具" in P, "寫明帶路一定要真的呼叫工具")
 check("協助管理地圖資料" not in P, "角色不再包含管理地圖（建圖等工具在銀行模式已拿掉）")
+check("本行營業到下午三點半」" not in P and "本行週一到週五上午九點到下午三點半營業" in P,
+      "回覆長度的範例句改成完整答案（筆電評估：模型照抄範例，漏了星期與開始時間）")
 check("# 本行知識庫（全文；回答本行業務問題只能依據這一節）" in SRC, "_load_system_prompt 附上的節名與提示文字一致")
 
 print(f"\n{sum(results)}/{len(results)} 通過")

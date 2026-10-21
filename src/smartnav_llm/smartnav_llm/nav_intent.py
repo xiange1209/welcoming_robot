@@ -31,6 +31,10 @@ _ALIASES: Sequence[Tuple[str, str]] = (
     ("貴賓廳", "貴賓室"),
     ("vip室", "貴賓室"),
     ("vip", "貴賓室"),
+    # ★ 2026-10-21：同一個地方的不同說法。地圖上標「廁所」、客人問「洗手間」也要對得上，
+    #   否則會一邊帶去廁所、一邊回答「沒有設定洗手間」。
+    ("廁所", "洗手間"),
+    ("化妝室", "洗手間"),
 )
 
 _STRIP = re.compile(r"[\s，。？！、,.?!：:；;「」『』（）()…~～\-—]")
@@ -103,6 +107,44 @@ def detect_nav_request(text: str, names: Iterable[str]) -> Optional[str]:
     if not has_nav_intent(text):
         return None
     return match_waypoint(text, names)
+
+
+# ★ 2026-10-21：bank_faq.txt 第 5 行列的「示範場地沒有設定」的地點。
+#   筆電 Ollama 評估（backups/研究數據/LLM評估_20261021/）：FAQ 已併入提示，模型問到洗手間、ATM
+#   仍會反問樓層或叫人「呼叫查詢地點工具」。這類問題答案是固定的，交給程式回答。
+UNCONFIGURED_PLACES: Sequence[Tuple[str, str]] = (
+    # (句子裡會出現的說法, 回答時用的名稱)
+    ("洗手間", "洗手間"),
+    ("廁所", "洗手間"),
+    ("化妝室", "洗手間"),
+    ("atm", "ATM"),
+    ("提款機", "ATM"),
+    ("取號機", "取號機"),
+    ("號碼牌", "取號機"),
+    ("電梯", "電梯"),
+    ("停車場", "停車場"),
+)
+
+
+def unconfigured_place(text: str, names: Iterable[str]) -> Optional[str]:
+    """問的是 FAQ 列為「示範場地沒有設定」的地點、而且地圖上也沒有這個地點 → 回傳要講的名稱。
+
+    地圖上真的有（例如有人標了「廁所」）就回 None，交給帶位——地圖才是現場的真相。
+    """
+    if not has_nav_intent(text):
+        return None
+    s = normalize(text)
+    on_map = {normalize(n) for n in names}
+    for word, say in UNCONFIGURED_PLACES:
+        w = normalize(word)
+        if w in s and w not in on_map and normalize(say) not in on_map:
+            return say
+    return None
+
+
+def mentions_place(text: str, name: str) -> bool:
+    """句子有沒有提到這個地點（同一套正規化與錯一字容忍）。給「叫錯帶位工具」防呆用。"""
+    return _name_score(normalize(name), normalize(text)) > 0
 
 
 # 只收「把人帶到某處」的說法。單獨的「我帶您」不收：「我帶您了解一下開戶流程」是正常回答。
