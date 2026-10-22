@@ -164,6 +164,9 @@ class MapServiceCcNode(Node):
         self.declare_parameter("self_mask_sectors_deg", [84.0, 118.0, 249.0, 275.0])
         self.declare_parameter("self_mask_max_range_m", 0.25)
         self.declare_parameter("laser_x_offset_m", 0.089)
+        # ★ 2026-10-22：雷射左右偏移（base_footprint 座標，正 = 偏左），預設 0.0＝舊行為。
+        #   與 path_teach_cc 的同名參數同一件事（說明見該檔宣告處）；這裡只用在探索中自己脫困的 _body_gap。
+        self.declare_parameter("laser_y_offset_m", 0.0)
         # 等 map -> base_footprint 出現的時間 (Pi 4 冷開機時 slam 第一張圖要好幾秒)
         self.declare_parameter("tf_ready_timeout_sec", 60.0)
         self.declare_parameter("lifecycle_transition_timeout_sec", 25.0)
@@ -393,6 +396,7 @@ class MapServiceCcNode(Node):
         self._self_sectors = [(_flat[i], _flat[i + 1]) for i in range(0, len(_flat) - 1, 2)]
         self._self_max_range = float(p("self_mask_max_range_m").value)
         self._laser_x = float(p("laser_x_offset_m").value)
+        self._laser_y = max(-0.10, min(0.10, float(p("laser_y_offset_m").value)))   # ★ 2026-10-22
         self._last_scan_mono = 0.0
         self._motion_anchor = None     # (x, y, monotonic)：最後一次「真的移動了」的位置與時間
         # ★ 2026-10-09（審查 [12]）：「車身旁很擠」自己的計時。原本脫困的 idle 只從 _motion_anchor
@@ -1354,7 +1358,8 @@ class MapServiceCcNode(Node):
                 d = math.degrees(ang) % 360.0
                 if any(lo <= d <= hi for lo, hi in self._self_sectors):
                     continue
-            x, y = r * math.cos(ang), r * math.sin(ang)
+            # ★ 2026-10-22：y 換成車身中線座標（getattr：沒經過 __init__ 的替身物件＝舊行為）
+            x, y = r * math.cos(ang), r * math.sin(ang) + getattr(self, "_laser_y", 0.0)
             gap = math.hypot(max(rear - x, x - front, 0.0), max(abs(y) - half_w, 0.0))
             best = min(best, gap)
         return best

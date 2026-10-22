@@ -139,6 +139,10 @@ class PathPoint:
 
 class PathTeachNode(Node):
 
+    # ★ 2026-10-22：雷射左右偏移的預設（見 laser_y_offset_m）。放在類別上，是讓不經 __init__ 的替身物件
+    #   （測試用 object.__new__）也讀得到 0.0 ＝ 舊行為。
+    laser_y = 0.0
+
     def __init__(self):
         super().__init__("path_teach_cc_node")
         cb = ReentrantCallbackGroup()
@@ -769,6 +773,19 @@ class PathTeachNode(Node):
         #   用錯會讓每個雷射點多推 0.222 m；在走廊裡沿長軸看不出來
         #   （平行牆的縱向歧義），進到房間才會冒出來。
         self.declare_parameter("laser_x_offset_m", 0.089)
+        # ★★ 2026-10-22：雷射的「左右」偏移（base_footprint 座標，單位 m，正 = 雷射在車身中線的左邊）★★
+        #
+        # 廠商 robot_model.yaml 寫雷射在 [0.08874, 0.00067, 0.11102]，左右只偏 0.67 mm＝正中間；
+        # 本檔所有車身矩形（_body_margin、_side_clearance、_end_gaps、_arc_clearance、_forward_clearance、
+        # _blocking_points）也都假設車身中線＝雷射 y=0、左右各 0.185 m。
+        # 但 10/20 三次自身回波量測（10/05、10/20 兩個朝向）顯示兩側鋁擠條造成的死角**不對稱**：
+        # 左 85.3°～114.4°（29.1°）、右 251.7°～272.5°（20.8°），中心鏡像誤差只有 2°（雷射沒轉歪）。
+        # 同一根鋁擠條越近擋住的角度越大 → 右邊比左邊遠約 1.4 倍 → 推算雷射偏左約 2.2～2.8 cm
+        # （推算，前提是兩根一樣、對稱；使用者 10/22 說「好像的確光達不是正中間」）。
+        # 偏 2.5 cm 的後果：左側淨空被低估 2.5 cm（保守）、**右側被高估 2.5 cm**（6 cm 的硬停門檻實際只剩約 3.5 cm）。
+        # 預設 0.0＝舊行為。量到實際值後：ros2 param set /path_teach_cc_node laser_y_offset_m 0.025
+        # （每趟重播開始時重讀，不必重啟；±0.10 以外視為輸入錯誤，夾到 ±0.10）。
+        self.declare_parameter("laser_y_offset_m", 0.0)
         # 單側空隙低於這個值就啟動貼牆排斥，把追蹤目標往外推。
         # 做成「靠太近才推開」而不是「隨時往中間拉」：後者會跟路徑追蹤打架，
         # 有些路徑本來就該貼一邊走。
@@ -894,6 +911,7 @@ class PathTeachNode(Node):
         self.escape_dir_margin = float(p("escape_dir_margin_m").value)
         self.scan_still_m = float(p("scan_still_m").value)
         self.laser_x = float(p("laser_x_offset_m").value)
+        self.laser_y = max(-0.10, min(0.10, float(p("laser_y_offset_m").value)))   # ★ 2026-10-22，見宣告處
         self.scan_stale_sec = float(p("scan_stale_sec").value)
         _flat = [float(v) for v in p("self_mask_sectors_deg").value]
         self.self_sectors = [(_flat[i], _flat[i + 1]) for i in range(0, len(_flat) - 1, 2)]
@@ -1376,7 +1394,10 @@ class PathTeachNode(Node):
             for i, (px, py) in enumerate(pts):
                 if i in hit:
                     continue
-                dx, dy = px - cx, py - cy
+                # ★ 2026-10-22：先把點換成「車身中線座標」（py + laser_y）再做弧線的相對位移與旋轉，
+                #   和 _arc_clearance 完全同一種做法（兩者判斷的是同一個「擋到」模型）；
+                #   pts 本身仍是雷射座標，下面 _classify_blocker 還要用它換算到地圖。
+                dx, dy = px - cx, (py + self.laser_y) - cy
                 bx = dx * c - dy * sn
                 by = dx * sn + dy * c
                 if rear <= bx <= front and abs(by) <= half_w:
@@ -1418,7 +1439,7 @@ class PathTeachNode(Node):
         cy_, sy_ = math.cos(yaw), math.sin(yaw)
         new = known = 0
         for lx, ly in pts:
-            bx, by = lx + self.laser_x, ly          # 雷達 -> base_footprint
+            bx, by = lx + self.laser_x, ly + self.laser_y   # 雷達 -> base_footprint（★ 2026-10-22：y 也要加偏移）
             mx = x0 + bx * cy_ - by * sy_
             my = y0 + bx * sy_ + by * cy_
             ci = int(math.floor((mx - ox) / res))
@@ -1982,7 +2003,7 @@ class PathTeachNode(Node):
                 continue
             # 車體座標：x 向前、y 向左（雷達與 base_footprint 同向，只差高度）
             x = r * math.cos(a)
-            y = r * math.sin(a) - lateral_offset
+            y = r * math.sin(a) - lateral_offset + self.laser_y   # ★ 2026-10-22：換成車身中線座標
             if abs(y) > half_w:
                 continue
             longitudinal = x if direction >= 0 else -x
@@ -2088,7 +2109,9 @@ class PathTeachNode(Node):
             if r > 2.0:
                 continue                    # 遠處的牆現在刮不到
             x = r * math.cos(a)
-            y = r * math.sin(a)
+            # ★ 2026-10-22：y 換成「車身中線座標」（雷射偏左 laser_y → 點的 y 要加 laser_y）。
+            #   雷射偏左時，右側的牆比雷射看起來的更靠近車身、左側更遠；舊寫法等於假設 laser_y = 0。
+            y = r * math.sin(a) + self.laser_y
             # 點到矩形的距離：各軸超出量的歐氏長度，都在裡面就是 0（已侵入）
             ox = max(rear - x, x - front, 0.0)
             oy = max(abs(y) - half_w, 0.0)
@@ -2142,7 +2165,7 @@ class PathTeachNode(Node):
             if r > 3.0:
                 continue
             x = self.laser_x + r * math.cos(a)
-            y = r * math.sin(a)
+            y = r * math.sin(a) + self.laser_y      # ★ 2026-10-22：車身中線座標
             if not (rear - 0.05 <= x <= front + 0.05):
                 continue
             if y > 0:
@@ -2172,7 +2195,7 @@ class PathTeachNode(Node):
             if r > 2.0:
                 continue
             x = self.laser_x + r * math.cos(a)
-            y = r * math.sin(a)
+            y = r * math.sin(a) + self.laser_y      # ★ 2026-10-22：車身中線座標
             oy = max(abs(y) - half_w, 0.0)
             if oy > 0.10:
                 continue                        # 側面的點交給 _side_clearance
@@ -2210,7 +2233,8 @@ class PathTeachNode(Node):
                 continue
             # lateral_offset 正 = 假設車子往左平移（與 _forward_clearance、
             # _do_escape 同一個慣例）。把掃描點反向平移即等效。
-            pts.append((r * math.cos(a), r * math.sin(a) - lateral_offset))
+            # ★ 2026-10-22：再加 laser_y，換成車身中線座標（下面的車身矩形是以中線為軸）
+            pts.append((r * math.cos(a), r * math.sin(a) - lateral_offset + self.laser_y))
         if not pts:
             return max_dist
 
@@ -2853,6 +2877,10 @@ class PathTeachNode(Node):
                 f"連續 {self.margin_resume_sec:.1f} 秒或推進 {self.stall_progress:.2f} m、"
                 f"逾時 {self.margin_stop_timeout:.0f} 秒交回導航層、"
                 f"事件中{'不' if self.margin_block_suppress_stuck else '仍會'}脫困")
+            # ★ 2026-10-22：這一趟實際生效的現場可調參數（ros2 param get 不算驗證——要看這行）
+            self.get_logger().info(
+                f"本趟生效：雷射左右偏移 {self.laser_y * 100:+.1f} cm（正＝偏左）、"
+                f"新障礙停車等 {self.new_obstacle_wait:.0f} 秒才交回、等不通 {self.escape_after:.0f} 秒後試脫困")
             self._trace_open(req.path_id)      # ★ 2026-10-20：逐拍紀錄（見 trace_csv_dir）
             return self._follow_loop(goal_handle, pts, scale, result)
         finally:
@@ -3973,8 +4001,18 @@ class PathTeachNode(Node):
         return result
 
     def _refresh_margin_params(self) -> None:
-        """硬停事件的四個參數（★ 2026-10-20，見 margin_resume_m）。__init__ 與每趟重播開始時讀。"""
+        """硬停事件的四個參數（★ 2026-10-20，見 margin_resume_m）。__init__ 與每趟重播開始時讀。
+
+        ★ 2026-10-22：同一個「每趟重讀」機制再加三個要在現場 A/B 的參數——
+          new_obstacle_wait_sec（新障礙停車等多久才交回導航層，預設 8 s）、
+          escape_after_sec（等這麼久還沒通就試脫困，預設 4 s）、
+          laser_y_offset_m（雷射左右偏移，預設 0.0）。
+          這三個原本只在 __init__ 讀一次，ros2 param set 沒有效果；預設值都沒變。
+        """
         p = self.get_parameter
+        self.new_obstacle_wait = max(0.0, float(p("new_obstacle_wait_sec").value))
+        self.escape_after = max(0.0, float(p("escape_after_sec").value))
+        self.laser_y = max(-0.10, min(0.10, float(p("laser_y_offset_m").value)))
         self.margin_resume_m = max(0.0, float(p("margin_resume_m").value))
         self.margin_resume_sec = max(0.0, float(p("margin_resume_sec").value))
         self.margin_stop_timeout = float(p("margin_stop_timeout_sec").value)

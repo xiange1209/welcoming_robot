@@ -127,13 +127,22 @@ def fake(values, no_progress=5.0):
     return o
 
 
+DEFAULTS = {"new_obstacle_wait_sec": 8.0, "escape_after_sec": 4.0, "laser_y_offset_m": 0.0}   # 2026-10-22 併入每趟重讀
 o = fake({"margin_resume_m": 0.03, "margin_resume_sec": 1.0, "margin_stop_timeout_sec": 0.0,
-          "margin_block_suppress_stuck": True})
+          "margin_block_suppress_stuck": True, **DEFAULTS})
 check(o.margin_stop_timeout == 10.0, f"逾時 0 → 沿用 no_progress × 2 = 10 s（實際 {o.margin_stop_timeout}）")
+check((o.new_obstacle_wait, o.escape_after, o.laser_y) == (8.0, 4.0, 0.0), "預設值沒變：新障礙等 8 s、脫困 4 s、雷射偏移 0")
 o = fake({"margin_resume_m": -1.0, "margin_resume_sec": -2.0, "margin_stop_timeout_sec": 6.0,
-          "margin_block_suppress_stuck": False})
+          "margin_block_suppress_stuck": False, "new_obstacle_wait_sec": 3.0, "escape_after_sec": 2.0,
+          "laser_y_offset_m": 0.5})
 check(o.margin_resume_m == 0.0 and o.margin_resume_sec == 0.0, "負值夾到 0")
 check(o.margin_stop_timeout == 6.0 and o.margin_block_suppress_stuck is False, "其餘照讀")
+check((o.new_obstacle_wait, o.escape_after) == (3.0, 2.0), "ros2 param set 改過的等待時間，下一趟重讀就生效")
+check(o.laser_y == 0.10, "雷射偏移超過 ±0.10 m 視為輸入錯誤，夾到 0.10")
+o = fake({"margin_resume_m": 0.03, "margin_resume_sec": 1.0, "margin_stop_timeout_sec": 0.0,
+          "margin_block_suppress_stuck": True, "new_obstacle_wait_sec": -5.0, "escape_after_sec": -1.0,
+          "laser_y_offset_m": -0.025})
+check((o.new_obstacle_wait, o.escape_after, o.laser_y) == (0.0, 0.0, -0.025), "等待時間負值夾到 0；偏右 2.5 cm（負值）照讀")
 
 print("── 6. 接線（AST／文字） ──")
 SRC = PT_PATH.read_text(encoding="utf-8")
@@ -157,6 +166,7 @@ import re  # noqa: E402
 check(not re.search(r"^\s*margin_stop_t = 0\.0\s+# 恢復了", SRC, re.M), "「一拍放行就歸零」那行已拿掉")
 check("idx < len(pts) - 3" in ast.get_source_segment(SRC, fl), "事件中不脫困：最後 3 點除外（保留放寬容差收下）")
 check("車身外緣持續不足" in SRC, "交回訊息保留「車身外緣持續不足」（navigation_action 靠這幾個字認）")
+check("本趟生效：雷射左右偏移" in ast.get_source_segment(SRC, ex), "每趟開始印出實際生效的雷射偏移與等待時間（現場驗證要看這行）")
 NA = NA_PATH.read_text(encoding="utf-8")
 check('declare_parameter("replan_fail_retry_sec", 4.0)' in NA, "navigation_action 宣告 replan_fail_retry_sec=4.0")
 check(NA.count("self.replan_fail_retry_sec = max(") == 2, "初始化一次＋每次導航重讀一次")
