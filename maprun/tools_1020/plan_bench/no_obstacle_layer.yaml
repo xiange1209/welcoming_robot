@@ -1,0 +1,5 @@
+# plan_bench 專用覆寫：沒有雷達時拿掉障礙層（其餘參數沿用 nav2_senior_akm_cc.yaml）
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      plugins: ["static_layer", "inflation_layer"]

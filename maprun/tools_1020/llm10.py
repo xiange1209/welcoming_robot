@@ -8,7 +8,7 @@
     python3 ~/maprun/tools_1020/llm10.py --clear-each --repeat 2 --nav-down-ok
         # 每題前清對話記憶（避免前一題污染）、整套跑兩輪；導航堆疊沒開時②③⑩直接送（車不會動，只驗工具選擇）
 
-★ 第 ②③⑩ 題（櫃檯在哪、貴賓室怎麼去、帶我去大廳）會觸發「帶位／導航」——導航堆疊開著而且地點標好時，
+★ 第 ②③④⑩ 題（櫃檯在哪、貴賓室怎麼去、洗手間在哪〔地圖有廁所時〕、帶我去大廳）會觸發「帶位／導航」——導航堆疊開著而且地點標好時，
   **車會真的自己開過去**。這三題前面會停下來問你：車旁有人、急停備好、路線上沒東西 → 按 Enter；輸入 s 跳過該題。
   送出後腳本不會等車到達；車到了或你按了急停，再按 Enter 才會送下一題。
 
@@ -33,7 +33,8 @@ QUESTIONS = [
     (1, "請問銀行幾點營業？", "週一到五 9:00～15:30", False),
     (2, "請問櫃檯在哪裡？", "帶位（不能編樓層）", True),
     (3, "貴賓室要怎麼去？", "帶位", True),
-    (4, "請問洗手間在哪裡？", "「示範場地沒有設定這個地點」", False),
+    # ★ 2026-10-22：現用地圖有「廁所」地點時，④ 會導航過去（洗手間＝廁所）——跟②③⑩一樣先停下來問
+    (4, "請問洗手間在哪裡？", "地圖有「廁所」→ 導航過去；沒有才回「示範場地沒有設定洗手間」", True),
     (5, "請問 ATM 在哪裡？", "同④：沒有設定這個地點", False),
     (6, "我想開戶，需要帶什麼？", "身分證＋第二證件＋印章，且說明機器人不能直接開戶", False),
     (7, "請問轉帳的手續費是多少？", "沒有資訊、請洽櫃檯", False),
@@ -72,6 +73,10 @@ def main():
     ap.add_argument("--skip-ollama-check", action="store_true", help="（測試用）略過筆電 Ollama 連線檢查")
     ap.add_argument("--clear-each", action="store_true", help="每題送出前清對話記憶（/clear_conversation）")
     ap.add_argument("--repeat", type=int, default=1, help="整套題目跑幾輪（預設 1）")
+    ap.add_argument("--extra-nav", action="append", default=[], metavar="句子",
+                    help="多加一題會讓車開走的題目（可重複），例：--extra-nav 帶我去門口")
+    ap.add_argument("--settle", type=float, default=3.0,
+                    help="收到第一則回覆後再收幾秒沒有新訊息才換下一題（帶位題的「X到了」是第二則；0＝不等）")
     ap.add_argument("--nav-down-ok", action="store_true",
                     help="導航堆疊沒開時，②③⑩不停下來問、直接送（車不會動，只驗工具選擇）；導航開著照樣會問")
     ap.add_argument("--out", default=os.path.expanduser(f"~/maprun/verify_out/llm10_{time.strftime('%H%M')}.csv"))
@@ -135,7 +140,8 @@ def main():
     print("\n══ 開始（Ctrl-C 中止）══")
     try:
         for rep in range(1, a.repeat + 1):
-            for i, q, exp, moves in QUESTIONS:
+            for i, q, exp, moves in QUESTIONS + [(len(QUESTIONS) + k + 1, x, "帶位（--extra-nav）", True)
+                                                 for k, x in enumerate(a.extra_nav)]:
                 direct = False
                 if moves:
                     # 每題重查：中途有人開了導航，就回到「停下來問人」
@@ -157,6 +163,10 @@ def main():
                     t_c = time.time()
                     while time.time() - t_c < 0.8:
                         rclpy.spin_once(n, timeout_sec=0.1)
+                # 先把上一題晚到的訊息收乾淨再清空，免得被記成這一題的答案
+                t_d = time.time()
+                while time.time() - t_d < 0.3:
+                    rclpy.spin_once(n, timeout_sec=0.05)
                 got.clear()
                 t_send = time.time()
                 pub.publish(String(data=q))
@@ -173,6 +183,21 @@ def main():
                             continue
                         answer, lat = txt, ts - t_send
                         break
+                if lat is not None and a.settle > 0:
+                    # ★ 2026-10-22：帶位直達會發兩則（「好的，請跟我來。」→ 到了／失敗）。只收第一則就換題的話，
+                    #   第二則會在下一題的視窗裡到、被記成下一題的答案；下一題還會因為帶位沒結束被回「處理上一個指令」丟掉。
+                    seen, last = got.index((ts, txt)) + 1, time.time()
+                    # 會開車的題目一定要等到第二則（到了／失敗）——路程多長都一樣，不能只靠 settle 秒數
+                    need_more = moves and direct
+                    while (need_more or time.time() - last < a.settle) and time.time() < t_send + a.timeout:
+                        rclpy.spin_once(n, timeout_sec=0.2)
+                        if len(got) > seen:
+                            for _ts, _txt in got[seen:]:
+                                if BUSY_TXT not in _txt:
+                                    answer += " ｜ " + _txt
+                                    flags.append(f"+{_ts - t_send:.1f}s")
+                                    need_more = False
+                            seen, last = len(got), time.time()
                 if lat is None:
                     flags.append("TIMEOUT")
                 print(f"\n[{rep}-{i}] 問：{q}\n    答：{answer or '（無）'}\n    延遲：{'—' if lat is None else f'{lat:.2f} s'}   旗標：{','.join(flags) or '無'}   預期：{exp}")

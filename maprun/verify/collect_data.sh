@@ -161,7 +161,11 @@ tar --exclude='*secrets*' --exclude='*face_database*' \
 SIZE=$(du -h "$OUT" | cut -f1)
 MD5=$(md5sum "$OUT" | cut -d' ' -f1)
 SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
-PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# ★ 2026-10-22：筆電走 Wi-Fi 熱點連進來，要給「預設路由那張網卡」的位址。
+#   hostname -I 的第一個是 eth0（雙板網段 10.10.10.x，筆電連不到）——10/22 印出 10.10.10.2 給使用者就是這個。
+PI_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+[ -n "$PI_IP" ] || PI_IP=$(ip -4 -o addr show wlan0 2>/dev/null | awk '{sub("/.*", "", $4); print $4; exit}')
+[ -n "$PI_IP" ] || PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 PI_IP="${PI_IP:-<Pi的IP>}"
 
 cat <<EOF
@@ -171,19 +175,30 @@ cat <<EOF
   SHA256: $SHA
 
 ───────────────────────────────────────────────────────
-在【Windows 筆電】開一個終端機（PowerShell），貼這行把檔案拉回去
-（研究數據一律放 backups，不要放進 車子/ 的 git 資料夾）：
+在【Windows 筆電】把檔案拉回去（研究數據一律放 backups，不要放進 車子/ 的 git 資料夾）。
+★ 檔名本身就含時間（_<時分>），同一天打包多次不會互相蓋掉——Pi 上與筆電上都一樣。
 
+  命令提示字元（cmd.exe）：
+  scp $(whoami)@${PI_IP}:~/car_data_${TAG}.tar.gz "%USERPROFILE%\Desktop\專題\backups\研究數據\"
+  certutil -hashfile "%USERPROFILE%\Desktop\專題\backups\研究數據\car_data_${TAG}.tar.gz" SHA256
+
+  PowerShell：
   scp $(whoami)@${PI_IP}:~/car_data_${TAG}.tar.gz "\$HOME/Desktop/專題/backups/研究數據/"
 
-拉完在筆電上核對雜湊（要跟上面一樣）：
-
-  certutil -hashfile "\$HOME/Desktop/專題/backups/研究數據/car_data_${TAG}.tar.gz" SHA256
+（雜湊要跟上面的 SHA256 一樣）
 ───────────────────────────────────────────────────────
 
-快速自我檢查 —— 有 FAIL 的項目：
+快速自我檢查 —— 近 24 小時驗證紀錄裡有 FAIL 的項目：
 EOF
-grep -h $'\tFAIL\t' "$HOME"/maprun/verify_out/*/results.tsv 2>/dev/null \
-  | awk -F'\t' '{printf "  ✗ %s = %s\n     %s\n", $1, $3, $4}' \
-  || echo "  （沒有 FAIL）"
+# ★ 2026-10-22：原本把 verify_out/*/results.tsv「所有歷史 run」的 FAIL 一起列出（9/22 電池、9/29 沒接硬體、
+#   10/05 滿舵 0 度……），看起來像今天車子壞了。改成只看近 24 小時的 run，並標出是哪一次。
+RECENT=$(find "$HOME"/maprun/verify_out -mindepth 2 -maxdepth 2 -name results.tsv -newermt '-24 hours' 2>/dev/null | sort)
+if [ -z "$RECENT" ]; then
+  echo "  （近 24 小時沒有跑過驗證腳本）"
+else
+  FAILS=$(for f in $RECENT; do
+    awk -F'\t' -v run="$(basename "$(dirname "$f")")" '$2 == "FAIL" {printf "  ✗ [%s] %s = %s\n     %s\n", run, $1, $3, $4}' "$f"
+  done)
+  if [ -n "$FAILS" ]; then echo "$FAILS"; else echo "  （沒有 FAIL）"; fi
+fi
 echo

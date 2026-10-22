@@ -24,6 +24,8 @@ hdr "電池"
 # ★★ 2026-09-30（車子端 9/29 抓到）：底盤沒開時 ros2 topic echo 把「WARNING: topic … not published」
 #    印到 **stdout**，原本 head -1 就把它當電壓，awk 對非數字做**字串比較**（"W" > "2"）→ 判 PASS。
 #    鐵則「電池 ≥ 23 V 才開始」這道關卡在底盤沒開時會自己放行。只接受整行是數字的輸出。
+# ★ 2026-10-22：門檻跟交接文件的鐵則對齊（≥ 23.5 V）。原本 23.0，中間 0.5 V 靠人把關。要暫時放寬：BATT_MIN=23.0 bash verify_0_preflight.sh
+BATT_MIN="${BATT_MIN:-23.5}"
 if ! here_a; then
   rec "電池電壓" INFO "（雙板）在 A 板" "底盤與電池都在 A"
 else
@@ -31,11 +33,11 @@ V=$(timeout 8 ros2 topic echo /PowerVoltage --once --field data 2>/dev/null | gr
 if [ -z "$V" ]; then
   rec "電池電壓" WARN "讀不到" "底盤節點沒起來？先跑 run_sensors_cc.sh 再回來"
 else
-  ok=$(awk -v v="$V" 'BEGIN{print (v>=23.0)?1:0}')
+  ok=$(awk -v v="$V" -v th="$BATT_MIN" 'BEGIN{print (v>=th)?1:0}')
   if [ "$ok" = 1 ]; then
-    rec "電池電壓" PASS "${V} V" "門檻 23.0 V"
+    rec "電池電壓" PASS "${V} V" "門檻 ${BATT_MIN} V"
   else
-    rec "電池電壓" FAIL "${V} V" "低於 23.0 V —— 先充電，不要開始實驗"
+    rec "電池電壓" FAIL "${V} V" "低於 ${BATT_MIN} V —— 先充電，不要開始實驗"
   fi
 fi
 fi   # ← here_a

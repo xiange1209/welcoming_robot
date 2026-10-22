@@ -29,6 +29,11 @@ ask "右滿舵，前輪實際轉角（度，填正值）" R_DEG
 judge() { # judge <左|右> <實測> <理論>
   local side="$1" got="$2" want="$3"
   [ -z "$got" ] && { rec "${side}滿舵轉角" WARN "未填" ""; return; }
+  # ★ 2026-10-22：0、負數或非數字＝沒量到（滿舵不可能是 0 度）。10/05 就是把沒量記成「0 度、行程不足」的 FAIL。
+  if ! [[ "$got" =~ ^[0-9]+([.][0-9]+)?$ ]] || [ "$(awk -v g="$got" 'BEGIN{print (g<=0)?1:0}')" = 1 ]; then
+    rec "${side}滿舵轉角" WARN "沒量到（填了「${got}」）" "0 度或非數字＝沒量，不是量到 0 度；量到再重跑這一支"
+    return
+  fi
   local ratio
   ratio=$(awk -v g="$got" -v w="$want" 'BEGIN{printf "%.0f", 100*g/w}')
   if [ "$(awk -v r="$ratio" 'BEGIN{print (r>=90)?1:0}')" = 1 ]; then
