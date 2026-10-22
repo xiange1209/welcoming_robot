@@ -8,6 +8,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from ament_index_python.packages import get_package_share_directory
 
 from .dependencies import make_admin_only
+from ..core.version import assets_signature
 from ..modules.chat import router as chat_router
 from ..modules.hardware import router as hardware_router
 from ..modules.imaging import router as imaging_router
@@ -45,6 +46,19 @@ def build_app(node) -> FastAPI:
             index_path.read_text(encoding="utf-8"),
             headers={"Cache-Control": "no-store, must-revalidate"},
         )
+
+    @app.get("/api/version", include_in_schema=False)
+    async def version() -> JSONResponse:
+        """目前部署的前端版本簽章（index.html 引用的 /assets/ 檔名）。
+
+        前端定期來問，和自己載入時的那一組不同就提示更新——主畫面 App 切走再切回來
+        不會重新載入，舊 JS 會一直跑。讀不到 index.html 時回空字串，前端視為「不知道」、不提示。
+        """
+        try:
+            sig = assets_signature((web_dir / "index.html").read_text(encoding="utf-8"))
+        except OSError:
+            sig = ""
+        return JSONResponse({"sig": sig}, headers={"Cache-Control": "no-store"})
 
     @app.get("/favicon.svg", include_in_schema=False)
     async def favicon():

@@ -3,6 +3,7 @@ import { LoginSheet } from "./components/LoginSheet";
 import { Dialogs, Toasts } from "./components/Overlays";
 import { TabBar } from "./components/TabBar";
 import { TopBar } from "./components/TopBar";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { useHeartbeat } from "./hooks/useVisibleInterval";
 import { useStoreValue } from "./hooks/useStore";
 import { refreshMaps, refreshWaypoints, startMapLayer } from "./lib/mapdata";
@@ -13,6 +14,7 @@ import { startTelemetry } from "./lib/telemetry";
 import { toast } from "./lib/toast";
 import { startChatTts, startTts } from "./lib/tts";
 import { startRegistrationWatch } from "./lib/users";
+import { startVersionWatch } from "./lib/version";
 
 import { GreetPage } from "./pages/GreetPage";
 import { HealthPage } from "./pages/HealthPage";
@@ -37,6 +39,7 @@ export default function App() {
     startTts();
     startRegistrationWatch();
     installTeleopGuards();
+    startVersionWatch();
 
     // 地圖與地點都是管理端點，沒先確認權杖就打只會拿到一串 401
     void restoreSession().then((ok) => {
@@ -96,6 +99,7 @@ export default function App() {
           }
         }}
       />
+      <UpdateBanner />
       {/*
         只掛目前這一頁，不是全部藏起來。
         原版是八頁全部留在 DOM 裡靠 display:none 切換，於是看不見的分頁照樣

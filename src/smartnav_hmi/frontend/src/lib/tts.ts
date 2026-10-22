@@ -1,3 +1,4 @@
+import { forSpeech } from "./speechText";
 import { createStore } from "./store";
 import { telemetryStore } from "./telemetry";
 import { toast } from "./toast";
@@ -107,16 +108,10 @@ function report(active: boolean): void {
   }).catch(() => {});
 }
 
-/* ★ 2026-10-21：電話／專線號碼要逐字唸。
-   10/20 實測平板把「165 反詐騙專線」唸成「一百六十五」（應唸「一六五」）——瀏覽器的
-   speechSynthesis 把阿拉伯數字一律當數量唸。只改送去唸的字串，畫面上的字不動。 */
-const DIGITS = "零一二三四五六七八九";
-const readDigits = (s: string) => s.replace(/\d/g, (d) => DIGITS[Number(d)]);
-export function forSpeech(text: string): string {
-  return text
-    .replace(/(撥打|打給|撥|專線|電話|熱線)(\s*)(\d{3,10})/g, (_m, a: string, sp: string, n: string) => a + sp + readDigits(n))
-    .replace(/(\d{3,10})(\s*)(反詐騙|專線|熱線)/g, (_m, n: string, sp: string, b: string) => readDigits(n) + sp + b);
-}
+/* ★ 電話／專線號碼要逐字唸（「165」→「一六五」），規則與說明在 speechText.ts。
+   2026-10-21 先做了「關鍵字＋3~10 位數字」；10/22 實測連字號號碼（0800-123456、02-2345-6789）
+   沒處理到，改寫並抽成獨立檔（純函式，可在 Node 測：maprun/tools_1021/test_tts_forspeech.py）。 */
+export { forSpeech };
 
 export function speak(text: string): void {
   if (!ttsSupported || !text) return;

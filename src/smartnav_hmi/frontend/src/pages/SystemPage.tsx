@@ -392,8 +392,8 @@ export function SystemPage({ active }: { active: boolean }) {
          會被壓扁、內容在卡片裡被裁掉，而不是讓外層捲動。
        ★ 節點卡在窄螢幕用 grow + shrink-0：左欄空的時候（後端是舊版）照舊
          撐滿整頁；左欄很長的時候保持內容高度、交給外層捲。 */
-    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto xl:grid xl:grid-cols-[1fr_1.15fr] xl:grid-rows-[minmax(0,1fr)] xl:overflow-hidden">
-      <div className="flex flex-none flex-col gap-3 empty:hidden xl:min-h-0 xl:overflow-y-auto">
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto xl:grid xl:grid-cols-[1fr_1.15fr] xl:grid-rows-[minmax(0,1fr)] xl:overflow-hidden portrait:grid portrait:grid-cols-[1fr_1.15fr] portrait:grid-rows-[minmax(0,1fr)] portrait:overflow-hidden">
+      <div className="flex flex-none flex-col gap-3 empty:hidden xl:min-h-0 xl:overflow-y-auto portrait:min-h-0 portrait:overflow-y-auto">
         <ScenarioCard active={active} onApplied={() => void refresh()} />
         <VerifyCard active={active} />
       </div>

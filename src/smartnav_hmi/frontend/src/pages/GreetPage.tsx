@@ -40,7 +40,7 @@ function Bubble({ message }: { message: ChatMessage }) {
     <div className={cx("flex flex-col", mine ? "items-end" : "items-start")}>
       <div
         className={cx(
-          "max-w-[86%] rounded-[18px] px-3.5 py-2 text-[15px] leading-relaxed whitespace-pre-wrap",
+          "max-w-[86%] rounded-[18px] px-3.5 py-2 text-[15px] leading-relaxed whitespace-pre-wrap portrait:max-w-[92%] portrait:text-[20px]",
           mine ? "bg-blue text-on-blue" : "bg-[var(--color-well)] text-label",
           message.ghost && "opacity-55 italic",
         )}
@@ -253,7 +253,7 @@ export function GreetPage({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[1.1fr_1fr]">
+    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[1.1fr_1fr] portrait:grid-rows-[minmax(0,2fr)_minmax(0,3fr)]">
       <Card title="現場影像" bodyClassName="min-h-[200px]">
         <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-ios bg-black">
           <img

@@ -250,7 +250,7 @@ function EmergencyStop() {
       title="立即停止所有動作（空白鍵）"
       // 送出中擋住重複點擊，但不改變大小以免手指跟丟
       className={cx(
-        "tap pressable flex-none rounded-ios border border-red/50 bg-red/85 px-3.5 text-[13px] font-semibold text-on-red",
+        "tap pressable flex-none rounded-ios border border-red/50 bg-red/85 px-3.5 text-[13px] font-semibold text-on-red portrait:min-h-[64px] portrait:px-6 portrait:text-[17px]",
         busy && "pointer-events-none opacity-55",
         done && "anim-ripple",
       )}

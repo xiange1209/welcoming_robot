@@ -158,7 +158,7 @@ export function MapPage({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.5fr_1fr]">
+    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.5fr_1fr] portrait:grid-rows-[minmax(0,11fr)_minmax(0,9fr)]">
       <Card
         title="地圖"
         actions={

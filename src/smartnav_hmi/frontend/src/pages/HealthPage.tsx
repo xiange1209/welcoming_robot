@@ -65,7 +65,7 @@ export function HealthPage() {
   const unknownNodes = nodes.filter((n) => n.device === "unknown");
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-2">
+    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-2 portrait:grid-cols-2">
       <Card
         title={`Pi 4（本機${health?.host ? "：" + health.host : ""}）`}
         className="overflow-y-auto"
