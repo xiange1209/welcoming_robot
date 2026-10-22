@@ -15,10 +15,18 @@ echo "══ 本機 $ROLE（$ME）→ 對方 $PEER　$(date '+%F %T') ══"
 
 echo "── ① 網路線 ──"
 ethtool eth0 2>/dev/null | grep -E "Speed|Duplex|Link detected" | sed 's/^\s*/  /'
-ping -c 1000 -i 0.01 -q "$PEER" 2>&1 | grep -E "packet loss|rtt" | sed 's/^/  /'
+# 先試 3 次：對方不在線時，1000 次 ping 會因為等 ARP 拖過兩分鐘（10/22 車上實測被逾時砍掉）
+if ping -c 3 -W 1 -q "$PEER" >/dev/null 2>&1; then
+  ping -c 1000 -i 0.01 -w 30 -q "$PEER" 2>&1 | grep -E "packet loss|rtt" | sed 's/^/  /'
+else
+  echo "  ✗ 對方 $PEER 不通（網路線沒插、對方沒開機或 IP 沒設）→ 跳過 1000 次 ping 與頻寬測試"
+  PEER_DOWN=1
+fi
 
 echo "── ② 頻寬 ──"
-if command -v iperf3 >/dev/null; then
+if [ -n "${PEER_DOWN:-}" ]; then
+  echo "  （對方不通，略過）"
+elif command -v iperf3 >/dev/null; then
   echo "  本機→對方：$(timeout 20 iperf3 -c "$PEER" -t 5 2>&1 | grep -E 'receiver$' | awk '{print $(NF-2), $(NF-1)}')"
   echo "  對方→本機：$(timeout 20 iperf3 -c "$PEER" -t 5 -R 2>&1 | grep -E 'receiver$' | awk '{print $(NF-2), $(NF-1)}')"
   echo "  （空白＝對方沒開 iperf3 -s）"

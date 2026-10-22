@@ -1,7 +1,10 @@
-# 貼到 A、B 兩塊板子 /etc/hosts 的最後面（sudo nano /etc/hosts）。之後兩板可以用名字互連：ssh car-b、ping car-a
-10.10.10.1   car-a
-10.10.10.2   car-b
+# 兩塊板子的名字（用 set_board_name.sh 設，不要手動改）
+#   sudo ~/maprun/dualboard/set_board_name.sh A    ← 8 GB（車上：底盤＋導航＋HMI）
+#   sudo ~/maprun/dualboard/set_board_name.sh B    ← 4 GB（人臉＋語音）；10/22 已在 4 GB 測試板做過
+# 腳本會在 /etc/hosts 加下面兩行，之後兩板可以用名字互連：ssh car-b、ping smartnav-a
+10.10.10.1   smartnav-a car-a
+10.10.10.2   smartnav-b car-b
 
-# ★ B 若是用 A 的映像複製出來的，hostname 也會是 wheeltec-r680，要改掉（兩台同名會混淆 log 與打包檔）：
-#     sudo hostnamectl set-hostname smartnav-face
-#   並把 B 的 /etc/hosts 裡「127.0.1.1  wheeltec-r680」那行改成「127.0.1.1  smartnav-face」（否則 sudo 會一直警告）。
+# ★ 這張卡的 hostname 與 /etc/hosts 原本由 cloud-init 管（preserve_hostname: false、user-data 寫死 wheeltec-r680），
+#   只用 hostnamectl 改，下次開機會被改回去 —— 所以腳本會先放 /etc/cloud/cloud.cfg.d/99-smartnav-hostname.cfg。
+# ★ 提示字元會顯示 [A·8GB]／[B·4GB]（依實際記憶體判斷）；它和 hostname 對不起來，就是 SD 卡插錯板。

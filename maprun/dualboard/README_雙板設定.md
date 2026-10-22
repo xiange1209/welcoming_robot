@@ -1,8 +1,21 @@
 # 雙板設定（草稿，2026-10-22 車上 agent）
 
-> **2026-10-22 筆電端審查後的版本**（車上 agent 草稿 → 審查 → 修正 6 處，見第 9 節）。這裡的檔案**全部沒有套用**到任何一塊板子：網路、校時、服務都沒動，只做了語法、解析與替身測試。
+> **2026-10-22 筆電端審查後的版本**（車上 agent 草稿 → 審查 → 修正 6 處，見第 9 節）。這裡的檔案**除了第 0 節列的 B 測試板那幾項之外都沒有套用**：校時、服務、A 板都沒動，其餘只做了語法、解析與替身測試。
+> ★ **2026-10-22 使用者決定：先在單板把所有功能驗完，之後才換雙板**——所以現在不要套用（單板驗證用的交辦在 `HANDOFF_car_agent_20261022.md`）。B 測試板那些設定跟著 SD 卡走，8 GB 板要用單板時先還原（同一份交辦 §0）。
 > 與草稿最大的差別：**終端機與所有腳本照舊 `source ~/maprun/env.sh` 就好**（雙板環境由標記檔 `~/.smartnav/dualboard_role` 決定，見第 9 節 ①）。
 > 起草時所在的是 **4 GB 測試板**，什麼周邊都沒接；SD 卡是 10/21 在車上（8 GB）用過的那張。
+
+## 0. ★ 10/22 已在 B（4 GB 測試板）實際套用、實測的部分（紀錄 `apply_log_B_20261022.txt`）
+| 做了什麼 | 結果 |
+|---|---|
+| `sudo nm_eth0_setup.sh B` | ✓ 連線設定 `dualboard-eth0`（優先權 100）；**沒插網路線、連結 DOWN，eth0 仍保有 10.10.10.2/24**（NM 顯示 connected）→ `ignore-carrier` 在 NM 1.46 有效 |
+| Wi-Fi 有沒有受影響 | ✓ 預設路由仍走 wlan0、ping 熱點 0% 掉包 |
+| DDS 綁 eth0（沒插線） | ✓ `ros2 topic list` 正常（同一份設定在套用前失敗：`eth0: does not match an available interface`）；同板兩個程式經 eth0 互傳成功 |
+| 單板環境（env.sh） | ✓ 不受影響，照樣看得到 HMI |
+| `check_dualboard.sh` | ✓ 沒有對方時正確回報（第一次因 1000 次 ping 等 ARP 卡住，已修：先試 3 次） |
+| 命名 `set_board_name.sh B` | ✓ hostname **smartnav-b**、cloud-init 覆寫（不再改回 wheeltec-r680）、/etc/hosts 加 A／B、提示字元 `[B·4GB]`；重跑不會重複加 |
+
+沒做（要第二塊板子、網路線或 Astra S）：校時設定、停 B 的 HMI、裝感知服務、V1／V2／V4~V9。原本的「Wired connection 1」（DHCP）沒動，靠優先權讓位。
 
 ## 1. 分工（使用者 10/22 定案）
 
@@ -32,12 +45,13 @@
 | `systemd/smartnav-perception.service` ＋ `launch/perception_b.launch.py` | B | `/etc/systemd/system/`；launch 原地 | B 開機自動開相機（人臉）、人臉、認證、語音輸入 |
 | `b_power_log.sh` ＋ `systemd/smartnav-b-powerlog.service` | B（選用） | `/etc/systemd/system/` | 每 10 秒記欠壓／降頻旗標 → `~/maprun/logs/b_power_<日期>.csv` |
 | `check_dualboard.sh` | A、B | 原地 | 唯讀檢查：網路線、頻寬、校時、跨板節點 |
-| `hosts_dualboard.txt` | A、B | 貼進 `/etc/hosts` | `car-a`／`car-b` 名稱 |
+| `set_board_name.sh` ＋ `hosts_dualboard.txt` | A、B | `/etc/hosts`、hostname、cloud-init 覆寫、~/.bashrc | 名字 smartnav-a／smartnav-b（car-a／car-b）＋提示字元 [A·8GB]／[B·4GB] |
 | `ssh_config_laptop.txt` | 筆電 | `%USERPROFILE%\.ssh\config` | `ssh car-b` 經 A 跳板 |
 
 ## 3. 安裝順序
 
 **A（8 GB，車上；挑車子停著時做）**
+0. `sudo ~/maprun/dualboard/set_board_name.sh A`（hostname smartnav-a、提示字元 [A·8GB]；A 的卡若是複製 B 這張，名字會是 smartnav-b，一定要改）
 1. `sudo ~/maprun/dualboard/nm_eth0_setup.sh A`
 2. `sudo apt install chrony iperf3`，裝 `chrony/50-dualboard-server.conf`，`sudo systemctl restart chrony`
 3. `/etc/hosts` 加 `hosts_dualboard.txt` 的兩行
@@ -48,7 +62,7 @@
 8. `~/maprun/dualboard/check_dualboard.sh` 的 ⑤ 要全 ✓（HMI 服務的環境＝overlay）
 
 **B（4 GB）**
-1. 準備 SD 卡：複製 A 的映像（或沿用這張測試卡）。**改 hostname 為 `smartnav-face`**（`hosts_dualboard.txt` 註解）。
+1. 準備 SD 卡：沿用 10/22 這張測試卡（**已改名 smartnav-b、eth0 已設好**），或複製 A 的映像後跑 `sudo set_board_name.sh B`、`sudo nm_eth0_setup.sh B`。★ 雙板需要**兩張各自完整的 SD 卡**（A 一張、B 一張）；目前這張卡同時帶著車上的資料與 B 的設定，分卡方式由使用者決定。
 2. 安裝期間先讓 B 連 Wi-Fi：`sudo apt install iperf3`，確認 `/etc/sysctl.d/60-ros2-dds.conf` 在（影像接收緩衝）。
 3. `sudo ~/maprun/dualboard/nm_eth0_setup.sh B`；`/etc/hosts` 加兩行；裝 `timesyncd/50-dualboard.conf`、`sudo systemctl enable systemd-time-wait-sync`；`~/maprun/dualboard/dualboard_mode.sh B`
 4. `sudo systemctl disable --now smartnav-hmi`（B 不跑 HMI）

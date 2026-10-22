@@ -11,7 +11,8 @@
 #   ~/maprun/verify/collect_data.sh 20261022             指定日期（CSV 以檔名含該日期篩，log 仍只收近 24 小時）
 #   ~/maprun/verify/collect_data.sh --all                ★ 全部帶走（不篩時間、全部 CSV）——要拉「前幾天」的資料用這個
 #   ~/maprun/verify/collect_data.sh --since='-10 days'   近 10 天有改動的 log／CSV（find -newermt 的時間描述）
-#   --all／--since 產生的檔名是 car_data_all_<日期>／car_data_since_<日期>，不會和每日包混淆。
+#   --all／--since 產生的檔名是 car_data_all_<日期>_<時分>／car_data_since_<日期>_<時分>，不會和每日包混淆。
+#   ★ 2026-10-22：所有檔名都加 <時分>。同一天打第二包會蓋掉第一包（拉回筆電時同名也會蓋掉），已經撞過兩次。
 #
 # ★ 2026-10-15 改版（原因都是實際踩到或查到的）：
 #   1. 原本固定只收「近 24 小時」→ 下次上車時拉不到上週的資料。加 --all／--since。
@@ -40,6 +41,7 @@ if [ "$ALL" = 1 ]; then TAG="all_${DAY}"; TF=(); CSV_PAT="*.csv"
 elif [ "$SINCE_SET" = 1 ]; then TAG="since_${DAY}"; TF=(-newermt "$SINCE"); CSV_PAT="*.csv"
 else TAG="${DAY}"; TF=(-newermt "$SINCE"); CSV_PAT="*${DAY}*.csv"
 fi
+TAG="${TAG}_$(date +%H%M)"
 OUT="$HOME/car_data_${TAG}.tar.gz"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT

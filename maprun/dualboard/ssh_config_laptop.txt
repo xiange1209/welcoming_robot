@@ -1,15 +1,26 @@
 # 貼到筆電的 %USERPROFILE%\.ssh\config（沒有這個檔就新建，用記事本存成 UTF-8、不要副檔名）。
-# 之後在命令提示字元打 ssh car-a 或 ssh car-b 就能連；VS Code Remote-SSH 也吃這份設定。
-# car-b 透過 car-a 跳板（B 只接網路線、不接 Wi-Fi）。
-# ★ car-a 的 IP 是筆電熱點用 DHCP 給的（10/20～10/22 是 192.168.137.106），變了就改 HostName。
-# ★ 正式運作時不要用 VS Code 連 B：10/22 在 4 GB 板上量到 VS Code 伺服器＋Claude 吃掉約 2.2 GB 記憶體，
-#   B 要留給人臉與語音（ssh 連進去看 log 沒關係）。
+# 之後在命令提示字元打 ssh car-a（8 GB）或 ssh car-b（4 GB）；VS Code Remote-SSH 也吃這份設定。
+#
+#   A＝8 GB（車上：底盤＋導航＋HMI）  hostname smartnav-a   Wi-Fi（熱點）＋網路線 10.10.10.1
+#   B＝4 GB（人臉＋語音，行動電源）    hostname smartnav-b   正式運作只有網路線 10.10.10.2 → 經 A 跳板
+#
+# ★ IP 是筆電熱點用 DHCP 給的，會變。要查哪個 IP 是哪塊板子：Windows「設定 → 網路和網際網路 → 行動熱點」的
+#   已連線裝置會列出名字（smartnav-a／smartnav-b），對照那裡的 IP 改 HostName。
+#   （10/22 4 GB 測試板拿到 192.168.137.106；10/20 的 8 GB 也是這個 IP，兩塊同時開時一定會不同。）
+# ★ 連上後提示字元會顯示 [A·8GB] 或 [B·4GB]，先看一眼再下指令。
+# ★ 正式運作時不要用 VS Code 連 B：10/22 在 4 GB 板上量到 VS Code 伺服器＋Claude 吃掉約 2.2 GB 記憶體。
 
-Host car-a
+Host car-a smartnav-a
     HostName 192.168.137.106
     User user
 
-Host car-b
+# 正式運作（B 只接網路線）：經 A 跳板
+Host car-b smartnav-b
     HostName 10.10.10.2
     User user
     ProxyJump car-a
+
+# 安裝期間 B 也接 Wi-Fi 時用這個（IP 照熱點清單填）
+Host car-b-wifi
+    HostName 192.168.137.XXX
+    User user
