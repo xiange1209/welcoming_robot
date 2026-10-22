@@ -20,6 +20,24 @@ SIGINT_GRACE_SEC = 20.0
 SIGTERM_GRACE_SEC = 5.0
 SESSION_READY_SEC = 0.5
 
+# ★★ 2026-10-22 雙板（maprun/dualboard/README_雙板設定.md）★★
+# B 板（4 GB，感知板）開機自動運作這四個單元：Astra S 相機（人臉模式）、人臉、認證、語音輸入。
+# A 的 HMI 在雙板模式下**不啟動也不停止它們**：
+#   - A 沒有 Astra S，啟動相機與語音會失敗；
+#   - A 若也開人臉，會跟 B 的人臉重複推論（還會收到 B 傳來的影像）；
+#   - 情境（teach／mapping 等）的 stop 清單裡有這幾個，單板時是為了讓出 CPU，雙板時它們在 B，停掉只會把感知關掉。
+# 單板（沒有 SMARTNAV_DUALBOARD=1）行為完全不變。SMARTNAV_REMOTE_UNITS（逗號分隔）可覆寫清單。
+REMOTE_UNITS_DEFAULT = ("camera", "face", "user_auth", "asr_chain")
+
+
+def remote_units() -> frozenset:
+    """雙板模式下在 B 板的單元；單板回空集合。"""
+    if os.environ.get("SMARTNAV_DUALBOARD", "") != "1":
+        return frozenset()
+    raw = os.environ.get("SMARTNAV_REMOTE_UNITS", "").strip()
+    names = [x.strip() for x in raw.split(",") if x.strip()] if raw else list(REMOTE_UNITS_DEFAULT)
+    return frozenset(names)
+
 
 class LaunchSupervisor:
     """只管理由統一 system_control.launch.py 建立的 launch session。"""
@@ -133,6 +151,18 @@ class LaunchSupervisor:
         with self._lock:
             op = self._operations[op_id]
             unit, action, variant = op["target"], op["action"], op.get("variant")
+        # ★ 2026-10-22 雙板：B 板的單元 A 不碰（成功回報，情境的其他步驟才會照常往下做）
+        if unit in remote_units():
+            self._set(
+                op_id,
+                status="succeeded",
+                phase="remote",
+                message=f"（雙板）{unit} 在 B 板（感知板）開機自動運作，A 不{'啟動' if action == 'start' else '停止'}它",
+            )
+            with self._lock:
+                if self._unit_ops.get(unit) == op_id:
+                    self._unit_ops.pop(unit, None)
+            return
         self._set(op_id, status="running", phase="launching" if action == "start" else "sigint")
         try:
             if action == "start":

@@ -1,0 +1,16 @@
+# /etc/systemd/system/smartnav-b-powerlog.service（只放 B，選用）
+# 行動電源供電的 B 每 10 秒記一次欠壓／降頻旗標（b_power_log.sh）；collect_data.sh 會把 ~/maprun/logs 一起帶走。
+# 安裝：sudo install -m 644 smartnav-b-powerlog.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now smartnav-b-powerlog
+[Unit]
+Description=SmartNav 雙板 B：行動電源欠壓／降頻紀錄
+
+[Service]
+Type=simple
+User=user
+ExecStart=/home/user/maprun/dualboard/b_power_log.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,15 @@ source "$(dirname "$0")/_lib.sh"
 
 echo "V0 開工前檢查   $(date '+%Y-%m-%d %H:%M:%S')"
 
+# ★★ 2026-10-22 雙板：底盤／雷達／電池在 A、Astra／麥克風／語音模型在 B。
+#   不在這塊板子上的項目記 INFO（不算 FAIL）——不然 A 上的 V0 永遠有 Astra／麥克風／語音模型的 FAIL，
+#   B 上永遠有底盤的 FAIL，而「V0 沒全過就不要往下做」會把整個測試流程卡死。
+#   單板（沒有 SMARTNAV_DUALBOARD=1）：兩個函式都回真，行為與以前完全相同。
+BOARD=""; [ "${SMARTNAV_DUALBOARD:-}" = 1 ] && BOARD="${SMARTNAV_BOARD:-}"
+here_a() { [ "$BOARD" != "B" ]; }   # 底盤、雷達、電池
+here_b() { [ "$BOARD" != "A" ]; }   # Astra 相機、麥克風、語音模型
+[ -n "$BOARD" ] && echo "（雙板模式：這塊是 $BOARD 板；另一塊的項目記 INFO）"
+
 # ── 電池 ────────────────────────────────────────────────────
 # ★ 低壓保護在 20 V，但 20 V 只切馬達不切舵機
 #   症狀是「方向舵會轉但車不走」，很容易誤判成程式壞掉。
@@ -15,6 +24,9 @@ hdr "電池"
 # ★★ 2026-09-30（車子端 9/29 抓到）：底盤沒開時 ros2 topic echo 把「WARNING: topic … not published」
 #    印到 **stdout**，原本 head -1 就把它當電壓，awk 對非數字做**字串比較**（"W" > "2"）→ 判 PASS。
 #    鐵則「電池 ≥ 23 V 才開始」這道關卡在底盤沒開時會自己放行。只接受整行是數字的輸出。
+if ! here_a; then
+  rec "電池電壓" INFO "（雙板）在 A 板" "底盤與電池都在 A"
+else
 V=$(timeout 8 ros2 topic echo /PowerVoltage --once --field data 2>/dev/null | grep -Eo '^[0-9]+([.][0-9]+)?$' | head -1)
 if [ -z "$V" ]; then
   rec "電池電壓" WARN "讀不到" "底盤節點沒起來？先跑 run_sensors_cc.sh 再回來"
@@ -26,14 +38,22 @@ else
     rec "電池電壓" FAIL "${V} V" "低於 23.0 V —— 先充電，不要開始實驗"
   fi
 fi
+fi   # ← here_a
 
 # ── 裝置 ────────────────────────────────────────────────────
 # ★ 硬體問題用列舉指令回答，不要用文件回答
 hdr "裝置（直接問核心，不看文件）"
+if here_a; then
 for dev in /dev/ttyUSB0 /dev/ttyUSB1; do
   [ -e "$dev" ] && rec "$dev" PASS "存在" "" || rec "$dev" FAIL "不存在" "底盤/雷達沒插好或編號跑掉"
 done
+else
+  rec "底盤／雷達（ttyUSB）" INFO "（雙板）在 A 板" ""
+fi
 
+if ! here_b; then
+  rec "Astra 相機／麥克風" INFO "（雙板）在 B 板" "Astra S 同時是相機和麥克風，插在 B"
+else
 if lsusb 2>/dev/null | grep -qi '2bc5:'; then
   rec "Astra 相機" PASS "$(lsusb | grep -i '2bc5:' | head -1 | sed 's/.*ID //')" ""
 else
@@ -44,6 +64,7 @@ fi
 CARD=$(arecord -l 2>/dev/null | grep -o '^card [0-9]*' | head -1 | grep -o '[0-9]*')
 [ -n "$CARD" ] && rec "麥克風" PASS "card $CARD" "★ 編號每次開機都會變，run_asr_cc.sh 會當場問" \
                 || rec "麥克風" FAIL "arecord -l 沒有裝置" ""
+fi   # ← here_b
 
 # ── 時鐘 ────────────────────────────────────────────────────
 # 時鐘沒同步的話所有 log 時戳都不能拿來比對
@@ -84,6 +105,9 @@ fi
 #   搜尋順序照 voice_utils.model_path_candidates：環境變數 > 套件 share > ~/models/<type>
 hdr "語音模型（找不到時節點照跑、只是不出字）"
 SHARE_M="$HOME/welcoming_robot_ws/install/smartnav_audio/share/smartnav_audio/models"
+if ! here_b; then
+  rec "語音模型" INFO "（雙板）在 B 板" "語音辨識跑在 B"
+else
 for t in asr:tokens.txt vad:silero_vad.onnx; do
   typ=${t%%:*}; f=${t#*:}; hit=""
   for d in "${SMARTNAV_AUDIO_MODELS_DIR:+$SMARTNAV_AUDIO_MODELS_DIR/$typ}" "$SHARE_M/$typ" "$HOME/models/$typ"; do
@@ -95,6 +119,7 @@ for t in asr:tokens.txt vad:silero_vad.onnx; do
     rec "$typ 模型" FAIL "三個位置都沒有 $f" "建 ~/models/$typ 指向模型目錄（見 HANDOFF_car_agent 第 4.5 節）"
   fi
 done
+fi   # ← here_b
 
 # ── 目錄結構（2026-09-23 攤平之後）─────────────────────────
 # ★ 套件直接放在 ~/welcoming_robot_ws/src/<套件>，不再有 src/smartnav_ws/src/ 這層。

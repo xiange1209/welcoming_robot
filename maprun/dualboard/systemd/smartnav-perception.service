@@ -1,0 +1,33 @@
+# /etc/systemd/system/smartnav-perception.service（只放 B）
+#
+# 雙板 B：開機自動開「相機（人臉模式）＋人臉＋認證＋語音輸入」（launch/perception_b.launch.py）。
+# 平板操作的 HMI 在 A。B 上的 smartnav-hmi 要停用 —— 否則會有兩個 HMI、兩套單元管理，
+# 而且 B 的 HMI 遙控也能對 cmd_vel_trimmed 發速度指令：
+#   sudo systemctl disable --now smartnav-hmi
+#
+# 安裝：sudo install -m 644 smartnav-perception.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now smartnav-perception
+# 狀態：systemctl status smartnav-perception
+# log ：~/.smartnav/logs/system_control/perception_b_<時間>.log（同時進 journal：journalctl -u smartnav-perception）
+# Astra S 開機沒列舉到（舊問題，照舊手動插拔）：插好後 sudo systemctl restart smartnav-perception
+#   ★ 插拔相機後語音也必須重啟（記憶：不會自己恢復），restart 這個服務就一起重啟了。
+# ★ 2026-10-22 車上 agent 起草，只做過 systemd-analyze verify，尚未實機執行。
+[Unit]
+Description=SmartNav 雙板 B：相機（人臉模式）＋人臉＋認證＋語音輸入
+After=network-online.target time-sync.target smartnav-eth0.service
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+# 等 Astra S 列舉、A 那邊的 DDS 就位
+ExecStartPre=/bin/sleep 20
+ExecStart=/bin/bash -c 'set +u; source /home/user/maprun/dualboard/env_dualboard.sh; LOG=/home/user/.smartnav/logs/system_control/perception_b_$(date +%%Y%%m%%d_%%H%%M%%S).log; exec > >(tee -a "$LOG") 2>&1; exec ros2 launch /home/user/maprun/dualboard/launch/perception_b.launch.py'
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

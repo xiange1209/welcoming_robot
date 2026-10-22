@@ -475,7 +475,13 @@ export function SystemPage({ active }: { active: boolean }) {
                     </div>
                   )}
                   {/* 前置條件不足時直接講清楚，不要讓人按了沒反應才去翻 log */}
-                  {u.blocked && (
+                  {/* ★ 2026-10-22 雙板：B 板的單元不是「啟動會失敗」，是 A 不管它——在跑時用中性說明，離線才標紅 */}
+                  {u.blocked && u.remote && (
+                    <div className={cx("text-[12px]", u.running ? "text-label-3" : "text-red")}>
+                      {u.running ? "◇" : "⚠"} {u.blocked}
+                    </div>
+                  )}
+                  {u.blocked && !u.remote && (
                     <div className="text-[12px] text-red">
                       ⚠ {u.blocked} —— 啟動會失敗
                     </div>

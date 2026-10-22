@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  雙板模式的 CycloneDDS 設定（A、B 兩塊板子共用）
+  由 ~/cyclonedds.xml 複製而來，只改了「網卡」一處，其餘（ParticipantIndex、緩衝、Watermarks）完全相同。
+
+  差別：
+    單板 ~/cyclonedds.xml   NetworkInterface autodetermine="true"   → 自動挑一張（通常是 wlan0）
+    雙板（這份）            NetworkInterface name="eth0"            → 只走兩板之間的網路線
+
+  為什麼只走 eth0：
+    1. Wi-Fi 網段上還有別台機器跑同一套系統（env.sh 註解：曾看到 3 個 /waypoint_service_node）。
+       單板靠 LOCALHOST 隔離；雙板要跨機，只能改成「綁網卡」把 Wi-Fi 那一側隔開（再加上 domain 42）。
+    2. 平板與筆電走 HMI 的 HTTP／WebSocket、筆電的 Ollama 也是 HTTP，都不需要 DDS。
+
+  ★ 風險：eth0 沒有 IP（沒插線、而 NetworkManager 又沒保留位址）時，CycloneDDS 會起不來，
+    該板所有 ROS 節點都會失敗。所以 nm/60-dualboard-eth0.conf 讓 eth0 沒插線也保有固定 IP。
+    A 是車子本體，一定要實測「拔掉網路線開機，車子照樣能動」（README 驗證步驟 V3）。
+  ★ 沒有設 <Peers>：兩板直連，多播可以用。ParticipantIndex=none 時埠號不固定，單播 Peers 不一定找得到對方，
+    所以主要靠多播。日後中間若加交換器而它擋多播，再改成 ParticipantIndex=auto＋Peers。
+  ★ 2026-10-22 車上 agent 起草，只做過 XML 與 CycloneDDS 解析檢查，尚未在雙板實機驗證。
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="eth0" priority="default" multicast="default" />
+      </Interfaces>
+      <AllowMulticast>default</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+
+    <Discovery>
+      <!-- 與單板相同：避免 "Failed to find a free participant index for domain 0" -->
+      <ParticipantIndex>none</ParticipantIndex>
+      <LeaseDuration>10s</LeaseDuration>
+    </Discovery>
+
+    <Internal>
+      <!-- 與單板相同：影像分片需要大接收緩衝（搭配 /etc/sysctl.d/60-ros2-dds.conf，B 也要有這個檔） -->
+      <SocketReceiveBufferSize min="10MB" />
+      <Watermarks>
+        <WhcHigh>2MB</WhcHigh>
+      </Watermarks>
+    </Internal>
+
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

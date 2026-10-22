@@ -1,0 +1,7 @@
+# 貼到 A、B 兩塊板子 /etc/hosts 的最後面（sudo nano /etc/hosts）。之後兩板可以用名字互連：ssh car-b、ping car-a
+10.10.10.1   car-a
+10.10.10.2   car-b
+
+# ★ B 若是用 A 的映像複製出來的，hostname 也會是 wheeltec-r680，要改掉（兩台同名會混淆 log 與打包檔）：
+#     sudo hostnamectl set-hostname smartnav-face
+#   並把 B 的 /etc/hosts 裡「127.0.1.1  wheeltec-r680」那行改成「127.0.1.1  smartnav-face」（否則 sudo 會一直警告）。

@@ -13,7 +13,17 @@ from typing import Dict, Optional
 from std_srvs.srv import Trigger
 
 from ..system.procinfo import proc_cmdlines
-from .supervisor import LaunchSupervisor
+from .supervisor import LaunchSupervisor, remote_units
+
+# ★ 2026-10-22 雙板：B 板單元在 A 的面板上要看「ROS 節點圖」，不能看本機行程（A 看不到 B 的行程）。
+#   名稱是 ROS 節點名（不是執行檔名）：system_control.launch.py 的 Node 以 f"{unit}_node" 命名，
+#   asr_chain.launch.py 命名 voice_trigger_node／speech_recognizer_node，Astra 的節點名是 camera。
+REMOTE_UNIT_NODES = {
+    "camera": ("camera",),
+    "face": ("face_node",),
+    "user_auth": ("user_auth_node",),
+    "asr_chain": ("voice_trigger_node", "speech_recognizer_node"),
+}
 
 
 class SystemControlManager:
@@ -477,11 +487,20 @@ class SystemControlManager:
             for k, v in self.VERIFY_SCRIPTS.items()
         ]
 
+    def _graph_node_names(self) -> set:
+        """ROS 節點圖上看得到的節點名（跨板；DDS 發現對方約 10 秒、對方消失約 12 秒才反映）。取不到回空集合。"""
+        try:
+            return {name for name, _ns in self._node.get_node_names_and_namespaces()}
+        except Exception:  # noqa: BLE001
+            return set()
+
     def system_status(self) -> list:
         """回報每個單元是否在跑"""
         procs = proc_cmdlines()
         mypid = os.getpid()
         units = []
+        remote = remote_units()                     # ★ 2026-10-22 雙板：在 B 板的單元（單板＝空集合）
+        graph = self._graph_node_names() if remote else set()
         for key, spec in self.SYSTEM_UNITS.items():
             # ★ 缺硬體而且標了 hide_when_missing 的單元直接不列出來。
             #   面板上一顆永遠按不動的按鈕，比沒有這顆按鈕更糟 ——
@@ -489,32 +508,50 @@ class SystemControlManager:
             if spec.get("hide_when_missing") and self._check_requires(spec.get("requires")):
                 continue
             found = []
-            for needle in spec["detect"]:
-                for pid, cmd in procs:
-                    # 排除自己，也排除 shell 包裝（bash -c "..." 會含有關鍵字）
-                    if pid == mypid or cmd.lstrip().startswith("/bin/bash"):
-                        continue
-                    if needle in cmd:
-                        found.append(needle)
-                        break
+            is_remote = key in remote
+            needles = list(REMOTE_UNIT_NODES.get(key, spec["detect"])) if is_remote else spec["detect"]
+            if is_remote:
+                # B 板單元：看 ROS 節點圖（本機行程看不到 B）
+                found = [n for n in needles if n in graph]
+            else:
+                for needle in spec["detect"]:
+                    for pid, cmd in procs:
+                        # 排除自己，也排除 shell 包裝（bash -c "..." 會含有關鍵字）
+                        if pid == mypid or cmd.lstrip().startswith("/bin/bash"):
+                            continue
+                        if needle in cmd:
+                            found.append(needle)
+                            break
             # ★ 有些單元的「模式」看行程名分不出來（相機的彩色/深度
             #   都是同一個 astra_camera_node），只能比對指令列裡的 launch 檔名。
             #   不做的話面板只會說「相機在跑」，而操作者最需要知道的是**哪一種**在跑。
             mode = ""
-            for vk, needle in (spec.get("variant_detect") or {}).items():
-                if any(needle in cmd for pid, cmd in procs if pid != mypid):
-                    mode = spec.get("variants", {}).get(vk, {}).get("label", vk)
-                    break
+            if not is_remote:
+                for vk, needle in (spec.get("variant_detect") or {}).items():
+                    if any(needle in cmd for pid, cmd in procs if pid != mypid):
+                        mode = spec.get("variants", {}).get(vk, {}).get("label", vk)
+                        break
+            blocked = self._check_requires(spec.get("requires"))
+            hint = spec.get("start_hint", "")
+            if is_remote:
+                # ★ 缺什麼就先講（面板會把 blocked 顯示成原因）：B 離線時一眼看得出來，不用去翻 log
+                blocked = (
+                    "在 B 板（感知板）開機自動運作，A 不啟動也不停止它"
+                    if found
+                    else "B 板（感知板）離線或還沒就緒：看網路線、B 的 smartnav-perception 服務（DDS 發現約 10 秒）"
+                )
+                hint = "雙板：這個單元在 B 板；燈號＝B 的節點在 ROS 網路上看得到"
             units.append(
                 {
                     "key": key,
                     "label": spec["label"],
                     "mode": mode,
-                    "running": len(found) == len(spec["detect"]),
-                    "partial": 0 < len(found) < len(spec["detect"]),
-                    "hint": spec.get("start_hint", ""),
+                    "remote": "B" if is_remote else "",
+                    "running": len(found) == len(needles),
+                    "partial": 0 < len(found) < len(needles),
+                    "hint": hint,
                     # 缺什麼就先講，不要讓操作者按了沒反應才去翻 log
-                    "blocked": self._check_requires(spec.get("requires")),
+                    "blocked": blocked,
                     # 有 variants 的單元由前端畫成多顆啟動按鈕
                     "variants": [
                         {"key": vk, "label": v["label"], "warn": v.get("warn", "")}
@@ -530,6 +567,9 @@ class SystemControlManager:
         spec = self.SYSTEM_UNITS.get(unit)
         if spec is None:
             return False, {"message": f"未知的單元：{unit}"}
+        # ★ 2026-10-22 雙板：B 板的單元直接說明，不去檢查 A 自己有沒有 Astra／模組（那些在 B）
+        if unit in remote_units():
+            return False, {"message": f"（雙板）{spec['label']} 在 B 板（感知板）開機自動運作，A 的 HMI 不啟動也不停止它"}
 
         variant_key = None
         if action.startswith("start:"):

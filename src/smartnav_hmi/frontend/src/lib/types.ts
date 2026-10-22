@@ -185,6 +185,8 @@ export interface SysUnit {
   partial?: boolean;
   /** 前置條件不足的說明。有值代表現在按下去一定失敗 */
   blocked?: string;
+  /** ★ 2026-10-22 雙板：這個單元在哪一塊板子（"B"＝感知板）；空＝A 自己。燈號看 ROS 節點圖，A 不啟動／停止它 */
+  remote?: string;
   variants?: SysVariant[];
   transition?: SysTransition | null;
 }

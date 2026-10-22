@@ -57,6 +57,8 @@ CHECKS = [
     ("LLM 接線：常駐／FAQ 併入／工具精簡／帶位防呆（31）", REPO / "maprun/tools_1021/test_llm_wiring.py"),
     ("導航修補：硬停事件／重規劃重試／逐拍紀錄／每趟重讀的等待時間（28）", REPO / "maprun/tools_1021/test_nav_replan.py"),
     ("雷射左右偏移 laser_y_offset_m 的車身幾何（17）", REPO / "maprun/tools_1021/test_laser_offset.py"),
+    ("雙板：A 的 HMI 不碰 B 的單元、狀態看節點圖（27）", REPO / "maprun/tools_1021/test_dualboard_hmi.py"),
+    ("雙板：環境覆蓋層 env.sh／overlay／dualboard_mode（19）", REPO / "maprun/tools_1021/test_dualboard_env.py"),
     ("ASR 修補：觸發塊重送／收音緩衝／除錯錄音／launch", REPO / "maprun/tools_1021/test_asr_fixes.py"),
 ]
 
