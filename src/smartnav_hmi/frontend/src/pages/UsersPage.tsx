@@ -278,7 +278,7 @@ export function UsersPage({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.3fr_1fr] portrait:grid-rows-[minmax(0,11fr)_minmax(0,9fr)]">
+    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.3fr_1fr] portrait:grid-rows-[minmax(0,12fr)_minmax(0,8fr)]">
       <Card
         title="已註冊使用者"
         actions={<Button onClick={() => void refreshUsers()}>重新整理</Button>}
@@ -324,7 +324,7 @@ export function UsersPage({ active }: { active: boolean }) {
         className="overflow-y-auto portrait:order-first"
         bodyClassName="gap-2.5"
       >
-        <div className="relative h-[min(34vh,260px)] flex-none overflow-hidden rounded-ios bg-black portrait:h-[min(30vh,360px)]">
+        <div className="relative h-[min(34vh,260px)] flex-none overflow-hidden rounded-ios bg-black portrait:h-[min(24vh,280px)]">
           <img
             ref={videoRef}
             alt="註冊預覽"

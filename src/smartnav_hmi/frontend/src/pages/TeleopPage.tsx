@@ -44,7 +44,7 @@ function DirectionPad() {
 
   return (
     <div
-      className="mx-auto grid max-w-[330px] grid-cols-3 gap-2.5 portrait:max-w-[440px]"
+      className="mx-auto grid max-w-[330px] grid-cols-3 gap-2.5 portrait:w-full portrait:max-w-[440px]"
       style={{ touchAction: "none", userSelect: "none" }}
     >
       {PAD.map((cell, i) => {

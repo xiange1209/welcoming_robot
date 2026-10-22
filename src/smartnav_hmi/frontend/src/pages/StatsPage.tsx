@@ -30,7 +30,7 @@ function Bars({
 
   return (
     <div>
-      <div className="flex items-end gap-[3px]" style={{ height }}>
+      <div className="flex gap-[3px]" style={{ height }}>
         {values.map((v, i) => {
           // 有資料時至少留 3%，否則「1 人次」跟「0 人次」在畫面上看起來一樣
           const h = v > 0 ? Math.max(3, Math.round((v / max) * 100)) : 0;
