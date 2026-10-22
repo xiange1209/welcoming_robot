@@ -369,17 +369,33 @@ class LaunchSupervisor:
             while time.monotonic() < until:
                 if not self._alive(data, unit, variant):
                     self._clear_state(unit)
+                    self._reap(int(data["pid"]))
                     return f"已停止 {unit}"
                 time.sleep(0.1)
             if not self._alive(data, unit, variant):
                 self._clear_state(unit)
+                self._reap(int(data["pid"]))
                 return f"已停止 {unit}"
         for _ in range(20):
             if not self._alive(data, unit, variant):
                 self._clear_state(unit)
+                self._reap(int(data["pid"]))
                 return f"已強制停止 {unit}"
             time.sleep(0.1)
         raise RuntimeError(f"{unit} 在 SIGKILL 後仍存活")
+
+    @staticmethod
+    def _reap(pid: int) -> None:
+        """收掉自己 Popen 出來、已經結束的 launch 行程。
+
+        ★ 2026-10-22：_start 沒有留下 Popen 物件，launch 結束後沒有人 wait()，會留下 `[ros2] <defunct>`
+          （10/22 實測停 LLM、導航各留一個，25～33 分鐘都沒被回收；要等下一次 Popen 時
+          subprocess 內部的 _cleanup() 才會順手收）。接管來的（不是這個行程的子行程）waitpid
+          會丟 ChildProcessError，直接略過。"""
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
 
     def _alive(self, data: dict, unit: str, variant: str | None) -> bool:
         try:

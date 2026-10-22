@@ -35,6 +35,10 @@ def make_bank_tools(node) -> dict:
         """帶客戶走到貴賓室。客戶說「帶我去貴賓室」「請帶路」「我要去 VIP 室」或同意前往貴賓室時，
         一定要呼叫此工具，機器人會實際開過去帶路。不要只用嘴巴指路，也不要反問客戶要不要帶位"""
         room_name = node.vip_room_waypoint_name
+        # ★ 2026-10-22：貴賓室只帶 VIP、黑名單一律不帶（規則見 access_policy.py）
+        deny = node.nav_denial(room_name)
+        if deny:
+            return f"執行結果: 失敗（不可重試）, 詳細信息: 權限不足。請對客人說：{deny}"
         try:
             if not node.list_waypoints_client.service_is_ready():
                 return f"執行結果: 失敗, 詳細信息: 導航系統未啟動，無法帶位，請以口頭指引貴賓前往{room_name}"

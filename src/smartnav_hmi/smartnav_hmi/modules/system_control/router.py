@@ -11,6 +11,9 @@
 """
 
 import asyncio
+import subprocess
+import threading
+import time
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -53,6 +56,33 @@ def build_router(node, admin_only) -> APIRouter:
     async def api_scenario_apply(key: str) -> JSONResponse:
         ok, result = node.system_control.scenario_request(key)
         return JSONResponse({"success": ok, **result}, status_code=202 if ok else 400)
+
+    # ── 電源（★ 2026-10-22）──────────────────────────
+    # 展示收尾不用再 SSH：先把所有單元依序關掉（同「全部關閉」情境），再交給 systemd。
+    # 立刻回 202、在背景做——單元一個一個優雅關閉要十幾秒，HTTP 不能等那麼久。
+    # dry_run=true 只回報會做什麼（測試用）。HMI 服務跑在 user 底下，靠 sudo -n（免密碼）。
+
+    @router.post("/api/power/{action}", dependencies=admin_only)
+    async def api_power(action: str, dry_run: bool = False) -> JSONResponse:
+        if action not in ("poweroff", "reboot"):
+            return JSONResponse({"success": False, "message": "只接受 poweroff 或 reboot"}, status_code=400)
+        cmd = ["sudo", "-n", "/usr/bin/systemctl", action]
+        label = "關機" if action == "poweroff" else "重新開機"
+        if dry_run:
+            return JSONResponse({"success": True, "dry_run": True,
+                                 "message": f"（測試）會先關閉所有單元，再執行 {' '.join(cmd)}"})
+
+        def work():
+            node.get_logger().warn(f"⏻ 管理者要求{label}：先關閉所有單元")
+            ok, steps = node.system_control.scenario_apply("all_off")
+            for s in steps:
+                node.get_logger().info(f"  {s}")
+            node.get_logger().warn(f"⏻ 單元關閉{'完成' if ok else '有失敗（照樣繼續）'}，執行 {' '.join(cmd)}")
+            time.sleep(1.0)
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        threading.Thread(target=work, daemon=True).start()
+        return JSONResponse({"success": True, "message": f"正在關閉所有功能，接著{label}"}, status_code=202)
 
     # ── 一鍵驗證（2026-09-24）────────────────────────
     # 同樣避開 /api/system/{unit}/{action:path} 萬用路由，用獨立前綴。

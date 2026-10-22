@@ -41,7 +41,8 @@ def build_router(node, admin_only) -> APIRouter:
         node.state.set_system(speaking=active)
         return JSONResponse({"ok": True, "active": active})
 
-    @router.post("/api/speak")
+    # ★ 2026-10-22：改成要登入——這支能讓機器人對著客人念任何字（語音測試頁用），不能開放給訪客
+    @router.post("/api/speak", dependencies=admin_only)
     async def api_speak(req: SayRequest) -> JSONResponse:
         """跳過 LLM，直接讓機器人念出這段文字（測試 TTS 用）"""
         text = req.text.strip()

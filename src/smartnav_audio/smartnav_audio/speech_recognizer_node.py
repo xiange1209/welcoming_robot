@@ -218,7 +218,21 @@ class SpeechRecognizerNode(Node):
         self.declare_parameter(
             "prefer_int8_model",
             True,
-            ParameterDescriptor(description="模型檔有 .int8 版就優先載入（RPi4 上明顯較快，準確率同級）"),
+            ParameterDescriptor(description="模型檔有 .int8 版就優先載入（只套用到 int8_components 列出的元件）"),
+        )
+        # ★★ 2026-10-22：decoder 不可以用 int8 ★★
+        #   同一批合成語音（asr_cer 的 10 句 × 2 位 TTS 語者）、同一套解碼設定，只換模型檔精度：
+        #       全 int8（8/17 起的現況）            CER 80.9%  RTF 0.43  ← 大量疊字（「逛逛逛逛」「朋友朋友」）與句首錯
+        #       encoder int8＋decoder fp32＋joiner int8  CER 21.7%  RTF 0.41
+        #       encoder int8＋decoder int8＋joiner fp32  CER 84.9%
+        #       全 fp32                               CER 27.0%  RTF 0.62
+        #   壞的是 decoder（14 MB、運算量很小），換回 fp32 幾乎不花 CPU。
+        #   10/20 實車的疊字（每對相鄰字約 11% 重複）與句首錯，跟這裡 int8 decoder 的錯誤型態一模一樣。
+        #   工具與數據：~/maprun/tools_1020/asr_bench.py、verify_out/asr_int8_20261022/。
+        self.declare_parameter(
+            "int8_components",
+            "encoder,joiner",
+            ParameterDescriptor(description="哪些元件用 int8（逗號分隔：encoder,decoder,joiner）。decoder 用 int8 會讓 CER 從約 22% 變約 81%"),
         )
 
         self.declare_parameter(
@@ -295,6 +309,11 @@ class SpeechRecognizerNode(Node):
         self._robot_said = []  # [(時刻, 正規化後的字串)]
         self._echo_drops = 0
         self.prefer_int8_model = self.get_parameter("prefer_int8_model").get_parameter_value().bool_value
+        self.int8_components = {
+            c.strip()
+            for c in self.get_parameter("int8_components").get_parameter_value().string_value.split(",")
+            if c.strip()
+        }
         self.use_sherpa_endpoint = self.get_parameter("use_sherpa_endpoint").get_parameter_value().bool_value
         self.rule1_min_trailing_silence = (
             self.get_parameter("rule1_min_trailing_silence").get_parameter_value().double_value
@@ -501,22 +520,22 @@ class SpeechRecognizerNode(Node):
                 #
                 # ⚠ 仍然是【推論】，上機要用 8/18 驗證清單段九實測 RTF 對照。
                 # 想退回舊行為（例如懷疑準確率掉了）：`-p prefer_int8_model:=false`
-                def _pick(stem):
-                    """同一個 stem 有 int8 就用 int8，沒有就退回 fp32。
+                def _pick(stem, component):
+                    """同一個 stem 有 int8 就用 int8（限 int8_components 列出的元件），沒有就退回 fp32。
 
                     ★ 刻意不加 `-> Path` 型別標註：這個檔沒有 `from pathlib import Path`
                       （`asr_model_dir` 是 `get_model_path()` 回傳的），
                       標註會在 def 當下就 NameError。
                     """
-                    if self.prefer_int8_model:
+                    if self.prefer_int8_model and component in self.int8_components:
                         cand = asr_model_dir / f"{stem}.int8.onnx"
                         if cand.exists():
                             return cand
                     return asr_model_dir / f"{stem}.onnx"
 
-                encoder_file = _pick("encoder-epoch-99-avg-1")
-                decoder_file = _pick("decoder-epoch-99-avg-1")
-                joiner_file = _pick("joiner-epoch-99-avg-1")
+                encoder_file = _pick("encoder-epoch-99-avg-1", "encoder")
+                decoder_file = _pick("decoder-epoch-99-avg-1", "decoder")
+                joiner_file = _pick("joiner-epoch-99-avg-1", "joiner")
                 tokens_file = asr_model_dir / "tokens.txt"
 
                 if not all(f.exists() for f in [encoder_file, decoder_file, joiner_file, tokens_file]):

@@ -253,6 +253,16 @@ class SystemControlManager:
             "note": "★ 人臉一定要關：實測音訊破碎 703 次，直接死因就是人臉推論"
             "吃光 CPU、音訊執行緒排不進去。另外平板要先在畫面上點一下解鎖朗讀",
         },
+        # ★ 2026-10-22：展示結束／換情境前一鍵全關（以前要 SSH 進去跑停止腳本）。順序是「上層先關」：
+        #   LLM／語音 → 迎賓／認證／人臉 → 相機 → 導航 → 底盤。本來就沒開的會被 scenario_request 跳過。
+        "all_off": {
+            "label": "全部關閉",
+            "why": "展示結束、或換情境之前：把所有功能單元依序關掉。HMI 本身照常（平板不會斷線）",
+            "stop": ["llm", "asr_chain", "speech_synthesizer", "voice_playback", "bank_reception", "user_auth",
+                     "face", "camera", "nav", "sensors"],
+            "start": [],
+            "note": "本來就沒開的單元會直接跳過。要關機請用下方「電源」卡（關機前也會先做這一步）",
+        },
         "demo": {
             "label": "完整迎賓故事線",
             "why": "全鏈路。順序照 demo.launch.py 的分階段：感測 → 導航 → 視覺 → 語音 → LLM",
@@ -389,7 +399,10 @@ class SystemControlManager:
 
         steps = []
         ok_all = True
+        live = {u["key"] for u in self.system_status() if u.get("running") or u.get("partial")}
         for unit in spec["stop"]:
+            if unit not in live:
+                continue
             ok, msg = self._supervisor.run_unit_sync(unit, "stop")
             steps.append(f"{'✓' if ok else '✗'} 停止 {unit}：{msg}")
             ok_all = ok_all and ok
@@ -406,7 +419,12 @@ class SystemControlManager:
         if spec is None:
             return False, {"message": f"未知的情境：{key}"}
         steps = []
+        # ★ 2026-10-22：跳過本來就沒開的單元——對沒在跑的單元下「停止」會被記成「操作失敗」
+        #   （_stop 找不到受管 launch），「全部關閉」會滿畫面紅字。有任何行程在（partial）照樣去停。
+        live = {u["key"] for u in self.system_status() if u.get("running") or u.get("partial")}
         for unit in spec["stop"]:
+            if unit not in live:
+                continue
             steps.append((unit, "stop", None))
         for item in spec["start"]:
             unit, _, variant = item.partition(":")

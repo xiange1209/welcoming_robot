@@ -30,11 +30,12 @@ from std_msgs.msg import Empty, String
 from action_msgs.msg import GoalStatus
 
 from smartnav_msgs.srv import ListMaps, SwitchMap, CreateWaypoint, ListWaypoints
+from smartnav_msgs.msg import UserIdentity
 from smartnav_msgs.action import CreateMap, GlobalLocalization, Navigate
 from smartnav_llm.llm_utils import get_config_path, get_knowledge_dir, NAVIGATE_WAIT_SEC
 from smartnav_llm.rag_store import BankKnowledgeStore
 from smartnav_llm import web_tools
-from smartnav_llm import nav_intent
+from smartnav_llm import access_policy, nav_intent
 
 
 class RosStreamHandler(BaseCallbackHandler):
@@ -324,6 +325,9 @@ class LLMServiceNode(Node):
         self.memory_lock = threading.Lock()
         self.agent_busy_lock = threading.Lock()
         self.is_agent_running = False
+        # ★ 2026-10-22：正在等結果、會讓車移動的 action 目標（帶位／導航）。客人在途中說「停下來」時拿來取消
+        self._active_goals: dict = {}  # id(goal_handle) -> goal_handle（ClientGoalHandle 不能 hash，不能放 set）
+        self._active_goals_lock = threading.Lock()
 
         # 建立 Callback Group
         self.cb_group = ReentrantCallbackGroup()
@@ -412,6 +416,11 @@ class LLMServiceNode(Node):
         )
         self.clear_history_sub = self.create_subscription(
             Empty, "clear_conversation", self.clear_conversation_callback, 10, callback_group=self.cb_group
+        )
+        # ★ 2026-10-22：人臉身分 → 帶位權限（黑名單不帶位、貴賓室只給 VIP）＋ VIP 個人化（見 access_policy.py）
+        self._identity: dict = {}
+        self.identity_sub = self.create_subscription(
+            UserIdentity, "user_identity", self._identity_cb, 10, callback_group=self.cb_group
         )
         # ★ 2026-10-21：記下機器人講過的話（10/20 14:59 LLM 收到「開始導航到 廁所」——
         #   那是導航節點自己的播報被麥克風收回來）
@@ -587,6 +596,8 @@ class LLMServiceNode(Node):
         取消失敗不往外拋：那時本來就已經要回報逾時了，再多一個例外只會讓
         真正的原因（逾時）被蓋掉。取消失敗只記 log。
         """
+        with self._active_goals_lock:
+            self._active_goals[id(goal_handle)] = goal_handle
         try:
             return self._wait_for_future(goal_handle.get_result_async(), timeout_sec)
         except TimeoutError:
@@ -596,6 +607,9 @@ class LLMServiceNode(Node):
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"✗ {what}逾時後送取消指令失敗: {exc}")
             raise TimeoutError(f"{what}超過 {timeout_sec:.0f} 秒未完成，已中止本次請求")
+        finally:
+            with self._active_goals_lock:
+                self._active_goals.pop(id(goal_handle), None)
 
     @staticmethod
     def _nav_failure_text(action_result) -> str:
@@ -764,6 +778,10 @@ class LLMServiceNode(Node):
                 _lw = self._wait_for_future(self.list_waypoints_client.call_async(ListWaypoints.Request()), 5.0)
                 if _lw is not None and _lw.success:
                     _ids = {wp.waypoint_id for wp in _lw.waypoints_info}
+                    _name = next((wp.waypoint_name for wp in _lw.waypoints_info if wp.waypoint_id == waypoint_id), "")
+                    _deny = self.nav_denial(_name) if _name else None
+                    if _deny:
+                        return f"執行結果: 失敗（不可重試）, 詳細信息: 權限不足。請對客人說：{_deny}"
                     if waypoint_id not in _ids:
                         _names = [wp.waypoint_name for wp in _lw.waypoints_info]
                         return (
@@ -1078,6 +1096,14 @@ class LLMServiceNode(Node):
             self._publish_reply(reply)
             return True
         wid = names[name]
+        deny = self.nav_denial(name)
+        if deny:
+            self.get_logger().info(f"🤖 Agent 最終決策回應: {deny}")
+            with self.memory_lock:
+                self.memory.add_message(HumanMessage(content=user_input))
+                self.memory.add_message(AIMessage(content=deny))
+            self._publish_reply(deny)
+            return True
         self.get_logger().info(f"🧭 帶位直達（程式判斷，不經模型）：'{user_input}' -> {name}（{wid}）")
         ack = "好的，請跟我來。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
         self._publish_reply(ack)
@@ -1113,6 +1139,29 @@ class LLMServiceNode(Node):
         except Exception:
             return text
 
+    def _identity_cb(self, msg: UserIdentity) -> None:
+        self._identity = {
+            "recognized": bool(msg.recognized),
+            "user_type": access_policy.TYPE_NAMES.get(int(msg.user_type.type), "GUEST"),
+            "user_name": msg.user_name,
+            "description": msg.description,
+            "stamp": time.time(),
+        }
+
+    def _access(self):
+        """（tier, identity, policy）：目前在機器人前面的人可以做什麼"""
+        policy = access_policy.load_policy()
+        identity = dict(self._identity)
+        return access_policy.tier_of(identity, policy), identity, policy
+
+    def nav_denial(self, waypoint_name: str):
+        """這個地點目前不能帶 → 回要對客人說的話；可以 → None（帶位工具與程式端帶位共用）"""
+        tier, _identity, policy = self._access()
+        deny = access_policy.nav_denial(tier, waypoint_name, policy)
+        if deny:
+            self.get_logger().info(f"🚫 帶位拒絕：{waypoint_name}（身分 {tier}）")
+        return deny
+
     def user_text_callback(self, msg: String) -> None:
         """處理使用者輸入"""
         user_input = msg.data
@@ -1124,6 +1173,19 @@ class LLMServiceNode(Node):
 
         with self.agent_busy_lock:
             if self.is_agent_running:
+                # ★ 2026-10-22：帶位途中客人說「停下來／取消」→ 真的取消目標。以前跟其他話一樣回
+                #   「正在處理上一個指令」然後丟掉，車照樣走（只剩平板急停）。取消走的是跟平板急停
+                #   同一條 action cancel 路徑；等結果的執行緒會收到「取消」，回「車子已經停下來了」。
+                with self._active_goals_lock:
+                    moving = list(self._active_goals.values())
+                if moving and nav_intent.is_stop_request(user_input):
+                    for gh in moving:
+                        try:
+                            gh.cancel_goal_async()
+                        except Exception as exc:  # noqa: BLE001
+                            self.get_logger().error(f"✗ 送取消指令失敗: {exc}")
+                    self.get_logger().warn(f"🛑 客人在帶位途中說「{user_input}」→ 取消 {len(moving)} 個進行中的目標")
+                    return
                 warning_msg = "系統目前正在處理上一個指令，請稍後再試..."
                 self.get_logger().warn(warning_msg)
                 self._publish_reply(warning_msg)
@@ -1180,7 +1242,10 @@ class LLMServiceNode(Node):
 
     def _run_agent_loop(self, user_input: str) -> None:
         """ReAct 自主思考迴圈"""
-        system_content = self._load_system_prompt()
+        tier, identity, _policy = self._access()
+        system_content = self._load_system_prompt() + access_policy.prompt_context(tier, identity)
+        if tier != "guest":
+            self.get_logger().info(f"👤 本輪客人身分：{tier}（系統提示已附上對應說明）")
 
         with self.memory_lock:
             chat_history = self.memory.get_history_messages()

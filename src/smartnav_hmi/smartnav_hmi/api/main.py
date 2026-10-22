@@ -10,6 +10,7 @@ from ament_index_python.packages import get_package_share_directory
 from .dependencies import make_admin_only
 from ..core.version import assets_signature
 from ..modules.chat import router as chat_router
+from ..modules.guide import router as guide_router
 from ..modules.hardware import router as hardware_router
 from ..modules.imaging import router as imaging_router
 from ..modules.jobs import router as jobs_router
@@ -91,5 +92,7 @@ def build_app(node) -> FastAPI:
     app.include_router(jobs_router.build_router(node, admin_only))
     app.include_router(users_router.build_router(node, admin_only))
     app.include_router(chat_router.build_router(node, admin_only))
+    # ★ 2026-10-22：迎賓頁的帶位（不用登入，依人臉身分決定能去哪裡，見 modules/guide/policy.py）
+    app.include_router(guide_router.build_router(node, admin_only))
 
     return app

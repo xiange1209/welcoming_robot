@@ -5,9 +5,10 @@
 
 import asyncio
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
 
+from ...core.auth import token_from_header
 from .visit_stats import read_visit_stats
 
 
@@ -15,7 +16,7 @@ def build_router(node, admin_only) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/stats")
-    async def api_stats(days: int = 7) -> JSONResponse:
+    async def api_stats(days: int = 7, authorization: str = Header(default="")) -> JSONResponse:
         """到訪統計。★ 與 /api/hardware 一樣刻意不要求登入 ——
         這是展示時要投影出來的頁面，登入畫面會打斷展示節奏；
         而且內容只有姓名與時間，沒有比迎賓頁的即時影像更敏感。
@@ -26,6 +27,12 @@ def build_router(node, admin_only) -> APIRouter:
         days = max(1, min(31, int(days)))
         data = await asyncio.get_running_loop().run_in_executor(
             None, read_visit_stats, days, node.visit_log_path)
+        # ★ 2026-10-22：沒登入時遮掉黑名單的姓名——這頁會投影給現場看，名字被當眾秀出來會讓情況升溫
+        #   （跟迎賓語音「只說中性的話」同一個道理）；次數統計照常給。
+        if not node.auth.valid(token_from_header(authorization)):
+            for r in data.get("recent") or []:
+                if r.get("type") == "BLACKLIST":
+                    r["name"] = "（已隱藏）"
         return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
     return router
