@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, Hint, Row } from "../components/ui";
 import { cx } from "../lib/cx";
 import { useVisibleInterval } from "../hooks/useVisibleInterval";
-import { api, post } from "../lib/api";
+import { api, post, run } from "../lib/api";
 import { confirmDialog } from "../lib/dialog";
 import type { ApiResult, Scenario, SysUnit, VerifyItem } from "../lib/types";
 
@@ -160,6 +160,39 @@ function ScenarioCard({
    ★ 同一時間只跑一支：V1 要量 12 秒的幀率，兩支同時跑會互相搶 CPU，
      量到的數字就不準了。 */
 const VERDICT = /^\s*(PASS|FAIL|WARN)\b/;
+
+/* ★ 2026-10-22：電源。展示收尾不用再 SSH：後端會先把所有功能單元依序關掉（同「全部關閉」情境），
+   再交給 systemd 關機／重開機。 */
+function PowerCard() {
+  const act = async (action: "poweroff" | "reboot") => {
+    const label = action === "poweroff" ? "關機" : "重新開機";
+    const ok = await confirmDialog({
+      title: `確定要${label}嗎？`,
+      message:
+        action === "poweroff"
+          ? "會先依序關掉所有功能（約半分鐘），然後關機，平板會斷線。等車上 Pi 的綠燈不再閃再拔電源。"
+          : "會先依序關掉所有功能，然後重新開機。HMI 約 1～2 分鐘後恢復，平板重新整理即可。",
+      confirmLabel: label,
+      destructive: true,
+    });
+    if (!ok) return;
+    await run(post(`/api/power/${action}`));
+  };
+
+  return (
+    <Card title="電源" className="flex-none">
+      <Hint className="mb-3">
+        展示結束直接在這裡關機，不用 SSH。關機前會自動把所有功能依序關掉。
+      </Hint>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="danger" onClick={() => void act("poweroff")}>
+          關機
+        </Button>
+        <Button onClick={() => void act("reboot")}>重新開機</Button>
+      </div>
+    </Card>
+  );
+}
 
 function VerifyCard({ active }: { active: boolean }) {
   const [list, setList] = useState<VerifyItem[]>([]);
@@ -392,10 +425,11 @@ export function SystemPage({ active }: { active: boolean }) {
          會被壓扁、內容在卡片裡被裁掉，而不是讓外層捲動。
        ★ 節點卡在窄螢幕用 grow + shrink-0：左欄空的時候（後端是舊版）照舊
          撐滿整頁；左欄很長的時候保持內容高度、交給外層捲。 */
-    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto xl:grid xl:grid-cols-[1fr_1.15fr] xl:grid-rows-[minmax(0,1fr)] xl:overflow-hidden portrait:grid portrait:grid-cols-[1fr_1.15fr] portrait:grid-rows-[minmax(0,1fr)] portrait:overflow-hidden">
-      <div className="flex flex-none flex-col gap-3 empty:hidden xl:min-h-0 xl:overflow-y-auto portrait:min-h-0 portrait:overflow-y-auto">
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto xl:grid xl:grid-cols-[1fr_1.15fr] xl:grid-rows-[minmax(0,1fr)] xl:overflow-hidden portrait:max-xl:grid portrait:max-xl:grid-cols-[1fr_1.15fr] portrait:max-xl:grid-rows-[minmax(0,1fr)] portrait:max-xl:overflow-hidden">
+      <div className="flex flex-none flex-col gap-3 empty:hidden xl:min-h-0 xl:overflow-y-auto portrait:max-xl:min-h-0 portrait:max-xl:overflow-y-auto">
         <ScenarioCard active={active} onApplied={() => void refresh()} />
         <VerifyCard active={active} />
+        <PowerCard />
       </div>
 
       <Card

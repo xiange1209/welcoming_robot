@@ -32,6 +32,7 @@ const TINT: Record<string, string> = {
 
 function Identity() {
   const { present, boxed } = useStoreValue(presenceStore);
+  const { admin } = useStoreValue(sessionStore);
 
   const id = useStoreSelector(
     telemetryStore,
@@ -49,16 +50,24 @@ function Identity() {
   );
 
   // 不新鮮、或這一幀根本沒有人臉框，就當成「沒有人」
-  const shown = present && boxed ? id : null;
+  // ★ 2026-10-22：沒登入（平板對著客人）時，黑名單一律顯示成一般訪客——不出現紅底、名字或「BLACKLIST」。
+  //   通報行員走 Telegram；登入的管理者照樣看得到完整身分。
+  const raw = present && boxed ? id : null;
+  const masked = !!raw && raw.type === "BLACKLIST" && !admin;
+  const shown = masked ? null : raw;
 
-  const who = shown
+  const who = masked
+    ? "訪客"
+    : shown
     ? shown.recognized
       ? shown.name
       : shown.name
         ? "訪客"
         : "等待辨識…"
     : "等待辨識…";
-  const sub = shown
+  const sub = masked
+    ? "歡迎光臨"
+    : shown
     ? shown.recognized
       ? `${shown.description || "已認證"}　相似度 ${shown.similarity}`
       : `未在資料庫中（相似度 ${shown.similarity}）`
@@ -250,7 +259,7 @@ function EmergencyStop() {
       title="立即停止所有動作（空白鍵）"
       // 送出中擋住重複點擊，但不改變大小以免手指跟丟
       className={cx(
-        "tap pressable flex-none rounded-ios border border-red/50 bg-red/85 px-3.5 text-[13px] font-semibold text-on-red portrait:min-h-[64px] portrait:px-6 portrait:text-[17px]",
+        "tap pressable flex-none rounded-ios border border-red/50 bg-red/85 px-3.5 text-[13px] font-semibold text-on-red portrait:max-lg:min-h-[64px] portrait:max-lg:px-6 portrait:max-lg:text-[17px]",
         busy && "pointer-events-none opacity-55",
         done && "anim-ripple",
       )}
@@ -287,7 +296,9 @@ export function TopBar({
             >
               <IconPalette className="size-5" />
             </Button>
-            {admin && <EmergencyStop />}
+            {/* ★ 2026-10-22：急停不分身分都看得到（後端 /api/estop 本來就不要求登入）。
+                誤按的代價只是車子停下來；帶位途中客人或旁人要能直接按。 */}
+            <EmergencyStop />
             <Button
               variant={admin ? "primary" : "plain"}
               onClick={admin ? onLogout : onLogin}

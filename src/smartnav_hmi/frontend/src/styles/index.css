@@ -54,6 +54,24 @@
     -webkit-tap-highlight-color: transparent;
   }
 
+  /* ★ 2026-10-22：平板當展示機（主畫面 App）。訪客按住畫面不放時，iOS 會選取文字、
+     或在影像上跳出「儲存影像／拷貝」選單——兩者都會蓋住畫面而且不好關。
+     只有輸入框保留選取（要能游標定位、貼上）。 */
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  input,
+  textarea,
+  [contenteditable="true"] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  img {
+    -webkit-user-drag: none;
+  }
+
   html,
   body,
   #root {

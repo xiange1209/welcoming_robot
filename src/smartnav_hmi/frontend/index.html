@@ -17,6 +17,11 @@
       content="black-translucent"
     />
     <meta name="mobile-web-app-capable" content="yes" />
+    <!-- ★ 2026-10-22：主畫面圖示與名稱。圖示放 src/assets 讓 Vite 帶雜湊輸出到 /assets/
+         （後端只開放 /、/assets/*、/favicon.svg，放 public/ 會 404，iOS 就改用網頁截圖當圖示）。
+         改了圖示要把主畫面上的舊圖示刪掉、重新「加入主畫面」才會換。 -->
+    <link rel="apple-touch-icon" href="/src/assets/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="SmartNav 迎賓" />
     <title>SmartNav 智慧銀行迎賓系統</title>
   </head>
   <body>

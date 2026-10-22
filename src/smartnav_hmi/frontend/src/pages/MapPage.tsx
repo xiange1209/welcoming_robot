@@ -13,6 +13,7 @@ import {
 } from "../components/ui";
 import { useStoreSelector, useStoreValue } from "../hooks/useStore";
 import { del, post, run } from "../lib/api";
+import { cx } from "../lib/cx";
 import { confirmDialog, promptDialog } from "../lib/dialog";
 import {
   mapsStore,
@@ -158,7 +159,8 @@ export function MapPage({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.5fr_1fr] portrait:grid-rows-[minmax(0,11fr)_minmax(0,9fr)]">
+    /* ★ 2026-10-22：直放時地圖 5：地點 7，地點卡才放得下 6 個地點（兩欄）＋地圖管理＋作業而不用在卡片裡捲。 */
+    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.5fr_1fr] portrait:max-xl:grid-rows-[minmax(0,5fr)_minmax(0,7fr)]">
       <Card
         title="地圖"
         actions={
@@ -205,10 +207,16 @@ export function MapPage({ active }: { active: boolean }) {
         )}
       </Card>
 
-      <Card title="地點" className="overflow-y-auto" bodyClassName="gap-4">
+      <Card title="地點" className="overflow-y-auto" bodyClassName="gap-4 portrait:max-xl:gap-3">
         {/* ★ 2026-10-21：補 shrink-0（10/20 車上直接改過 dist，這裡補回原始碼）——min-h 取代了 flex 子項的
             min-height:auto，清單被壓到 120 px、地點卡溢出蓋到「地圖管理」（平板截圖「破圖」） */}
-        <div className="flex min-h-[120px] shrink-0 flex-col gap-1.5">
+        {/* ★ 2026-10-22：直放時地點排兩欄（820 寬一列只放一個地點太浪費，6 個地點要捲才看得到「地圖管理」） */}
+        <div
+          className={cx(
+            "flex min-h-[120px] shrink-0 flex-col gap-1.5",
+            waypoints.length > 0 && "portrait:max-xl:grid portrait:max-xl:grid-cols-2 portrait:max-xl:content-start",
+          )}
+        >
           {waypoints.length === 0 && (
             <Empty>
               尚無地點。切到「建立地點」模式後在地圖上點一下即可新增。

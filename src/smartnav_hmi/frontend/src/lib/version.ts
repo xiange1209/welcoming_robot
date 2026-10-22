@@ -11,7 +11,11 @@ import { ttsStore } from "./tts";
  *
  * 做法：後端 /api/version 回報目前部署的 index.html 引用了哪些 /assets/ 檔案
  * （Vite 把內容雜湊放在檔名裡，內容一變檔名就變），這裡拿來和自己載入時的那一組比。
- * 不一樣 → 顯示「有新版本」橫幅；閒置一段時間且沒在遙控、沒在朗讀就自動重載。
+ * 不一樣 → 顯示「有新版本」橫幅，並且：
+ *   - App 從背景回到前景（visibilitychange／pageshow）時發現 → 立刻重載。這時沒有人正在操作
+ *     （遙控在切到背景時就被 installTeleopGuards 停掉了），是換版最不打擾的時刻。
+ *     這個做法是車上 agent 10/22 在 hmi_ipad.patch 的 version.ts 想出來的，併進這一份。
+ *   - 一直開在前景：閒置一段時間且沒在遙控、沒在朗讀才自動重載（可能有人正在打字）。
  *
  * ★ 第一次部署這個檢查時，平板上還在跑的舊 JS 沒有它，要完全關掉 App 再開一次；
  *   之後的更新才會自動提示。
@@ -64,9 +68,10 @@ async function check(): Promise<void> {
   }
 }
 
-function maybeReload(): void {
+/** force＝剛從背景回來（沒有人在操作），不必等閒置 */
+function reloadIfAllowed(force: boolean): void {
   if (!versionStore.get().stale || document.hidden) return;
-  if (Date.now() - lastActivity < IDLE_RELOAD_MS) return;
+  if (!force && Date.now() - lastActivity < IDLE_RELOAD_MS) return;
   if (teleopStore.get().moving || ttsStore.get().status === "speaking") return;
   /* 重載一次之後簽章還是對不起來（例如部署到一半），不要再自動重載——
      否則每閒置 45 秒就重載一次。同一個版本只自動重載一次；橫幅仍在，可以手動按。 */
@@ -98,12 +103,17 @@ export function startVersionWatch(): void {
   setInterval(() => {
     if (!document.hidden) void check();
   }, POLL_MS);
-  // 主畫面 App 從背景回來正是最容易遇到舊版的時刻：立刻問一次，並把「回來」算成一次互動，
-  // 讓自動重載至少再等 45 秒，不要在使用者剛看到畫面的瞬間換掉它
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return;
+  // 主畫面 App 從背景回來正是最容易遇到舊版的時刻：立刻問一次，有新版就直接重載
+  const onResume = () => {
     bump();
-    void check();
+    void check().then(() => reloadIfAllowed(true));
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) onResume();
   });
-  setInterval(maybeReload, 5_000);
+  // 從瀏覽器的返回／前進快取（bfcache）還原時不會重新執行腳本，只會觸發 pageshow
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) onResume();
+  });
+  setInterval(() => reloadIfAllowed(false), 5_000);
 }

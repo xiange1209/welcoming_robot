@@ -1,9 +1,10 @@
-import { memo, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { IconSend } from "../components/icons";
 import { Button, Card, Field, Hint, Select } from "../components/ui";
 import { cx } from "../lib/cx";
 import { useStoreSelector, useStoreValue } from "../hooks/useStore";
 import { useVideoStream } from "../hooks/useVideoStream";
+import { useVisibleInterval } from "../hooks/useVisibleInterval";
 import { post, run } from "../lib/api";
 import { confirmDialog } from "../lib/dialog";
 import { resetCachedMessages, telemetryStore } from "../lib/telemetry";
@@ -40,7 +41,7 @@ function Bubble({ message }: { message: ChatMessage }) {
     <div className={cx("flex flex-col", mine ? "items-end" : "items-start")}>
       <div
         className={cx(
-          "max-w-[86%] rounded-[18px] px-3.5 py-2 text-[15px] leading-relaxed whitespace-pre-wrap portrait:max-w-[92%] portrait:text-[20px]",
+          "max-w-[86%] rounded-[18px] px-3.5 py-2 text-[15px] leading-relaxed whitespace-pre-wrap portrait:max-lg:max-w-[92%] portrait:max-lg:text-[20px]",
           mine ? "bg-blue text-on-blue" : "bg-[var(--color-well)] text-label",
           message.ghost && "opacity-55 italic",
         )}
@@ -217,6 +218,78 @@ function TtsButton() {
   );
 }
 
+interface Destination {
+  waypoint_id: string;
+  name: string;
+  vip_only: boolean;
+}
+interface GuideInfo {
+  success: boolean;
+  can_navigate: boolean;
+  tier: string;
+  destinations: Destination[];
+  busy?: boolean;
+}
+
+/* ★ 2026-10-22：訪客帶位。依人臉辨識到的身分顯示能去的地點：
+   一般訪客＝一般地點；VIP＝再加貴賓專屬（★）；黑名單＝整列不出現——平板對著客人，什麼都不說最中性。
+   這裡只負責顯示，能不能去由後端 /api/guide 依同一份規則再判一次。
+   導航沒開（地點服務沒起來）時整列不出現，不跳錯誤提示：迎賓頁不是除錯的地方。 */
+function GuideChips({ active }: { active: boolean }) {
+  const [info, setInfo] = useState<GuideInfo | null>(null);
+  const identityKey = useStoreSelector(telemetryStore, (t) => {
+    const i = t.snap.identity || {};
+    return `${!!i.recognized}|${i.user_type || ""}|${i.user_name || ""}`;
+  });
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch("/api/guide/destinations", { cache: "no-store" });
+      const data = (await res.json()) as GuideInfo;
+      setInfo(data.success ? data : null);
+    } catch {
+      setInfo(null);
+    }
+  }, []);
+
+  useVisibleInterval(load, 15000, active);
+  // 換人（身分變了）就馬上重拿，不等下一輪
+  useEffect(() => {
+    if (active) void load();
+  }, [identityKey, active, load]);
+
+  if (!info || !info.can_navigate || info.destinations.length === 0) return null;
+
+  const go = async (d: Destination) => {
+    const ok = await confirmDialog({
+      title: `要我帶您到「${d.name}」嗎？`,
+      message: "請跟著機器人走。途中想停下來，說「停下來」就可以。",
+      confirmLabel: "出發",
+    });
+    if (!ok) return;
+    await run(post("/api/guide", { waypoint_id: d.waypoint_id }), () => void load());
+  };
+
+  return (
+    <div className="mt-3 flex flex-none flex-wrap items-center gap-2">
+      <span className="text-[13px] text-label-3">
+        {info.tier === "vip" ? "貴賓帶位" : "帶我去"}
+      </span>
+      {info.destinations.map((d) => (
+        <Button
+          key={d.waypoint_id}
+          disabled={info.busy}
+          variant={d.vip_only ? "primary" : "plain"}
+          onClick={() => void go(d)}
+        >
+          {d.vip_only ? `★ ${d.name}` : d.name}
+        </Button>
+      ))}
+      {info.busy && <span className="text-[12px] text-label-3">帶位中…</span>}
+    </div>
+  );
+}
+
 function LlmModel() {
   // 空字串代表 llm_service_node 還沒啟動（模型名稱是 latched 話題，一啟動就會收到）
   const model = useStoreSelector(
@@ -253,7 +326,10 @@ export function GreetPage({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[1.1fr_1fr] portrait:grid-rows-[minmax(0,2fr)_minmax(0,3fr)]">
+    /* ★ 2026-10-22：iPad Air 11 吋直放（820×1180）時影像 2：對話 3。
+       原本兩張卡平分高度，對話只剩 311 px（約四則訊息），影像卡反而左右留黑邊。
+       只在直向且未達 lg 時套用，橫放與寬螢幕維持左右兩欄。 */
+    <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[1.1fr_1fr] portrait:max-lg:grid-rows-[minmax(0,2fr)_minmax(0,3fr)]">
       <Card title="現場影像" bodyClassName="min-h-[200px]">
         <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-ios bg-black">
           <img
@@ -266,6 +342,7 @@ export function GreetPage({ active }: { active: boolean }) {
 
       <Card title="對話">
         <ChatScroller />
+        <GuideChips active={active} />
 
         <div className="mt-3 flex flex-none flex-wrap items-center gap-2">
           <Field

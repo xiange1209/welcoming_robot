@@ -41,7 +41,8 @@ export const TABS: TabSpec[] = [
   { id: "system", label: "系統開關", icon: IconPower, admin: true },
   { id: "users", label: "使用者管理", icon: IconUsers, admin: true },
   { id: "health", label: "系統", icon: IconHealth },
-  { id: "voice", label: "語音測試", icon: IconVoice },
+  // ★ 2026-10-22：要登入——這頁能讓機器人對客人念任何字（後端 /api/speak 也改成要登入）
+  { id: "voice", label: "語音測試", icon: IconVoice, admin: true },
 ];
 
 /**

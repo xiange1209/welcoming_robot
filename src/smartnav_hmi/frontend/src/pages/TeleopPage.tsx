@@ -44,7 +44,7 @@ function DirectionPad() {
 
   return (
     <div
-      className="mx-auto grid max-w-[330px] grid-cols-3 gap-2.5 portrait:w-full portrait:max-w-[440px]"
+      className="mx-auto grid max-w-[330px] grid-cols-3 gap-2.5 portrait:max-xl:w-full portrait:max-xl:max-w-[440px]"
       style={{ touchAction: "none", userSelect: "none" }}
     >
       {PAD.map((cell, i) => {
@@ -53,7 +53,7 @@ function DirectionPad() {
             <button
               key="stop"
               type="button"
-              className="pressable h-[68px] rounded-ios border border-red/40 bg-red/20 text-[24px] text-red portrait:h-[84px]"
+              className="pressable h-[68px] rounded-ios border border-red/40 bg-red/20 text-[24px] text-red portrait:max-xl:h-[84px]"
               // 急停綁 pointerdown 而不是 click：click 要等 pointerup 才觸發，
               // 而且在觸控裝置上還有延遲。急停不能等。
               onPointerDown={(e) => {
@@ -74,7 +74,7 @@ function DirectionPad() {
             key={key}
             type="button"
             className={cx(
-              "pressable h-[68px] rounded-ios border text-[26px] transition-colors portrait:h-[84px]",
+              "pressable h-[68px] rounded-ios border text-[26px] transition-colors portrait:max-xl:h-[84px]",
               on
                 ? "border-blue bg-blue text-on-blue"
                 : "border-[var(--color-outline-variant)] bg-[var(--color-surface)] text-label",
@@ -300,7 +300,8 @@ export function TeleopPage({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.4fr_1fr] portrait:grid-rows-[minmax(0,9fr)_minmax(0,11fr)]">
+    /* ★ 2026-10-22：直放時地圖 4：遙控 5——遙控卡的方向鍵＋速度＋車尾雷達開關要一眼看完，不能在卡片裡捲 */
+    <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[1.4fr_1fr] portrait:max-xl:grid-rows-[minmax(0,4fr)_minmax(0,5fr)]">
       {/* ── 左：即時地圖 + 建圖 + 教導路徑 ───────────────── */}
       <Card title="即時地圖" className="overflow-y-auto" bodyClassName="gap-3">
         <MapCanvas
