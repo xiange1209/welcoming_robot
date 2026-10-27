@@ -240,10 +240,15 @@ class VoiceTriggerNode(Node):
         self._init_recorder()
 
         # 建立 QoS 配置檔
+        # ★★ 2026-10-28：depth 5 -> 40 ★★
+        #   觸發時把 _audio_buffer 的 15 塊預錄（480 ms）一口氣送出；訂閱端 depth 5 時 DDS 只留最新 5 塊，
+        #   **最早的那幾塊（＝句首）被靜默覆蓋**。車上重現：15 則連發、depth 5 只收到 6 則，depth 30 全收。
+        #   10/27 實車辨識結果幾乎每句都掉句首 1~2 字（我要開戶→不要開戶、機器人你→人你）就是這個。
+        #   訂閱端（speech_recognizer_node）要一起改，兩邊取小的那個才是實際值。
         audio_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=40,
         )
 
         self.audio_pub = self.create_publisher(AudioData, audio_topic, audio_qos)
@@ -372,7 +377,9 @@ class VoiceTriggerNode(Node):
         建立 AudioRecorder 實例並啟動音訊捕獲
         """
         last_error = None
-        for attempt in range(self.device_open_retries):
+        # 給秒數時多留一次機會，用來退回 'high'（見下方 except）
+        extra = 0 if isinstance(self.audio_latency, str) else 1
+        for attempt in range(self.device_open_retries + extra):
             try:
                 device = self.device
                 if self.device_name_match:
@@ -406,6 +413,13 @@ class VoiceTriggerNode(Node):
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 self._recorder = None
+                # ★ 2026-10-27：預設改成給秒數（0.2）之後，萬一這個裝置不接受，退回 "high"（10/21~27 實車一直能開的設定）
+                #   再試，最差就是跟以前一樣，不會讓整條 ASR 起不來。
+                if not isinstance(self.audio_latency, str):
+                    self.get_logger().warning(
+                        f"麥克風用 latency={self.audio_latency!r} 開不起來（{exc}），退回 'high' 再試")
+                    self.audio_latency = "high"
+                    continue
                 if attempt + 1 < self.device_open_retries:
                     delay = 0.25 * (2 ** attempt)
                     self.get_logger().warning(

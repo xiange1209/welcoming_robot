@@ -52,21 +52,67 @@ if action == "scenario":
     action = "start"
     time.sleep(3)
 want = action == "start"
-before = running()
-print(f"{action} 前:", {k: before.get(k, {}).get("running") for k in units})
-for u in units:
-    if bool(before.get(u, {}).get("running")) == want:
-        print(f"  {u}: 已經是{'開' if want else '關'}的，不動")
-        continue
-    st, js = call("POST", f"/api/system/{u}/{action}", {}, token=tok)
-    print(f"  POST {action} {u} → HTTP {st}；{js.get('message')!r}")
-t0 = time.time()
-while time.time() - t0 < 120:
-    time.sleep(3)
-    now = running()
-    state = {k: now.get(k, {}).get("running") for k in units}
-    print(f"  +{time.time() - t0:3.0f}s {state}")
-    if all(bool(v) == want for v in state.values()):
-        break
-print("  全部單元:", {k: v.get("running") for k, v in running().items()})
+# ★ 2026-10-27：導航要指定啟動方式（「nav」單獨啟動會被 HTTP 400 拒絕）→ 寫成 nav:localization，
+#   送出 /api/system/nav/start:localization；等待與「已經開著」都看基本鍵 nav。
+base = {u: u.partition(":")[0] for u in units}
+
+
+def wait_op(op_id, label, limit=150):
+    """等 HMI 的開／關作業真的結束（POST 只回 202「已排入」，失敗是之後才發生的）。回 (status, message)。"""
+    t_w, last = time.time(), None
+    while time.time() - t_w < limit:
+        st, js = call("GET", f"/api/system/operations/{op_id}", token=tok)
+        js = js.get("operation") or {}   # 回應包在 {"success": …, "operation": {…}} 裡
+        if st == 200 and js:
+            cur = (js.get("status"), js.get("phase"))
+            if cur != last:
+                print(f"    {label}：{js.get('phase') or js.get('status')}（{js.get('message')}）"
+                      f"｜{time.time() - t_w:.0f}s", flush=True)
+                last = cur
+            if js.get("status") in ("succeeded", "failed"):
+                return js.get("status"), str(js.get("message") or "")
+        time.sleep(2)
+    return "timeout", f"{limit} 秒沒結束"
+
+
+def request(unit, act):
+    st, js = call("POST", f"/api/system/{unit}/{act}", {}, token=tok)
+    print(f"  POST {act} {unit} → HTTP {st}；{js.get('message')!r}", flush=True)
+    if st >= 400 or not js.get("operation_id"):
+        return ("failed" if st >= 400 else "unknown"), str(js.get("message") or "")
+    return wait_op(js["operation_id"], f"{unit} {act}")
+
+
+try:
+    before = running()
+    print(f"{action} 前:", {base[u]: before.get(base[u], {}).get("running") for u in units}, flush=True)
+    for u in units:
+        if bool(before.get(base[u], {}).get("running")) == want:
+            print(f"  {u}: 已經是{'開' if want else '關'}的，不動", flush=True)
+            continue
+        variant = u.partition(":")[2]
+        act = f"{action}:{variant}" if (want and variant) else action
+        status, msg = request(base[u], act)
+        # ★ 2026-10-27：單元的 launch 還在跑、但 HMI 用來偵測的節點掛了（10/27 map_service_cc 當掉）——
+        #   HMI 說「沒在跑」卻拒絕再開（作業失敗：「單元已由受管 launch 執行中」），以前就乾等 120 秒、畫面不動。
+        #   現在：先停掉那個 launch（HMI 的 stop 停得掉，實測），等它停完再開一次。
+        if want and status == "failed" and "受管 launch 執行中" in msg:
+            print(f"  ⚠ {base[u]}：launch 還在跑但有節點掛了（HMI 偵測不到）→ 先停掉再重開", flush=True)
+            request(base[u], "stop")
+            status, msg = request(base[u], act)
+        if status not in ("succeeded", "unknown"):
+            print(f"  ✗ {base[u]} {act}：{status}（{msg}）", flush=True)
+    t0 = time.time()
+    while time.time() - t0 < 120:
+        time.sleep(3)
+        now = running()
+        state = {base[u]: now.get(base[u], {}).get("running") for u in units}
+        print(f"  +{time.time() - t0:3.0f}s {state}", flush=True)
+        if all(bool(v) == want for v in state.values()):
+            break
+    print("  全部單元:", {k: v.get("running") for k, v in running().items()}, flush=True)
+except KeyboardInterrupt:
+    print("\n  （中斷：不再等單元開關；已送出的開／關要求 HMI 會照做）", flush=True)
+    call("POST", "/api/logout", {}, token=tok)
+    sys.exit(130)
 call("POST", "/api/logout", {}, token=tok)

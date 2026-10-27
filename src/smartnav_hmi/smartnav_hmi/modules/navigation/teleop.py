@@ -98,6 +98,11 @@ class TeleopController:
             lin = ang = 0.0
         lin = max(-self.TELEOP_MAX_LINEAR, min(self.TELEOP_MAX_LINEAR, lin))
         ang = max(-self.TELEOP_MAX_ANGULAR, min(self.TELEOP_MAX_ANGULAR, ang))
+        # ★ 2026-10-27：倒車時把轉向反過來，讓平板的「左」永遠是「輪子往左打」（像開真的車：倒車方向盤往左＝車尾往左）。
+        #   阿克曼車的舵角 = atan(軸距 × ω / v)：倒車（v<0）時 ω>0 其實是輪子往右打 —— 原本平板的 ◣（後退＋左）
+        #   車尾往右、跟箭頭相反，也跟 teleop_twist_keyboard 的 m（後退左下＝ω<0）相反。前進不受影響。
+        if lin < 0.0:
+            ang = -ang
 
         with self._teleop_lock:
             self._teleop_linear = lin

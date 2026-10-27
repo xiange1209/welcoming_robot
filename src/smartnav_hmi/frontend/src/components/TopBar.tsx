@@ -289,13 +289,17 @@ export function TopBar({
         <div className="flex items-center gap-2">
           <Identity />
           <div className="flex flex-none items-center gap-2">
-            <Button
-              variant="ghost"
-              aria-label="主題設定"
-              onClick={() => setThemeOpen(true)}
-            >
-              <IconPalette className="size-5" />
-            </Button>
+            {/* ★ 2026-10-26：主題設定只給管理者（客人不需要換配色，免得以為有一堆功能可以按）。
+                下面那排系統狀態不用登入也看得到（使用者要求）。 */}
+            {admin && (
+              <Button
+                variant="ghost"
+                aria-label="主題設定"
+                onClick={() => setThemeOpen(true)}
+              >
+                <IconPalette className="size-5" />
+              </Button>
+            )}
             {/* ★ 2026-10-22：急停不分身分都看得到（後端 /api/estop 本來就不要求登入）。
                 誤按的代價只是車子停下來；帶位途中客人或旁人要能直接按。 */}
             <EmergencyStop />
@@ -309,6 +313,7 @@ export function TopBar({
         </div>
 
         <div className="flex flex-wrap items-center gap-1">
+          {/* ★ 2026-10-26 使用者：相機、電壓這些狀態不用登入也可以看 */}
           <Connection />
           <Fps />
           <Voltage />

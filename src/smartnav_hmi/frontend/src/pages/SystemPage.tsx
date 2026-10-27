@@ -477,7 +477,9 @@ export function SystemPage({ active }: { active: boolean }) {
             return (
               <div
                 key={u.key}
-                className="flex items-center gap-2.5 rounded-ios px-1 py-2"
+                // ★ 2026-10-26：iPad Air 11 吋直式（820 px）兩欄時每欄只剩約 390 px，
+                //   按鈕群組不縮，文字被擠成一字一行 → 允許換行、文字至少 8.5rem、按鈕換到下一行靠右
+                className="flex flex-wrap items-center gap-2.5 rounded-ios px-1 py-2"
               >
                 <span
                   className={cx(
@@ -487,7 +489,7 @@ export function SystemPage({ active }: { active: boolean }) {
                   )}
                 />
 
-                <div className="min-w-0 flex-1">
+                <div className="min-w-[8.5rem] flex-1">
                   <div className="text-[14px]">{u.label}</div>
                   {u.hint && (
                     <div className="text-[12px] text-label-3">{u.hint}</div>
@@ -522,7 +524,7 @@ export function SystemPage({ active }: { active: boolean }) {
                   )}
                 </div>
 
-                <div className="flex flex-none flex-wrap justify-end gap-1.5">
+                <div className="ml-auto flex flex-none flex-wrap justify-end gap-1.5">
                   {/* 執行中或半死狀態都給「停止」：卡在一半時最需要的就是能把它收乾淨 */}
                   {p ? (
                     <Button variant="danger" disabled>

@@ -51,7 +51,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
-from tf2_ros import Buffer, TransformListener
+from smartnav_navigation_cc.lazy_tf import LazyTf, spin_resilient
 
 from smartnav_msgs.action import GlobalLocalization
 from smartnav_msgs.msg import WaypointInfo
@@ -211,8 +211,11 @@ class WaypointServiceCcNode(Node):
         #
         # 注意：不要壓到 1。實測 depth=1 反而更貴（32% vs 20%）——
         # 每則訊息各觸發一次 executor 喚醒，失去批次處理的攤提效果。
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self, qos=20, static_qos=1)
+        # ★ 2026-10-23：改成需要時才掛（lazy_tf.py）。這支節點只有「在目前位置建點」與全域定位會用到位姿，
+        #   卻整天掛著監聽——光掛著就吃約 16% 單核（tf_bench 量測）。閒置 tf_idle_sec 秒自動拆掉。
+        self.declare_parameter("tf_idle_sec", 30.0)
+        self._tf = LazyTf(self, idle_sec=float(self.get_parameter("tf_idle_sec").value), qos=20)   # 靜態 TF 用 LazyTf 的標準 QoS（★ 10/24）
+        self._pose_wanted_until = 0.0  # 這個時間點以前，下面的 timer 會讓監聽保持接上（建點、全域定位進行中）
         # 位姿更新頻率。這個值只給 create_waypoint (在目前位置建點) 用，
         # 是人手動觸發的動作，2 Hz 綽綽有餘。
         # 原本 10 Hz：TF 查詢在 Python 裡不便宜，實測這個 timer 是本節點
@@ -270,7 +273,7 @@ class WaypointServiceCcNode(Node):
                 # 跟機器人自己定位得準不準無關，跳過定位品質檢查。
                 target_pose = copy.deepcopy(request.pose)
             else:
-                if not self.pose_received:
+                if not self._want_pose(5.0):
                     return self._waypoint_error(response, "當前沒有獲取到位置資訊，無法建立地點")
                 if self.current_covariance_norm > self.max_covariance_norm:
                     return self._waypoint_error(response, "當前定位不夠準確，請嘗試全域定位")
@@ -443,6 +446,8 @@ class WaypointServiceCcNode(Node):
         result.pose = Pose()
 
         self.get_logger().info("收到全域定位請求")
+        # 全域定位最多跑好幾分鐘（車子會自己轉、等 AMCL 收斂），整段都要有位姿
+        self._want_pose(600.0, wait=False)
 
         try:
             if not self.current_map:
@@ -542,6 +547,9 @@ class WaypointServiceCcNode(Node):
             self._localizing = False
             self._stop_robot()
             return self._abort_localization(goal_handle, result, "系統出現異常，全域定位失敗")
+        finally:
+            # 結束（成功、失敗、取消都算）就不用再留著位姿：5 秒後讓 TF 監聽可以被拆掉
+            self._pose_wanted_until = time.monotonic() + 5.0
 
     def _drive_until_converged(self, goal_handle) -> str:
         """開著車跑，直到 AMCL 收斂
@@ -721,9 +729,21 @@ class WaypointServiceCcNode(Node):
             self.current_map = msg.data
             self.get_logger().info(f"更新當前地圖: {self.current_map or '(無)'}")
 
+    def _want_pose(self, secs: float, wait: bool = True) -> bool:
+        """接下來 secs 秒要用位姿：接上 TF 監聽並（wait 時）等第一筆，回傳有沒有拿到新鮮的位姿"""
+        self._pose_wanted_until = max(self._pose_wanted_until, time.monotonic() + secs)
+        self.pose_received = False  # 舊的位姿可能是幾分鐘前的，不能拿來建點
+        self._tf.buffer(wait_for=("map", self.robot_base_frame) if wait else None)
+        self._update_current_pose()
+        return self.pose_received
+
     def _update_current_pose(self) -> None:
+        # 有人要用位姿時才讓監聽續命；沒人要時只用「已經接上的」，不主動叫醒（閒置就讓它被拆掉）
+        buf = self._tf.buffer() if time.monotonic() < self._pose_wanted_until else self._tf.peek()
+        if buf is None:
+            return
         try:
-            tf = self.tf_buffer.lookup_transform("map", self.robot_base_frame, Time())
+            tf = buf.lookup_transform("map", self.robot_base_frame, Time())
         except Exception:  # noqa: BLE001
             # 建圖模式或還沒定位好時查不到是正常的，不要洗版
             return
@@ -810,7 +830,8 @@ class WaypointServiceCcNode(Node):
             return -1.0
         info, grid = snap
         try:
-            tf = self.tf_buffer.lookup_transform("map", self.robot_base_frame, Time())
+            tf = self._tf.buffer(wait_for=("map", self.robot_base_frame)).lookup_transform(
+                "map", self.robot_base_frame, Time())
         except Exception:  # noqa: BLE001
             return -1.0
 
@@ -1006,7 +1027,7 @@ def main(args=None):
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
-        executor.spin()
+        spin_resilient(executor, node)   # ★ 10/27：LazyTf 拆監聽的競態不能讓節點死掉（見 lazy_tf.py）
     except KeyboardInterrupt:
         pass
     finally:

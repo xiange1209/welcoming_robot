@@ -401,11 +401,19 @@ class HmiServerNode(Node):
         )
         # 中繼節點不在時的直通路徑，理由見 TeleopController._publish_teleop
         self.teleop_direct_pub = self.create_publisher(Twist, "cmd_vel", teleop_qos)
+        # ★★ 2026-10-27：原本讀 .integer_value —— 0.6 是 double，integer_value 是 0 → 看門狗變成 0 秒：
+        #   每一則平板指令進來，下一個 50 ms 補送週期就判「逾時」連送三次零速（當天 journal 850 次
+        #   「遙控逾時 0.0 秒」、「實際補送 0 次」）。車速在指令與 0 之間跳，韌體在車速 0 時把舵機扳正
+        #   → 使用者回報「平板遙控會抖動跟回正，只有鍵盤順」。.value 才是宣告時的 0.6。
+        watchdog_sec = float(self.get_parameter("teleop_watchdog_sec").value)
+        if watchdog_sec <= 0.0:
+            self.get_logger().error(f"teleop_watchdog_sec={watchdog_sec} 不合理，改用 0.6 秒")
+            watchdog_sec = 0.6
         self.teleop = TeleopController(
             self,
             self.teleop_pub,
             self.teleop_direct_pub,
-            watchdog_sec=float(self.get_parameter("teleop_watchdog_sec").get_parameter_value().integer_value),
+            watchdog_sec=watchdog_sec,
             lidar_node_name_param="lidar_node_name",
         )
         self.teleop.start()

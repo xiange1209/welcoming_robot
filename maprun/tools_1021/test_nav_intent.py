@@ -109,5 +109,15 @@ for text, want in [("帶我去門口", False), ("請帶我去大廳。", False),
                    ("帶我去貴賓市", True), ("貴賓室要怎麼去？", True), ("帶帶我去乖乖貴貴賓賓去", True)]:
     check(ni.mentions_place(text, "貴賓室") == want, f"{want!s:5}「{text}」提到貴賓室")
 
+print("── 8. 模型把工具呼叫講成文字（★ 2026-10-26 導航沒開時實測到） ──")
+for text, want in [("呼叫帶位到貴賓室的工具 {object <nil> <nil> [] {}}", True),
+                   ('{"name": "navigate_tool", "arguments": {"waypoint_id": "x"}}', True),
+                   ("我來呼叫導航工具帶您過去", True), ("guide_to_vip_room_tool", True),
+                   ("我將使用查詢匯率的工具", True),
+                   ("本行週一到週五上午九點到下午三點半營業。", False), ("您可以請行員協助您。", False),
+                   ("請問您要換多少美金？", False), ("好的，請跟我來。", False),
+                   ("需要的話我請行員來協助您。", False), ("你需要帶身分證、第二證件和印章，到櫃檯辦理。", False)]:
+    check(ni.leaks_tool_call(text) == want, f"{want!s:5}「{text[:30]}」")
+
 print(f"\n{sum(results)}/{len(results)} 通過")
 sys.exit(0 if all(results) else 1)

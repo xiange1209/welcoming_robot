@@ -179,7 +179,7 @@ cat <<EOF
 ★ 檔名本身就含時間（_<時分>），同一天打包多次不會互相蓋掉——Pi 上與筆電上都一樣。
 
   命令提示字元（cmd.exe）：
-  scp $(whoami)@${PI_IP}:~/car_data_${TAG}.tar.gz "%USERPROFILE%\Desktop\專題\backups\研究數據\"
+  scp $(whoami)@${PI_IP}:~/car_data_${TAG}.tar.gz "%USERPROFILE%\Desktop\專題\backups\研究數據\car_data_${TAG}.tar.gz"
   certutil -hashfile "%USERPROFILE%\Desktop\專題\backups\研究數據\car_data_${TAG}.tar.gz" SHA256
 
   PowerShell：

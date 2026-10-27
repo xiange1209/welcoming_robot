@@ -12,6 +12,8 @@
 # 復原：刪 /etc/cloud/cloud.cfg.d/99-smartnav-hostname.cfg，/etc/hosts 與 ~/.bashrc 用 .bak_<日期> 還原，
 #       sudo hostnamectl set-hostname wheeltec-r680
 # ★ 2026-10-22 車上 agent：先在 B（4 GB 測試板）手動做過一遍、確認有效，再整理成這支；B 上重跑過一次確認不會重複加。
+# ★ 2026-10-23：第 2 步加的 smartnav-a／smartnav-b 兩行**重開機會被 cloud-init 洗掉**（user-data 的 manage_etc_hosts: true
+#   蓋過第 1 步寫的 false）。改用 board_profile.py（board_profiles.ini），它改的是 cloud-init 範本。
 set -e
 [ "$(id -u)" = 0 ] || { echo "要用 sudo 執行：sudo $0 A|B"; exit 1; }
 case "${1:-}" in

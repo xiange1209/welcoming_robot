@@ -201,8 +201,11 @@ def generate_launch_description():
                 "debug_wav_dir", default_value=EnvironmentVariable("ASR_DEBUG_WAV_DIR", default_value="")
             ),
             # ★ 2026-10-21：收音緩衝 low／high／秒數（例 0.2）。原本寫死 low，10/20 input overflow 全開 74 次/分。
+            # ★ 2026-10-27：預設改 0.2 秒。這個麥克風（Astra S）的 "high" 實際只有 32 ms（log：latency='high' -> 實際 32.0 ms），
+            #   等於沒加大：10/27 demo 全開時溢位 21~145 次/分。給秒數讓 PortAudio 多留緩衝；收音還是每 32 ms 送一塊，
+            #   只有程式被卡住時才會用到多的緩衝。這個值開不起來時 voice_trigger 會自己退回 "high"。
             DeclareLaunchArgument(
-                "audio_latency", default_value=EnvironmentVariable("ASR_AUDIO_LATENCY", default_value="high")
+                "audio_latency", default_value=EnvironmentVariable("ASR_AUDIO_LATENCY", default_value="0.2")
             ),
             OpaqueFunction(function=_preflight),
         ]

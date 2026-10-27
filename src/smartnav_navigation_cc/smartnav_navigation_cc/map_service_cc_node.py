@@ -58,7 +58,7 @@ from rclpy.time import Time
 
 from action_msgs.srv import CancelGoal
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import GetParameters, SetParameters
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import Bool, Empty, String
 from std_srvs.srv import Empty as EmptySrv
@@ -68,7 +68,7 @@ from sensor_msgs.msg import LaserScan
 from nav2_msgs.srv import LoadMap as Nav2LoadMap
 from nav2_msgs.srv import ManageLifecycleNodes
 from nav2_msgs.srv import SaveMap as Nav2SaveMap
-from tf2_ros import Buffer, TransformListener
+from smartnav_navigation_cc.lazy_tf import LazyTf, spin_resilient
 
 from frontier_exploration_ros2.srv import ControlExploration
 from smartnav_msgs.action import CreateMap
@@ -233,6 +233,14 @@ class MapServiceCcNode(Node):
         self.amcl_set_params_client = self.create_client(
             SetParameters, "/amcl/set_parameters", callback_group=self.client_cb_group
         )
+        # ★ 2026-10-28：自動探索期間暫時改規劃半徑（見 explore_planner_radius_m）
+        self.planner_get_params_client = self.create_client(
+            GetParameters, "/planner_server/get_parameters", callback_group=self.client_cb_group
+        )
+        self.planner_set_params_client = self.create_client(
+            SetParameters, "/planner_server/set_parameters", callback_group=self.client_cb_group
+        )
+        self._planner_radius_saved: Optional[float] = None
         # 逼 amcl 就地更新一次並發布 /amcl_pose (不移動的話它預設不會發)
         self.nomotion_update_client = self.create_client(
             EmptySrv, "/request_nomotion_update", callback_group=self.client_cb_group
@@ -310,8 +318,27 @@ class MapServiceCcNode(Node):
         #
         # 注意：不要壓到 1。實測 depth=1 反而更貴（32% vs 20%）——
         # 每則訊息各觸發一次 executor 喚醒，失去批次處理的攤提效果。
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self, qos=20, static_qos=1)
+        # ★ 2026-10-23：改成需要時才掛（lazy_tf.py）。上面三處都是開機／切換／偶爾才查，
+        #   定位模式（展示）下唯一的定期使用是每 30 秒存位姿——那個改吃 /amcl_pose（見下），
+        #   所以展示時監聽會被拆掉，省下約 16% 單核（tf_bench：光掛著 TransformListener 就 0.8% → 17.1%）。
+        #   自動探索期間 _maybe_unwedge 每 0.5 秒要位姿，監聽會一直接著，行為跟以前一樣。
+        self.declare_parameter("tf_idle_sec", 30.0)
+        # ★ 2026-10-28：自動探索時把 planner_server 的規劃半徑暫時降到這個值，探索結束設回原值（0＝不動）。
+        #   10/24 為了帶位把 yaml 的規劃半徑從 0.95 拉到 1.40（帶位 A/B 新 4/4、舊 0/4，帶位維持 1.40），
+        #   但探索走的是 Nav2 自己的規劃器、沒有 path_teach 的降級候選：10/27 探索 27 分鐘 23 個目標，
+        #   「no valid path found」38 次、遠一點的目標幾乎都規劃不出來，使用者：「大部分都是我手動遙控的」。
+        #   探索在乎的是「到得了」，不是循跡精度（MPPI 自己有阿克曼限制），所以探索期間退回 10/24 以前的 0.95。
+        self.declare_parameter("explore_planner_radius_m", 0.95)
+        self._tf = LazyTf(self, idle_sec=float(self.get_parameter("tf_idle_sec").value), qos=20)   # 靜態 TF 用 LazyTf 的標準 QoS（★ 10/24）
+        # 存位姿用：AMCL 自己發的定位結果（只在更新時發，便宜；車子不動時最後一則仍然有效）
+        self._last_amcl_pose = None
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            "amcl_pose",
+            self._amcl_pose_callback,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE),
+            callback_group=self.client_cb_group,
+        )
 
         # ------------------------------------------------------------------
         # 對外服務
@@ -634,7 +661,7 @@ class MapServiceCcNode(Node):
         while time.monotonic() < deadline:
             if not rclpy.ok():
                 return False
-            if self.tf_buffer.can_transform("map", "base_footprint", Time()):
+            if self._tf.buffer().can_transform("map", "base_footprint", Time()):
                 return True
             time.sleep(0.2)
         return False
@@ -722,7 +749,7 @@ class MapServiceCcNode(Node):
         """
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
-            if self.tf_buffer.can_transform("odom_combined", "base_footprint", Time()):
+            if self._tf.buffer().can_transform("odom_combined", "base_footprint", Time()):
                 break
             time.sleep(0.1)
         else:
@@ -745,7 +772,7 @@ class MapServiceCcNode(Node):
     def _current_robot_pose(self):
         """讀 map -> base_footprint，回 (x, y, yaw)，失敗回 None"""
         try:
-            tf = self.tf_buffer.lookup_transform("map", "base_footprint", Time())
+            tf = self._tf.buffer(wait_for=("map", "base_footprint")).lookup_transform("map", "base_footprint", Time())
         except Exception:  # noqa: BLE001
             return None
         q = tf.transform.rotation
@@ -1046,6 +1073,9 @@ class MapServiceCcNode(Node):
             self.use_exploration = False
             return True
 
+        # 先改規劃半徑再叫 explorer 開始：Smac 改半徑要重建查找表（約 5 秒），不要跟第一個探索目標撞在一起。
+        # START 失敗時 create_map 會呼叫 _stop_exploration，在那裡設回。
+        self._apply_explore_planner_radius()
         req = ControlExploration.Request()
         req.action = ControlExploration.Request.ACTION_START
         try:
@@ -1064,9 +1094,65 @@ class MapServiceCcNode(Node):
         self.get_logger().info("✓ 自動探索已啟動")
         return True
 
+    # ── 探索期間的規劃半徑（★ 2026-10-28，見 explore_planner_radius_m）──────────
+    def _planner_radius_param(self, value: Optional[float] = None) -> Optional[float]:
+        """value=None：讀 planner_server 的 GridBased.minimum_turning_radius；否則設成 value，回設定後的值。
+        失敗回 None。Smac 改半徑會在參數回呼裡重建查找表（實測阻塞約 5 秒），所以設定的逾時給 15 秒。"""
+        name = "GridBased.minimum_turning_radius"
+        try:
+            if value is None:
+                if not self.planner_get_params_client.wait_for_service(timeout_sec=2.0):
+                    return None
+                req = GetParameters.Request()
+                req.names = [name]
+                res = wait_for_future(self.planner_get_params_client.call_async(req), timeout_sec=5.0)
+                if res is None or not res.values or res.values[0].type != ParameterType.PARAMETER_DOUBLE:
+                    return None
+                return float(res.values[0].double_value)
+            if not self.planner_set_params_client.wait_for_service(timeout_sec=2.0):
+                return None
+            req = SetParameters.Request()
+            req.parameters = [Parameter(name=name, value=ParameterValue(
+                type=ParameterType.PARAMETER_DOUBLE, double_value=float(value)))]
+            res = wait_for_future(self.planner_set_params_client.call_async(req), timeout_sec=15.0)
+            if res is None or not all(r.successful for r in res.results):
+                return None
+            return float(value)
+        except Exception as exc:  # noqa: BLE001 —— 半徑改不了不能擋住探索
+            self.get_logger().warn(f"讀／改規劃半徑失敗：{exc}")
+            return None
+
+    def _apply_explore_planner_radius(self) -> None:
+        target = float(self.get_parameter("explore_planner_radius_m").value or 0.0)
+        if target <= 0.0 or self._planner_radius_saved is not None:
+            return
+        orig = self._planner_radius_param()
+        if orig is None:
+            self.get_logger().warn("自動探索：讀不到 planner_server 的規劃半徑，維持原值")
+            return
+        if abs(orig - target) < 1e-3:
+            return
+        if self._planner_radius_param(target) is None:
+            self.get_logger().warn(f"自動探索：規劃半徑改不成 {target:.2f} m，維持 {orig:.2f} m")
+            return
+        self._planner_radius_saved = orig
+        self.get_logger().info(f"自動探索：規劃半徑 {orig:.2f} → {target:.2f} m（探索結束設回）")
+
+    def _restore_planner_radius(self) -> None:
+        orig, self._planner_radius_saved = self._planner_radius_saved, None
+        if orig is None:
+            return
+        if self._planner_radius_param(orig) is None:
+            # 設不回去：帶位會用到探索的半徑。講清楚，重開導航堆疊就會回到 yaml 的值
+            self.get_logger().error(
+                f"⚠ 探索結束，但規劃半徑設不回 {orig:.2f} m —— 帶位前請重開導航堆疊（或 ros2 param set）")
+        else:
+            self.get_logger().info(f"探索結束：規劃半徑設回 {orig:.2f} m")
+
     def _stop_exploration(self) -> None:
         self._exploration_active = False
         self.exploration_active_pub.publish(Bool(data=False))
+        self._restore_planner_radius()            # ★ 2026-10-28：探索期間改過規劃半徑就設回（沒改過不動）
         if not self.use_exploration:
             return
 
@@ -1248,11 +1334,20 @@ class MapServiceCcNode(Node):
         except Exception:  # noqa: BLE001
             pass  # 偶爾逾時無所謂，下一輪會再試
 
+    def _amcl_pose_callback(self, msg: PoseWithCovarianceStamped) -> None:
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._last_amcl_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+
     def _persist_pose_tick(self) -> None:
-        """定位模式下定期記錄位姿，供下次開機接續"""
+        """定位模式下定期記錄位姿，供下次開機接續
+
+        ★ 2026-10-23：改用最後一則 /amcl_pose，不查 TF——查 TF 會每 30 秒把 TF 監聽叫醒一次，
+          等於整天掛著（見 lazy_tf.py）。重開機後 AMCL 會從這裡重新收斂，差的那一點里程計增量無所謂。
+        """
         if self.mode != MODE_LOCALIZATION or not self.current_map_id:
             return
-        pose = self._current_robot_pose()
+        pose = self._last_amcl_pose
         if pose is not None:
             self._save_map_state(self.current_map_id, pose)
 
@@ -1508,16 +1603,19 @@ class MapServiceCcNode(Node):
             response.message = "/control_exploration 服務不存在 (frontier_explorer 沒啟動?)"
             return response
 
+        self._apply_explore_planner_radius()      # ★ 2026-10-28（見 explore_planner_radius_m）
         req = ControlExploration.Request()
         req.action = ControlExploration.Request.ACTION_START
         try:
             res = wait_for_future(self.control_exploration_client.call_async(req), timeout_sec=10.0)
         except Exception as exc:  # noqa: BLE001
+            self._restore_planner_radius()
             response.success = False
             response.message = f"啟動探索失敗: {exc}"
             return response
 
         if not res.accepted:
+            self._restore_planner_radius()
             response.success = False
             response.message = f"探索服務拒絕啟動: {res.message}"
             return response
@@ -1844,7 +1942,7 @@ def main(args=None):
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
-        executor.spin()
+        spin_resilient(executor, node)   # ★ 10/27：LazyTf 拆監聽的競態不能讓節點死掉（見 lazy_tf.py）
     except KeyboardInterrupt:
         pass
     finally:

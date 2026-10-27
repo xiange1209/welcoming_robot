@@ -77,6 +77,10 @@ def main():
                     help="多加一題會讓車開走的題目（可重複），例：--extra-nav 帶我去門口")
     ap.add_argument("--settle", type=float, default=3.0,
                     help="收到第一則回覆後再收幾秒沒有新訊息才換下一題（帶位題的「X到了」是第二則；0＝不等）")
+    # ★ 2026-10-27：使用者要自動化——帶位題不再每題停下來問、到了也不用按 Enter：等第二則回覆（到了／失敗）就換下一題。
+    #   安全確認改由 day_test 在這一步開始前問一次（車旁有人拿平板急停）。
+    ap.add_argument("--auto-nav", action="store_true", help="帶位題不停下來問、等「到了／失敗」那則回覆自動換下一題")
+    ap.add_argument("--nav-timeout", type=float, default=330.0, help="--auto-nav 時帶位題最多等幾秒")
     ap.add_argument("--nav-down-ok", action="store_true",
                     help="導航堆疊沒開時，②③⑩不停下來問、直接送（車不會動，只驗工具選擇）；導航開著照樣會問")
     ap.add_argument("--out", default=os.path.expanduser(f"~/maprun/verify_out/llm10_{time.strftime('%H%M')}.csv"))
@@ -143,10 +147,14 @@ def main():
             for i, q, exp, moves in QUESTIONS + [(len(QUESTIONS) + k + 1, x, "帶位（--extra-nav）", True)
                                                  for k, x in enumerate(a.extra_nav)]:
                 direct = False
+                nav_up = []
                 if moves:
                     # 每題重查：中途有人開了導航，就回到「停下來問人」
                     nav_up = sorted(set(NAV_NODES) & {nm for nm, _ in n.get_node_names_and_namespaces()})
-                    if a.nav_down_ok and not nav_up:
+                    if a.auto_nav:
+                        print(f"\n[{rep}-{i}] 這題會觸發帶位（--auto-nav：不停下來問，等到了／失敗再換下一題）"
+                              + ("" if nav_up else "——⚠ 導航節點不在線，車不會動，只收一則回覆"))
+                    elif a.nav_down_ok and not nav_up:
                         direct = True
                         print(f"\n[{rep}-{i}] 這題會觸發帶位／導航，但導航堆疊沒開 → 車不會動，直接送（只驗工具選擇）")
                     else:
@@ -188,8 +196,11 @@ def main():
                     #   第二則會在下一題的視窗裡到、被記成下一題的答案；下一題還會因為帶位沒結束被回「處理上一個指令」丟掉。
                     seen, last = got.index((ts, txt)) + 1, time.time()
                     # 會開車的題目一定要等到第二則（到了／失敗）——路程多長都一樣，不能只靠 settle 秒數
-                    need_more = moves and direct
-                    while (need_more or time.time() - last < a.settle) and time.time() < t_send + a.timeout:
+                    # ★ 10/27：只有真的要帶位（第一則是「請跟我來」）才等第二則；貴賓室對一般訪客會直接婉拒、只有一則，
+                    #   以前會白等 330 秒（當天第 3 題卡住、使用者以為當掉按 Ctrl-C，十題只記到 2 題）。
+                    need_more = moves and (direct or (a.auto_nav and bool(nav_up) and "請跟我來" in answer))
+                    q_limit = t_send + (max(a.timeout, a.nav_timeout) if moves and a.auto_nav else a.timeout)
+                    while (need_more or time.time() - last < a.settle) and time.time() < q_limit:
                         rclpy.spin_once(n, timeout_sec=0.2)
                         if len(got) > seen:
                             for _ts, _txt in got[seen:]:
@@ -204,7 +215,9 @@ def main():
                 rows.append([rep, i, q, exp, answer.replace("\n", " "), "" if lat is None else f"{lat:.2f}",
                              ",".join(flags), "", "是" if a.clear_each else "否"])
                 spans.append((t_send, t_send + lat if lat is not None else time.time()))
-                if moves and not direct:
+                if moves and a.auto_nav:
+                    time.sleep(3.0)   # 到了之後讓車停穩、TTS 念完
+                elif moves and not direct:
                     input("  車到了（或已按急停）再按 Enter 送下一題：")
                 else:
                     time.sleep(1.0)

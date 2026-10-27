@@ -78,6 +78,8 @@ try:
     from nav2_msgs.msg import CollisionMonitorState
 except ImportError:                                  # pragma: no cover
     CollisionMonitorState = None
+from rcl_interfaces.msg import Parameter as ParameterMsg, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -87,7 +89,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Empty, String
 from std_srvs.srv import SetBool, Trigger
-from tf2_ros import Buffer, TransformListener
+from smartnav_navigation_cc.lazy_tf import LazyTf, spin_resilient
 
 from smartnav_msgs.action import FollowTaughtPath
 from smartnav_msgs.msg import TaughtPathInfo
@@ -142,6 +144,25 @@ class PathTeachNode(Node):
     # ★ 2026-10-22：雷射左右偏移的預設（見 laser_y_offset_m）。放在類別上，是讓不經 __init__ 的替身物件
     #   （測試用 object.__new__）也讀得到 0.0 ＝ 舊行為。
     laser_y = 0.0
+    __recording = False  # _recording property 的預設值（替身物件不經 __init__ 也讀得到）
+
+    # ★ 2026-10-23：錄製取樣計時器（50 Hz）只在錄製時跑。沒在錄的時候 _record_tick 雖然一進去就 return，
+    #   但 rclpy 每秒 50 次喚醒 executor 本身就要錢——tf_bench/node_idle_cpu.py 量到 TF 改成按需掛之後，
+    #   本節點閒置仍有約 20%（單核），大宗就是這個計時器。設 _recording 就順手開關計時器，
+    #   原本四個設定 _recording 的地方一行都不用改。
+    @property
+    def _recording(self) -> bool:
+        return self.__recording
+
+    @_recording.setter
+    def _recording(self, on: bool) -> None:
+        self.__recording = bool(on)
+        timer = getattr(self, "_record_timer", None)
+        if timer is not None:
+            if on:
+                timer.reset()
+            else:
+                timer.cancel()
 
     def __init__(self):
         super().__init__("path_teach_cc_node")
@@ -365,6 +386,37 @@ class PathTeachNode(Node):
         # 偏離檢查的搜尋視窗（點數）。0 = 整條路徑（2026-08-19 早上的行為）。
         # 60 點 ≈ 9 m 路徑（每段約 3 點 0.45 m），已遠超任何合理的定位漂移。
         self.declare_parameter("xte_window_pts", 60)
+        # ★★ 2026-10-24：循跡的「即時修正」三件事（車上 agent；依據 ~/maprun/verify_out/path_planning_progress_20261024.md）★★
+        #
+        # 10/21 實車重播 4 趟（~/maprun/logs/replay_*_live_20261021_*.csv）：顯示的偏離中位 6~11 cm、最大 17~58 cm。
+        # 離線循跡模擬（~/maprun/tools_1020/track_sim/；車子模型照 8/29 實測：左 1.030／右 1.183 m、
+        # 底盤偏移 +0.235 rad/m、trim 殘差、舵機延遲、AMCL 誤差。現行設定模擬出來的顯示偏離中位 7.2 cm，與實車同級）
+        # 找到三個控制端補得到的地方（規劃端的見 yaml 的 minimum_turning_radius 與下面的 plan_candidates）：
+        #
+        # (1) lookahead_interpolate：前視點沿路徑**內插**到剛好 L_d。
+        #     舊做法取「第一個距離 >= L_d 的路徑點」。規劃路徑的點距 15~19 cm（一個運動基元），
+        #     實際前視在 L_d ~ L_d+0.19 m 之間跳，純追蹤增益 2/L_d² 跟著跳（0.48 -> 0.67 m 等於增益掉一半）。
+        # (2) xte_segment：偏離量改算到**線段**的距離（舊：到最近的路徑點）。
+        #     點距 15~19 cm 時車子正好在線上、走到兩點中間也會顯示偏 ~4 cm（最多 9 cm）。
+        #     0.60 m 中止門檻與 feedback 的 cross_track_error_m 都吃這個值。
+        # (3) xte_integral：橫向誤差**積分**修正（以「走過的距離」積分；前進、倒車各一個積分器——
+        #     同一個底盤偏移在倒車的行進座標裡正負相反）。純追蹤等效於「位置＋朝向」比例控制，
+        #     遇到持續的轉向偏差（trim 殘差、左右不對稱、欠轉）會留一個固定偏離；積分把它吃掉。
+        #     抗飽和：誤差大於 xte_integral_gate_m（交給純追蹤）、曲率已經箝到上限、
+        #     或正在繞障／貼牆推開（目標是故意偏的）時都不積分。
+        #     增益 = 純追蹤的等效位置增益 2/L_d² ÷ xte_integral_dist_m（距離常數）；1.5 m 時
+        #     前進約是穩定上限（Routh：k_i < 2/L_d × 2/L_d²）的 1/6、倒車約 1/4。
+        #     修正量上限 xte_integral_max_curv（0.15 /m，約 trim 原始偏移的六成）。
+        # 模擬（R1.40 的規劃路徑 30 條 × 6 種干擾 × 2 次；中止判定兩組都用舊的頂點距離）：
+        #     (1)(3) 開 vs 全關：成功 298 -> 310／360、標準干擾的偏離 p95 11.5 -> 8.0 cm，6 種干擾沒有一種變差。
+        # ★ 實車還沒跑過。三個都能單獨關（每趟重播開始時重讀，ros2 param set 不必重啟）；全設 false＝舊行為。
+        # ★★ 2026-10-27：早上一度退回 false；傍晚實車 A/B 新（四項開＋規劃 1.40）4/4、舊 0/4 → 預設改回 true。
+        self.declare_parameter("lookahead_interpolate", True)
+        self.declare_parameter("xte_segment", True)
+        self.declare_parameter("xte_integral", True)
+        self.declare_parameter("xte_integral_dist_m", 1.5)
+        self.declare_parameter("xte_integral_max_curv", 0.15)
+        self.declare_parameter("xte_integral_gate_m", 0.25)
         # ★★ 2026-08-19：姿態判別（行進中的朝向誤差）★★
         #
         # 使用者原話：「需要姿態判別跟位置判別與猜測，不然它會一直亂撞、
@@ -628,6 +680,29 @@ class PathTeachNode(Node):
         # global_costmap 的 update_frequency 是 1.0 Hz：等 2 秒，下一次更新就會把
         # 雷達「現在看得到」的東西重新標回去，看不到的殘影則不會回來。
         self.declare_parameter("plan_clear_settle_sec", 2.0)
+        # ★★ 2026-10-24：規劃「多候選擇優」（車上 agent；依據 ~/maprun/verify_out/path_planning_progress_20261024.md）★★
+        #
+        # SmacPlannerHybrid 給的路徑有兩種毛病，都會讓車子離開「原先規劃的路徑」：
+        #   ① 朝向折角的折返點：折返前後車頭朝向不連續（離線實測 櫃台->門口 266° -> 236°），車子轉不過去只能甩出去
+        #   ② 微折返：兩次折返之間不到 0.30 m 的原地鋸齒轉向（10 月保留下來的規劃路徑，81 個折返裡 43 段是這種）
+        # 根源是 Hybrid-A* 的離散化（關掉 smooth_path 也一樣）：終點差幾公分、差幾度，搜出來的路徑就不同。
+        # 所以同一個目標多規劃幾條——終點原樣，加上沿車頭 ±shift、橫向 ±shift、朝向 ±dyaw——用 _path_score 挑最好的
+        # （車子轉不過去的弧長、折角折返、微折返、折返數、倒車長、路徑長）。
+        # 候選終點離真正終點超過 plan_candidate_max_goal_err_m 的不收（離線測「門口->貴賓室」時，擾動後的終點落進
+        # 起點的容許範圍，規劃器回一條長度 0 的路徑）。選中的路徑最後一點朝向設回真正終點的朝向（終點對齊用）。
+        # 離線（6 地點兩兩 30 條、規劃半徑 1.40）：折返 62 -> 44、折角折返 11 -> 4、微折返 21 -> 9，每對多花約 0.2 秒。
+        # shift 0.06 m 遠小於到點容許 goal_tolerance_m 0.20；dyaw 2.8° 小於終點對齊容許 5°（不會多一次三點對齊）。
+        # plan_candidates:=false＝舊行為（只規劃一次）。每次規劃都重讀，ros2 param set 立即生效。
+        self.declare_parameter("plan_candidates", True)   # ★ 10/27 傍晚 A/B 新 4/4、舊 0/4 → 維持開（見 lookahead_interpolate）
+        self.declare_parameter("plan_candidate_shift_m", 0.06)
+        self.declare_parameter("plan_candidate_dyaw_deg", 2.8)
+        self.declare_parameter("plan_candidate_max_goal_err_m", 0.10)
+        # ★ 2026-10-24：yaml 的規劃半徑放大到 1.40 之後，窄處可能規劃不出來。原樣與所有候選都失敗時，依序把
+        #   planner_server 的 GridBased.minimum_turning_radius 暫時降到這些值再試一次（只試原樣終點；每改一次 Smac
+        #   都要重建查找表，實測阻塞約 5 秒），成功與否最後都非同步設回原值。<= 0 的值略過；[0.0]＝不降級（舊行為）。
+        #   降級得到的路徑可能有車子轉不過去的地方——可行性檢查會照實警告。
+        # ★ 10/27 傍晚：規劃半徑改回 1.40（A/B 新 4/4），窄處規劃不出來時照原設計降到 1.20、0.95 再試。
+        self.declare_parameter("plan_fallback_radii", [1.20, 0.95])
         # ── 防撞煞住太久 = 前方被擋住（2026-10-08）──────────────────────────
         # collision_monitor（Jazzy）只在「換狀態」時發訊息，持續 APPROACH 時最後一則一直是 APPROACH。
         # 10/01 把 `_safety_braking` 的 1 秒過期拿掉後，煞車被永久當成「被煞停、不算卡住」：
@@ -900,6 +975,8 @@ class PathTeachNode(Node):
         self.stall_progress = float(p("stall_progress_m").value)
         # ★ 2026-10-20：硬停事件的遲滯與逾時（見 margin_resume_m 的宣告說明）
         self._refresh_margin_params()
+        # ★ 2026-10-24：循跡即時修正三件事（見 lookahead_interpolate 的宣告說明）
+        self._refresh_tracking_params()
         self._trace_fh = None         # 逐拍紀錄（見 trace_csv_dir）
         self._trace_t0 = 0.0
         self.wall_veto_m = float(p("wall_veto_m").value)
@@ -926,8 +1003,13 @@ class PathTeachNode(Node):
         self.wall_push_max = float(p("wall_push_max_m").value)
 
         # ── 狀態 ──────────────────────────────────────────────
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self, qos=20, static_qos=1)
+        # ★ 2026-10-23：TF 監聽改成需要時才掛（lazy_tf.py）。所有位姿都經過 _robot_pose()：
+        #   錄製（50 Hz）與重播／脫困時一直在查 → 監聽一直接著，行為跟以前一樣；
+        #   閒置（沒有錄製也沒有重播）30 秒就拆掉——10/20 全功能同開時本節點閒置也吃 25~38%，
+        #   tf_bench 量到光掛著 TransformListener 就 0.8% → 17.1%（單核）。
+        #   tf_idle_sec <= 0 會一直掛著（等同舊行為），出問題時可以一行參數退回。
+        self.declare_parameter("tf_idle_sec", 30.0)
+        self._tf = LazyTf(self, idle_sec=float(self.get_parameter("tf_idle_sec").value), qos=20)   # 靜態 TF 用 LazyTf 的標準 QoS（★ 10/24）
 
         self._db_lock = threading.Lock()
         self._paths: dict = {}          # path_id -> {"meta": {...}, "points": [PathPoint]}
@@ -1135,6 +1217,13 @@ class PathTeachNode(Node):
         # MPPI 控制器，不是規劃器。所以「用 nav2 規劃、用純追蹤執行」。
         self._planner_client = ActionClient(
             self, ComputePathToPose, "compute_path_to_pose", callback_group=cb)
+        # ★ 2026-10-24：規劃降級（plan_fallback_radii）用——暫時改 planner_server 的規劃半徑、事後設回
+        self._planner_get_params = self.create_client(
+            GetParameters, "/planner_server/get_parameters", callback_group=cb)
+        self._planner_set_params = self.create_client(
+            SetParameters, "/planner_server/set_parameters", callback_group=cb)
+        # 兩個規劃請求同時降級時，後一個會把「已經降過的值」當原值設回去——同一時間只准一個降級
+        self._plan_fallback_lock = threading.Lock()
 
         # 規劃前先清一次全域成本地圖的 obstacle 層（2026-08-05）。
         #
@@ -1157,7 +1246,9 @@ class PathTeachNode(Node):
         )
 
         # 錄製取樣。50 Hz 只是查 TF，成本很低；真正決定點密度的是距離門檻。
-        self.create_timer(0.02, self._record_tick, callback_group=cb)
+        self._record_timer = self.create_timer(0.02, self._record_tick, callback_group=cb)
+        if not self._recording:
+            self._record_timer.cancel()  # 平常不跑，開始錄製時（_recording = True）才 reset
 
         self.get_logger().info(
             f"教導路徑節點啟動：資料庫 {self._db_file}，已載入 {len(self._paths)} 條路徑"
@@ -1468,7 +1559,9 @@ class PathTeachNode(Node):
 
     def _robot_pose(self) -> Optional[Tuple[float, float, float]]:
         try:
-            tf = self.tf_buffer.lookup_transform(self.map_frame, self.robot_frame, Time())
+            # 剛接上監聽（閒置後第一次要位姿）時最多等 1 秒讓 /tf 進來；之後不會再等
+            buf = self._tf.buffer(wait_for=(self.map_frame, self.robot_frame))
+            tf = buf.lookup_transform(self.map_frame, self.robot_frame, Time())
         except Exception:
             return None
         t = tf.transform.translation
@@ -1620,10 +1713,15 @@ class PathTeachNode(Node):
             out[i] = PathPoint(xs / k, ys / k, pts[i].yaw, pts[i].direction)
         return out
 
-    def _check_feasibility(self, pts: List[PathPoint]) -> Tuple[bool, str, list]:
+    def _check_feasibility(self, pts: List[PathPoint], geometric: bool = False) -> Tuple[bool, str, list]:
         """檢查路徑上每一小截所需的轉彎半徑，抓出車子做不到的地方。
 
         回傳 `(可行, 一句話摘要, 最糟的幾段)`。
+
+        ★ 2026-10-24：geometric=True（規劃路徑用）改用 xy 幾何算，不用點上存的 yaw——
+          Smac 在終點與折返點的 yaw 會跳，10/21 每條規劃路徑都被報「有 9~21 處車子做不到」，
+          其中「需要半徑 0.387 m」那種其實是 yaw 欄位的假象（見 _geometric_tight_spots）。
+          錄製的教導路徑照舊用 yaw（點距 5 cm，xy 被 AMCL 抖動主導）。
 
         === 為什麼需要（2026-08-06 實測）===
 
@@ -1683,6 +1781,9 @@ class PathTeachNode(Node):
 
         bad = []
         worst_r = float("inf")
+        if geometric:
+            bad, worst_r = self._geometric_tight_spots(pts, min_r_left, min_r_right)
+            segs = []           # 下面的 yaw 視窗迴圈不跑
         for a, b in segs:
             for i in range(a, b - 1):
                 arc = 0.0
@@ -2370,6 +2471,104 @@ class PathTeachNode(Node):
             i += 1
         return len(pts) - 1, pts[-1]
 
+    @staticmethod
+    def _project_on_path(pts: List[PathPoint], idx: int, x: float, y: float) -> Tuple[float, int]:
+        """(x, y) 投影到 idx 附近、**同一個行進方向**的路徑線段上（★ 2026-10-24）。
+
+        回傳 (帶號橫向誤差, 投影所在線段的起點索引)。正 = 在行進方向的**左邊**——前進、倒車都一樣，
+        因為線段 pts[i] -> pts[i+1] 本身就是行進方向，與 _pure_pursuit 鏡射後的曲率是同一個座標系。
+        這一段的折線畫到折返點為止（折返點是下一個方向的第一點），跟 _lookahead_point 停在折返點同一個規則。
+        """
+        d0 = pts[idx].direction
+        lo = idx
+        while lo > 0 and lo > idx - 2 and pts[lo - 1].direction == d0:
+            lo -= 1
+        best_d2, best_e, best_i = float("inf"), 0.0, idx
+        for i in range(lo, min(len(pts) - 1, idx + 3)):
+            if pts[i].direction != d0:
+                break
+            x0, y0, x1, y1 = pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y
+            dx, dy = x1 - x0, y1 - y0
+            seg2 = dx * dx + dy * dy
+            if seg2 < 1e-12:
+                continue
+            t = max(0.0, min(1.0, ((x - x0) * dx + (y - y0) * dy) / seg2))
+            px, py = x0 + t * dx, y0 + t * dy
+            d2 = (x - px) ** 2 + (y - py) ** 2
+            if d2 < best_d2:
+                best_d2, best_i = d2, i
+                best_e = (dx * (y - py) - dy * (x - px)) / math.sqrt(seg2)
+        return best_e, best_i
+
+    @staticmethod
+    def _lookahead_point_interp(pts: List[PathPoint], seg_i: int,
+                                x: float, y: float, ld: float) -> Tuple[int, PathPoint]:
+        """沿路徑**內插**出距離 (x, y) 剛好 ld 的點（★ 2026-10-24，見 lookahead_interpolate）。
+
+        從投影所在線段 seg_i 往前找第一段「終點已在 ld 外」的線段，解線段與半徑 ld 的圓的交點（取遠的那個）。
+        走到折返點或路徑終點都還在 ld 內就回傳那一點——與 _lookahead_point 停在折返點同一個規則，
+        所以折返前的收尾、終點前的收尾行為不變。回傳的索引是內插點所在線段的終點（給 preview 等呼叫端用）。
+        """
+        d0 = pts[seg_i].direction
+        i = seg_i
+        while i < len(pts) - 1 and pts[i].direction == d0:
+            x0, y0, x1, y1 = pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y
+            if math.hypot(x1 - x, y1 - y) >= ld:
+                dx, dy = x1 - x0, y1 - y0
+                fx, fy = x0 - x, y0 - y
+                a = dx * dx + dy * dy
+                b = 2.0 * (fx * dx + fy * dy)
+                c = fx * fx + fy * fy - ld * ld
+                disc = b * b - 4.0 * a * c
+                if a > 1e-12 and disc >= 0.0:
+                    t = max(0.0, min(1.0, (-b + math.sqrt(disc)) / (2.0 * a)))
+                    return i + 1, PathPoint(x0 + t * dx, y0 + t * dy, pts[i].yaw, d0)
+                return i + 1, pts[i + 1]
+            i += 1
+        return i, pts[i]
+
+    def _pick_target(self, pts: List[PathPoint], idx: int, x: float, y: float,
+                     ld: float) -> Tuple[int, PathPoint]:
+        """純追蹤的目標點：lookahead_interpolate 開著用內插，關著用舊的「第一個 >= ld 的路徑點」。
+        預覽（障礙檢查）與真正下指令**都走這裡**，兩邊的目標點才會一致（見 2026-08-24 預覽端漏補軸距那段）。"""
+        if self._la_interp:
+            _e, seg_i = self._project_on_path(pts, idx, x, y)
+            return self._lookahead_point_interp(pts, seg_i, x, y, ld)
+        return self._lookahead_point(pts, idx, x, y, ld)
+
+    def _xi_step(self, xi: dict, prev_xy, pts: List[PathPoint], idx: int, rx: float, ry: float,
+                 direction: int, lin: float, ang: float, state: str, total_off: float, ki: float):
+        """橫向誤差積分的一拍（★ 2026-10-24，見 xte_integral）。更新 xi[direction]，回傳新的 prev_xy。
+
+        抗飽和：曲率已經箝到上限（再積只會累積）、誤差大於 xte_integral_gate_m（交給純追蹤）、
+        繞障或貼牆推開（目標是故意偏的）、一拍走超過 10 cm（脫困、定位跳）都不積。
+        """
+        e, _ = self._project_on_path(pts, idx, rx, ry)
+        ds = 0.0 if prev_xy is None else math.hypot(rx - prev_xy[0], ry - prev_xy[1])
+        lft = (ang * lin >= 0)
+        cap = 1.0 / max(0.05, self.min_radius_left if lft else self.min_radius_right)
+        sat = abs(lin) > 1e-6 and abs(ang) >= abs(lin) * cap * 0.98
+        if (state != "avoiding" and abs(total_off) < 1e-3 and abs(e) < self._xi_gate
+                and not sat and ds < 0.10):
+            lim = self._xi_max / max(1e-6, ki)
+            xi[direction] = max(-lim, min(lim, xi[direction] + e * ds))
+        return (rx, ry)
+
+    @staticmethod
+    def _xte_to_segments(pts: List[PathPoint], lo: int, hi: int, x: float, y: float) -> float:
+        """(x, y) 到 pts[lo:hi] 這段折線的最短距離（★ 2026-10-24，見 xte_segment）。
+        跨折返的那一小段也算（折返點本身就在路徑上），所以不會比「到最近的點」大。"""
+        best = float("inf")
+        for i in range(lo, max(lo, hi - 1)):
+            x0, y0, x1, y1 = pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y
+            dx, dy = x1 - x0, y1 - y0
+            seg2 = dx * dx + dy * dy
+            t = 0.0 if seg2 < 1e-12 else max(0.0, min(1.0, ((x - x0) * dx + (y - y0) * dy) / seg2))
+            best = min(best, (x - x0 - t * dx) ** 2 + (y - y0 - t * dy) ** 2)
+        if best == float("inf"):
+            best = min((p.x - x) ** 2 + (p.y - y) ** 2 for p in pts[lo:hi]) if hi > lo else 0.0
+        return math.sqrt(best)
+
     def _track_ref(self, pose, direction: int) -> Tuple[float, float]:
         """回傳這個行進方向下的**追蹤參考點**（世界座標）。
 
@@ -2385,8 +2584,13 @@ class PathTeachNode(Node):
         return x, y
 
     def _pure_pursuit(self, pose, target: PathPoint, direction: int,
-                      speed: float, lateral_offset: float) -> Tuple[float, float]:
-        """回傳 (linear, angular)"""
+                      speed: float, lateral_offset: float,
+                      extra_curv: float = 0.0) -> Tuple[float, float]:
+        """回傳 (linear, angular)
+
+        extra_curv（★ 2026-10-24）：加在純追蹤曲率上、箝制之前的修正量（行進座標，正＝往左），
+        目前只有橫向誤差積分（xte_integral）用。預設 0＝舊行為。
+        """
         x, y, yaw = pose
         # ★ 倒車時把追蹤參考點從後軸移到前軸（見 __init__ 的長註解）。
         #   前進時不動 —— 前進的參考點本來就該是後軸。
@@ -2416,7 +2620,7 @@ class PathTeachNode(Node):
         if direction < 0:
             bx, by = -bx, -by
 
-        curvature = 2.0 * by / (ld * ld)
+        curvature = 2.0 * by / (ld * ld) + extra_curv
         # ★ 曲率上限分左右（2026-08-10）★
         #
         # 舊寫法 `max_curv = 1.0/min_radius` 對兩邊用同一個上限，於是左轉時
@@ -2845,7 +3049,8 @@ class PathTeachNode(Node):
         #
         # 注意這幾行必須在 self._following = True 之前：下面有 return 路徑，
         # 提早離開時那個旗標還沒設，不會留下「以為還在重播」的狀態。
-        feasible, feas_note, _bad = self._check_feasibility(pts)
+        # ★ 2026-10-24：規劃出來的路徑用 xy 幾何檢查，錄製的照舊（見 _check_feasibility 的 geometric）
+        feasible, feas_note, _bad = self._check_feasibility(pts, geometric=(meta.get("source") == "plan"))
         if feasible:
             self.get_logger().info(feas_note)
         else:
@@ -2872,6 +3077,12 @@ class PathTeachNode(Node):
         try:
             # ★ 2026-10-20：硬停事件參數每趟重讀（ros2 param set 不必重啟就能 A/B），並印出這趟用的值
             self._refresh_margin_params()
+            self._refresh_tracking_params()
+            self.get_logger().info(
+                f"循跡修正：前視內插 {'開' if self._la_interp else '關'}、偏離算到線段 {'開' if self._xte_seg else '關'}、"
+                f"橫向誤差積分 {'開' if self._xi_on else '關'}"
+                + (f"（距離常數 {self._xi_dist:.2f} m、上限 {self._xi_max:.2f} /m、門檻 {self._xi_gate * 100:.0f} cm）"
+                   if self._xi_on else ""))
             self.get_logger().info(
                 f"硬停事件：恢復要 > {(self.body_margin_stop + self.margin_resume_m) * 100:.0f} cm "
                 f"連續 {self.margin_resume_sec:.1f} 秒或推進 {self.stall_progress:.2f} m、"
@@ -2942,6 +3153,10 @@ class PathTeachNode(Node):
         # 涵蓋舵機延遲與欠轉 —— 見 _arc_clearance_robust。
         prev_pose_for_curv = None
         curv_meas = None
+        # ★ 2026-10-24：橫向誤差積分（見 xte_integral）。前進、倒車各一個——同一個底盤偏移
+        #   在倒車的行進座標裡正負相反；每趟重播從 0 開始。
+        xi = {1: 0.0, -1: 0.0}
+        xi_prev_xy = None
         yaw_strikes = 0            # 朝向誤差超標次數（只拿來印，判準是下面那個）
         yaw_over_sec = 0.0         # ★ 真正的判準：朝向超標累計了幾秒
         yaw_warned = False
@@ -3159,10 +3374,13 @@ class PathTeachNode(Node):
             if self.xte_window > 0:
                 _lo = max(0, idx - self.xte_window)
                 _hi = min(len(pts), idx + self.xte_window + 1)
-                _seg = pts[_lo:_hi]
             else:
-                _seg = pts
-            xte = math.sqrt(min((p.x - x) ** 2 + (p.y - y) ** 2 for p in _seg))
+                _lo, _hi = 0, len(pts)
+            if self._xte_seg:
+                # ★ 2026-10-24：到線段的距離，不是到最近的點（見 xte_segment）
+                xte = self._xte_to_segments(pts, _lo, _hi, x, y)
+            else:
+                xte = math.sqrt(min((p.x - x) ** 2 + (p.y - y) ** 2 for p in pts[_lo:_hi]))
             in_grace = (self.escape_grace > 0.0 and last_escape_t > 0.0
                         and time.monotonic() - last_escape_t < self.escape_grace)
             if xte > self.max_xte and not in_grace:
@@ -3561,8 +3779,12 @@ class PathTeachNode(Node):
             if cur_dir < 0 and self.rev_front_axle:
                 _pv_ld = self.la_rev_ahead + self.axle_spacing
             _rx, _ry = self._track_ref(pose, cur_dir)
-            _pv_i, _pv_tgt = self._lookahead_point(pts, idx, _rx, _ry, _pv_ld)
-            _pv_v, _pv_w = self._pure_pursuit(pose, _pv_tgt, cur_dir, 1.0, avoid_offset)
+            # ★ 2026-10-24：橫向誤差積分的修正量（見 xte_integral）。增益用標稱速度的前視算，
+            #   減速時 L_d 變短也不會讓積分增益跟著跳；預覽與下指令用同一個值（積分在下完指令後才更新）。
+            _xi_ki = (2.0 / (_pv_ld * _pv_ld)) / self._xi_dist
+            _xi_curv = -_xi_ki * xi[cur_dir] if self._xi_on else 0.0
+            _pv_i, _pv_tgt = self._pick_target(pts, idx, _rx, _ry, _pv_ld)
+            _pv_v, _pv_w = self._pure_pursuit(pose, _pv_tgt, cur_dir, 1.0, avoid_offset, _xi_curv)
             preview_curv = (_pv_w / abs(_pv_v)) if abs(_pv_v) > 1e-6 else 0.0
             # ★ 往前看的距離必須**大於**拿來比的門檻 ★
             # 第一版寫成 max_dist=self.obs_slow（1.20），但門檻是
@@ -3943,9 +4165,17 @@ class PathTeachNode(Node):
                 # 「往前瞄多遠」用倒車自己的值，再加軸距做幾何修正
                 ld = self.la_rev_ahead + self.axle_spacing
             _rx, _ry = self._track_ref(pose, cur_dir)
-            _tgt_i, target = self._lookahead_point(pts, idx, _rx, _ry, ld)
+            _tgt_i, target = self._pick_target(pts, idx, _rx, _ry, ld)
             total_off = avoid_offset + wall_push
-            lin, ang = self._pure_pursuit(pose, target, cur_dir, abs(speed), total_off)
+            lin, ang = self._pure_pursuit(pose, target, cur_dir, abs(speed), total_off, _xi_curv)
+            # ★ 2026-10-24：橫向誤差積分（見 xte_integral）——下完指令才更新，下一拍生效。
+            #   繞障／貼牆推開時目標是故意偏的（total_off != 0），積進去會跟它打架；單純因為前方有東西
+            #   減速（state == "slowing"，10/21 實車佔 33~65% 的拍數）目標沒偏，照積。
+            #   曲率已經箝到上限時再積只會累積（積分飽和）；誤差大時交給純追蹤；
+            #   一拍走超過 10 cm（脫困、定位跳）不算數。
+            if self._xi_on:
+                xi_prev_xy = self._xi_step(xi, xi_prev_xy, pts, idx, _rx, _ry, cur_dir,
+                                           lin, ang, state, total_off, _xi_ki)
 
             # ★ 把橫向偏移的組成放進 feedback（2026-08-06）★
             # 實測車子在走廊裡一路貼右牆（右 0.03 / 左 0.56）而偏離持續變大，
@@ -4019,6 +4249,16 @@ class PathTeachNode(Node):
         if self.margin_stop_timeout <= 0.0:
             self.margin_stop_timeout = self.no_progress * 2.0
         self.margin_block_suppress_stuck = bool(p("margin_block_suppress_stuck").value)
+
+    def _refresh_tracking_params(self) -> None:
+        """循跡即時修正的參數（★ 2026-10-24，見 lookahead_interpolate 的宣告說明）。__init__ 與每趟重播開始時讀。"""
+        p = self.get_parameter
+        self._la_interp = bool(p("lookahead_interpolate").value)
+        self._xte_seg = bool(p("xte_segment").value)
+        self._xi_on = bool(p("xte_integral").value)
+        self._xi_dist = max(0.2, abs(float(p("xte_integral_dist_m").value)))
+        self._xi_max = max(0.0, abs(float(p("xte_integral_max_curv").value)))
+        self._xi_gate = max(0.0, abs(float(p("xte_integral_gate_m").value)))
 
     @staticmethod
     def _margin_release(now: float, clear_t: float, margin: float, stop_m: float,
@@ -4983,7 +5223,9 @@ class PathTeachNode(Node):
                 return resp
             # 相鄰段的接點會重複，去掉後面那段的第一個點
             all_pts.extend(seg[1:] if all_pts else seg)
-            cur = tgt
+            # ★ 2026-10-24：下一段從**這一段實際的終點**接（舊：cur = tgt）。多候選擇優可能把終點挪了幾公分
+            #   （見 plan_candidates），從 tgt 接會在接點留一個小跳躍；不開多候選時 Smac 的終點就是 tgt，結果一樣。
+            cur = self._make_pose(seg[-1].x, seg[-1].y, seg[-1].yaw)
 
         if len(all_pts) < 2:
             resp.success = False
@@ -5019,14 +5261,15 @@ class PathTeachNode(Node):
         # 那個保證**，順便確認門檻沒設得太嚴。8/06 用 0.80 當門檻時，
         # 規劃器的正常輸出（實測 0.79872，差 0.2%）被誤報成不可行 —— 那次
         # 誤報讓人以為規劃器壞了。門檻改 0.76 之後對照組才分得開。
-        feasible, feas_note, _ = self._check_feasibility(all_pts)
+        # ★ 2026-10-24：規劃路徑用 xy 幾何檢查（見 _check_feasibility 的 geometric）
+        feasible, feas_note, _ = self._check_feasibility(all_pts, geometric=True)
         if feasible:
             self.get_logger().info(feas_note)
         else:
             self.get_logger().warn(
                 f"⚠ 規劃器產出的路徑{feas_note}\n"
-                "   規劃器本應保證這件事 —— 先確認 SmacPlannerHybrid 的 "
-                "minimum_turning_radius 沒有被改小，再看門檻是不是設太嚴")
+                "   規劃器本應保證這件事 —— 先看上面有沒有「暫時降到 … m 再試」（降級規劃），"
+                "沒有的話確認 SmacPlannerHybrid 的 minimum_turning_radius 沒有被改小，再看門檻是不是設太嚴")
         self.get_logger().info(
             f"規劃路徑已存檔「{name}」：{len(all_pts)} 點、{length:.2f} m、{cusps} 個折返點"
         )
@@ -5074,8 +5317,218 @@ class PathTeachNode(Node):
         self.get_logger().info("已清空全域成本地圖的 obstacle 層")
         return True
 
+    # 規劃候選的分數權重（越小越好；單位「相當於多走幾公尺」。★ 2026-10-24，見 plan_candidates）。
+    # 與 ~/maprun/tools_1020/track_sim/plan_metrics.py 同一套——兩邊改了要一起改，離線結果才對得上。
+    _SCORE_W_INFEASIBLE_M = 10.0   # 每公尺「車子轉不過去」的弧長（xy 幾何，見 _geometric_tight_spots）
+    _SCORE_W_KINK = 3.0            # 每個朝向折角 > 15° 的折返點（車子轉不過去，只能甩出去）
+    _SCORE_W_MICRO = 2.0           # 每段 < 0.30 m 的微折返（原地鋸齒轉向）
+    _SCORE_W_CUSP = 0.8            # 每個折返點（停車換向一次）
+    _SCORE_W_REVERSE_M = 1.0       # 倒車每公尺額外再算一公尺
+
     def _plan_leg(self, start: Pose, goal: Pose) -> Optional[List[PathPoint]]:
-        """呼叫 nav2 規劃一段，回傳路徑點；失敗回 None
+        """規劃一段，回傳路徑點；失敗回 None。
+
+        ★ 2026-10-24：plan_candidates 開著時，終點原樣＋6 個小擾動各規劃一次，用 _path_score 挑最好的；
+          全部失敗再依 plan_fallback_radii 暫時降低規劃半徑（見兩個參數的宣告說明）。關掉＝舊行為（只規劃一次）。
+        """
+        p = self.get_parameter
+        gx, gy = goal.position.x, goal.position.y
+        gyaw = yaw_from_quat(goal.orientation)
+        cands = [("原樣", goal)]
+        if bool(p("plan_candidates").value):
+            d = abs(float(p("plan_candidate_shift_m").value))
+            dy = math.radians(abs(float(p("plan_candidate_dyaw_deg").value)))
+            c, s = math.cos(gyaw), math.sin(gyaw)
+            if d > 0.0:
+                cands += [("終點往前", self._make_pose(gx + d * c, gy + d * s, gyaw)),
+                          ("終點往後", self._make_pose(gx - d * c, gy - d * s, gyaw)),
+                          ("終點往左", self._make_pose(gx - d * s, gy + d * c, gyaw)),
+                          ("終點往右", self._make_pose(gx + d * s, gy - d * c, gyaw))]
+            if dy > 0.0:
+                cands += [("朝向+", self._make_pose(gx, gy, gyaw + dy)),
+                          ("朝向-", self._make_pose(gx, gy, gyaw - dy))]
+        max_err = abs(float(p("plan_candidate_max_goal_err_m").value))
+        best = self._plan_candidates(start, cands, gx, gy, max_err)
+        if best is None:
+            radii = [float(r) for r in p("plan_fallback_radii").value if float(r) > 0.0]
+            if radii:
+                best = self._plan_fallback_radii(start, goal, radii)
+        if best is None:
+            return None
+        _score, _name, pts, _det = best
+        # 終點對齊（_align_final_yaw）對的是 pts[-1].yaw：設回真正終點的朝向，不要對到擾動過的
+        pts[-1].yaw = gyaw
+        return pts
+
+    def _plan_candidates(self, start: Pose, cands, gx: float, gy: float, max_err: float):
+        """逐一規劃候選、打分，回傳最好的 (分數, 名稱, 路徑點, 明細)；全部失敗回 None。"""
+        scored = []
+        for name, g in cands:
+            pts, timed_out = self._plan_once(start, g)
+            if timed_out:
+                break      # 規劃器沒回應：別再對其他候選各等 30 秒
+            if not pts:
+                continue
+            if name != "原樣" and math.hypot(pts[-1].x - gx, pts[-1].y - gy) > max_err:
+                continue   # 擾動後的終點離真正終點太遠（例如落進起點容許範圍、回一條長度 0 的路徑）
+            self._annotate_directions(pts)
+            sc, det = self._path_score(pts)
+            scored.append((sc, name, pts, det))
+        if not scored:
+            return None
+        best = min(scored, key=lambda t: t[0])
+        if len(cands) > 1:
+            c0 = next((t for t in scored if t[1] == "原樣"), None)
+            bd = best[3]
+            msg = (f"多候選規劃：{len(scored)}/{len(cands)} 條成功，選「{best[1]}」分數 {best[0]:.1f}"
+                   f"（折返 {bd['cusps']}、折角 {bd['kinks']}、微折返 {bd['micro']}、"
+                   f"轉不過去 {bd['tight_m']:.2f} m、長 {bd['length_m']:.2f} m）")
+            if c0 is not None and c0 is not best:
+                cd = c0[3]
+                msg += (f"；原樣 {c0[0]:.1f}（折返 {cd['cusps']}、折角 {cd['kinks']}、微折返 {cd['micro']}、"
+                        f"轉不過去 {cd['tight_m']:.2f} m）")
+            elif c0 is None:
+                msg += "；原樣規劃不出來"
+            self.get_logger().info(msg)
+        return best
+
+    def _planner_radius(self) -> Optional[float]:
+        """讀 planner_server 現在的 GridBased.minimum_turning_radius（降級前記下來、事後設回）。"""
+        if not self._planner_get_params.wait_for_service(timeout_sec=2.0):
+            return None
+        req = GetParameters.Request()
+        req.names = ["GridBased.minimum_turning_radius"]
+        fut = self._planner_get_params.call_async(req)
+        if not self._spin_until(fut, 5.0) or fut.result() is None or not fut.result().values:
+            return None
+        v = fut.result().values[0]
+        return float(v.double_value) if v.type == ParameterType.PARAMETER_DOUBLE else None
+
+    def _set_planner_radius(self, r: float, wait: bool = True) -> bool:
+        """改 planner_server 的規劃半徑。Smac 在參數回呼裡重建查找表，實測阻塞約 5 秒。
+        wait=False：送出就走（設回原值時用；下一次規劃請求會自己排在它後面）。"""
+        if not self._planner_set_params.wait_for_service(timeout_sec=2.0):
+            return False
+        req = SetParameters.Request()
+        req.parameters = [ParameterMsg(name="GridBased.minimum_turning_radius",
+                                       value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                                            double_value=float(r)))]
+        fut = self._planner_set_params.call_async(req)
+        if not wait:
+            return True
+        if not self._spin_until(fut, 15.0) or fut.result() is None:
+            return False
+        return all(x.successful for x in fut.result().results)
+
+    def _plan_fallback_radii(self, start: Pose, goal: Pose, radii: List[float]):
+        """原樣與所有候選都規劃不出來：暫時降低規劃半徑再試一次原樣終點（見 plan_fallback_radii）。
+        同一時間只准一個（_plan_fallback_lock）：後一個要等前一個送出「設回原值」之後才讀原值。"""
+        with self._plan_fallback_lock:
+            return self._plan_fallback_radii_locked(start, goal, radii)
+
+    def _plan_fallback_radii_locked(self, start: Pose, goal: Pose, radii: List[float]):
+        orig = self._planner_radius()
+        if orig is None:
+            self.get_logger().warn("規劃不出來，但讀不到 planner_server 的規劃半徑，不降級")
+            return None
+        gx, gy = goal.position.x, goal.position.y
+        try:
+            for r in radii:
+                if r >= orig - 1e-6:
+                    continue                 # 只往小的降
+                self.get_logger().warn(
+                    f"規劃半徑 {orig:.2f} m 規劃不出來，暫時降到 {r:.2f} m 再試（Smac 重建查找表約 5 秒）")
+                if not self._set_planner_radius(r):
+                    self.get_logger().warn(f"　改不了 planner_server 的規劃半徑（{r:.2f} m），跳過")
+                    continue
+                best = self._plan_candidates(start, [("原樣", goal)], gx, gy, float("inf"))
+                if best is not None:
+                    self.get_logger().warn(
+                        f"⚠ 降到 {r:.2f} m 才規劃出來——這條路徑可能有車子轉不過去的地方（可行性檢查會照實列出）")
+                    return best
+            return None
+        finally:
+            if not self._set_planner_radius(orig, wait=False):
+                self.get_logger().error(
+                    f"⛔ 規劃半徑設不回 {orig:.2f} m！手動：ros2 param set /planner_server "
+                    f"GridBased.minimum_turning_radius {orig:.2f}")
+
+    def _geometric_tight_spots(self, pts: List[PathPoint], lim_l: Optional[float] = None,
+                               lim_r: Optional[float] = None):
+        """用 xy 幾何（三點外接圓，點距 >= 0.10 m、不跨折返）找車子轉不過去的地方（★ 2026-10-24）。
+
+        回傳 (清單, 最緊半徑)。清單格式同 _check_feasibility 的 bad。門檻同 _check_feasibility：
+        該方向控制器半徑 × 0.95；左右看「實際打哪邊」＝ sign(轉向 × 行進方向)。
+        ★ 為什麼規劃路徑不用點上存的 yaw：Smac 在終點直接套目標朝向、在折返點留著上一格的朝向，
+          用 yaw 算會把那裡報成「需要半徑 0.4 m」（10/21 log 就是這樣），車子其實照 xy 走得過去；
+          而真的會讓車子甩出去的「朝向折角」由 _path_score 的折角項另外算。
+        """
+        if lim_l is None or lim_r is None:
+            lim_l, lim_r = self.min_radius_left * 0.95, self.min_radius_right * 0.95
+        segs, s = [], 0
+        for i in range(1, len(pts)):
+            if pts[i].direction != pts[i - 1].direction:
+                segs.append((s, i))
+                s = i
+        segs.append((s, len(pts)))
+        bad, worst = [], float("inf")
+        for a, b in segs:
+            idxs = [a]
+            for i in range(a + 1, min(b + 1, len(pts))):      # 這一段的折線畫到折返點為止
+                if math.hypot(pts[i].x - pts[idxs[-1]].x, pts[i].y - pts[idxs[-1]].y) >= 0.10:
+                    idxs.append(i)
+            for i0, i1, i2 in zip(idxs, idxs[1:], idxs[2:]):
+                p0, p1, p2 = pts[i0], pts[i1], pts[i2]
+                ax, ay, bx, by = p1.x - p0.x, p1.y - p0.y, p2.x - p1.x, p2.y - p1.y
+                cross = ax * by - ay * bx
+                la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+                lc = math.hypot(p2.x - p0.x, p2.y - p0.y)
+                if abs(cross) < 1e-9 or lc < 0.5 * (la + lb):
+                    continue
+                r = la * lb * lc / (2.0 * abs(cross))
+                worst = min(worst, r)
+                left = (cross > 0) if p0.direction >= 0 else (cross < 0)
+                lim = lim_l if left else lim_r
+                if r < lim:
+                    bad.append({"from": i0, "to": i2, "arc_m": round(0.5 * (la + lb), 4),
+                                "dyaw_deg": round(math.degrees(math.atan2(abs(cross), ax * bx + ay * by)), 2),
+                                "radius_m": round(r, 4), "turn": "左" if left else "右", "limit_m": round(lim, 4)})
+        return bad, worst
+
+    def _path_score(self, pts: List[PathPoint]):
+        """規劃候選的分數（越小越好）與明細（★ 2026-10-24，權重見 _SCORE_W_*）。pts 要先標好行進方向。"""
+        length = rev = 0.0
+        for p0, p1 in zip(pts, pts[1:]):
+            dl = math.hypot(p1.x - p0.x, p1.y - p0.y)
+            length += dl
+            if p0.direction < 0:
+                rev += dl
+        bad, worst = self._geometric_tight_spots(pts)
+        tight_m = sum(d["arc_m"] for d in bad)
+        cusps, kinks = [], 0
+        for c in range(1, len(pts) - 1):
+            if pts[c].direction == pts[c - 1].direction:
+                continue
+            cusps.append(c)
+            din = math.atan2(pts[c].y - pts[c - 1].y, pts[c].x - pts[c - 1].x)
+            dout = math.atan2(pts[c + 1].y - pts[c].y, pts[c + 1].x - pts[c].x)
+            hin = din if pts[c - 1].direction > 0 else din + math.pi     # 幾何上的車頭朝向
+            hout = dout if pts[c].direction > 0 else dout + math.pi
+            kinks += abs(math.degrees(norm_angle(hout - hin))) > 15.0
+        micro = 0
+        for c0, c1 in zip(cusps, cusps[1:]):
+            if sum(math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y) for i in range(c0, c1)) < 0.30:
+                micro += 1
+        score = (length + self._SCORE_W_REVERSE_M * rev + self._SCORE_W_INFEASIBLE_M * tight_m
+                 + self._SCORE_W_KINK * kinks + self._SCORE_W_MICRO * micro + self._SCORE_W_CUSP * len(cusps))
+        return score, {"length_m": length, "reverse_m": rev, "tight_m": tight_m, "cusps": len(cusps),
+                       "kinks": kinks, "micro": micro, "worst_r": worst}
+
+    def _plan_once(self, start: Pose, goal: Pose) -> Tuple[Optional[List[PathPoint]], bool]:
+        """呼叫 nav2 規劃一次，回傳 (路徑點或 None, 是否逾時)
+
+        ★ 2026-10-24：原本叫 _plan_leg；改名後由新的 _plan_leg 包一層多候選擇優。
+          多回傳「是否逾時」：規劃器沒回應時，_plan_leg 不要再對其他候選各等 30 秒。
 
         用同步等待而不是 callback：這是服務回呼，本來就允許阻塞，
         而且節點用的是 MultiThreadedExecutor，不會卡住其他回呼。
@@ -5100,25 +5553,25 @@ class PathTeachNode(Node):
         send_future = self._planner_client.send_goal_async(req)
         if not self._spin_until(send_future, 10.0):
             self.get_logger().error("送出規劃請求逾時")
-            return None
+            return None, True
         handle = send_future.result()
         if handle is None or not handle.accepted:
             self.get_logger().error("規劃請求被拒絕")
-            return None
+            return None, False
 
         result_future = handle.get_result_async()
         if not self._spin_until(result_future, 20.0):
             self.get_logger().error("等待規劃結果逾時")
-            return None
+            return None, True
         wrapped = result_future.result()
         if wrapped is None or wrapped.status != GoalStatus.STATUS_SUCCEEDED:
-            return None
+            return None, False
 
         poses = wrapped.result.path.poses
         if len(poses) < 2:
-            return None
+            return None, False
         return [PathPoint(ps.pose.position.x, ps.pose.position.y,
-                          yaw_from_quat(ps.pose.orientation), 1) for ps in poses]
+                          yaw_from_quat(ps.pose.orientation), 1) for ps in poses], False
 
     def _stamped(self, pose: Pose) -> PoseStamped:
         ps = PoseStamped()
@@ -5165,7 +5618,7 @@ def main(args=None):
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
-        executor.spin()
+        spin_resilient(executor, node)   # ★ 10/27：LazyTf 拆監聽的競態不能讓節點死掉（見 lazy_tf.py）
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

@@ -165,6 +165,20 @@ def promises_navigation(reply: str) -> bool:
     return True
 
 
+# ★ 2026-10-26：模型把工具呼叫「講」成文字（沒有真的呼叫）。10/26 導航沒開時實測：
+#   「貴賓室要怎麼去？」→「呼叫帶位到貴賓室的工具 {object <nil> <nil> [] {}}」，原文會被平板唸出來。
+#   只收工具呼叫才會有的殘渣：Go 的 <nil>、{object、英文工具名、JSON 鍵、「呼叫／調用…工具」。
+_TOOL_LEAK = re.compile(
+    r"(\{\s*object|<nil>|[a-z_]+_tool\b|tool_calls?|function_call|\"name\"\s*:|\"arguments\"\s*:|"
+    r"(呼叫|調用|调用|使用)[^，。！？,.!?]{0,15}(工具|函式|函數))"
+)
+
+
+def leaks_tool_call(reply: str) -> bool:
+    """回覆裡有沒有工具呼叫的殘渣（模型沒真的呼叫，而是把它講出來）"""
+    return bool(reply) and bool(_TOOL_LEAK.search(reply))
+
+
 # ★ 2026-10-22：帶位途中客人要車停下的說法。以前這時候說什麼都被回「系統目前正在處理上一個指令」丟掉，
 #   客人喊「停下來」車照樣走（只剩平板急停）。誤判的代價是「車停下來」，所以可以寬一點；
 #   但不收單獨的「等等」「不要」——ASR 疊字常把別的字聽成「等等」，「不要」也太常出現。

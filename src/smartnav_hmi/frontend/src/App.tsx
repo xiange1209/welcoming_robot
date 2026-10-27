@@ -8,7 +8,7 @@ import { useHeartbeat } from "./hooks/useVisibleInterval";
 import { useStoreValue } from "./hooks/useStore";
 import { refreshMaps, refreshWaypoints, startMapLayer } from "./lib/mapdata";
 import { logout, restoreSession, sessionStore } from "./lib/session";
-import { TABS, type TabId } from "./lib/tabs";
+import { TABS, visibleTabs, type TabId } from "./lib/tabs";
 import { installTeleopGuards } from "./lib/teleop";
 import { startTelemetry } from "./lib/telemetry";
 import { toast } from "./lib/toast";
@@ -49,9 +49,11 @@ export default function App() {
     });
   }, []);
 
-  /* 管理分頁未登入時是「鎖上」而不是消失——見 TabBar 的說明。
-     這一行是還原成舊行為（完全隱藏）的唯一開關：換成 visibleTabs(admin) 即可。 */
-  const tabs = TABS;
+  /* ★ 2026-10-26 使用者要求：沒登入就**完全不顯示**管理分頁（原本是顯示成「鎖上」），
+     免得客人以為有一堆功能。一般使用者只剩「迎賓」一頁，導覽列也收起來；
+     工作人員用右上角「管理者登入」進來。要還原成鎖上的樣子：把這行換回 `TABS`。 */
+  const tabs = visibleTabs(admin);
+  const showTabBar = tabs.length > 1;
   const isLocked = (t: (typeof TABS)[number]) => !!t.admin && !admin;
 
   /* 站在管理分頁時被登出（權杖過期也算），要把人帶回公開頁，否則會停在一個
@@ -111,18 +113,24 @@ export default function App() {
       */}
       <main
         key={tab}
-        className="anim-page flex min-h-0 flex-1 flex-col p-3 pb-[calc(env(safe-area-inset-bottom)+92px)]"
+        className={
+          showTabBar
+            ? "anim-page flex min-h-0 flex-1 flex-col p-3 pb-[calc(env(safe-area-inset-bottom)+92px)]"
+            : "anim-page flex min-h-0 flex-1 flex-col p-3 pb-[calc(env(safe-area-inset-bottom)+12px)]"
+        }
       >
         {page}
       </main>
-      <TabBar
-        tabs={tabs}
-        active={tab}
-        locked={isLocked}
-        onSelect={setTab}
-        // 鎖著的分頁點下去直接開登入框，不用自己去找右上角那顆按鈕
-        onLocked={() => setLoginOpen(true)}
-      />
+      {showTabBar && (
+        <TabBar
+          tabs={tabs}
+          active={tab}
+          locked={isLocked}
+          onSelect={setTab}
+          // 鎖著的分頁點下去直接開登入框，不用自己去找右上角那顆按鈕
+          onLocked={() => setLoginOpen(true)}
+        />
+      )}
       {/* 條件掛載：每次開啟都是全新的元件實例，帳密與錯誤訊息自然是空的。
           共用平板上「不要把上一個人的狀態留著」就靠這一點，不必寫重置邏輯。 */}
       {loginOpen && (

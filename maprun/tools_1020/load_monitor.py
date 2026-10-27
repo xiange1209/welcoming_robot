@@ -24,6 +24,7 @@ import re
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -88,22 +89,25 @@ def main():
     n = Node("load_monitor_cc")
     cnt = collections.Counter()
     topics = {"/user_identity": None, "/face_embedding": None}
+    # ★ 2026-10-28：只計數 → raw=True（收到的是序列化位元組，不做反序列化）。
+    #   10/27 全開時「python3」（本工具＋latency_logger）合計約 40%（以單核計），在 CPU 閒置 0~2% 的車上，
+    #   量測工具自己就佔了一成總 CPU；raw 訂閱省掉 Python 端拆 LaserScan／Odometry 的成本。
     # 自訂訊息型別：只為了計數，用執行期查到的型別訂閱
     from rosidl_runtime_py.utilities import get_message
     for name, types in n.get_topic_names_and_types():
         if name in topics and types:
             try:
-                n.create_subscription(get_message(types[0]), name, lambda _m, k=name: cnt.update([k]), 10)
+                n.create_subscription(get_message(types[0]), name, lambda _m, k=name: cnt.update([k]), 10, raw=True)
                 topics[name] = types[0]
             except Exception:  # noqa: BLE001
                 pass
-    n.create_subscription(CameraInfo, "/camera/color/camera_info", lambda _m: cnt.update(["camera_info"]), qos_profile_sensor_data)
-    n.create_subscription(LaserScan, "/scan", lambda _m: cnt.update(["/scan"]), qos_profile_sensor_data)
-    n.create_subscription(String, "/user_text", lambda _m: cnt.update(["/user_text"]), 10)
-    n.create_subscription(String, "/llm_response", lambda _m: cnt.update(["/llm_response"]), 10)
-    n.create_subscription(Twist, "/cmd_vel", lambda _m: cnt.update(["/cmd_vel"]), qos_profile_sensor_data)
+    n.create_subscription(CameraInfo, "/camera/color/camera_info", lambda _m: cnt.update(["camera_info"]), qos_profile_sensor_data, raw=True)
+    n.create_subscription(LaserScan, "/scan", lambda _m: cnt.update(["/scan"]), qos_profile_sensor_data, raw=True)
+    n.create_subscription(String, "/user_text", lambda _m: cnt.update(["/user_text"]), 10, raw=True)
+    n.create_subscription(String, "/llm_response", lambda _m: cnt.update(["/llm_response"]), 10, raw=True)
+    n.create_subscription(Twist, "/cmd_vel", lambda _m: cnt.update(["/cmd_vel"]), qos_profile_sensor_data, raw=True)
     # 底盤里程計：全開時曾從 24 Hz 掉到 6 Hz（底盤驅動也被餓到），要一起看
-    n.create_subscription(Odometry, "/odom", lambda _m: cnt.update(["/odom"]), qos_profile_sensor_data)
+    n.create_subscription(Odometry, "/odom", lambda _m: cnt.update(["/odom"]), qos_profile_sensor_data, raw=True)
     clk = os.sysconf("SC_CLK_TCK")
     cols = ["時間", "標籤", "CPU閒置%", "load1", "可用MB", "溫度C", "throttled", "ASR_overflow",
             "user_identity", "face_embedding", "camera_info", "scan", "user_text", "llm_response", "cmd_vel", "odom", "前6行程(%1核)"]
@@ -135,8 +139,8 @@ def main():
             print("  " + "  ".join(str(x) for x in row[:16]) + "  | " + top)
             cnt.clear()
             p0, t0c, i0c, w0 = p1, t1c, i1c, w1
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass   # ★ 10/26：背景執行時用 SIGTERM 停（bash 背景工作會忽略 SIGINT），rclpy 會丟 ExternalShutdownException
     finally:
         with open(out, "w", newline="", encoding="utf-8-sig") as fh:
             w = csv.writer(fh)
@@ -149,7 +153,7 @@ def main():
                   + (f"；ASR overflow 共 {sum(ovf)} 次（{sum(ovf) / (len(rows) * a.interval / 60):.1f} 次/分）" if ovf else "；（沒有 ASR log）")
                   + f"；溫度最高 {max(float(r[5]) for r in rows if r[5]):.1f} °C ══\n存檔：{out}")
         n.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

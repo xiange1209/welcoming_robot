@@ -77,7 +77,15 @@ slam_toolbox:
     # 但這對「開進去看」的探索流程本來就是正確的行為。
     max_laser_range: 5.0
     minimum_time_interval: 0.5
-    transform_timeout: 0.2
+    # ★ 2026-10-28：0.2 -> 1.0。slam_toolbox 發的 map->odom 時間戳＝「最後收到的掃描時間 + transform_timeout」，
+    #   而它處理一筆掃描（匹配＋迴路閉合）時不收新掃描——Pi 4 上一處理超過 0.2 秒，MPPI 用路徑的時間去查就
+    #   落到未來：10/27 探索 23 個目標有 10 個在 1~6 秒內就 ABORTED（error_code=102＝TF_ERROR），
+    #   12 次「extrapolation into the future」：落後 66~75 ms ×7、~575 ms ×2、1.9~2.0 s ×2、6.2 s ×1。
+    #   1.0 蓋得住前兩類（12 次裡 9 次）；秒級的是 slam 自己卡住（迴路閉合＋當時規劃器一直規劃失敗搶 CPU），
+    #   要靠探索期間降規劃半徑（map_service_cc 的 explore_planner_radius_m）一起減。
+    #   這個值只是把「map->odom 的修正量」往後延用，map->odom 本來就變很慢，延用 1 秒不影響建圖。
+    #   驗證：python3 ~/maprun/tools_1020/explore_summary.py（TF_ERROR 中止次數、落後毫秒數）
+    transform_timeout: 1.0
     tf_buffer_duration: 30.0
     stack_size_to_use: 40000000
     enable_interactive_mode: false

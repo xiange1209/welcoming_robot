@@ -98,6 +98,9 @@ def generate_launch_description():
             ekf_config,
             {
                 "imu0": unbiased_topic,
+                # ★ 2026-10-26：原廠 ekf.yaml 開著 debug、寫到不存在的 /home/wheeltec/debug/file.txt
+                #   → 每次啟動報「unable to create debug output file」，濾波迴圈還照樣組除錯字串。關掉。
+                "debug": False,
                 # 原廠 imu0_config 的第 6 個 (絕對 yaw) 是 true，也就是把 IMU
                 # 自己算出來的 orientation.yaw 當成絕對姿態測量餵給 EKF。
                 #

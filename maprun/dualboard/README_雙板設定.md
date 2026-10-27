@@ -1,5 +1,13 @@
 # 雙板設定（草稿，2026-10-22 車上 agent）
 
+> ★★ **2026-10-23 起改用一份設定檔＋一支工具**：`board_profiles.ini`（single／A／B 每一項要什麼值、改在哪裡）＋`board_profile.py`
+>   `python3 board_profile.py status`（這塊板子是哪一種、逐項 ✓／✗）→ `plan A`（只列出）→ `sudo python3 board_profile.py apply A`（備份＋套用＋再檢查）。
+>   回單板＝`apply single`。測試 `test_board_profile.py`（沙盒 57 項：三種來回、重複執行、記憶體不符拒絕、重現 10/22 的 B 狀態）。
+>   下面第 0～5 節的各支腳本還在、行為沒變，但 **`set_board_name.sh` 加的 /etc/hosts 兩行重開機會被洗掉**：
+>   user-data 的 `manage_etc_hosts: true` 蓋過 cloud.cfg.d 的 `false`，cloud-init 每次開機依範本重寫 /etc/hosts（10/23 在 B 上看到）。
+>   `board_profile.py` 改的是範本 `/etc/cloud/templates/hosts.debian.tmpl`，開機前後一致。
+> ★ **2026-10-23 這張 SD 卡（4 GB 測試板）已改回 wheeltec-r680 單板**（第 0 節那些 B 設定全部拿掉；紀錄與原檔備份 `revert_r680_20261023/`）。
+
 > **2026-10-22 筆電端審查後的版本**（車上 agent 草稿 → 審查 → 修正 6 處，見第 9 節）。這裡的檔案**除了第 0 節列的 B 測試板那幾項之外都沒有套用**：校時、服務、A 板都沒動，其餘只做了語法、解析與替身測試。
 > ★ **2026-10-22 使用者決定：先在單板把所有功能驗完，之後才換雙板**——所以現在不要套用（單板驗證用的交辦在 `HANDOFF_car_agent_20261022.md`）。B 測試板那些設定跟著 SD 卡走，8 GB 板要用單板時先還原（同一份交辦 §0）。
 > 與草稿最大的差別：**終端機與所有腳本照舊 `source ~/maprun/env.sh` 就好**（雙板環境由標記檔 `~/.smartnav/dualboard_role` 決定，見第 9 節 ①）。
@@ -89,6 +97,7 @@
 | V0 | A、B 各跑一次一鍵驗證 | 雙板時另一塊板子的項目記 INFO（A：Astra／麥克風／語音模型在 B；B：電池／底盤在 A），**不能有 FAIL** |
 
 ## 5. 回到單板（任何一步出問題）
+- ★ 2026-10-23 起：`sudo python3 ~/maprun/dualboard/board_profile.py apply single`（下面三條它都會做，另外還原 hostname、/etc/hosts、.bashrc、校時）。
 - A：刪 HMI drop-in → `daemon-reload` → `restart smartnav-hmi`；終端機改回 `source ~/maprun/env.sh`。網路線設定可以留著（沒用到不影響），要拿掉照 `nm_eth0_setup.sh` 檔頭。
 - B：`sudo systemctl disable --now smartnav-perception`；要當單板用就 `enable --now smartnav-hmi`。
 - 沒有修改任何既有檔案（`env.sh`、`~/cyclonedds.xml`、原本的服務檔都沒動），所以回復只是「不用新的那幾個」。

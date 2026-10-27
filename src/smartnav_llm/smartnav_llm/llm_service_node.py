@@ -1057,12 +1057,16 @@ class LLMServiceNode(Node):
 
     def _waypoint_name_map(self) -> dict:
         """目前地圖的 {地點名稱: 地點ID}；查不到回空 dict（交給模型處理）"""
+        # ★ 2026-10-26：順便記下「查不到」（導航沒起來／服務失敗）——跟「地圖上真的沒有地點」要分開，
+        #   否則導航沒開時「洗手間在哪」會被答成「示範場地沒有設定洗手間」（地圖其實有廁所）。
+        self._waypoints_unavailable = True
         try:
             if not self.list_waypoints_client.service_is_ready():
                 return {}
             res = self._wait_for_future(self.list_waypoints_client.call_async(ListWaypoints.Request()), 3.0)
             if res is None or not res.success:
                 return {}
+            self._waypoints_unavailable = False
             return {wp.waypoint_name: wp.waypoint_id for wp in res.waypoints_info if wp.waypoint_name}
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f"帶位判斷：查地點失敗（交給模型）: {exc}")
@@ -1074,6 +1078,15 @@ class LLMServiceNode(Node):
         force_intent=True（模型已經答應帶路時用）：不再要求句子裡有「帶我去」這類字，只看地點。
         """
         names = self._waypoint_name_map()
+        if not names and self._waypoints_unavailable and not force_intent and nav_intent.has_nav_intent(user_input):
+            reply = "導航系統還沒準備好，暫時沒辦法帶位；請稍等一下再說一次，或洽詢櫃檯行員。"
+            self.get_logger().warning(f"🧭 問路／帶路，但查不到地點（導航沒起來？）：'{user_input}'")
+            self.get_logger().info(f"🤖 Agent 最終決策回應: {reply}")
+            with self.memory_lock:
+                self.memory.add_message(HumanMessage(content=user_input))
+                self.memory.add_message(AIMessage(content=reply))
+            self._publish_reply(reply)
+            return True
         name = None
         if names and "navigate_tool" in self.tools_map:
             if force_intent:
@@ -1105,7 +1118,9 @@ class LLMServiceNode(Node):
             self._publish_reply(deny)
             return True
         self.get_logger().info(f"🧭 帶位直達（程式判斷，不經模型）：'{user_input}' -> {name}（{wid}）")
-        ack = "好的，請跟我來。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
+        # ★ 2026-10-27：客人講完話通常站在車子正前方，出發時會擋住（上機實測「前方障礙」就在起步）；
+        #   規劃路徑約三成是先倒車，所以也不能叫人站後面 → 請客人先站到旁邊。
+        ack = "好的，請跟我來。請先站到我旁邊，等我開動再跟上。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
         self._publish_reply(ack)
         try:
             if name == self.vip_room_waypoint_name and "guide_to_vip_room_tool" in self.tools_map:
@@ -1303,6 +1318,13 @@ class LLMServiceNode(Node):
                         self.stream_handler.drop_held()
                         self.get_logger().warning("⚠️ 模型回了空白，改用預設句")
                         final_reply = "不好意思，我沒有聽清楚，可以再說一次嗎？"
+                    elif nav_intent.leaks_tool_call(final_reply):
+                        # ★ 2026-10-26：模型把工具呼叫講成文字（3B 常見），原文不能唸給客人聽
+                        self.stream_handler.drop_held()
+                        self.get_logger().warning(f"⚠️ 模型把工具呼叫講成文字（沒有真的呼叫）：{final_reply}")
+                        if self._try_direct_navigation(user_input, force_intent=True):
+                            return
+                        final_reply = "抱歉，這個我現在沒辦法處理，請洽詢櫃檯行員協助。"
                     elif self.nav_guard and not nav_called and nav_intent.promises_navigation(final_reply):
                         self.stream_handler.drop_held()
                         self.get_logger().warning(f"⚠️ 模型答應帶路、這一輪卻沒呼叫導航：{final_reply}")

@@ -1,7 +1,8 @@
 """子系統開關：單元表、測試情境、啟停與狀態查詢。
 
 從 hmi_server_node.py 搬出來。只吃 node（要讀 logger、要問 /get_nav_mode
-服務）與 jobs（call_service 的阻塞封裝），不持有任何 ROS 訂閱/發布。
+服務）與 jobs（call_service 的阻塞封裝）。唯一的 ROS 訂閱在 nav_camera.py
+（★ 2026-10-28：/navigation_active → 導航中暫停人臉相機）。
 """
 
 import importlib.util
@@ -13,6 +14,7 @@ from typing import Dict, Optional
 from std_srvs.srv import Trigger
 
 from ..system.procinfo import proc_cmdlines
+from .nav_camera import NavCameraPause
 from .supervisor import LaunchSupervisor, remote_units
 
 # ★ 2026-10-22 雙板：B 板單元在 A 的面板上要看「ROS 節點圖」，不能看本機行程（A 看不到 B 的行程）。
@@ -122,6 +124,13 @@ class SystemControlManager:
             #   system_control.launch.py 與 demo.launch.py 都明確覆寫為 false。
             "start_hint": "迎賓流程的觸發點。需要深度相機的彩色影像",
             "requires": {"module": "insightface"},
+            # ★ 2026-10-23：省電模式（沒人時每 4 秒推論一次）。全功能同開時 CPU 閒置是 0%，
+            #   人臉沒人時也要 43%（以單核計）；省電模式量到 22%，迎賓延遲中位 1.57 → 2.16 s。
+            "variant_detect": {"eco": "empty_interval_sec:=4.0"},
+            "variants": {
+                "normal": {"label": "一般（每 2 秒）"},
+                "eco": {"label": "省電（沒人時每 4 秒）"},
+            },
         },
         "user_auth": {
             "label": "使用者認證 / 決策",
@@ -280,6 +289,25 @@ class SystemControlManager:
             ],
             "note": "⚠ 這是唯一近乎全開的情境，CPU 帳已逼近 400%。全部起完約需 90 秒，請等狀態全綠再開始演",
         },
+        # ★ 2026-10-23：單板 A/B 用。跟上面一模一樣，只差人臉改用省電模式（沒人時每 4 秒推論一次）。
+        #   靜態量測：沒人時人臉 CPU 43% → 25%（單核計）；代價是客人剛走近時迎賓慢一點（中位 1.6 → 約 2.4～3.2 秒）。
+        #   下週照雙板判斷表（verify_out/dualboard_unified_design_20261023.md §0）兩個情境各跑幾輪再決定預設用哪個。
+        "demo_eco": {
+            "label": "完整迎賓故事線（人臉省電）",
+            "why": "同「完整迎賓故事線」，但人臉沒人時每 4 秒才推論一次，把 CPU 讓給導航與語音",
+            "stop": ["nav", "face"],
+            "start": [
+                "sensors",
+                "nav:localization",
+                "camera:face",
+                "face:eco",
+                "user_auth",
+                "bank_reception",
+                "asr_chain",
+                "llm",
+            ],
+            "note": "單板 CPU 吃緊時用這個。人臉若已經用一般模式開著，會先停掉再用省電模式重開",
+        },
     }
 
     # ------------------------------------------------------------------
@@ -353,6 +381,14 @@ class SystemControlManager:
         # 而模組裝沒裝在一次執行期間不會變。
         self._requires_cache: Dict[str, str] = {}
         self._supervisor = LaunchSupervisor(lambda msg: self._node.get_logger().error(msg))
+        # ★ 2026-10-28：導航中暫停人臉相機（單板全開時帶位 CPU 不夠；說明在 nav_camera.py）
+        self.nav_camera = NavCameraPause(node, self._supervisor,
+                                         self.SYSTEM_UNITS["camera"]["variant_detect"]["face"])
+
+    def _forget_camera_if(self, units) -> None:
+        """操作者自己動到相機（單元開關或情境）→ 導航中暫停相機的「自動開回來」作廢，以人為準。"""
+        if any(str(u).partition(":")[0] == "camera" for u in units):
+            self.nav_camera.forget()
 
     def _check_requires(self, requires: Optional[dict]) -> str:
         """回傳「缺什麼」的說明，都齊全就回空字串"""
@@ -397,6 +433,7 @@ class SystemControlManager:
         if spec is None:
             return False, [f"未知的情境：{key}"]
 
+        self._forget_camera_if(list(spec["stop"]) + list(spec["start"]))
         steps = []
         ok_all = True
         live = {u["key"] for u in self.system_status() if u.get("running") or u.get("partial")}
@@ -418,6 +455,7 @@ class SystemControlManager:
         spec = self.SCENARIOS.get(key)
         if spec is None:
             return False, {"message": f"未知的情境：{key}"}
+        self._forget_camera_if(list(spec["stop"]) + list(spec["start"]))
         steps = []
         # ★ 2026-10-22：跳過本來就沒開的單元——對沒在跑的單元下「停止」會被記成「操作失敗」
         #   （_stop 找不到受管 launch），「全部關閉」會滿畫面紅字。有任何行程在（partial）照樣去停。
@@ -551,6 +589,9 @@ class SystemControlManager:
                         break
             blocked = self._check_requires(spec.get("requires"))
             hint = spec.get("start_hint", "")
+            if key == "camera" and not found and not is_remote and self.nav_camera.paused():
+                mode = "導航中自動暫停（到點後自動恢復）"
+                hint = "帶位途中把 CPU 讓給導航；導航結束約 3 秒後自動用人臉模式開回來。現在按啟動＝以你為準、不再自動開關"
             if is_remote:
                 # ★ 缺什麼就先講（面板會把 blocked 顯示成原因）：B 離線時一眼看得出來，不用去翻 log
                 blocked = (
@@ -625,6 +666,7 @@ class SystemControlManager:
                 break
         ok, operation = self._supervisor.request_unit(unit, action, variant_key)
         if ok:
+            self._forget_camera_if([unit])
             what = spec["label"]
             if variant_key:
                 what += f" — {spec['variants'][variant_key]['label']}"

@@ -121,6 +121,20 @@ class FaceEmbeddingNode(Node):
             2.0,
             ParameterDescriptor(description="待機時兩幀之間最少間隔幾秒。0 = 不限制（★ 會吃滿 CPU 並餓死音訊）"),
         )
+        # ★ 2026-10-23：省電模式。鏡頭前連續 empty_after_frames 次推論都沒有臉，就改用這個間隔，
+        #   一偵測到臉立刻回到 process_interval_sec。0 = 關閉（行為跟以前完全一樣）。
+        #   靜態量測（10/22 face_e2e_bench）：間隔 2 s → 沒人時 CPU 43%、迎賓延遲中位 1.57 s；
+        #   4 s → 22%、2.16 s。省電模式讓「沒人」走 4 s、「有人」照 2 s，迎賓只在人剛走近時慢一點。
+        self.declare_parameter(
+            "empty_interval_sec",
+            0.0,
+            ParameterDescriptor(description="省電：連續沒偵測到臉時改用的間隔秒數（0 = 關閉）"),
+        )
+        self.declare_parameter(
+            "empty_after_frames",
+            2,
+            ParameterDescriptor(description="連續幾次推論都沒有臉，才切到省電間隔"),
+        )
         self.declare_parameter(
             "process_interval_navigating_sec",
             2.0,
@@ -171,6 +185,14 @@ class FaceEmbeddingNode(Node):
             self.get_parameter("process_interval_navigating_sec").get_parameter_value().double_value
         )
         self._skip_when_nav = bool(self.get_parameter("skip_while_navigating").get_parameter_value().bool_value)
+        self._interval_empty = float(self.get_parameter("empty_interval_sec").get_parameter_value().double_value)
+        self._empty_after = int(self.get_parameter("empty_after_frames").get_parameter_value().integer_value)
+        self._no_face_streak = 0
+        if self._interval_empty > 0:
+            self.get_logger().info(
+                f"省電模式：連續 {self._empty_after} 次沒有臉 → 每 {self._interval_empty:.1f} 秒一次，"
+                f"有臉時 {self._interval_idle:.1f} 秒"
+            )
         self._navigating = False
         self._last_process = 0.0
         self._n_done = 0
@@ -197,6 +219,9 @@ class FaceEmbeddingNode(Node):
                 elif p.name == "process_interval_navigating_sec":
                     self._interval_nav = float(p.value)
                     self.get_logger().info(f"導航中間隔更新為 {self._interval_nav:.2f} 秒")
+                elif p.name == "empty_interval_sec":
+                    self._interval_empty = float(p.value)
+                    self.get_logger().info(f"省電間隔更新為 {self._interval_empty:.2f} 秒（0 = 關閉）")
                 elif p.name == "skip_while_navigating":
                     self._skip_when_nav = bool(p.value)
                     self.get_logger().info(f"導航中{'完全跳過' if self._skip_when_nav else '改用降頻'}")
@@ -404,6 +429,8 @@ class FaceEmbeddingNode(Node):
             self._n_skip += 1
             return
         interval = self._interval_nav if self._navigating else self._interval_idle
+        if not self._navigating and self._interval_empty > 0 and self._no_face_streak >= self._empty_after:
+            interval = max(interval, self._interval_empty)
         now = time.monotonic()
         if interval > 0.0 and (now - self._last_process) < interval:
             self._n_skip += 1
@@ -428,6 +455,7 @@ class FaceEmbeddingNode(Node):
 
             # 偵測與提取
             face = self.face_engine.detect_and_extract(cv_image)
+            self._no_face_streak = 0 if face is not None else self._no_face_streak + 1
 
             if face is not None:
                 # 建立並發佈人臉向量訊息

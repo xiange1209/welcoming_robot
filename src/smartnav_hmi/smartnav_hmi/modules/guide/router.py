@@ -76,7 +76,8 @@ def build_router(node, admin_only) -> APIRouter:
             goal.target_name = name
             job_id = node.jobs.start_action("navigate", goal, f"帶位到 {name}（迎賓頁，{tier}）")
             node.get_logger().info(f"🧭 迎賓頁帶位：{name}（身分 {tier}）")
-            return {"success": True, "message": f"好的，帶您到{name}", "job_id": job_id}
+            # ★ 10/27：按平板的人就站在車旁／車前，出發會擋住；約三成路徑先倒車，所以請客人站旁邊（同 LLM 帶位的說法）
+            return {"success": True, "message": f"好的，帶您到{name}。請先站到我旁邊，等我開動再跟上。", "job_id": job_id}
 
         return await guard(node, work)
 

@@ -52,6 +52,13 @@ def _actions(context):
         "speech_synthesizer": ("smartnav_audio", "speech_synthesizer", {}),
         "voice_playback": ("smartnav_audio", "voice_playback", {}),
     }
+    # ★ 2026-10-23：人臉的兩種啟動方式。normal＝跟沒給 variant 一樣（情境裡的 "face" 走這條）；
+    #   eco＝沒人時每 4 秒推論一次（empty_interval_sec），一偵測到臉回到 2 秒。
+    #   參數用 ros_arguments 帶在指令列上，HMI 才能從行程指令列看出目前是哪個模式（variant_detect）。
+    if unit == "face" and variant in ("normal", "eco"):
+        extra = ["-p", "empty_interval_sec:=4.0"] if variant == "eco" else []
+        return [Node(package="smartnav_vision", executable="face_embedding", name="face_node", output="screen",
+                     parameters=[{"enable_gpu": False}], ros_arguments=extra)]
     if unit in nodes and not variant:
         package, executable, parameters = nodes[unit]
         return [Node(package=package, executable=executable, name=f"{unit}_node", output="screen", parameters=[parameters])]

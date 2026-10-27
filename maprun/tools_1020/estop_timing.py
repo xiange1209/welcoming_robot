@@ -85,7 +85,9 @@ class EstopTiming(Node):
         before = [v for t, v in self.odom if t0 - LOOKBACK_S <= t <= t0]
         vmax = max(before) if before else None
         n = len(self.done) + len(self.pending) + 1
-        self.pending.append({"n": n, "t0": t0, "vmax": vmax})
+        # ★ 2026-10-27：記下按下當下的負載。上機第一天 load 25+ 時量到 4.55 s（零速指令 +0.10 s 就送出）——
+        #   滿載時底盤驅動解析串口回報會落後，/odom 的「車速」可能比實際慢好幾秒，判讀時要一起看。
+        self.pending.append({"n": n, "t0": t0, "vmax": vmax, "load1": os.getloadavg()[0]})
         print(f"[#{n}] 收到急停（t0）；按下前 {LOOKBACK_S:.0f} 秒內最大車速 "
               f"{'無 /odom 資料' if vmax is None else f'{vmax:.3f} m/s'}。量測中……", flush=True)
 
@@ -127,6 +129,8 @@ class EstopTiming(Node):
                 verdict = f"PASS（≤{self.limit:.2f} s）"
             else:
                 verdict = f"FAIL（> {self.limit:.2f} s）"
+            if p.get("load1", 0.0) >= 8.0:   # 四核：load 8 以上＝嚴重滿載
+                verdict += f"｜⚠ 按下時 load {p['load1']:.1f}（滿載，/odom 可能落後，數字偏大）"
             f = lambda x: "無" if x is None else f"+{x:.2f}s"
             line = (f"[#{p['n']}] 按下前最大車速 {('?' if vmax is None else f'{vmax:.3f}')} m/s | "
                     f"最後非零指令 {f(last_nz)} | 第一則零速 {f(first_z)} | "

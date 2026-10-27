@@ -418,10 +418,12 @@ class SpeechRecognizerNode(Node):
         self.callback_group = ReentrantCallbackGroup()
 
         # QoS 設定
+        # ★★ 2026-10-28：depth 5 -> 40（跟 voice_trigger_node 一起改，說明在那邊）★★
+        #   觸發瞬間會連發 15 塊預錄；depth 5 時句首被 DDS 靜默丟掉，這裡的「佇列已滿」計數也看不到。
         audio_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=40,
         )
         # ★★ 2026-08-20：durability 從 TRANSIENT_LOCAL 改回 VOLATILE ★★
         #

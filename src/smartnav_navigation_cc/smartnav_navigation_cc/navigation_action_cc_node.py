@@ -31,17 +31,20 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalRespons
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
 from geometry_msgs.msg import PoseWithCovarianceStamped, Quaternion
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import ClearEntireCostmap
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Empty, String
 from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
 
 from smartnav_msgs.action import FollowTaughtPath, Navigate
 from smartnav_msgs.srv import DeleteTaughtPath, GetWaypoint, PlanTaughtPath
+
+from smartnav_navigation_cc import depart_gate
 
 # 內層導航被別人取消（平板急停、卡住偵測），外層卻沒收到取消時的結果訊息。
 # ★ 「請勿自動重試」是寫給 LLM 看的：它的提示詞要求失敗先自動重試，
@@ -169,6 +172,12 @@ class NavigationActionCcNode(Node):
         self.declare_parameter("blocked_poll_sec", 4.0)
         self.declare_parameter("blocked_speech_wait", "前面的路被擋住了，我在這裡等，通了就繼續")
         self.declare_parameter("blocked_speech_resume", "路通了，繼續前進")
+        # ★ 2026-10-27：出發前確認第一段行進方向淨空（客人講完話常站在車前；路徑三成先倒車）。見 depart_gate.py。
+        #   depart_gate_enable:=false＝舊行為（規劃完直接起跑）。
+        self.declare_parameter("depart_gate_enable", True)
+        self.declare_parameter("depart_clear_m", 0.90)       # 雷射到行進方向最近的東西至少這麼遠才出發
+        self.declare_parameter("depart_sector_deg", 25.0)    # 行進方向左右各幾度（0.45 m 寬的人在 0.9 m 約 ±14°）
+        self.declare_parameter("depart_wait_max_sec", 20.0)  # 最多等多久，之後照常出發
 
         self.max_covariance_norm = float(self.get_parameter("max_covariance_norm").value)
         self.navigation_timeout_sec = float(self.get_parameter("navigation_timeout_sec").value)
@@ -717,6 +726,28 @@ class NavigationActionCcNode(Node):
                 stuck_rounds = 0
             # 重試次數用完的出口在迴圈開頭（attempt > max_replan_attempts）
 
+    def _depart_gate(self, goal_handle, path_id):
+        """出發前確認第一段行進方向淨空（見 depart_gate.py）。回 False＝等的時候被取消。
+
+        只在這段期間訂閱 /scan（放在可重入的 client_cb_group，動作執行緒在這裡等的時候它照樣收得到）。
+        """
+        if not bool(self.get_parameter("depart_gate_enable").value):
+            return True
+        holder = {"scan": None}
+        sub = self.create_subscription(LaserScan, "/scan", lambda m: holder.__setitem__("scan", m),
+                                       qos_profile_sensor_data, callback_group=self.client_cb_group)
+        try:
+            return depart_gate.wait_until_clear(
+                lambda: holder["scan"], lambda: goal_handle.is_cancel_requested,
+                lambda txt: self.speech_text_pub.publish(String(data=txt)),
+                lambda txt: self.get_logger().info(txt),
+                direction=depart_gate.first_direction(path_id),
+                clear_m=float(self.get_parameter("depart_clear_m").value),
+                sector_deg=float(self.get_parameter("depart_sector_deg").value),
+                wait_max_sec=float(self.get_parameter("depart_wait_max_sec").value))
+        finally:
+            self.destroy_subscription(sub)
+
     def _wait_for_passage(self, goal_handle, waypoint_name, target_pose, deadline, blocked_since):
         """通道被地圖上沒有的障礙整個擋住（繞也繞不過）—— 原地等，定期重新規劃，一通就走。
 
@@ -846,6 +877,9 @@ class NavigationActionCcNode(Node):
         #   以前車子會先動一下才在 _wait_taught_result 的第一圈看到取消。
         #   送出重播請求之前就返回：不送 goal、不說「開始導航」、不動 /navigation_active。
         if goal_handle.is_cancel_requested:
+            return "cancel", None, plan.path_id
+        # ★ 10/27：起跑前確認行進方向淨空；有人就請他讓開、等淨空（等的時候被取消就不出發）
+        if getattr(self, "_announce_start", True) and not self._depart_gate(goal_handle, plan.path_id):
             return "cancel", None, plan.path_id
         follow = FollowTaughtPath.Goal()
         follow.path_id = plan.path_id
