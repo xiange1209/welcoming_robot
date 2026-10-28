@@ -17,7 +17,14 @@ const EMPTY: ChatMessage[] = [];
 function StatsLine({ stats }: { stats: ChatStats }) {
   const parts: [string, string][] = [];
   if (stats.total != null) parts.push(["總耗時", `${stats.total}s`]);
-  if (stats.think != null) parts.push(["首字延遲", `${stats.think}s`]);
+  // 「等待首字」是客人說完到第一個字出現，含檢索與工具；真正的 TTFT 只算模型那一段
+  if (stats.think != null) parts.push(["等待首字", `${stats.think}s`]);
+  // 拆解：檢索（知識庫）＋工具（第一個字之前跑的）＋TTFT（請求送出到第一個 token）＋其他（ROS、組提示）
+  if (stats.retrieve != null) parts.push(["└ 檢索", `${stats.retrieve}s`]);
+  if (stats.tool != null) parts.push(["工具", `${stats.tool}s`]);
+  if (stats.ttft != null) parts.push(["TTFT", `${stats.ttft}s`]);
+  if (stats.other != null) parts.push(["其他", `${stats.other}s`]);
+  if (stats.model != null) parts.push(["模型", `${stats.model}s`]);
   if (stats.generate != null) parts.push(["產生", `${stats.generate}s`]);
   if (stats.cps != null) parts.push(["", `${stats.cps} 字/秒`]);
   if (stats.chars != null) parts.push(["", `${stats.chars} 字`]);
@@ -37,6 +44,11 @@ function StatsLine({ stats }: { stats: ChatStats }) {
 
 function Bubble({ message }: { message: ChatMessage }) {
   const mine = message.role === "user";
+
+  /* 對話框只放客人說的話與 LLM 的回覆。黑名單公告、「我要倒車…」這類非 LLM 的語音
+     平板照樣會唸（朗讀讀的是 messages 清單，見 tts.ts），只是不畫成泡泡。 */
+  if (message.hidden) return null;
+
   return (
     <div className={cx("flex flex-col", mine ? "items-end" : "items-start")}>
       <div

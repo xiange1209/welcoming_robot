@@ -81,7 +81,7 @@ class VoiceTriggerNode(Node):
 
         # 基本音訊參數
         # ★ 2026-09-18：VAD 模型路徑可覆寫。留空 = 走預設搜尋順序
-        #   （SMARTNAV_AUDIO_MODELS_DIR -> 套件 share -> ~/models/vad）。
+        #   （SMARTNAV_AUDIO_MODELS_DIR -> 套件 share 的 models/vad -> 功能包原始碼的 models/vad）。
         #   9/17 實測：套件裡根本沒有 models/ 目錄，VAD 一次都沒觸發過，
         #   而症狀跟「沒人講話」一模一樣，現場很難分辨。
         self.declare_parameter(
@@ -103,6 +103,14 @@ class VoiceTriggerNode(Node):
                 description="收音緩衝：low／high（PortAudio 依裝置給的預設）或秒數如 0.2；low = 2026-10-20 以前的行為",
                 dynamic_typing=True,
             ),
+        )
+        # ★ 2026-10-28：收音執行緒用即時排程（SCHED_FIFO），對策 input overflow。
+        #   溢位是突發的（log 實測：一次 76 次集中在 3 個時間點），都對得上 CPU 被佔滿，回呼本身很輕。
+        #   0 = 不申請；沒有 rtprio 權限時只會警告一次，不影響收音（見 AudioRecorder._request_realtime）。
+        self.declare_parameter(
+            "audio_rt_priority",
+            30,
+            ParameterDescriptor(description="收音執行緒的 SCHED_FIFO 優先權 1~99；0 = 關閉"),
         )
         self.declare_parameter("device", -1)
         self.declare_parameter(
@@ -406,6 +414,7 @@ class VoiceTriggerNode(Node):
                     channels=channels,
                     mono_mixer=mixer,
                     latency=self.audio_latency,  # ★ 2026-10-21：原本 recorder 內寫死 "low"
+                    rt_priority=self.get_parameter("audio_rt_priority").get_parameter_value().integer_value,
                 )
                 self._recorder.start()
                 self.get_logger().info(f"✓ 麥克風錄製已啟動（device={device}）")

@@ -9,7 +9,9 @@
   - 地圖與地點的建立、切換：HMI 的管理功能，不在這裡
 """
 
+import json
 import re
+import requests
 import threading
 import time
 from collections import deque
@@ -98,6 +100,18 @@ class RosStreamHandler(BaseCallbackHandler):
         self.current_sentence = ""
         self.held: List[str] = []
         self.hold = True
+        # 這一整輪（跨 agent 迴圈的所有推論）是否已經送出過第一個 token。
+        # 給耗時拆解用：第一個字之前的工具執行時間才算進「首字延遲」。
+        self.seen_token = False
+        # TTFT（time to first token）：把請求送給模型 -> 第一個 token 回來，只含模型這一段，
+        # 不含檢索與工具。取這一整輪第一個吐出 token 的那次推論（begin_turn 到第一個 token）。
+        self.round_start = None
+        self.ttft = None
+
+    def start_turn(self) -> None:
+        """一輪對話開始（客人說完一句話）。和 begin_turn 不同：它每次推論都會呼叫，這個一輪只呼叫一次"""
+        self.seen_token = False
+        self.ttft = None
 
     def begin_turn(self, hold: bool = True) -> None:
         """開始新一輪推論：清掉上一輪的殘留與暫扣區
@@ -123,6 +137,7 @@ class RosStreamHandler(BaseCallbackHandler):
         self.current_sentence = ""
         self.held = []
         self.hold = hold
+        self.round_start = time.monotonic()  # 緊接著就是 invoke()，TTFT 從這裡起算
 
     def _emit(self, sentence: str) -> None:
         if self.hold:
@@ -154,6 +169,9 @@ class RosStreamHandler(BaseCallbackHandler):
             return
 
         self.stream_publisher.publish(String(data=token))
+        if not self.seen_token and self.round_start is not None:
+            self.ttft = time.monotonic() - self.round_start
+        self.seen_token = True
 
         self.buffer += token
         parts = self.split_pattern.split(self.buffer)
@@ -295,6 +313,20 @@ class LLMServiceNode(Node):
         self.keep_alive = self.declare_parameter("keep_alive", "-1").get_parameter_value().string_value
         # 節點啟動後在背景先問一次（結果丟掉），把模型與系統提示載進顯存，第一位客人不用等 47 秒。
         self.warmup_on_start = self.declare_parameter("warmup_on_start", True).get_parameter_value().bool_value
+        # ★★ 2026-10-28：提示快取保溫（keep_warm_sec，<=0 關閉）★★
+        #
+        # 實測（筆電 Ollama 0.30.4、llama3.1:8b、同一份 1,513 token 提示）：兩次請求相隔 ≤6 秒，
+        # 第二次 prefill 只要 33 毫秒（快取命中）；相隔 ≥8 秒就失效，prefill 1.9~2.7 秒，
+        # 閒置 3 分鐘 4.3 秒、6 分鐘 5.1 秒。客人講話的節奏是 15~60 秒一句，所以幾乎每一句都踩在失效區，
+        # HMI 上的首字延遲 5~9 秒就是這個。快取壽命這麼短的原因在筆電那邊，從這裡看不到。
+        #
+        # 對策：句子之間每 keep_warm_sec 秒送一個只含系統提示、num_predict=1 的極小請求（熱的時候約 35 毫秒）。
+        # 實測每 4 秒一次保溫 60 秒後，真實提問 prefill 94 毫秒、整個請求 1.1 秒。
+        # ★ 間隔必須小於快取壽命（約 6~8 秒）：每 10 秒保溫實測無效，每個保溫請求自己都沒命中（各 2.5 秒）。
+        # 代價：Ollama 那台每 4 秒多算一次，GPU 不會進省電。
+        self.keep_warm_sec = float(self.declare_parameter("keep_warm_sec", 4.0).get_parameter_value().double_value)
+        self._llm_busy = False  # 主迴圈正在等模型推論；保溫這時不送，免得和真實請求搶 GPU
+        self._ollama_last = time.monotonic()  # 最近一次對聊天模型的請求（真實或保溫）結束的時刻
 
         # ── 簡體轉繁體 ───────────────────────────────────
         # 系統提示詞早就寫了「回覆一律使用繁體中文」，但小模型會忽略它：
@@ -381,6 +413,9 @@ class LLMServiceNode(Node):
         # 建立發佈者和訂閱者
         self.llm_response_pub = self.create_publisher(String, "llm_response", 10)
         self.llm_stream_pub = self.create_publisher(String, "llm_stream", 10)
+        # 首字延遲的拆解（JSON，單位秒）：{"retrieve": 知識庫檢索, "tool": 第一個字之前花在工具上的時間}。
+        # HMI 用它把「首字延遲」拆成 檢索／工具／模型。每次有新數字就發一次（累計值），HMI 取最後一筆。
+        self.llm_timing_pub = self.create_publisher(String, "llm_timing", 10)
         # ★ 2026-08-17：串流「作廢」訊號。
         #
         # HMI 端的 llm_streaming 緩衝只會「累加」（append_stream），而清空它的
@@ -441,6 +476,9 @@ class LLMServiceNode(Node):
         )
         if self.warmup_on_start:
             threading.Thread(target=self._warmup_llm, daemon=True).start()
+        if self.keep_warm_sec > 0:
+            threading.Thread(target=self._keep_warm_loop, daemon=True).start()
+            self.get_logger().info(f"✓ 提示快取保溫已啟用：每 {self.keep_warm_sec:g} 秒一次（keep_warm_sec:=0 可關閉）")
 
     def _init_callback(self) -> None:
         """初始化回調函式"""
@@ -693,6 +731,48 @@ class LLMServiceNode(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f"Ollama 暖機失敗（不影響對話，只是第一題會比較慢）: {exc}")
 
+    def _keep_warm_loop(self) -> None:
+        """背景保溫：定時送極小請求，讓 Ollama 的系統提示快取不過期（原因與數據見 keep_warm_sec 宣告處）
+
+        只含系統提示（不含知識庫片段與客人說明）：真實請求的前綴就是這一段，後面不同的部分才需要重算。
+        參數（模型、num_ctx、keep_alive）要和主迴圈一致——num_ctx 不同會讓 Ollama 重載模型。
+        """
+        time.sleep(4.0)  # 讓暖機先走（暖機本身就會把快取燙熱）
+        failing = False
+        while rclpy.ok():
+            wait = self.keep_warm_sec - (time.monotonic() - self._ollama_last)
+            if wait > 0 or self._llm_busy:
+                time.sleep(max(min(wait, self.keep_warm_sec), 0.2))
+                continue
+            t0 = time.monotonic()
+            try:
+                body = {
+                    "model": self.model_name,
+                    "stream": False,
+                    "options": {"temperature": self.temperature, "num_predict": 1, "num_ctx": self.num_ctx},
+                    "messages": [
+                        {"role": "system", "content": self._load_system_prompt()},
+                        {"role": "user", "content": "。"},
+                    ],
+                }
+                body.update(self._ollama_extra_kwargs())  # keep_alive：和主迴圈同一套規則
+                resp = requests.post(f"{self.ollama_base_url.rstrip('/')}/api/chat", json=body, timeout=30)
+                resp.raise_for_status()
+                if failing:
+                    self.get_logger().info("✓ 提示快取保溫恢復")
+                    failing = False
+                took = time.monotonic() - t0
+                if took > 1.0:
+                    # 保溫請求慢 = 快取已經過期被它重新燙熱（剛啟動、剛被其他程式佔用、或剛換過提示）
+                    self.get_logger().info(f"🔥 保溫請求花了 {took:.1f} 秒（快取已重新預熱）")
+            except Exception as exc:  # noqa: BLE001
+                if not failing:
+                    self.get_logger().warning(f"提示快取保溫失敗（不影響對話，只是回應會變慢；30 秒後重試）: {exc}")
+                failing = True
+                self._ollama_last = time.monotonic() + 26.0  # 退避：下次約 30 秒後再試
+                continue
+            self._ollama_last = time.monotonic()
+
     def _knowledge_section(self, user_input: str, chat_history: List[BaseMessage]) -> str:
         """附在系統提示最後的「本行知識庫」一節。
 
@@ -730,6 +810,16 @@ class LLMServiceNode(Node):
         with self._robot_said_lock:
             recent = [t for ts, t in self._robot_said if now - ts <= self.robot_echo_sec]
         return nav_intent.is_robot_echo(text, recent)
+
+    def _publish_timing(self, retrieve_sec: float, tool_sec: float) -> None:
+        """回報這一輪「首字之前」的耗時拆解給 HMI（累計值，HMI 取最後一筆）
+
+        ttft 是模型自己的首 token 時間（見 RosStreamHandler.ttft），還沒吐字時沒有這個欄位。
+        """
+        timing = {"retrieve": round(retrieve_sec, 2), "tool": round(tool_sec, 2)}
+        if self.stream_handler.ttft is not None:
+            timing["ttft"] = round(self.stream_handler.ttft, 2)
+        self.llm_timing_pub.publish(String(data=json.dumps(timing)))
 
     def _publish_reply(self, text: str) -> None:
         """發 /llm_response（平板會顯示並唸出來），同時記進「機器人講過的話」"""
@@ -927,7 +1017,13 @@ class LLMServiceNode(Node):
                 chat_history = self.memory.get_history_messages()
 
             # 檢索會呼叫遠端 Ollama，所以放在這條 agent 執行緒裡（不是 ROS callback）
+            self.stream_handler.start_turn()
+            t_retrieve = time.monotonic()
             knowledge_section = self._knowledge_section(user_input, chat_history)
+            retrieve_sec = time.monotonic() - t_retrieve
+            tool_sec = 0.0  # 第一個字之前花在工具上的時間（第一個字之後才跑的工具不算「等待首字」）
+            ttft_sent = False
+            self._publish_timing(retrieve_sec, tool_sec)
             system_content = self._load_system_prompt() + knowledge_section + customer_context
 
             agent_chain = self._chain_for(user_input)
@@ -945,14 +1041,22 @@ class LLMServiceNode(Node):
                 #   「先講一段旁白、再去呼叫工具」（見 begin_turn 的 docstring）。
                 self.stream_handler.begin_turn(hold=(self.hold_all_iterations or iteration == 0))
 
-                response = agent_chain.invoke(
-                    {
-                        "system_prompt": system_content,
-                        "history": chat_history,
-                        "input": user_input,
-                        "agent_scratchpad": agent_scratchpad,
-                    }
-                )
+                self._llm_busy = True
+                try:
+                    response = agent_chain.invoke(
+                        {
+                            "system_prompt": system_content,
+                            "history": chat_history,
+                            "input": user_input,
+                            "agent_scratchpad": agent_scratchpad,
+                        }
+                    )
+                finally:
+                    self._llm_busy = False
+                    self._ollama_last = time.monotonic()
+                if self.stream_handler.ttft is not None and not ttft_sent:
+                    ttft_sent = True
+                    self._publish_timing(retrieve_sec, tool_sec)  # 第一次有 TTFT：補發一次，HMI 取最後一筆
 
                 # ★ 2026-08-20：撞到 num_predict 上限要吼出來。
                 #   撞上限而且沒有 tool_calls，極可能是工具呼叫 JSON 被切斷
@@ -1052,6 +1156,8 @@ class LLMServiceNode(Node):
                         # （本檔多處註解都記錄過 qwen2.5:3b 的格式不穩）。
                         # 接住之後回一句模型看得懂的話，讓它自己重試或改口，
                         # 比整輪垮掉好。
+                        t_tool = time.monotonic()
+                        counts_toward_first_token = not self.stream_handler.seen_token
                         try:
                             tool_result = self.tools_map[tool_name].invoke(tool_args)
                         except Exception as exc:  # noqa: BLE001
@@ -1060,6 +1166,9 @@ class LLMServiceNode(Node):
                                 "執行結果: 失敗, 詳細信息: 工具參數不完整或格式不正確，"
                                 "請補齊必要資訊後重試，或改用其他方式協助客戶"
                             )
+                        if counts_toward_first_token:
+                            tool_sec += time.monotonic() - t_tool
+                            self._publish_timing(retrieve_sec, tool_sec)
                     else:
                         tool_result = f"錯誤：找不到工具 {tool_name}"
 

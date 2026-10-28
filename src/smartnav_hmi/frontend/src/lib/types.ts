@@ -23,6 +23,14 @@ export interface Identity {
 export interface ChatStats {
   total?: number;
   think?: number;
+  /** think = 等待首字（客人說完 -> 第一個字）≈ retrieve + tool + ttft + other（有 LLM 節點回報才有拆解）。
+   *  ttft 只含模型：請求送出 -> 第一個 token，不含檢索與工具。
+   *  舊版節點沒有 ttft，剩下的整段記在 model。 */
+  retrieve?: number;
+  tool?: number;
+  ttft?: number;
+  other?: number;
+  model?: number;
   generate?: number;
   cps?: number;
   chars?: number;
@@ -35,6 +43,8 @@ export interface ChatMessage {
   stats?: ChatStats;
   /** 串流中的暫時訊息，前端自己塞的，不會從後端來 */
   ghost?: boolean;
+  /** 不是 LLM 推論的語音（黑名單公告、導航播報、迎賓詞…）：對話框不畫，但朗讀照常（平板讀的是這份清單） */
+  hidden?: boolean;
 }
 
 export interface SystemStats {

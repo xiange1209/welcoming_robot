@@ -163,7 +163,9 @@ def model_path_candidates(model_type: str, override: Optional[str] = None) -> Li
         cands.append(Path(get_package_share_directory("smartnav_audio")) / "models" / model_type)
     except Exception:
         pass                       # 套件沒裝好時仍要能走後面的退路
-    cands.append(Path.home() / "models" / model_type)
+    # 功能包原始碼底下的 models/：直接從原始碼或 --symlink-install 跑時就是它；
+    # 一般 install 的這個位置不存在，無害。模型一律放在功能包自己的 models/，不要放 ~/models。
+    cands.append(Path(__file__).resolve().parent.parent / "models" / model_type)
     return cands
 
 
@@ -188,8 +190,10 @@ def get_model_path(model_type: str, override: Optional[str] = None,
 
     這次的修法（車子端交接建議的 (b) 案）：
       1. 多給幾條退路：呼叫端參數 > 環境變數 `SMARTNAV_AUDIO_MODELS_DIR`
-         > 套件 share > `~/models/<type>`。
-         Pi 上模型實體就在 `~/models/`，最後那條退路直接讓現行機器可用。
+         > 套件 share（install 後的 models/） > 功能包原始碼底下的 models/。
+         ★ 2026-10-28：拿掉原本最後一條 `~/models/<type>`。模型已經放進功能包的 models/，
+         那個目錄不見之後節點照樣啟動、卻永遠聽不到（VAD／ASR 都沒載入）；
+         而且熱詞檔是從 `<模型目錄>.parent.parent` 推 share 目錄，模型放在 `~/models` 時一定推錯。
       2. **找不到一律 `logger.error` 並印出找過的完整清單**，不再只是 warning。
          呼叫端仍自行決定要不要 raise（見各節點）。
 

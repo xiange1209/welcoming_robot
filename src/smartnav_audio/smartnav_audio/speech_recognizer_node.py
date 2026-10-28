@@ -64,6 +64,11 @@ class SpeechRecognizerNode(Node):
         # 參數聲明
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("num_threads", 4)
+        # ★ 2026-10-28：辨識行程的 nice 值（-20~19，越小越優先；0 = 不調整）。
+        #   見 __init__ 裡套用處的說明。
+        self.declare_parameter(
+            "process_nice", -10, ParameterDescriptor(description="辨識行程的 nice 值；0 = 不調整；需要 nice 權限")
+        )
         self.declare_parameter("user_text_topic", "/user_text", ParameterDescriptor(description="辨識到的完整文字話題"))
         self.declare_parameter(
             "partial_text_topic", "/partial_text", ParameterDescriptor(description="辨識過程中的部分文字話題")
@@ -206,7 +211,7 @@ class SpeechRecognizerNode(Node):
         )
 
         # ★ 2026-09-18：模型路徑可覆寫。留空 = 走預設搜尋順序
-        #   （SMARTNAV_AUDIO_MODELS_DIR -> 套件 share -> ~/models/asr）。
+        #   （SMARTNAV_AUDIO_MODELS_DIR -> 套件 share 的 models/asr -> 功能包原始碼的 models/asr）。
         #   9/17 現場靠在 install/ 底下手動做軟連結才跑起來，
         #   而 install/ 會被下一次 colcon build 清掉 —— 這個參數就是那個臨時解的正式版。
         self.declare_parameter(
@@ -335,6 +340,7 @@ class SpeechRecognizerNode(Node):
         # 參數獲取
         self.sample_rate = self.get_parameter("sample_rate").get_parameter_value().integer_value
         self.num_threads = self.get_parameter("num_threads").get_parameter_value().integer_value
+        self._apply_process_nice(self.get_parameter("process_nice").get_parameter_value().integer_value)
         self.user_text_topic = self.get_parameter("user_text_topic").get_parameter_value().string_value
         self.partial_text_topic = self.get_parameter("partial_text_topic").get_parameter_value().string_value
         audio_topic = self.get_parameter("audio_topic").get_parameter_value().string_value
@@ -495,7 +501,7 @@ class SpeechRecognizerNode(Node):
         try:
             # 使用本地 ASR 模型
             # ★ 2026-09-18：加上可覆寫路徑（見 voice_utils.get_model_path 的說明）。
-            #   參數留空時行為不變，仍走 share -> ~/models/asr 的搜尋順序。
+            #   參數留空時走 share -> 功能包原始碼 models/asr 的搜尋順序。
             asr_model_dir = get_model_path(
                 "asr",
                 override=self.get_parameter("asr_model_dir").get_parameter_value().string_value,
@@ -698,6 +704,25 @@ class SpeechRecognizerNode(Node):
         except Exception as e:
             self.get_logger().error(f"初始化 ASR 模型失敗: {e}")
 
+    def _apply_process_nice(self, nice: int) -> None:
+        """把辨識的 CPU 優先級調得比背景的相機、導航高（nice 越小越優先）
+
+        ★ 2026-10-28：實測辨識會「趕不上即時」。Pi 4 只有 4 顆核心，相機、影像壓縮、HMI、
+          導航全擠在一起（load average 16~19）；辨識本來 RTF 就有 0.76，被搶走一點就大於 1，
+          音訊佇列塞滿、丟塊，輕則漏字、重則整句沒有結果。
+        Linux 的 setpriority 只作用在呼叫的那條執行緒，之後建立的執行緒才繼承 —— 所以要在
+        建立辨識執行緒、載入 onnxruntime 之前呼叫（見 __init__ 的位置）。
+        用 nice 而不是即時排程：辨識是長時間吃滿 CPU 的運算，用 SCHED_FIFO 會把其他節點餓死。
+        權限來自 /etc/security/limits.d/99-ros-realtime.conf（nice -19）；失敗只警告一次。
+        """
+        if nice == 0:
+            return
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, int(nice))
+            self.get_logger().info(f"✓ 辨識行程 nice={os.getpriority(os.PRIO_PROCESS, 0)}（優先於背景節點）")
+        except (AttributeError, PermissionError, OSError) as exc:
+            self.get_logger().warning(f"無法調整辨識行程優先級（{exc}）——CPU 吃緊時辨識可能趕不上即時")
+
     def _audio_callback(self, msg: AudioData) -> None:
         """音訊話題回呼函數
 
@@ -722,7 +747,20 @@ class SpeechRecognizerNode(Node):
             # 進行語音辨識
             self.audio_queue.put_nowait((audio, msg.is_final))
         except queue.Full:
-            self.get_logger().warning("音訊處理佇列已滿，丟棄當前音訊塊")
+            if msg.is_final:
+                # ★ 2026-10-28：句尾標記不能丟。佇列滿時 put_nowait 丟掉的是「最新」那塊，
+                #   而 is_final 與結尾的靜音塊正好是最後才到的 —— 辨識端少了句尾，
+                #   sherpa 不會收句，整句話永遠不輸出（實測：3.4 秒的語音丟了 19 塊，之後 70 秒都沒出字）。
+                #   所以句尾到時，寧可丟最舊的一塊來騰位置。
+                try:
+                    self.audio_queue.get_nowait()
+                    self.audio_queue.task_done()
+                    self.audio_queue.put_nowait((audio, True))
+                    self.get_logger().warning("音訊處理佇列已滿，丟棄最舊的音訊塊以保留句尾標記")
+                except (queue.Empty, queue.Full):
+                    self.get_logger().warning("音訊處理佇列已滿，句尾標記也丟失了")
+            else:
+                self.get_logger().warning("音訊處理佇列已滿，丟棄當前音訊塊")
         except Exception as e:
             self.get_logger().error(f"處理音訊失敗: {e}")
 

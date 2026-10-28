@@ -4,6 +4,7 @@
 提供麥克風錄製功能，支持串流方式處理音訊數據
 """
 
+import os
 import queue
 import threading
 import numpy as np
@@ -31,6 +32,7 @@ class AudioRecorder:
         channels: int = 1,
         mono_mixer: Optional[Callable] = None,
         latency: Any = "high",
+        rt_priority: int = 0,
     ):
         """初始化麥克風錄製器
 
@@ -51,6 +53,8 @@ class AudioRecorder:
             latency: 收音緩衝，原樣交給 sd.InputStream。"low"／"high" 是 PortAudio
                 依裝置給的預設值，也可直接給秒數（float）。
                 ★ 2026-10-21：原本寫死 "low"，預設改 "high"，原因見 start()。
+            rt_priority: >0 時，收音執行緒在第一次回呼時替自己申請 SCHED_FIFO 即時排程（優先權 1~99）；
+                0 = 不申請。原因見 _request_realtime()。
         """
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
@@ -60,6 +64,8 @@ class AudioRecorder:
         self.channels = max(1, int(channels))
         self.mono_mixer = mono_mixer
         self.latency = latency
+        self.rt_priority = max(0, min(99, int(rt_priority)))
+        self._rt_pending = self.rt_priority > 0  # 第一次回呼時才申請（要在 PortAudio 的收音執行緒裡做）
         self.logger = logger or get_default_logger(__name__)
 
         self._recording = False
@@ -161,6 +167,28 @@ class AudioRecorder:
             finally:
                 self._thread = None
 
+    def _request_realtime(self) -> None:
+        """讓「目前這條執行緒」（PortAudio 的收音執行緒）改用 SCHED_FIFO 即時排程
+
+        ★ 2026-10-28：input overflow 的對策。
+        回呼本身很輕（一次 copy + put_nowait），VAD 也在背景執行緒，所以溢位不是回呼太慢，
+        而是 Pi 4 的 4 顆核心被相機、人臉、導航、建置擠滿（load average 實測到 19）時，
+        收音執行緒是一般分時排程（TS），排不到就來不及把緩衝區取走 -> 溢位 -> 丟一段音訊。
+        實測這個行程的 rtprio 上限是 95（/etc/security/limits.d/99-ros-realtime.conf），
+        卻沒有任何執行緒用到。收音執行緒大部分時間睡在 ALSA 的 poll 上，用即時排程只佔很少 CPU，
+        但一醒來就能先於其他行程拿到核心。
+
+        失敗（沒有 rtprio 權限、不在 Linux）只警告一次，收音照常，退回原本的行為。
+        """
+        try:
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(self.rt_priority))  # pid 0 = 呼叫的執行緒
+            self.logger.info(f"✓ 收音執行緒已改用即時排程 SCHED_FIFO（優先權 {self.rt_priority}）")
+        except (AttributeError, PermissionError, OSError) as exc:
+            self.logger.warning(
+                f"收音執行緒無法改用即時排程（{exc}）——CPU 吃緊時仍可能 input overflow。"
+                f"檢查 `ulimit -r`（需要 >= {self.rt_priority}）；/etc/security/limits.d 只對新的登入工作階段生效。"
+            )
+
     def _audio_callback(self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags) -> None:
         """音訊串流回呼函數，由 sounddevice 在音訊線程中週期性調用
 
@@ -172,6 +200,10 @@ class AudioRecorder:
             time: 時間資訊物件，包含音訊裝置的時間戳
             status: 音訊串流狀態標誌
         """
+        if self._rt_pending:
+            self._rt_pending = False
+            self._request_realtime()
+
         if status:
             self.logger.warning(f"音訊流狀態異常: {status}")
 

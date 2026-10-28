@@ -71,7 +71,9 @@ class HmiState:
             self.identity["updated_at"] = time.time()
             self._bump()
 
-    def add_message(self, role: str, text: str, stats: Optional[Dict[str, Any]] = None) -> None:
+    def add_message(
+        self, role: str, text: str, stats: Optional[Dict[str, Any]] = None, hidden: bool = False
+    ) -> None:
         text = (text or "").strip()
         if not text:
             return
@@ -87,10 +89,34 @@ class HmiState:
             entry: Dict[str, Any] = {"role": role, "text": text, "ts": time.time()}
             if stats:
                 entry["stats"] = stats
+            if hidden:
+                # 不是 LLM 推論的語音（黑名單公告、導航播報、迎賓詞…）：對話框不顯示。
+                # 仍要留在清單裡——平板的朗讀是讀這份清單的最新機器人訊息，拿掉就不唸了。
+                entry["hidden"] = True
             self.messages.append(entry)
             del self.messages[: max(0, len(self.messages) - self.max_messages)]
             self._messages_version += 1
             self._bump()
+
+    def patch_last_robot_stats(self, make_extra) -> None:
+        """事後補充最後一則機器人回覆的統計。make_extra(目前的 stats) 回傳要併進去的欄位；值為 None 的欄位會被刪掉。"""
+        with self._lock:
+            for m in reversed(self.messages):
+                if m["role"] != "robot":
+                    continue
+                stats = m.get("stats")
+                if not stats:
+                    return
+                extra = make_extra(stats)
+                if extra:
+                    for k, v in extra.items():
+                        if v is None:
+                            stats.pop(k, None)
+                        else:
+                            stats[k] = v
+                    self._messages_version += 1
+                    self._bump()
+                return
 
     def clear_messages(self) -> None:
         """清空對話紀錄與串流中的殘句

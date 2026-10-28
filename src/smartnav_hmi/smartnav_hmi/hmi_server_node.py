@@ -326,6 +326,7 @@ class HmiServerNode(Node):
         self.create_subscription(String, "partial_text", self.chat.on_partial_text, 10, callback_group=cb)
         self.create_subscription(String, "llm_response", self.chat.on_llm_response, 10, callback_group=cb)
         self.create_subscription(String, "llm_stream", self.chat.on_llm_stream, 10, callback_group=cb)
+        self.create_subscription(String, "llm_timing", self.chat.on_llm_timing, 10, callback_group=cb)
         self.create_subscription(Empty, "llm_stream_reset", self.chat.on_llm_stream_reset, 10, callback_group=cb)
         # 模型名稱是 latched，HMI 比 LLM 晚啟動也收得到
         self.create_subscription(String, "llm_model", self.chat.on_llm_model, latched_qos, callback_group=cb)
