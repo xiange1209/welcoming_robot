@@ -2,6 +2,7 @@
 
 import re
 
+from smartnav_msgs.action import RequestNavigation
 from smartnav_msgs.msg import UserType
 
 # 使用者類別清單
@@ -26,12 +27,6 @@ NODE_GROUPS = [
             "speech_recognizer_node",
             "speech_synthesizer_node",
             "audio_playback_node",
-            # ★ 2026-08-10：這三個原本寫的是 map_service_node /
-            #   waypoint_service_node / navigation_service_node —— 那是**舊套件**
-            #   smartnav_navigation 的節點名，實機從不啟動，於是健康頁上
-            #   永遠有三行紅色的「尚未啟動」，久了就被當背景雜訊忽略，
-            #   真的有東西沒起來時反而看不出來。
-            #   實機 nav_bringup_cc.launch.py 起的是 _cc 版：
             "map_service_cc_node",
             "waypoint_service_cc_node",
             "navigation_action_cc_node",
@@ -40,6 +35,8 @@ NODE_GROUPS = [
             "steering_trim_cc_node",
             # 迎賓劇本沒起來時要看得出來——它是完整故事線的核心
             "bank_reception_node",
+            # 帶位的唯一入口；沒起來時 LLM 與迎賓頁都帶不了位，要看得出來
+            "nav_arbiter_node",
         ],
     ),
     ("nav2 定位", ["map_server", "amcl"]),
@@ -85,9 +82,7 @@ ACTION_TIMEOUTS = {
     #   以後改 exploration_timeout_sec 要同步改這裡。
     "create_map": 1920.0,
     "global_localization": 260.0,  # 節點內建 200 秒
-    # ★ 2026-10-09：LLM 端等導航／帶位結果的上限是 smartnav_llm/llm_utils.py 的 NAVIGATE_WAIT_SEC，
-    #   與這個值同為 340 秒 —— 兩邊都必須大於節點的 navigation_timeout_sec（300）。
-    #   LLM 端原本寫死 200 秒，比節點還短，會先宣告失敗再重試（2026-10-08 審查）。
-    #   改這個值要同步改 NAVIGATE_WAIT_SEC。
-    "navigate": 340.0,  # 節點內建 300 秒（navigation_timeout_sec）
+    # "navigate" 指的是對 nav_arbiter 的 request_navigation（HMI 不直接呼叫 /navigate）；
+    # 時限的單一來源是 RequestNavigation.action，與 LLM 端等結果的上限同值。
+    "navigate": RequestNavigation.Goal.CLIENT_WAIT_SEC,
 }

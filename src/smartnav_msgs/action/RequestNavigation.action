@@ -1,0 +1,43 @@
+# 請求導航（經 smartnav_brain 的 nav_arbiter 仲裁）
+#
+# 系統裡「讓車子去某個地點」只有這一條入口。仲裁節點依來源與目前客人的身分
+# 決定准不准，准了才轉給真正的導航動作 /navigate；LLM、HMI 都不直接呼叫 /navigate。
+#
+# 取消這個 goal = 取消底層的導航（仲裁節點會轉送）。
+
+# 請求來源。權限規則依來源不同：
+#   LLM        客人用說的。受身分限制（黑名單不帶位、貴賓專屬地點只給 VIP），不可指定座標
+#   GUEST_UI   迎賓頁（不用登入）。規則同 LLM
+#   OPERATOR   已登入 HMI 的管理者。不受身分限制，可導航到任意座標
+uint8 SOURCE_LLM = 0
+uint8 SOURCE_GUEST_UI = 1
+uint8 SOURCE_OPERATOR = 2
+
+# 時限（秒）——全系統只有這一處定義，由內而外各留餘裕，最內層的放棄訊息才會先到：
+#   導航節點 navigation_timeout_sec（300） < nav_arbiter 的 TIMEOUT_SEC < 呼叫端等結果的 CLIENT_WAIT_SEC
+# 呼叫端（LLM、HMI）等結果的上限用 CLIENT_WAIT_SEC，不要自己再訂一個數字。
+# 導航節點的 navigation_timeout_sec 若調高，這兩個值也要跟著調高。
+float64 TIMEOUT_SEC = 340.0     # nav_arbiter 等底層導航的上限；超過就取消底層目標並回 OUTCOME_TIMEOUT
+float64 CLIENT_WAIT_SEC = 360.0 # 呼叫端等 nav_arbiter 結果的上限；超過代表 nav_arbiter 本身沒回應
+
+uint8 source
+string waypoint_id
+bool use_target_pose            # true 時忽略 waypoint_id，導航到 target_pose（僅 OPERATOR）
+geometry_msgs/Pose target_pose  # 目標座標（map frame）
+string target_name              # 顯示名稱（僅供語音播報，可留空）
+---
+uint8 OUTCOME_SUCCEEDED = 0
+uint8 OUTCOME_FAILED = 1            # 底層導航失敗（路徑被擋、定位丟失…）
+uint8 OUTCOME_DENIED = 2            # 身分不允許；message 是可以直接對客人說的中性話術
+uint8 OUTCOME_CANCELED = 3          # 被使用者／急停／外部取消；不可自動重試
+uint8 OUTCOME_UNKNOWN_WAYPOINT = 4  # 地點 ID 不存在；message 附上現有地點名稱
+uint8 OUTCOME_BUSY = 5              # 已經有一趟導航在進行
+uint8 OUTCOME_UNAVAILABLE = 6       # 地點服務或導航動作沒起來；無法判斷權限時也是這個（預設拒絕）
+uint8 OUTCOME_TIMEOUT = 7           # 超過仲裁節點的等待上限，已取消底層目標；不可自動重試
+
+uint8 outcome
+bool success                    # outcome == OUTCOME_SUCCEEDED
+string message
+---
+# 目前階段。AUTHORIZED = 已通過身分檢查、底層導航也接受了目標（車子即將出發）
+string phase

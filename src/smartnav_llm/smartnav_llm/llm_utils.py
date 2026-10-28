@@ -8,15 +8,6 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-# ★ 2026-10-09（2026-10-08 審查）：LLM 工具（navigate_tool、帶位工具）等 Navigate 結果的上限，秒。
-#   原本兩處各寫死 200 秒，比 navigation_action_cc 自己的總逾時 navigation_timeout_sec（300）和
-#   等通道 blocked_patience_sec（180）都短：車子被擋住、在原地等人走開時，LLM 會搶在節點之前
-#   把這趟當成失敗並取消目標，而提示詞叫它失敗先自動重試，於是又導航一次。
-#   必須**大於**節點的 300 秒，節點自己的放棄訊息才會先到 LLM。
-#   與 HMI 的 smartnav_hmi/core/constants.py ACTION_TIMEOUTS["navigate"] 同值（兩邊互相指著，
-#   改一邊要同步改另一邊）；節點的 navigation_timeout_sec 若調高，這個值也要跟著調高。
-NAVIGATE_WAIT_SEC = 340.0
-
 
 def get_default_logger(module_name: str) -> logging.Logger:
     """取得預設日誌記錄器
@@ -51,7 +42,7 @@ def get_config_path(config_name: str) -> Optional[Path]:
         Path: 配置文件路徑，如果找不到則回傳 None
     """
     try:
-        # 延遲匯入，讓不依賴 ROS 的模組 (如知識庫檢索) 可以單獨測試
+        # 延遲匯入，讓不依賴 ROS 的模組可以單獨測試
         from ament_index_python.packages import get_package_share_directory
 
         # 取得 ROS 2 功能包共享目錄
@@ -67,24 +58,4 @@ def get_config_path(config_name: str) -> Optional[Path]:
     except Exception as e:
         logger = get_default_logger(__name__)
         logger.warning(f"無法取得配置文件路徑 ({config_name}): {e}")
-        return None
-
-
-def get_knowledge_dir() -> Optional[Path]:
-    """取得銀行知識庫資料夾路徑
-
-    Returns:
-        Path: 知識庫資料夾路徑，如果找不到則回傳 None
-    """
-    try:
-        from ament_index_python.packages import get_package_share_directory
-
-        knowledge_dir = Path(get_package_share_directory("smartnav_llm")) / "knowledge"
-        if knowledge_dir.is_dir():
-            return knowledge_dir
-
-        return None
-    except Exception as e:
-        logger = get_default_logger(__name__)
-        logger.warning(f"無法取得知識庫資料夾路徑: {e}")
         return None

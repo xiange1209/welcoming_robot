@@ -3,8 +3,8 @@
 併回 repo 之後的行為測試。這些改動原本只有車上的整合測試（要 ROS、HMI 服務），筆電端沒有任何保護。
 
 測什麼（純函式用真的程式、其餘用替身或原始碼斷言；不需要 ROS）
-  ✓ 身分權限：LLM 的 access_policy.py 與 HMI 的 guide/policy.py 是兩份各自維護的規則，這裡逐項比對
-    （6 種身分 × 4 組規則 × 5 個地點）——平板點的和嘴巴說的必須一致
+  ✓ 身分權限：規則只有一份（smartnav_brain/access_policy.py，由 nav_arbiter 套用）；LLM 與 HMI 不再有自己的規則，
+    這裡逐項驗證分級與「能不能去」（9 種身分 × 4 組規則 × 5 個地點），並斷言 LLM／HMI 沒有復活舊規則檔
   ✓ 規則檔壞掉／缺欄位時退回預設；身分過期當一般訪客；ADMIN 視同 VIP；黑名單可由規則檔放行
   ✓ 對客人說的話一律中性：拒絕訊息、平板訊息、黑名單的系統提示都不出現「黑名單」「BLACKLIST」「辨識」
   ✓ 帶位途中喊停 is_stop_request：該停的說法、不該停的說法（含「停車場在哪裡」不能把車停下來）
@@ -12,8 +12,7 @@
     其他情境一樣跳過沒在跑的停止步驟；啟動步驟不受影響
   ✓ 存取控制（原始碼斷言）：關機／重開機與 /api/speak 要登入；/api/estop 刻意不要登入（人人按得到）；
     /api/stats 對未登入遮黑名單姓名
-  ✓ LLM 接線：訂 user_identity、三條帶位路徑（程式端直接帶位、navigate_tool、貴賓室工具）都檢查權限、
-    等結果時登記目標讓喊停取消得到
+  ✓ LLM 接線：所有帶位路徑都經 nav_arbiter（不自己判斷、不訂 user_identity）、等結果時登記目標讓喊停取消得到
   ✓ ASR：int8_components 預設不含 decoder
 不測：真的導航、真的 ROS 訂閱、iPad 畫面（見 maprun/tools_1021/hmi_visual_check.mjs）。
 
@@ -40,6 +39,7 @@ except Exception:  # noqa: BLE001
 CAR = Path(os.environ.get("SMARTNAV_REPO") or Path(__file__).resolve().parents[2])
 LLM = CAR / "src/smartnav_llm/smartnav_llm"
 HMI = CAR / "src/smartnav_hmi/smartnav_hmi"
+BRAIN = CAR / "src/smartnav_brain/smartnav_brain"
 results = []
 
 
@@ -60,10 +60,9 @@ def src(path):
     return Path(path).read_text(encoding="utf-8")
 
 
-# ══ 1. 身分權限：兩份規則逐項比對 ═════════════════════════════
-print("── 1. 身分權限：LLM 與 HMI 兩份規則逐項一致 ──")
-llm_pol = load_file("llm_access_policy", LLM / "access_policy.py")
-hmi_pol = load_file("hmi_guide_policy", HMI / "modules/guide/policy.py")
+# ══ 1. 身分權限：單一規則 ═════════════════════════════════════
+print("── 1. 身分權限：smartnav_brain/access_policy.py 是唯一一份規則 ──")
+pol = load_file("brain_access_policy", BRAIN / "access_policy.py")
 NOW = 1_000_000.0
 IDENTITIES = {
     "沒有人": None,
@@ -85,77 +84,80 @@ POLICIES = {
 WAYPOINTS = ["貴賓室", "門口", "櫃台", "起點", "大廳"]
 
 
-def as_llm(i):          # LLM 節點存的是收到的時刻 stamp
+def with_stamp(i):
     if i is None: return None
     d = {k: v for k, v in i.items() if k != "age"}
     d["stamp"] = NOW - i.get("age", 0.5)
     return d
 
 
-def as_hmi(i):          # HMI 狀態裡存的是 updated_at
-    if i is None: return None
-    d = {k: v for k, v in i.items() if k != "age"}
-    d["updated_at"] = NOW - i.get("age", 0.5)
-    return d
+def expected(ident, override, wp):
+    """不看實作、直接由規則寫出的期望：(分級, 能不能去)"""
+    p = {**pol.DEFAULT, **override}
+    fresh = ident is not None and ident.get("age", 0.5) <= p["identity_fresh_sec"]
+    kind = ident.get("user_type") if ident else None
+    if not (ident and ident.get("recognized") and fresh):
+        tier = "guest"
+    elif kind == "BLACKLIST" and not p["blacklist_can_navigate"]:
+        tier = "blocked"
+    elif kind in ("VIP", "ADMIN"):
+        tier = "vip"
+    else:
+        tier = "guest"
+    ok = tier != "blocked" and not (wp in p["vip_only_waypoints"] and tier != "vip")
+    return tier, ok
 
 
-mismatch = []
+bad = []
 n = 0
 for (iname, ident), (pname, override), wp in itertools.product(IDENTITIES.items(), POLICIES.items(), WAYPOINTS):
-    pl_llm = {**llm_pol.DEFAULT, **override}
-    pl_hmi = {**hmi_pol.DEFAULT, **override}
-    t1 = llm_pol.tier_of(as_llm(ident), pl_llm, now=NOW)
-    t2 = hmi_pol.tier_of(as_hmi(ident), pl_hmi, now=NOW)
-    ok1 = llm_pol.nav_denial(t1, wp, pl_llm) is None
-    ok2 = hmi_pol.allowed(t2, wp, pl_hmi)
+    p = {**pol.DEFAULT, **override}
+    tier = pol.tier_of(with_stamp(ident), p, now=NOW)
+    ok = pol.navigation_denial(tier, wp, p) is None
     n += 1
-    if t1 != t2 or ok1 != ok2:
-        mismatch.append((iname, pname, wp, t1, t2, ok1, ok2))
-check(not mismatch, f"{n} 種組合兩份規則的身分分級與「能不能去」完全一致" + ("" if not mismatch else f"；不一致：{mismatch[:3]}"))
-check(llm_pol.DEFAULT["vip_only_waypoints"] == hmi_pol.DEFAULT["vip_only_waypoints"] == ["貴賓室"]
-      and llm_pol.DEFAULT["identity_fresh_sec"] == hmi_pol.DEFAULT["identity_fresh_sec"]
-      and llm_pol.DEFAULT["blacklist_can_navigate"] is hmi_pol.DEFAULT["blacklist_can_navigate"] is False,
-      "兩份預設值相同（貴賓室只給 VIP、身分 10 秒、黑名單不帶位）")
-
-pl = {**llm_pol.DEFAULT}
-tiers = {k: llm_pol.tier_of(as_llm(v), pl, now=NOW) for k, v in IDENTITIES.items()}
-check(tiers["沒有人"] == tiers["空的"] == tiers["認不出來"] == tiers["訪客"] == tiers["未知身分字串"] == "guest", "沒有人／空的／認不出來／訪客／未知字串 → guest")
-check(tiers["VIP"] == tiers["ADMIN"] == "vip", "VIP 與 ADMIN（員工）→ vip")
-check(tiers["黑名單"] == "blocked", "黑名單 → blocked")
-check(tiers["過期的VIP"] == "guest", "身分超過 10 秒沒更新 → 回到 guest（人走了不能留著貴賓權限）")
-check(llm_pol.nav_denial("blocked", "門口", pl) and llm_pol.nav_denial("guest", "貴賓室", pl)
-      and llm_pol.nav_denial("vip", "貴賓室", pl) is None and llm_pol.nav_denial("guest", "門口", pl) is None,
+    if (tier, ok) != expected(ident, override, wp):
+        bad.append((iname, pname, wp, tier, ok))
+check(not bad, f"{n} 種組合的身分分級與「能不能去」都符合規則" + ("" if not bad else f"；不符：{bad[:3]}"))
+check(pol.DEFAULT["vip_only_waypoints"] == ["貴賓室"] and pol.DEFAULT["identity_fresh_sec"] == 10.0
+      and pol.DEFAULT["blacklist_can_navigate"] is False, "預設值：貴賓室只給 VIP、身分 10 秒、黑名單不帶位")
+check(not (LLM / "access_policy.py").exists() and not (HMI / "modules/guide/policy.py").exists(),
+      "LLM 與 HMI 沒有自己的規則檔（不可復活第二份規則）")
+check(pol.navigation_denial("blocked", "門口", pol.DEFAULT) and pol.navigation_denial("guest", "貴賓室", pol.DEFAULT)
+      and pol.navigation_denial("vip", "貴賓室", pol.DEFAULT) is None and pol.navigation_denial("guest", "門口", pol.DEFAULT) is None,
       "黑名單任何地點都拒；訪客不能去貴賓室、可以去門口；VIP 都可以")
 
 print("── 2. 規則檔（~/.smartnav/access_policy.json）──")
 tmp = Path(tempfile.mkdtemp(prefix="acc_pol_"))
-for mod, label in ((llm_pol, "LLM"), (hmi_pol, "HMI")):
-    mod.POLICY_PATH = tmp / "none.json"
-    check(mod.load_policy() == mod.DEFAULT, f"{label}：沒有規則檔 → 預設值")
-    f = tmp / f"{label}.json"
-    f.write_text("{壞掉的 json", encoding="utf-8"); mod.POLICY_PATH = f
-    check(mod.load_policy() == mod.DEFAULT, f"{label}：規則檔壞掉 → 預設值（不能因為檔案壞了就放行或崩潰）")
-    f.write_text(json.dumps({"vip_only_waypoints": ["貴賓室", "經理室"]}), encoding="utf-8")
-    got = mod.load_policy()
-    check(got["vip_only_waypoints"] == ["貴賓室", "經理室"] and got["identity_fresh_sec"] == 10.0, f"{label}：只寫一個欄位，其餘欄位用預設")
+pol.POLICY_PATH = tmp / "none.json"
+check(pol.load_policy() == pol.DEFAULT, "沒有規則檔 → 預設值")
+f = tmp / "bad.json"
+f.write_text("{壞掉的 json", encoding="utf-8"); pol.POLICY_PATH = f
+check(pol.load_policy() == pol.DEFAULT, "規則檔壞掉 → 預設值（不能因為檔案壞了就放行或崩潰）")
+f.write_text(json.dumps({"vip_only_waypoints": ["貴賓室", "經理室"]}), encoding="utf-8")
+got = pol.load_policy()
+check(got["vip_only_waypoints"] == ["貴賓室", "經理室"] and got["identity_fresh_sec"] == 10.0, "只寫一個欄位，其餘欄位用預設")
 
 print("── 3. 對客人說的話一律中性 ──")
 FORBIDDEN = ("黑名單", "BLACKLIST", "辨識", "名單")
 texts = {
-    "LLM BLOCKED_REPLY": llm_pol.BLOCKED_REPLY,
-    "LLM 貴賓室被拒": llm_pol.nav_denial("guest", "貴賓室", llm_pol.DEFAULT) or "",
-    "LLM blocked 被拒": llm_pol.nav_denial("blocked", "門口", llm_pol.DEFAULT) or "",
+    "BLOCKED_REPLY": pol.BLOCKED_REPLY,
+    "貴賓室被拒": pol.navigation_denial("guest", "貴賓室", pol.DEFAULT) or "",
+    "blocked 被拒": pol.navigation_denial("blocked", "門口", pol.DEFAULT) or "",
+    "座標被拒": pol.POSE_DENIED_REPLY,
 }
-hsrc = src(HMI / "modules/guide/router.py")
-m = re.search(r'BLOCKED_MSG\s*=\s*"([^"]+)"', hsrc)
-texts["HMI BLOCKED_MSG"] = m.group(1) if m else ""
 for k, v in texts.items():
     check(v and not any(w in v for w in FORBIDDEN), f"{k}：「{v[:28]}…」不含黑名單／辨識字樣")
-ctx_blocked = llm_pol.prompt_context("blocked", {"user_name": "某人", "description": "備註"})
+hsrc = src(HMI / "modules/guide/router.py")
+check("BLOCKED_MSG" not in hsrc and "access_policy" not in hsrc, "迎賓頁不自己寫拒絕話術（用 nav_arbiter 回的 message）")
+cp = load_file("llm_customer_prompt", LLM / "customer_prompt.py")
+ctx_blocked = cp.prompt_context("blocked", "某人", "備註")
 check("黑名單" not in ctx_blocked and "某人" not in ctx_blocked and "備註" not in ctx_blocked, "黑名單的系統提示：不帶姓名與備註、不出現「黑名單」")
-ctx_vip = llm_pol.prompt_context("vip", {"user_name": "測試貴賓", "description": "分行經理"})
+ctx_vip = cp.prompt_context("vip", "測試貴賓", "分行經理")
 check("測試貴賓" in ctx_vip and "分行經理" in ctx_vip, "VIP 的系統提示有姓名與備註")
-check(llm_pol.prompt_context("guest", {"user_name": "李大華"}) == "", "一般訪客：不附任何身分資訊")
+check(cp.prompt_context("guest", "李大華", "") == "", "一般訪客：不附任何身分資訊")
+arb = src(BRAIN / "nav_arbiter_node.py")
+check('if tier == access_policy.TIER_VIP:' in arb and "msg.user_name" in arb.split("if tier == access_policy.TIER_VIP:")[1][:200],
+      "access_context 只有 vip 帶姓名與備註（其他等級不外流身分）")
 
 print("── 4. 帶位途中喊停 is_stop_request ──")
 ni = load_file("nav_intent_mod", LLM / "nav_intent.py")
@@ -212,6 +214,7 @@ Mgr = mgr.SystemControlManager
 
 def make(live_units, partial_units=()):
     m = object.__new__(Mgr)
+    m.nav_camera = types.SimpleNamespace(paused=lambda: False, forget=lambda: None)   # 10/28 新增的導航中暫停人臉相機；這個測試不涉及
     calls, requests = [], []
     m._supervisor = types.SimpleNamespace(
         run_unit_sync=lambda unit, action, variant=None: calls.append((unit, action, variant)) or (True, f"{action} {unit}"),
@@ -283,10 +286,11 @@ check("guide_router.build_router" in main_py and "assets_signature" in main_py a
 
 print("── 7. LLM 接線（原始碼斷言）──")
 node_src = src(LLM / "llm_service_node.py")
-tools_src = src(LLM / "bank_tools.py")
-check("UserIdentity" in node_src and re.search(r'create_subscription\(\s*UserIdentity,\s*"user_identity"', node_src), "訂了 /user_identity")
-check(node_src.count("self.nav_denial(") >= 2 and "def nav_denial" in node_src, "程式端直接帶位與 navigate_tool 都呼叫 nav_denial")
-check("node.nav_denial(room_name)" in tools_src, "貴賓室帶位工具也檢查權限（黑名單不能靠說「帶我去貴賓室」繞過）")
+tools_src = src(LLM / "tools.py")
+check("UserIdentity" not in node_src and "access_policy" not in node_src and "nav_denial" not in node_src,
+      "LLM 不訂 user_identity、不自己判斷權限")
+check("RequestNavigation.Goal.SOURCE_LLM" in node_src and "_navigate_to(" in tools_src,
+      "所有帶位都經 _navigate_to → nav_arbiter（來源 SOURCE_LLM）")
 check("_active_goals[id(goal_handle)]" in node_src and "_active_goals.pop(id(goal_handle)" in node_src, "等結果時登記進行中的目標、結束時移除（喊停取消得到）")
 check("is_stop_request(user_input)" in node_src and "cancel_goal_async()" in node_src, "忙碌時先判斷喊停，是就取消目標")
 check("set()" not in re.search(r"self\._active_goals[^\n]*", node_src).group(0), "進行中目標用 dict 不用 set（ClientGoalHandle 不能 hash）")

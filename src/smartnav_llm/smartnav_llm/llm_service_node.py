@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
-"""LLM 對話服務節點
+"""LLM 對話服務節點（迎賓對話）
 
-使用 Ollama 調用本地模型，根據使用者輸入智能決定調用哪個服務
-支援對話記憶、流式傳輸和服務自動化
-另整合銀行知識庫檢索 (RAG) 與即時資訊查詢，可回答行內業務與股價匯率等問題
+職責：聽懂客人說的話（user_text）、用 Ollama 的模型回話（llm_response／speech_text），
+需要動作時呼叫 tools.py 的工具提出請求。本節點不做業務決策：
+  - 能不能帶位、帶去哪：smartnav_brain 的 nav_arbiter 判斷（本節點只送 RequestNavigation）
+  - 通報行員的實際送出：smartnav_brain 的 bank_reception_node
+  - 地圖與地點的建立、切換：HMI 的管理功能，不在這裡
 """
 
 import re
@@ -14,7 +16,6 @@ from collections import deque
 from pathlib import Path
 from typing import List, Any
 from langchain_ollama import ChatOllama
-from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
@@ -29,13 +30,13 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from std_msgs.msg import Empty, String
 from action_msgs.msg import GoalStatus
 
-from smartnav_msgs.srv import ListMaps, SwitchMap, CreateWaypoint, ListWaypoints
-from smartnav_msgs.msg import UserIdentity
-from smartnav_msgs.action import CreateMap, GlobalLocalization, Navigate
-from smartnav_llm.llm_utils import get_config_path, get_knowledge_dir, NAVIGATE_WAIT_SEC
-from smartnav_llm.rag_store import BankKnowledgeStore
-from smartnav_llm import web_tools
-from smartnav_llm import access_policy, nav_intent
+from smartnav_msgs.srv import ListWaypoints
+from smartnav_msgs.msg import AccessContext
+from smartnav_msgs.action import RequestNavigation
+from smartnav_llm.llm_utils import get_config_path
+from smartnav_llm import customer_prompt, nav_intent, tool_gate
+from smartnav_llm.knowledge_base import KnowledgeBase, OllamaEmbedder
+from smartnav_llm.tools import make_tools
 
 
 class RosStreamHandler(BaseCallbackHandler):
@@ -215,12 +216,12 @@ class LLMServiceNode(Node):
         super().__init__("llm_service_node")
 
         # 宣告與讀取參數
-        # 192.168.137.1 是 Windows 行動熱點 (ICS) 的閘道，也就是跑 Ollama 的筆電本身；
-        # Pi 在同一個熱點下拿到的是 192.168.137.106。舊值 192.168.11.101 是別的網段，連不到。
+        # 預設是目前跑 Ollama 的那台機器（192.168.11.156）。換網路或換機器時用
+        # `-p ollama_base_url:=http://<IP>:11434` 覆寫；網段不同就連不到（節點仍會啟動，對話時才失敗）。
         # ★ 沒有 launch 檔會覆寫這個值 —— HMI 經 run_node_cc.sh 直接 `ros2 run` 啟動，
         #   參數來源鏈上只有這一環，所以這個預設值就是實際生效的值。
         self.ollama_base_url = (
-            self.declare_parameter("ollama_base_url", "http://192.168.137.1:11434").get_parameter_value().string_value
+            self.declare_parameter("ollama_base_url", "http://192.168.11.156:11434").get_parameter_value().string_value
         )
         # ★ 2026-08-31：等導航堆疊的**總期限**（見 _wait_for_services）。
         #   等不到就降級啟動——對話一定可用，只有導航工具會在被呼叫時失敗。
@@ -228,12 +229,11 @@ class LLMServiceNode(Node):
         self.services_wait_timeout_sec = float(
             self.declare_parameter("services_wait_timeout_sec", 45.0).get_parameter_value().double_value
         )
-        # 2026-08-10 實測換模型：orieg/gemma3-tools 是 11.8B，「你好」要 117 秒，
-        # 而且會為了打招呼誤叫 query_datetime_tool（回你日期而不是回你好）。
-        # qwen2.5:3b 同樣四題平均 4.1 秒（1.5~7.6，7.6 是模型冷載入那次），
-        # 工具觸發也正常：「你好」純閒聊、「現在幾點」才叫 datetime。
-        # 第 4 週驗收要端到端 < 6 秒，只有 3b 這條線達得到。
-        self.model_name = self.declare_parameter("model_name", "qwen2.5:3b").get_parameter_value().string_value
+        # 2026-10-28 起預設改用 llama3.1:8b（支援工具呼叫）。2026-10-28 用它跑過一輪端到端對話（Ollama 在
+        # 192.168.11.156）：帶位、權限、FAQ、通報、時間查詢的流程都通；已知的行為問題是「你好」會多叫
+        # list_waypoints_tool 並把地點 ID 唸出來、「幾點關門」會誤叫時間工具、通報原因會亂碼。
+        # 先前用過的 qwen2.5:3b 與 orieg/gemma3-tools 的比較（延遲、工具觸發）已不適用，不再保留。
+        self.model_name = self.declare_parameter("model_name", "llama3.1:8b").get_parameter_value().string_value
         self.temperature = self.declare_parameter("temperature", 0.0).get_parameter_value().double_value
         # ★★ 2026-08-19：限制回覆長度 ★★
         #
@@ -281,8 +281,9 @@ class LLMServiceNode(Node):
         # Qwen tokenizer 估算、誤差約 ±5%），再加歷史、工具結果與 256 的生成上限，一定超過 4096。
         # 超過時 Ollama 會截掉輸入；被截掉的若是系統提示詞的規則（例如「查不到就說查不到」），
         # 規則就靜默失效。截斷只會印在 Ollama 的伺服器日誌（truncating input prompt），這個節點看不到。
-        # 8192 的 KV cache 對 qwen2.5:3b 約 0.3 GB，4 GB 顯存放得下【推算，未實測】。
-        # 若改用 gemma3:4b 等更大的模型，可能擠出顯存而卸載到 CPU（變慢數倍），要把這個值降回 4096。
+        # 上面的 token 數是用 Qwen tokenizer 估的；llama3.1:8b 的 tokenizer 不同，實際數字未重算。
+        # 8B 模型的權重（Q4 約 4.9 GB）在 4 GB 顯存放不下，Ollama 會把一部分層放在 CPU（變慢），
+        # 這時 num_ctx 越大越吃記憶體——若延遲不能接受，先降 num_ctx 或換顯存更大的機器。
         self.num_ctx = self.declare_parameter("num_ctx", 8192).get_parameter_value().integer_value
         # ★★ 2026-10-21：模型常駐顯存（keep_alive）與啟動暖機 ★★
         #
@@ -290,7 +291,7 @@ class LLMServiceNode(Node):
         # 之後每次閒置超過 5 分鐘就被卸載、下一題重載 2.3~3.8 秒——共 9 次，正好對上車上 log 裡
         # 「閒置 >5 分後的第一題 5.1~8.2 秒」那 9 輪（間隔 <5 分的一律 <3.2 秒）。Ollama 預設 keep_alive 5 分鐘。
         # "-1" = 常駐到 Ollama 重啟（測試／展示日筆電專門跑這個）；也可給 "60m" 這類時間；"" = 用 Ollama 預設。
-        # 要釋放顯存：筆電執行 `ollama stop qwen2.5:3b`。
+        # 要釋放顯存：執行 Ollama 的那台機器上跑 `ollama stop llama3.1:8b`。
         self.keep_alive = self.declare_parameter("keep_alive", "-1").get_parameter_value().string_value
         # 節點啟動後在背景先問一次（結果丟掉），把模型與系統提示載進顯存，第一位客人不用等 47 秒。
         self.warmup_on_start = self.declare_parameter("warmup_on_start", True).get_parameter_value().bool_value
@@ -312,13 +313,22 @@ class LLMServiceNode(Node):
             except Exception as exc:  # 沒裝就照原樣輸出，不要讓節點起不來
                 self.get_logger().warning(f"opencc 不可用，略過簡轉繁：{exc}")
 
-        # 銀行知識庫與即時資訊查詢參數
+        # ── 知識庫檢索（RAG）：每一輪由程式先檢索、把相關片段附在系統提示最後（不是工具，見 knowledge_base.py）──
+        # 向量模型跑在 ollama_base_url 那台（要先 `ollama pull bge-m3`）；Ollama 連不上或沒裝 chromadb 會自動退到
+        # 關鍵字檢索，enable_rag:=false 則每輪附上整份 FAQ（舊行為）。
         self.enable_rag = self.declare_parameter("enable_rag", True).get_parameter_value().bool_value
-        self.enable_web_tools = self.declare_parameter("enable_web_tools", True).get_parameter_value().bool_value
-        self.knowledge_dir = self.declare_parameter("knowledge_dir", "").get_parameter_value().string_value
-        # 留空表示只用關鍵字檢索；填入 embedding 模型 (如 bge-m3) 可額外啟用語意檢索
-        self.embed_model = self.declare_parameter("embed_model", "").get_parameter_value().string_value
+        self.embed_model = self.declare_parameter("embed_model", "bge-m3").get_parameter_value().string_value
         self.rag_top_k = self.declare_parameter("rag_top_k", 3).get_parameter_value().integer_value
+        # 相似度（1 − cosine 距離）低於這個值的片段不附。2026-10-28 用 bge-m3 對 16 個正向題＋5 個無關題量過
+        # （maprun/tools_1021/rag_eval.py）：正向最低 0.539、無關最高 0.489，空間只有 0.05、樣本很小；
+        # 知識庫內容或 embedding 模型一換就要重跑 rag_eval.py 重新量。
+        self.rag_min_similarity = (
+            self.declare_parameter("rag_min_similarity", 0.50).get_parameter_value().double_value
+        )
+        knowledge_db = self.declare_parameter("knowledge_db_dir", "").get_parameter_value().string_value
+        self.enable_realtime_info = (
+            self.declare_parameter("enable_realtime_info", True).get_parameter_value().bool_value
+        )
 
         # 初始化對話記憶
         self.memory = ConversationMemory()
@@ -332,67 +342,41 @@ class LLMServiceNode(Node):
         # 建立 Callback Group
         self.cb_group = ReentrantCallbackGroup()
 
-        # 建立服務/動作/客戶端
-        self.list_maps_client = self.create_client(ListMaps, "list_maps", callback_group=self.cb_group)
-        self.switch_map_client = self.create_client(SwitchMap, "switch_map", callback_group=self.cb_group)
-        self.create_waypoint_client = self.create_client(
-            CreateWaypoint, "create_waypoint", callback_group=self.cb_group
-        )
+        # 建立服務/動作/客戶端（唯讀的地點查詢；導航一律經 nav_arbiter）
         self.list_waypoints_client = self.create_client(ListWaypoints, "list_waypoints", callback_group=self.cb_group)
 
-        # ── 銀行場景（2026-08-01 復原）────────────────────────
-        self.enable_bank_tools = self.declare_parameter("enable_bank_tools", True).get_parameter_value().bool_value
-        # ★★ 2026-10-21：銀行模式的收斂（10/20 銀行十題：對 2／部分 1／錯 7，工具呼叫 5/10）★★
-        # (1) inline_bank_faq：FAQ 全文（26 行）直接附在系統提示最後，模型不必先「決定要不要查」——
-        #     10/20 沒呼叫工具的題目全部答錯或答偏（貴賓室、洗手間、ATM、換美金、信用卡）。
-        #     附上之後 query_bank_faq_tool 用不到，從工具表拿掉。
-        # (2) bank_hide_map_tools：建圖／切圖／建點／列地圖不是迎賓會用的，卻暴露在語音雜訊下
-        #     （10/20 15:32 雜訊「錯哦沒錯哦 M」讓模型呼叫了股價工具）。銀行模式預設拿掉。
-        # (3) direct_nav：明確的帶路要求由程式直接導航（見 nav_intent.py）；
-        #     nav_guard：模型嘴上答應帶路、這一輪卻沒呼叫導航時攔下來。
-        self.inline_bank_faq = self.declare_parameter("inline_bank_faq", True).get_parameter_value().bool_value
-        self.bank_hide_map_tools = self.declare_parameter("bank_hide_map_tools", True).get_parameter_value().bool_value
+        # 對話行為
+        # direct_nav：明確的帶路要求由程式直接送給 nav_arbiter（見 nav_intent.py）；
+        # nav_guard：模型嘴上答應帶路、這一輪卻沒呼叫導航時攔下來。
         self.direct_nav = self.declare_parameter("direct_nav", True).get_parameter_value().bool_value
         self.nav_guard = self.declare_parameter("nav_guard", True).get_parameter_value().bool_value
         # 機器人最近講過的話（含導航節點的播報），擋被麥克風收回來的回音；0 = 關閉
         self.robot_echo_sec = float(self.declare_parameter("robot_echo_sec", 20.0).get_parameter_value().double_value)
         self._robot_said = deque(maxlen=20)  # (monotonic 時刻, 文字)
         self._robot_said_lock = threading.Lock()
-        self._faq_cache = None
-        # ── 系統提示詞要用哪一份 ────────────────────────────────
-        # ★ 2026-08-14：這裡原本寫死讀 system_prompt.txt。
-        #
-        # config/ 底下一直有兩份提示詞：
-        #   system_prompt.txt       導航／地圖版（沒有一句提到通報行員）
-        #   system_prompt_bank.txt  銀行迎賓版（明寫真人服務→notify_staff_tool）
-        # 但 _run_agent_loop 寫死讀前者，**銀行版從來沒有被載入過**。
-        #
-        # 而導航版第 6 節寫著「凡是問題出現『今天』『現在』『幾點』『星期幾』，
-        # 都必須先呼叫查詢時間的工具」——「你們幾點關門」裡有「幾點」，
-        # 模型是**照著提示詞做**才去叫 query_datetime_tool 的。
-        # 2026-08-14 實測：冷開場（無對話歷史）5 次全部叫 query_datetime_tool，
-        # 然後拿當下時刻去幻覺出「我們銀行今天晚上 17:30 已經關門了」。
-        #
-        # 留空 = 自動：有銀行工具就用銀行版，沒有就用導航版。
-        self.system_prompt_file = self.declare_parameter("system_prompt_file", "").get_parameter_value().string_value
-        # 帶位目標的地點名稱。做成參數而不是寫死：地圖上的地點名是使用者
-        # 自己取的，寫死「貴賓室」會在他取名「VIP室」時直接失敗。
-        self.vip_room_waypoint_name = (
-            self.declare_parameter("vip_room_waypoint_name", "貴賓室").get_parameter_value().string_value
+        faq_path = get_config_path("bank_faq.txt")
+        self.knowledge = KnowledgeBase(
+            faq_path or Path("bank_faq.txt"),
+            OllamaEmbedder(self.ollama_base_url, self.embed_model) if self.enable_rag else None,
+            self.embed_model,
+            db_dir=Path(knowledge_db) if knowledge_db else Path.home() / ".smartnav" / "knowledge_db",
+            top_k=self.rag_top_k,
+            min_similarity=self.rag_min_similarity,
+            logger=self.get_logger(),
         )
+        # 建索引會呼叫遠端 Ollama，放背景；建好之前的對話先附整份 FAQ
+        threading.Thread(target=self.knowledge.load, daemon=True).start()
         # ★ 2026-08-17：每一輪都扣住旁白（見 RosStreamHandler.begin_turn 的 docstring）。
         #   false = 只扣第 0 輪 = 2026-08-17 之前的行為（較低延遲、但可能唸出旁白）。
         self.hold_all_iterations = self.declare_parameter("hold_all_iterations", True).get_parameter_value().bool_value
         # 通報只發話題，實際送出由 bank_reception_node 負責（通報中樞）
         self.staff_notify_pub = self.create_publisher(String, "staff_notify_request", 10)
-        self.global_localization_client = ActionClient(
-            self, GlobalLocalization, "global_localization", callback_group=self.cb_group
+        # ★ 導航只能經 smartnav_brain 的 nav_arbiter（身分判斷、單一進行中都在那裡）；本節點不碰 /navigate
+        self.request_navigation_client = ActionClient(
+            self, RequestNavigation, "request_navigation", callback_group=self.cb_group
         )
-        self.create_map_client = ActionClient(self, CreateMap, "create_map", callback_group=self.cb_group)
-        self.navigate_client = ActionClient(self, Navigate, "navigate", callback_group=self.cb_group)
-
-        # 初始化銀行知識庫
-        self.knowledge_store = self._init_knowledge_store()
+        self.current_user_text = ""  # 目前這一輪客人說的話；同一時間只會有一輪在跑（is_agent_running）
+        self._nav_local = threading.local()  # 這條執行緒上目前這趟導航的「放行時」回呼與最後結果
 
         # 建立發佈者和訂閱者
         self.llm_response_pub = self.create_publisher(String, "llm_response", 10)
@@ -417,10 +401,13 @@ class LLMServiceNode(Node):
         self.clear_history_sub = self.create_subscription(
             Empty, "clear_conversation", self.clear_conversation_callback, 10, callback_group=self.cb_group
         )
-        # ★ 2026-10-22：人臉身分 → 帶位權限（黑名單不帶位、貴賓室只給 VIP）＋ VIP 個人化（見 access_policy.py）
-        self._identity: dict = {}
-        self.identity_sub = self.create_subscription(
-            UserIdentity, "user_identity", self._identity_cb, 10, callback_group=self.cb_group
+        # 客人等級（VIP 個人化用）。判斷在 brain：這裡只是拿來調整語氣，帶位准不准以 nav_arbiter 的回覆為準
+        self.access_context_stale_sec = (
+            self.declare_parameter("access_context_stale_sec", 5.0).get_parameter_value().double_value
+        )
+        self._access_context = None  # (AccessContext, 收到時的 monotonic)
+        self.access_context_sub = self.create_subscription(
+            AccessContext, "access_context", self._access_context_cb, 10, callback_group=self.cb_group
         )
         # ★ 2026-10-21：記下機器人講過的話（10/20 14:59 LLM 收到「開始導航到 廁所」——
         #   那是導航節點自己的播報被麥克風收回來）
@@ -442,49 +429,18 @@ class LLMServiceNode(Node):
         # 初始化工具鏈
         self._init_modern_llm_tools()
 
-        # ★ 啟動時就把「實際會載入哪一份提示詞」印出來並確認檔案存在。
-        #   ros2 param get 只證明參數伺服器存了值，不證明節點讀得到那個檔，
-        #   所以這裡直接去解析路徑（這個坑專案裡踩過三次）。
-        prompt_name = self._resolve_system_prompt_name()
-        prompt_path = get_config_path(prompt_name)
+        # ★ 啟動時就確認提示詞檔存在（ros2 param get 只證明參數伺服器存了值，不證明節點讀得到那個檔）
         self.get_logger().info(
-            f"✓ 系統提示詞: {prompt_name} " f"({'已找到' if prompt_path else '★找不到，會用內建預設'})"
+            f"✓ 系統提示詞: {self.SYSTEM_PROMPT_FILE} "
+            f"({'已找到' if get_config_path(self.SYSTEM_PROMPT_FILE) else '★找不到，會用內建預設'})"
         )
         self.get_logger().info(f"✓ LLM 對話服務節點已初始化 (模型: {self.model_name})")
         self.get_logger().info(
-            f"✓ 銀行模式設定：FAQ 併入提示={self.inline_bank_faq and bool(self._bank_faq_text())}、"
+            f"✓ 對話設定：知識庫檢索={'開（' + self.embed_model + '）' if self.enable_rag else '關（整份 FAQ）'}、"
             f"程式端帶位={self.direct_nav}、帶位防呆={self.nav_guard}、回音擋 {self.robot_echo_sec:.0f} 秒"
         )
         if self.warmup_on_start:
             threading.Thread(target=self._warmup_llm, daemon=True).start()
-
-    def _init_knowledge_store(self):
-        """初始化銀行知識庫
-
-        Returns:
-            Optional[BankKnowledgeStore]: 知識庫實例，停用或找不到資料夾時為 None
-        """
-        if not self.enable_rag:
-            self.get_logger().info("銀行知識庫已停用 (enable_rag=False)")
-            return None
-
-        knowledge_dir = Path(self.knowledge_dir) if self.knowledge_dir else get_knowledge_dir()
-        if not knowledge_dir or not knowledge_dir.is_dir():
-            self.get_logger().warning("✗ 找不到知識庫資料夾，銀行問答功能將無法使用")
-            return None
-
-        store = BankKnowledgeStore(
-            knowledge_dir=knowledge_dir,
-            ollama_base_url=self.ollama_base_url if self.embed_model else "",
-            embed_model=self.embed_model,
-            top_k=self.rag_top_k,
-        )
-        chunk_count = store.load()
-        if not chunk_count:
-            self.get_logger().warning(f"✗ 知識庫沒有任何內容: {knowledge_dir}")
-            return None
-
-        return store
 
     def _init_callback(self) -> None:
         """初始化回調函式"""
@@ -493,25 +449,8 @@ class LLMServiceNode(Node):
 
     def _wait_for_services(self) -> None:
         """等待所有基礎服務或動作就緒"""
-        services = [
-            ("list_maps", self.list_maps_client),
-            ("create_waypoint", self.create_waypoint_client),
-            ("list_waypoints", self.list_waypoints_client),
-            ("switch_map", self.switch_map_client),
-        ]
-        # ★★ 2026-08-17：`global_localization` 移出這張「非等到不可」的清單 ★★
-        #
-        # 工具已下架（見 tools_map 上方的說明），LLM 節點再也不會呼叫它，
-        # 但它原本留在這裡 -> 那個 action server 沒起來，**整個 LLM 節點就卡在
-        # 初始化、連「你好」都不會回**。這是一個純粹多餘的啟動硬相依：
-        # 對話功能完全不需要它，而它屬於導航堆疊（常常晚啟動或根本沒啟動）。
-        #
-        # client 本身**保留**（`self.global_localization_client`），HMI 的手動
-        # 「全域定位」按鈕走的是 HMI 自己的 ActionClient，兩邊都不受影響。
-        actions = [
-            ("create_map", self.create_map_client),
-            ("navigate", self.navigate_client),
-        ]
+        services = [("list_waypoints", self.list_waypoints_client)]
+        actions = [("request_navigation", self.request_navigation_client)]
         # ★★ 2026-08-31 修正：加上**總期限**，等不到就降級啟動，不要卡死 ★★
         #
         #   舊寫法是 `while not client.wait_for_service(timeout_sec=2.0)` ——
@@ -564,7 +503,7 @@ class LLMServiceNode(Node):
 
         # 阻塞當前獨立執行緒，直到被喚醒或超時
         if not event.wait(timeout=timeout_sec):
-            raise TimeoutError(f"服務請求超時")
+            raise TimeoutError("服務請求超時")
 
         return future.result()
 
@@ -611,357 +550,80 @@ class LLMServiceNode(Node):
             with self._active_goals_lock:
                 self._active_goals.pop(id(goal_handle), None)
 
-    @staticmethod
-    def _nav_failure_text(action_result) -> str:
-        """導航／帶位沒成功時給模型看的結果文字
+    def _nav_result_text(self, wrapped, success_text: str = "") -> str:
+        """nav_arbiter 的 RequestNavigation 結果 → 給模型看的「執行結果: …」
 
-        ★ 2026-09-25（審查）：「取消」與「被外部停止」一定要跟「失敗」分開，而且要寫明不可重試。
-          以前 ABORTED 一律回「導航過程中發生錯誤」、帶位的取消也回「失敗」——
-          提示詞 §3 叫模型「失敗先自動重試」，平板按了緊急停止，模型卻再叫一次導航，車子又開出去。
-          navigation_action_cc 在「nav2 被別人取消、外層沒收到取消」時會回「導航被外部停止…請勿自動重試」。
+        「取消」「逾時」「權限不足」「忙線」一律標「（不可重試）」：提示詞 §3 叫模型失敗先自動重試，
+        平板按了緊急停止、或客人不能去那裡，模型卻再叫一次導航，車子又開出去（2026-09-25 審查）。
         """
-        msg = getattr(action_result.result, "message", "") or ""
-        if action_result.status == GoalStatus.STATUS_CANCELED:
+        result = wrapped.result
+        self._nav_local.last = result
+        msg = result.message
+        outcome = result.outcome
+        if wrapped.status == GoalStatus.STATUS_SUCCEEDED and result.success:
+            return f"執行結果: 成功, 詳細信息: {success_text or msg}"
+        if outcome == RequestNavigation.Result.OUTCOME_DENIED:
+            return f"執行結果: 失敗（不可重試）, 詳細信息: 權限不足。請對客人說：{msg}"
+        if outcome == RequestNavigation.Result.OUTCOME_CANCELED or wrapped.status == GoalStatus.STATUS_CANCELED:
             return f"執行結果: 取消（不可重試）, 詳細信息: {msg or '導航請求被系統或使用者取消'}"
-        if "外部停止" in msg:
-            return f"執行結果: 已被停止（不可重試）, 詳細信息: {msg}"
+        if outcome == RequestNavigation.Result.OUTCOME_TIMEOUT:
+            return f"執行結果: 逾時（不可重試）, 詳細信息: {msg}"
+        if outcome == RequestNavigation.Result.OUTCOME_BUSY:
+            return f"執行結果: 失敗（不可重試）, 詳細信息: {msg}"
+        if outcome == RequestNavigation.Result.OUTCOME_UNKNOWN_WAYPOINT:
+            return f"執行結果: 失敗, 詳細信息: {msg}。請先呼叫 list_waypoints_tool 取得正確的地點ID再導航"
         return f"執行結果: 失敗, 詳細信息: {msg or '導航過程中發生錯誤'}"
 
     @staticmethod
     def _nav_timeout_text(msg: str) -> str:
-        """導航／帶位等到 NAVIGATE_WAIT_SEC 仍沒結果（取消指令已送出）時給模型看的結果文字
+        """等 nav_arbiter 超過 CLIENT_WAIT_SEC 仍沒結果（取消指令已送出）時給模型看的結果文字
 
-        ★ 2026-10-09（審查）：跟 _nav_failure_text 的「取消／已被停止」同一種寫法，標「（不可重試）」。
-          以前逾時直接落到工具的 except，變成「執行結果: 失敗, 詳細信息: 導航超過 200 秒未完成…」，
-          跟一般失敗長得一樣；提示詞叫模型失敗先自動重試，它就再叫一次導航，新目標重新計一輪逾時，
-          路被擋住的話等於讓車子再原地等一輪。兩份提示詞「被停止或取消時絕對不可重試」那條已列入「逾時」。
-        只給 _wait_for_action_result 丟出的逾時用（車子已經出發）；送出目標那一步的 5 秒等待逾時
-        （車根本沒動）仍是一般失敗。
+        正常情況 nav_arbiter 會先自己逾時並回 OUTCOME_TIMEOUT；走到這裡代表 nav_arbiter 本身沒回應。
         """
         return f"執行結果: 逾時（不可重試）, 詳細信息: {msg}"
 
+    def _navigate_to(self, waypoint_id: str, success_text: str = "") -> str:
+        """經 nav_arbiter 帶位／導航，等到結果。回傳給模型看的「執行結果: …」。
+
+        放行時（nav_arbiter 通過身分檢查、底層也接受目標）會呼叫這條執行緒上登記的
+        self._nav_local.on_authorized；被拒絕就不會呼叫——程式端帶位靠這個決定要不要先說「請跟我來」。
+        """
+        on_authorized = getattr(self._nav_local, "on_authorized", None)
+        self._nav_local.on_authorized = None
+        self._nav_local.last = None
+        if not self.request_navigation_client.server_is_ready():
+            return "執行結果: 失敗, 詳細信息: 導航仲裁節點（nav_arbiter）未啟動，無法帶位"
+
+        goal = RequestNavigation.Goal()
+        goal.source = RequestNavigation.Goal.SOURCE_LLM
+        goal.waypoint_id = waypoint_id
+
+        def _feedback(msg) -> None:
+            if msg.feedback.phase == "AUTHORIZED" and on_authorized:
+                on_authorized()
+
+        future = self.request_navigation_client.send_goal_async(goal, feedback_callback=_feedback)
+        goal_handle = self._wait_for_future(future, timeout_sec=5.0)
+        if goal_handle is None or not goal_handle.accepted:
+            return "執行結果: 失敗, 詳細信息: 導航請求未被接受"
+        # ★ 逾時要主動取消（見 _wait_for_action_result）。上限 CLIENT_WAIT_SEC 比 nav_arbiter 自己的逾時
+        #   （TIMEOUT_SEC）再大一點，讓 nav_arbiter 的 OUTCOME_TIMEOUT 先到。
+        try:
+            wrapped = self._wait_for_action_result(goal_handle, RequestNavigation.Goal.CLIENT_WAIT_SEC, "導航")
+        except TimeoutError as exc:
+            return self._nav_timeout_text(str(exc))
+        return self._nav_result_text(wrapped, success_text)
+
     def _init_modern_llm_tools(self) -> None:
-        """定義工具對照表"""
-
-        @tool
-        def create_map_tool(map_name: str) -> str:
-            """建立一張新地圖，並自動載入該地圖與座標，除非使用者要求建立地圖，否則不應該呼叫此工具"""
-            goal = CreateMap.Goal()
-            goal.map_name = map_name
-            future = self.create_map_client.send_goal_async(goal)
-            try:
-                goal_handle = self._wait_for_future(future, timeout_sec=5.0)
-
-                if not goal_handle.accepted:
-                    return f"執行結果: 失敗, 詳細信息: 建立地圖請求被系統拒絕"
-
-                # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
-                # ★ 2026-09-25：500 -> 1920，與 HMI 的 constants.py "create_map" 同值。
-                #   這裡一逾時就送取消，而 map_service 收到取消會**丟掉這趟的圖**、還原舊圖。
-                #   500 秒比 map_service 的 exploration_timeout_sec（1800）短得多，
-                #   等於自動探索超過 8 分鐘、或遙控超過 8 分鐘，整趟就白跑（2026-09-25 審查抓到）。
-                #   1920 = 1800 秒探索上限 + 存圖與切回定位的收尾時間。
-                action_result = self._wait_for_action_result(goal_handle, 1920.0, "建立地圖")
-
-                id = action_result.result.map_info.map_id
-                name = action_result.result.map_info.map_name
-
-                if action_result.status == GoalStatus.STATUS_SUCCEEDED:
-                    return f"執行結果: 成功, 地圖信息(包含地圖ID與地圖名稱): ({id}, {name}), 詳細信息: {action_result.result.message}"
-                elif action_result.status == GoalStatus.STATUS_CANCELED:
-                    return "執行結果: 取消, 詳細信息: 建立地圖請求被系統或使用者取消"
-                elif action_result.status == GoalStatus.STATUS_ABORTED:
-                    return f"執行結果: 失敗, 詳細信息: 建立地圖過程中發生錯誤"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {action_result.result.message}"
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
-
-        @tool
-        def list_maps_tool() -> str:
-            """查詢現有的地圖列表信息"""
-            req = ListMaps.Request()
-            future = self.list_maps_client.call_async(req)
-            try:
-                res = self._wait_for_future(future, timeout_sec=5.0)
-                if res.success:
-                    ids = [wp.map_id for wp in res.maps_info]
-                    names = [wp.map_name for wp in res.maps_info]
-                    return f"執行結果: 成功, 地圖列表信息(包含地圖ID與地圖名稱): {list(zip(ids, names))}, 詳細信息: {res.message}"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {res.message}"
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
-
-        @tool
-        def switch_map_tool(map_id: str) -> str:
-            """切換地圖，呼叫此工具時不應該使用地圖名稱"""
-            req = SwitchMap.Request()
-            req.map_id = map_id
-            future = self.switch_map_client.call_async(req)
-            try:
-                res = self._wait_for_future(future, timeout_sec=5.0)
-                if res.success:
-                    return f"執行結果: 成功, 詳細信息: {res.message}"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {res.message}"
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
-
-        @tool
-        def create_waypoint_tool(waypoint_name: str) -> str:
-            """在當前載入的地圖中建立一個地點，除非使用者要求建立地點，否則不應該呼叫此工具"""
-            req = CreateWaypoint.Request()
-            req.waypoint_name = waypoint_name
-            future = self.create_waypoint_client.call_async(req)
-            try:
-                res = self._wait_for_future(future, timeout_sec=5.0)
-                if res.success:
-                    id = res.waypoint_info.waypoint_id
-                    name = res.waypoint_info.waypoint_name
-                    map_id = res.waypoint_info.map_id
-                    x = res.waypoint_info.pose.position.x
-                    y = res.waypoint_info.pose.position.y
-                    return f"執行結果: 成功, 地點信息(包含地點ID、地點名稱、地圖ID、地點座標): ({id}, {name}, {map_id}, ({x}, {y})), 詳細信息: {res.message}"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {res.message}"
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
-
-        @tool
-        def list_waypoints_tool() -> str:
-            """查詢當前載入的地圖中的地點列表信息，如果不知道導航地點，應該優先呼叫此工具"""
-            req = ListWaypoints.Request()
-            future = self.list_waypoints_client.call_async(req)
-            try:
-                res = self._wait_for_future(future, timeout_sec=5.0)
-                if res.success:
-                    ids = [wp.waypoint_id for wp in res.waypoints_info]
-                    names = [wp.waypoint_name for wp in res.waypoints_info]
-                    map_ids = [wp.map_id for wp in res.waypoints_info]
-                    x = [wp.pose.position.x for wp in res.waypoints_info]
-                    y = [wp.pose.position.y for wp in res.waypoints_info]
-                    return f"執行結果: 成功, 地點列表信息(包含地點ID、地點名稱、地圖ID、地點座標): {list(zip(ids, names, map_ids, list(zip(x, y))))}, 詳細信息: {res.message}"
-                else:
-                    return f"執行結果: 失敗, 詳細信息: {res.message}"
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
-
-        # ★★ 2026-08-17：global_localization_tool 已下架，不再暴露給 LLM ★★
-        #
-        # 這裡原本有一個 @tool global_localization_tool。拿掉的理由是安全：
-        # 全域定位的實作會讓車子繞一個約 0.9 m 半徑的圓弧，而我們的走廊只有
-        # 0.99 m 寬 —— 也就是「一被呼叫就會擦牆」。
-        #
-        # 8/17 實機事故（log: ~/.ros/log/python3_5596_1786954243007.log）：
-        # 客人只是對著平板說「大門口」，模型就自己叫了這個工具，車子開始繞圈；
-        # 第一次跑了 129 秒，模型接著又叫了第二次，那次卡到 300 秒逾時才回來。
-        # ★ 客人的任何一句話都不該能讓車子動起來做這件事。
-        #
-        # 下架的是「LLM 的入口」而已：
-        #   - /global_localization action 本身完全沒動，
-        #   - self.global_localization_client 也保留（啟動時仍會等它就緒），
-        #   - HMI 的「全域定位」按鈕走的是 hmi_server_node 自己的 action client
-        #     （POST /api/localize -> _start_action），與這裡無關，照常可用。
-        # 走廊裡真正該用的是 HMI 的 /api/localize/here（不需移動的掃描對齊）。
-
-        @tool
-        def navigate_tool(waypoint_id: str) -> str:
-            """控制機器人導航到特定地點，請提供地點ID而非座標，如果不知道導航地點，應該優先呼叫 list_waypoints_tool 工具來查詢地點列表信息"""
-            # ★ 2026-08-26（W7）：先確認這個 ID 真的存在。
-            #   小模型會自己編 waypoint_id（或把地點**名稱**當成 ID 傳進來）。
-            #   不擋的話會直接送出一個查無此點的 Navigate goal，錯誤要等到
-            #   action server 回來才知道，訊息還不會告訴模型「該去查列表」。
-            #   list_waypoints 是本機服務，成本很低。查不到列表就放行（不因為
-            #   驗證機制自己壞掉而擋住正常導航）。
-            try:
-                _lw = self._wait_for_future(self.list_waypoints_client.call_async(ListWaypoints.Request()), 5.0)
-                if _lw is not None and _lw.success:
-                    _ids = {wp.waypoint_id for wp in _lw.waypoints_info}
-                    _name = next((wp.waypoint_name for wp in _lw.waypoints_info if wp.waypoint_id == waypoint_id), "")
-                    _deny = self.nav_denial(_name) if _name else None
-                    if _deny:
-                        return f"執行結果: 失敗（不可重試）, 詳細信息: 權限不足。請對客人說：{_deny}"
-                    if waypoint_id not in _ids:
-                        _names = [wp.waypoint_name for wp in _lw.waypoints_info]
-                        return (
-                            f"執行結果: 失敗, 詳細信息: 地點ID「{waypoint_id}」不存在。"
-                            f"現有地點：{_names}。請先呼叫 list_waypoints_tool "
-                            "取得正確的地點ID再導航"
-                        )
-            except Exception as _exc:  # noqa: BLE001
-                self.get_logger().warning(f"導航前地點驗證略過（查詢失敗）: {_exc}")
-
-            goal = Navigate.Goal()
-            goal.waypoint_id = waypoint_id
-            future = self.navigate_client.send_goal_async(goal)
-            try:
-                goal_handle = self._wait_for_future(future, timeout_sec=5.0)
-
-                if goal_handle is None or not goal_handle.accepted:
-                    return f"執行結果: 失敗, 詳細信息: 導航請求未被接受"
-
-                # ★ 2026-08-26：逾時要主動取消，見 _wait_for_action_result
-                # ★ 2026-10-09（審查）：上限改用共用常數 NAVIGATE_WAIT_SEC（340 秒，見 llm_utils.py）——
-                #   原本的 200 秒比節點自己的 300 秒總逾時還短，LLM 會搶在節點之前宣告失敗再重試。
-                #   等到上限仍沒結果 → 回「逾時（不可重試）」，不落到下面的 except 變成一般「失敗」。
-                #   try 只包這一行：送出目標那一步的 5 秒等待逾時（車根本沒動）照舊是一般失敗。
-                try:
-                    action_result = self._wait_for_action_result(goal_handle, NAVIGATE_WAIT_SEC, "導航")
-                except TimeoutError as exc:
-                    return self._nav_timeout_text(str(exc))
-
-                if action_result.status == GoalStatus.STATUS_SUCCEEDED:
-                    return f"執行結果: 成功, 詳細信息: {action_result.result.message}"
-                return self._nav_failure_text(action_result)
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: {str(e)}"
-
-        @tool
-        def search_bank_knowledge_tool(question: str) -> str:
-            """查詢本行的業務規定與分行資訊。凡是客戶詢問營業時間、櫃檯位置、開戶、換匯、
-            存款、貸款、信用卡、手續費、掛失、證件文件等與本行有關的問題，都必須先呼叫此工具，
-            嚴禁自行回答。請將客戶問題原句作為參數傳入"""
-            if not self.knowledge_store:
-                return "執行結果: 失敗, 詳細信息: 知識庫尚未設定，請據實告知客戶你查不到，並引導客戶洽詢櫃檯行員"
-            try:
-                return self.knowledge_store.build_context(question)
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: 知識庫查詢發生錯誤 {str(e)}"
-
-        @tool
-        def query_stock_price_tool(stock: str) -> str:
-            """查詢台股即時股價，參數請填股票名稱或代號，例如「台積電」或「2330」"""
-            try:
-                return web_tools.query_stock_price(stock)
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: 股價查詢發生錯誤 {str(e)}"
-
-        @tool
-        def query_exchange_rate_tool(currency: str, amount: float = 1.0) -> str:
-            """查詢外幣對新台幣的即時參考匯率。currency 填幣別，例如「美金」「日幣」；
-            amount 填客戶要換算的外幣金額，客戶沒說金額就不用填"""
-            try:
-                return web_tools.query_exchange_rate(currency, amount)
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: 匯率查詢發生錯誤 {str(e)}"
-
-        @tool
-        def query_weather_tool(city: str = "台北") -> str:
-            """查詢目前天氣，參數填城市名稱，客戶沒指定城市就不用填"""
-            try:
-                return web_tools.query_weather(city)
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: 天氣查詢發生錯誤 {str(e)}"
-
-        @tool
-        def query_datetime_tool() -> str:
-            """查詢**此刻的鐘面時間**，例如「現在幾點」「今天幾號」「今天星期幾」。
-            ★ 只在客戶問當下時刻時使用。客戶問「你們幾點關門」「營業到幾點」問的是
-            本行的營業時段，那要用查銀行業務資料的工具，不要用這個"""
-            try:
-                return web_tools.query_datetime()
-            except Exception as e:
-                return f"執行結果: 失敗, 詳細信息: 時間查詢發生錯誤 {str(e)}"
-
-        # 對照表與工具集
-        self.tools_map = {
-            "create_map_tool": create_map_tool,
-            "list_maps_tool": list_maps_tool,
-            "switch_map_tool": switch_map_tool,
-            "create_waypoint_tool": create_waypoint_tool,
-            "list_waypoints_tool": list_waypoints_tool,
-            "navigate_tool": navigate_tool,
-            # ★ global_localization_tool 蓄意不列在這裡（2026-08-17，見上方說明）。
-            #   bind_tools() 只綁 tools_map 裡的東西，所以不在這張表上 = 模型看不到、
-            #   也叫不到。要恢復請先解決 0.9 m 圓弧 vs 0.99 m 走廊的問題。
-        }
-
-        # ★ 2026-08-14：知識庫工具與銀行 FAQ 工具**不可以同時掛上**。
-        #
-        # search_bank_knowledge_tool 的描述寫「營業時間、櫃檯位置、開戶、換匯…
-        # 都必須先呼叫此工具」，query_bank_faq_tool 的描述寫「營業時間、開戶、
-        # 匯兌等」——兩個工具對同一批問題都宣稱自己是正解，機率被劈成兩半，
-        # 3B 模型挑哪個變成擲骰子。（兩者的資料來源其實還是同一份 FAQ。）
-        #
-        # 銀行場景下統一走 query_bank_faq_tool。★ 2026-10-21 更正：它**不**走 RAG，
-        # 直接讀 config/bank_faq.txt 整份回傳（bank_tools.py 的註解與 10/20 log 都證實）；
-        # 而 inline_bank_faq（預設開）會把同一份 FAQ 附在系統提示裡，並把這個工具拿掉。
-        if self.knowledge_store and not self.enable_bank_tools:
-            self.tools_map["search_bank_knowledge_tool"] = search_bank_knowledge_tool
-
-        if self.enable_web_tools:
-            # 匯率與時間留著：匯率是銀行業務（bank_faq.txt 有提到），
-            # 時間則被系統提示詞 §6 的規則直接依賴。
-            self.tools_map.update(
-                {
-                    "query_exchange_rate_tool": query_exchange_rate_tool,
-                    "query_datetime_tool": query_datetime_tool,
-                }
-            )
-            # ★★ 2026-08-26（W5）：股價／天氣拆成獨立開關 ★★
-            #
-            # 工具數量直接影響小模型的工具選擇準確率 —— 這是本檔 :660 附近
-            # 已經記錄過的實測結論（qwen2.5:3b 在工具太多時會挑錯）。
-            # 股價與天氣**都不在銀行迎賓的故事線裡**，卻各佔一個工具名額。
-            #
-            # ★ 預設**維持 True**，行為與 8/26 之前完全相同 —— 這是刻意的：
-            #   在上機當天悄悄拿掉功能，比多兩個工具危險。
-            #   彩排時若觀察到選錯工具，用
-            #       -p enable_stock_weather_tools:=false
-            #   一行就能收斂到 11 個工具，不必改程式。
-            # ★ 2026-10-21：銀行模式預設改成 False。10/20 實車 15:32，語音雜訊「錯哦沒錯哦 M」
-            #   讓模型呼叫了股價工具、回了一筆真實股價（llm_20261020_153116.log）。上面「悄悄拿掉
-            #   比較危險」的顧慮，這次以交接檔與 README 明寫的方式處理。非銀行模式維持 True。
-            if self.declare_parameter(
-                "enable_stock_weather_tools", not self.enable_bank_tools
-            ).get_parameter_value().bool_value:
-                self.tools_map.update(
-                    {
-                        "query_stock_price_tool": query_stock_price_tool,
-                        "query_weather_tool": query_weather_tool,
-                    }
-                )
-
-        # ── 銀行場景工具（2026-08-01 從 git 歷史復原）────────────
-        #
-        # 帶位／通報／FAQ 三個工具。做成可關閉的（enable_bank_tools）是因為
-        # 工具數量直接影響小模型的工具選擇準確率——qwen2.5:3b 在工具太多時
-        # 會挑錯。純導航測試時關掉，銀行展示時開啟。
-        #
-        # 通報工具只發 ROS topic 不直接打 Telegram：實際送出集中在
-        # bank_reception_node（通報中樞），這樣「通報」永遠只有一個出口，
-        # 也讓 brain 沒啟動時工具仍可執行（會回報提示而不是拋例外）。
-        if self.enable_bank_tools:
-            try:
-                # ★ 2026-09-29：9/23 重構誤改成 smartnav_ws.src.… 的路徑（攤平後不存在），
-                #   ImportError 被下面吞成 warning，帶位／通報行員／FAQ 三個工具靜默消失。
-                from smartnav_llm.bank_tools import make_bank_tools
-
-                self.tools_map.update(make_bank_tools(self))
-            except ImportError as exc:
-                self.get_logger().warning(f"✗ 銀行工具載入失敗（略過）: {exc}")
-
-        # ★ 2026-10-21：銀行模式收斂工具（理由見 inline_bank_faq／bank_hide_map_tools 的宣告處）
-        if self.enable_bank_tools:
-            dropped = []
-            if self.bank_hide_map_tools:
-                for name in ("create_map_tool", "list_maps_tool", "switch_map_tool", "create_waypoint_tool"):
-                    if self.tools_map.pop(name, None) is not None:
-                        dropped.append(name)
-            if self.inline_bank_faq and self._bank_faq_text():
-                if self.tools_map.pop("query_bank_faq_tool", None) is not None:
-                    dropped.append("query_bank_faq_tool")
-            if dropped:
-                self.get_logger().info(f"✓ 銀行模式拿掉 {len(dropped)} 個用不到的工具: {', '.join(dropped)}")
-
+        """掛上工具並建立 agent chain"""
+        self.tools_map = make_tools(self, self.enable_realtime_info)
         self.get_logger().info(f"✓ 已載入 {len(self.tools_map)} 個工具: {', '.join(self.tools_map)}")
 
         # 初始化模型並綁定工具
         self.stream_handler = RosStreamHandler(self.llm_stream_pub, self.speech_text_pub, self._to_traditional)
         stream_handler = self.stream_handler
-        raw_llm = self._make_chat_llm([stream_handler])
-        self.llm_with_tools = raw_llm.bind_tools(list(self.tools_map.values()))
+        self._raw_llm = self._make_chat_llm([stream_handler])
+        self._chains: dict = {}  # 工具名稱組合 -> chain（每輪給的工具不同，見 tool_gate.py）
         self.get_logger().info(
             f"✓ Ollama 上下文 num_ctx={self.num_ctx}（Ollama 在 4 GB 顯存的預設是 4096；見 num_ctx 參數說明）、"
             f"keep_alive={self.keep_alive or '（Ollama 預設 5 分鐘）'}"
@@ -977,8 +639,16 @@ class LLMServiceNode(Node):
             ]
         )
 
-        # 定義整合工具的 Agent Chain，將提示模板與工具調用結合起來
-        self.agent_chain = RunnablePassthrough() | self.prompt_template | self.llm_with_tools
+    def _chain_for(self, user_input: str):
+        """這一輪的 agent chain：只綁定 tool_gate 認為這句話可能用到的工具（沒有工具就是純對話）"""
+        names = tuple(tool_gate.allowed_tools(user_input, self.tools_map))
+        chain = self._chains.get(names)
+        if chain is None:
+            llm = self._raw_llm.bind_tools([self.tools_map[n] for n in names]) if names else self._raw_llm
+            chain = RunnablePassthrough() | self.prompt_template | llm
+            self._chains[names] = chain
+        self.get_logger().info(f"🧰 本輪給模型的工具: {', '.join(names) or '（無，純對話）'}")
+        return chain
 
     # ── ★ 2026-10-21：Ollama 連線、暖機、FAQ、回音與程式端帶位 ─────────────────
     def _ollama_extra_kwargs(self) -> dict:
@@ -988,7 +658,9 @@ class LLMServiceNode(Node):
             return {}
         fields = getattr(ChatOllama, "model_fields", None) or getattr(ChatOllama, "__fields__", None) or {}
         if "keep_alive" not in fields:
-            self.get_logger().warning("這版 langchain_ollama 的 ChatOllama 沒有 keep_alive 欄位，略過——模型閒置 5 分鐘仍會被卸載")
+            self.get_logger().warning(
+                "這版 langchain_ollama 的 ChatOllama 沒有 keep_alive 欄位，略過——模型閒置 5 分鐘仍會被卸載"
+            )
             return {}
         try:
             return {"keep_alive": int(ka)}
@@ -1021,18 +693,27 @@ class LLMServiceNode(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f"Ollama 暖機失敗（不影響對話，只是第一題會比較慢）: {exc}")
 
-    def _bank_faq_text(self) -> str:
-        """bank_faq.txt 全文（讀一次就快取；讀不到回空字串 = 退回用工具查）"""
-        if self._faq_cache is None:
-            self._faq_cache = ""
-            try:
-                p = get_config_path("bank_faq.txt")
-                if p:
-                    with open(p, "r", encoding="utf-8") as f:
-                        self._faq_cache = f.read().strip()
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warning(f"讀不到 bank_faq.txt（改回用工具查）: {exc}")
-        return self._faq_cache
+    def _knowledge_section(self, user_input: str, chat_history: List[BaseMessage]) -> str:
+        """附在系統提示最後的「本行知識庫」一節。
+
+        純問候不附（沒有業務問題，附了只會讓模型亂講營業時間）；檢索可用就附檢索到的片段；
+        還沒建好、關鍵字模式查不到、或 enable_rag:=false，就附整份 FAQ。
+        """
+        if tool_gate.is_social(user_input):
+            return ""
+        kb = self.knowledge
+        if self.enable_rag and kb.ready:
+            # 客人的追問常常很短（「那週六呢」），檢索要帶上前一句才有主題
+            query = user_input
+            if len(user_input) < 6:
+                prev = next((m.content for m in reversed(chat_history) if isinstance(m, HumanMessage)), "")
+                query = f"{prev} {user_input}".strip()
+            section = kb.context_for(query)
+            if section:
+                return section
+        if kb.full_text:
+            return "\n\n---\n\n# 本行知識庫（全文；回答本行業務問題只能依據這一節）\n\n" + kb.full_text
+        return ""
 
     def _robot_speech_cb(self, msg: String) -> None:
         self._remember_robot_said(msg.data)
@@ -1109,32 +790,39 @@ class LLMServiceNode(Node):
             self._publish_reply(reply)
             return True
         wid = names[name]
-        deny = self.nav_denial(name)
-        if deny:
-            self.get_logger().info(f"🤖 Agent 最終決策回應: {deny}")
-            with self.memory_lock:
-                self.memory.add_message(HumanMessage(content=user_input))
-                self.memory.add_message(AIMessage(content=deny))
-            self._publish_reply(deny)
-            return True
         self.get_logger().info(f"🧭 帶位直達（程式判斷，不經模型）：'{user_input}' -> {name}（{wid}）")
         # ★ 2026-10-27：客人講完話通常站在車子正前方，出發時會擋住（上機實測「前方障礙」就在起步）；
         #   規劃路徑約三成是先倒車，所以也不能叫人站後面 → 請客人先站到旁邊。
-        ack = "好的，請跟我來。請先站到我旁邊，等我開動再跟上。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
-        self._publish_reply(ack)
+        ack = (
+            "好的，請跟我來。請先站到我旁邊，等我開動再跟上。"  # 導航節點起跑時自己會播「開始導航到 X」，這裡不重複地點
+        )
+        # 這句只在 nav_arbiter 放行後才說；被拒絕（不能去、忙線）就直接回它給的話術
+        acked = []
+
+        def _say_ack() -> None:
+            acked.append(True)
+            self._publish_reply(ack)
+
+        self._nav_local.on_authorized = _say_ack
         try:
-            if name == self.vip_room_waypoint_name and "guide_to_vip_room_tool" in self.tools_map:
-                result = str(self.tools_map["guide_to_vip_room_tool"].invoke({}))
-            else:
-                result = str(self.tools_map["navigate_tool"].invoke({"waypoint_id": wid}))
+            result = str(self.tools_map["navigate_tool"].invoke({"waypoint_id": wid}))
         except Exception as exc:  # noqa: BLE001
             result = f"執行結果: 失敗, 詳細信息: {exc}"
         self.get_logger().info(f"📥 帶位結果: {result}")
-        reply = f"{name}到了。" if result.startswith("執行結果: 成功") else self._nav_fail_reply(name, result)
+        last = getattr(self._nav_local, "last", None)
+        if result.startswith("執行結果: 成功"):
+            reply = f"{name}到了。"
+        elif last is not None and last.outcome in (
+            RequestNavigation.Result.OUTCOME_DENIED,
+            RequestNavigation.Result.OUTCOME_BUSY,
+        ):
+            reply = last.message
+        else:
+            reply = self._nav_fail_reply(name, result)
         self.get_logger().info(f"🤖 Agent 最終決策回應: {reply}")
         with self.memory_lock:
             self.memory.add_message(HumanMessage(content=user_input))
-            self.memory.add_message(AIMessage(content=f"{ack}{reply}"))
+            self.memory.add_message(AIMessage(content=f"{ack if acked else ''}{reply}"))
         self._publish_reply(reply)
         return True
 
@@ -1154,28 +842,16 @@ class LLMServiceNode(Node):
         except Exception:
             return text
 
-    def _identity_cb(self, msg: UserIdentity) -> None:
-        self._identity = {
-            "recognized": bool(msg.recognized),
-            "user_type": access_policy.TYPE_NAMES.get(int(msg.user_type.type), "GUEST"),
-            "user_name": msg.user_name,
-            "description": msg.description,
-            "stamp": time.time(),
-        }
+    def _access_context_cb(self, msg: AccessContext) -> None:
+        self._access_context = (msg, time.monotonic())
 
-    def _access(self):
-        """（tier, identity, policy）：目前在機器人前面的人可以做什麼"""
-        policy = access_policy.load_policy()
-        identity = dict(self._identity)
-        return access_policy.tier_of(identity, policy), identity, policy
-
-    def nav_denial(self, waypoint_name: str):
-        """這個地點目前不能帶 → 回要對客人說的話；可以 → None（帶位工具與程式端帶位共用）"""
-        tier, _identity, policy = self._access()
-        deny = access_policy.nav_denial(tier, waypoint_name, policy)
-        if deny:
-            self.get_logger().info(f"🚫 帶位拒絕：{waypoint_name}（身分 {tier}）")
-        return deny
+    def _customer_context(self) -> str:
+        """附在系統提示最後的「目前的客人」。brain 沒回報或太久沒更新就當一般訪客（不個人化）。"""
+        entry = self._access_context
+        if entry is None or time.monotonic() - entry[1] > self.access_context_stale_sec:
+            return ""
+        ctx = entry[0]
+        return customer_prompt.prompt_context(ctx.tier, ctx.user_name, ctx.description)
 
     def user_text_callback(self, msg: String) -> None:
         """處理使用者輸入"""
@@ -1225,52 +901,41 @@ class LLMServiceNode(Node):
 
         self.get_logger().info("🧹 已清除對話記憶")
 
-    def _resolve_system_prompt_name(self) -> str:
-        """決定要載入哪一份系統提示詞
-
-        Returns:
-            str: 提示詞檔名。參數留空時依 enable_bank_tools 自動選擇。
-        """
-        if self.system_prompt_file:
-            return self.system_prompt_file
-        return "system_prompt_bank.txt" if self.enable_bank_tools else "system_prompt.txt"
+    SYSTEM_PROMPT_FILE = "system_prompt.txt"
 
     def _load_system_prompt(self) -> str:
-        """讀取系統提示詞（讀不到就退回內建預設）"""
-        name = self._resolve_system_prompt_name()
-        path = get_config_path(name)
+        """讀取系統提示詞（讀不到就退回內建預設）；知識庫那一節每輪另外附，見 _knowledge_section"""
+        path = get_config_path(self.SYSTEM_PROMPT_FILE)
         if path:
             with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-            # ★ 2026-10-21：銀行模式把 FAQ 全文附在最後（見 inline_bank_faq 的宣告處）
-            if self.enable_bank_tools and self.inline_bank_faq and name == "system_prompt_bank.txt":
-                faq = self._bank_faq_text()
-                if faq:
-                    text += "\n\n---\n\n# 本行知識庫（全文；回答本行業務問題只能依據這一節）\n\n" + faq
-            return text
+                return f.read()
 
-        self.get_logger().warning(f"✗ 無法找到 {name}，使用內建預設提示語")
-        return (
-            "你是一個專業的智慧導航機器人助手，職責是幫助使用者管理地圖並完成多步驟導航\n"
-            "你可以連續、分步驟地呼叫工具來完成任務，如果使用者給予複合指令，請一步一步調用工具\n"
-        )
+        self.get_logger().warning(f"✗ 無法找到 {self.SYSTEM_PROMPT_FILE}，使用內建預設提示語")
+        return "你是一個專業的銀行迎賓服務機器人，請用繁體中文簡短回答客戶，需要帶路時呼叫導航工具。\n"
 
     def _run_agent_loop(self, user_input: str) -> None:
         """ReAct 自主思考迴圈"""
-        tier, identity, _policy = self._access()
-        system_content = self._load_system_prompt() + access_policy.prompt_context(tier, identity)
-        if tier != "guest":
-            self.get_logger().info(f"👤 本輪客人身分：{tier}（系統提示已附上對應說明）")
-
-        with self.memory_lock:
-            chat_history = self.memory.get_history_messages()
-
-        agent_scratchpad: List[BaseMessage] = []
-        max_iterations = 10
-        nav_called = False  # 這一輪有沒有呼叫過會讓車移動的工具（給帶位防呆用）
-        self.get_logger().info("🧠 LLM 開始進入多步驟決策鏈...")
+        self.current_user_text = user_input  # 通報行員時用客人的原句（見 tools.notify_staff_tool）
 
         try:
+            # 準備工作也要在 try 裡：任何例外都必須走到 finally 清除 is_agent_running，否則節點之後每句話都回「正在處理上一個指令」
+            customer_context = self._customer_context()
+            if customer_context:
+                self.get_logger().info("👤 本輪客人有專屬說明（系統提示已附上）")
+
+            with self.memory_lock:
+                chat_history = self.memory.get_history_messages()
+
+            # 檢索會呼叫遠端 Ollama，所以放在這條 agent 執行緒裡（不是 ROS callback）
+            knowledge_section = self._knowledge_section(user_input, chat_history)
+            system_content = self._load_system_prompt() + knowledge_section + customer_context
+
+            agent_chain = self._chain_for(user_input)
+            agent_scratchpad: List[BaseMessage] = []
+            max_iterations = 10
+            nav_called = False  # 這一輪有沒有呼叫過會讓車移動的工具（給帶位防呆用）
+            self.get_logger().info("🧠 LLM 開始進入多步驟決策鏈...")
+
             # ★ 2026-10-21：明確的帶路要求交給程式（10/20「帶我去門口」×5，模型零次呼叫導航）
             if self.direct_nav and self._try_direct_navigation(user_input):
                 return
@@ -1280,7 +945,7 @@ class LLMServiceNode(Node):
                 #   「先講一段旁白、再去呼叫工具」（見 begin_turn 的 docstring）。
                 self.stream_handler.begin_turn(hold=(self.hold_all_iterations or iteration == 0))
 
-                response = self.agent_chain.invoke(
+                response = agent_chain.invoke(
                     {
                         "system_prompt": system_content,
                         "history": chat_history,
@@ -1366,20 +1031,7 @@ class LLMServiceNode(Node):
 
                     self.get_logger().info(f"🛠️ LLM 決定呼叫服務: {tool_name}, 參數: {tool_args}")
 
-                    # ★★ 2026-10-21：叫錯帶位工具防呆 ★★
-                    #   筆電 Ollama 評估（backups/研究數據/LLM評估_20261021/）：程式端帶位沒攔到的時候，
-                    #   模型會把「帶我去門口／櫃檯／大廳」叫成去貴賓室的工具——車會開錯地方，舊版還回過
-                    #   「已成功帶您走到大廳」的假成功。客人沒提到貴賓室就不執行：句子裡有別的地點就改帶去那裡，
-                    #   沒有就回失敗讓模型改口。被擋下的不算 nav_called，所以後面「答應帶路」的防呆照樣有效。
-                    if (tool_name == "guide_to_vip_room_tool" and self.nav_guard
-                            and not nav_intent.mentions_place(user_input, self.vip_room_waypoint_name)):
-                        self.get_logger().warning(
-                            f"⚠️ 模型要帶去{self.vip_room_waypoint_name}，但客人沒提到：{user_input}")
-                        if self._try_direct_navigation(user_input, force_intent=True):
-                            return
-                        tool_result = (f"執行結果: 失敗, 詳細信息: 客戶沒有提到{self.vip_room_waypoint_name}，"
-                                       "不可以帶去那裡；請直接問客戶要去哪裡")
-                    elif tool_name in self.tools_map:
+                    if tool_name in self.tools_map:
                         if tool_name in nav_intent.NAV_TOOL_NAMES:
                             nav_called = True
                         # ★★ 2026-08-26：工具呼叫要包起來 ★★

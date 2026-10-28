@@ -86,7 +86,7 @@ check(ni.is_robot_echo("導航到廁所", ["開始導航到 廁所"]), "播報�
 check(not ni.is_robot_echo("帶我去門口", ["好的，請跟我來。", "開始導航到 廁所"]), "客人的新要求不算")
 check(not ni.is_robot_echo("我要辦理業務", ["請問您要辦理什麼業務呢"]), "用了機器人的詞造新句子不算（bigram 0.6 < 0.8）")
 check(not ni.is_robot_echo("你好", ["你好"]), "太短（<4 字）不判")
-check("navigate_tool" in ni.NAV_TOOL_NAMES and "guide_to_vip_room_tool" in ni.NAV_TOOL_NAMES, "會讓車移動的兩個工具都在清單")
+check(ni.NAV_TOOL_NAMES == {"navigate_tool"}, "會讓車移動的工具只有 navigate_tool（貴賓室也走它）")
 
 print("── 6. FAQ 列為「示範場地沒有設定」的地點（程式直接回答） ──")
 for text, names, want in [
@@ -104,15 +104,10 @@ for text, names, want in [
     got = ni.unconfigured_place(text, names)
     check(got == want, f"「{text}」（{'有' if '廁所' in names else '無'}廁所）→ {got}（預期 {want}）")
 
-print("── 7. 有沒有提到某個地點（給「叫錯貴賓室帶位」防呆用） ──")
-for text, want in [("帶我去門口", False), ("請帶我去大廳。", False), ("我要去VIP室", True),
-                   ("帶我去貴賓市", True), ("貴賓室要怎麼去？", True), ("帶帶我去乖乖貴貴賓賓去", True)]:
-    check(ni.mentions_place(text, "貴賓室") == want, f"{want!s:5}「{text}」提到貴賓室")
-
-print("── 8. 模型把工具呼叫講成文字（★ 2026-10-26 導航沒開時實測到） ──")
+print("── 7. 模型把工具呼叫講成文字（★ 2026-10-26 導航沒開時實測到） ──")
 for text, want in [("呼叫帶位到貴賓室的工具 {object <nil> <nil> [] {}}", True),
                    ('{"name": "navigate_tool", "arguments": {"waypoint_id": "x"}}', True),
-                   ("我來呼叫導航工具帶您過去", True), ("guide_to_vip_room_tool", True),
+                   ("我來呼叫導航工具帶您過去", True), ("navigate_tool", True),
                    ("我將使用查詢匯率的工具", True),
                    ("本行週一到週五上午九點到下午三點半營業。", False), ("您可以請行員協助您。", False),
                    ("請問您要換多少美金？", False), ("好的，請跟我來。", False),

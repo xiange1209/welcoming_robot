@@ -209,6 +209,10 @@ def generate_launch_description():
         Node(package="smartnav_brain", executable="bank_reception",
              name="bank_reception_node", output="screen",
              condition=IfCondition(LaunchConfiguration("brain"))),
+        # 帶位的唯一入口（LLM／迎賓頁都經它；沒開就沒人能帶位）
+        Node(package="smartnav_brain", executable="nav_arbiter",
+             name="nav_arbiter_node", output="screen",
+             condition=IfCondition(LaunchConfiguration("brain"))),
     ])
 
     # ── 18 s：語音 ──

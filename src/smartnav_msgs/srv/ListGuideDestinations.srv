@@ -1,0 +1,8 @@
+# 目前這位客人可以去的地點（已套用身分規則與迎賓頁的排除清單）
+---
+bool success
+string message                  # 失敗原因，或不能帶位時可對客人說的中性話術
+string tier                     # AccessContext 的 tier；blocked 對外一律回 guest
+bool can_navigate               # false = 迎賓頁整列不顯示
+bool busy                       # 已有一趟導航在進行
+GuideDestination[] destinations

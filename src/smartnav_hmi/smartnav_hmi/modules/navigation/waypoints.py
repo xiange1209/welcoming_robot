@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_srvs.srv import Trigger
 
-from smartnav_msgs.action import GlobalLocalization, Navigate
+from smartnav_msgs.action import GlobalLocalization, RequestNavigation
 from smartnav_msgs.srv import CreateWaypoint, ListWaypoints
 
 from ..imaging.geometry import make_pose, quaternion_to_yaw
@@ -99,7 +99,8 @@ def build_router(node, admin_only) -> APIRouter:
 
     @router.post("/api/navigate", dependencies=admin_only)
     async def api_navigate(req: NavigateRequest) -> JSONResponse:
-        goal = Navigate.Goal()
+        goal = RequestNavigation.Goal()
+        goal.source = RequestNavigation.Goal.SOURCE_OPERATOR  # 已登入的管理者（admin_only）；不受客人身分限制
         if req.waypoint_id:
             goal.waypoint_id = req.waypoint_id
             label = f"導航到地點 {req.target_name or req.waypoint_id}"

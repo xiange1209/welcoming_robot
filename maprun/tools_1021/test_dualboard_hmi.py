@@ -164,6 +164,7 @@ class FakeNode:
 
 def make_manager(graph_names, procs):
     m = object.__new__(mgr.SystemControlManager)
+    m.nav_camera = types.SimpleNamespace(paused=lambda: False)   # 10/28 新增的導航中暫停人臉相機；這個測試不涉及
     m._node = FakeNode(graph_names)
     m._supervisor = types.SimpleNamespace(transition=lambda unit: None)
     m._requires_cache = {}

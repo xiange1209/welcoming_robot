@@ -59,6 +59,7 @@ from smartnav_msgs.srv import (
     ListMaps,
     ListUsers,
     ListTaughtPaths,
+    ListGuideDestinations,
     ListWaypoints,
     PlanTaughtPath,
     RecordPath,
@@ -67,7 +68,7 @@ from smartnav_msgs.srv import (
     SwitchMap,
     UpdateUser,
 )
-from smartnav_msgs.action import CreateMap, FollowTaughtPath, GlobalLocalization, Navigate
+from smartnav_msgs.action import CreateMap, FollowTaughtPath, GlobalLocalization, RequestNavigation
 
 from .api.main import build_app
 from .core.auth import AdminAuth, resolve_password
@@ -436,6 +437,9 @@ class HmiServerNode(Node):
                 "finish_map": self.create_client(Trigger, "/finish_map", callback_group=cb),
                 "create_waypoint": self.create_client(CreateWaypoint, "create_waypoint", callback_group=cb),
                 "list_waypoints": self.create_client(ListWaypoints, "list_waypoints", callback_group=cb),
+                "list_guide_destinations": self.create_client(
+                    ListGuideDestinations, "list_guide_destinations", callback_group=cb
+                ),
                 # 掃描對齊：不需要移動車子的局部位姿修正（map_service_cc 提供）。
                 # 走廊裡優先用它，不要用會繞圈的全域定位——0.9 m 半徑的圓弧
                 # 在 0.99 m 的走廊會撞牆。
@@ -472,7 +476,8 @@ class HmiServerNode(Node):
         self.action_clients.update(
             {
                 "create_map": ActionClient(self, CreateMap, "create_map", callback_group=cb),
-                "navigate": ActionClient(self, Navigate, "navigate", callback_group=cb),
+                # 導航一律經 nav_arbiter（身分判斷在那裡）；job 名稱仍叫 "navigate"，前端不用動
+                "navigate": ActionClient(self, RequestNavigation, "request_navigation", callback_group=cb),
                 "global_localization": ActionClient(self, GlobalLocalization, "global_localization", callback_group=cb),
             }
         )

@@ -24,7 +24,8 @@ from smartnav_msgs.srv import (
     RegisterFacePhoto,
     UpdateUser,
 )
-from smartnav_brain.user_manager import UserType, UserManager
+from smartnav_brain.user_manager import UserManager
+from smartnav_brain.user_types import UserType
 from smartnav_brain.brain_utils import compute_similarity
 
 

@@ -137,6 +137,11 @@ class SystemControlManager:
             "detect": ["user_auth"],
             "start_hint": "辨識到人之後決定要不要迎賓、走哪個流程",
         },
+        "nav_arbiter": {
+            "label": "導航仲裁（身分／權限）",
+            "detect": ["nav_arbiter"],
+            "start_hint": "LLM 與迎賓頁帶位的唯一入口：依身分決定准不准，再轉給導航；沒開就不能帶位（預設拒絕）。需先開「使用者認證 / 決策」才認得出貴賓",
+        },
         "bank_reception": {
             "label": "迎賓劇本（銀行）",
             "detect": ["bank_reception"],
@@ -227,7 +232,7 @@ class SystemControlManager:
         "mapping": {
             "label": "建圖（遙控）",
             "why": "底盤雷達 + 導航堆疊（建圖模式）。人用遙控把環境走一遍。其餘全關，把 CPU 讓出來",
-            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
+            "stop": ["face", "user_auth", "bank_reception", "nav_arbiter", "llm", "asr_chain", "camera", "nav"],
             "start": ["sensors", "nav:mapping"],
             "note": "導航堆疊會先停掉、再用建圖模式重啟（換模式一定要重啟）。"
             "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
@@ -237,7 +242,7 @@ class SystemControlManager:
         "auto_mapping": {
             "label": "建圖（自動探索）",
             "why": "同上，但啟動 frontier explorer，車子會自己找沒去過的地方開過去",
-            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
+            "stop": ["face", "user_auth", "bank_reception", "nav_arbiter", "llm", "asr_chain", "camera", "nav"],
             "start": ["sensors", "nav:explore"],
             "note": "⚠ 車子會自己跑動，旁邊要有人顧著。導航堆疊會先停掉、再用探索模式重啟；"
             "全綠後（約 80 秒）到「遙控建圖」分頁按「開始建圖」才會開始探索。"
@@ -267,7 +272,7 @@ class SystemControlManager:
         "all_off": {
             "label": "全部關閉",
             "why": "展示結束、或換情境之前：把所有功能單元依序關掉。HMI 本身照常（平板不會斷線）",
-            "stop": ["llm", "asr_chain", "speech_synthesizer", "voice_playback", "bank_reception", "user_auth",
+            "stop": ["llm", "asr_chain", "speech_synthesizer", "voice_playback", "nav_arbiter", "bank_reception", "user_auth",
                      "face", "camera", "nav", "sensors"],
             "start": [],
             "note": "本來就沒開的單元會直接跳過。要關機請用下方「電源」卡（關機前也會先做這一步）",
@@ -284,6 +289,7 @@ class SystemControlManager:
                 "face",
                 "user_auth",
                 "bank_reception",
+                "nav_arbiter",
                 "asr_chain",
                 "llm",
             ],
@@ -303,6 +309,7 @@ class SystemControlManager:
                 "face:eco",
                 "user_auth",
                 "bank_reception",
+                "nav_arbiter",
                 "asr_chain",
                 "llm",
             ],

@@ -28,12 +28,17 @@ class JobRunner:
     #
     # 解法：直接對 action 的 cancel 服務送「取消全部」。ROS 2 action 規格：
     # goal_id 全零 + stamp 全零 = 取消該伺服器上**所有**目標，與是誰送出的無關。
+    #   "navigate" 這個 job 名稱對應的是 nav_arbiter 的 request_navigation（取消會轉送給底層導航）；
+    #   真正的 /navigate 排在 RAW_CANCEL，這樣 nav_arbiter 掛掉時急停照樣停得住車。
     ACTION_CANCEL_ALL = ("navigate", "follow_taught_path", "global_localization", "create_map")
     # ★ 2026-09-25：再加上 nav2 本體，而且排第一個。自動探索（frontier explorer）與 LLM 的導航，
     #   最後都是 navigate_to_pose 的目標；HMI 送的零速會被 nav2 controller 下一拍（10~20 Hz）蓋掉。
     #   以前探索中按急停，要等 create_map 取消 → map_service 0.5 秒輪詢 → 叫 explorer STOP 車才停。
     #   直接取消 nav2 不依賴任何中間節點（審查 safety#5）。
-    RAW_CANCEL = {"nav2": "/navigate_to_pose"}
+    RAW_CANCEL = {"nav2": "/navigate_to_pose", "navigate_server": "/navigate"}
+    # 這些 action 的目標要先通過 nav_arbiter 核准（feedback phase == AUTHORIZED）才算開始執行；
+    # 被拒絕時結果裡的 message 是可以直接對客人說的話
+    AUTHORIZED_ACTIONS = ("navigate",)
 
     def __init__(self, node, state, service_clients: Dict[str, Any], action_clients: Dict[str, Any],
                  service_timeout: float, cancel_callback_group):
@@ -113,7 +118,13 @@ class JobRunner:
                 self.state.set_job(job_id, status="failed", message=f"動作 {name} 未就緒（對應節點沒啟動？）")
                 return
 
-            send_future = client.send_goal_async(goal)
+            needs_authorization = name in self.AUTHORIZED_ACTIONS
+
+            def _on_feedback(msg) -> None:
+                if getattr(msg.feedback, "phase", "") == "AUTHORIZED":
+                    self.state.set_job(job_id, status="running", message="執行中…")
+
+            send_future = client.send_goal_async(goal, feedback_callback=_on_feedback)
             goal_handle = self.await_future(send_future, timeout=10.0)
             if goal_handle is None or not goal_handle.accepted:
                 self.state.set_job(job_id, status="rejected", message="動作目標被拒絕")
@@ -121,7 +132,11 @@ class JobRunner:
 
             with self._job_handles_lock:
                 self._job_handles[job_id] = goal_handle
-            self.state.set_job(job_id, status="running", message="執行中…")
+            if needs_authorization:
+                # 等 nav_arbiter 核准；核准前維持 pending（feedback 可能比這行先到，所以不能在這裡覆寫成別的狀態）
+                self.state.set_job(job_id, message="等待核准…")
+            else:
+                self.state.set_job(job_id, status="running", message="執行中…")
 
             result_future = goal_handle.get_result_async()
             # 動作本身有自己的逾時（見 ACTION_TIMEOUTS 的註解），
@@ -162,6 +177,15 @@ class JobRunner:
         finally:
             with self._job_handles_lock:
                 self._job_handles.pop(job_id, None)
+
+    def wait_started(self, job_id: str, timeout: float) -> Dict[str, Any]:
+        """等 job 離開 pending（被核准而開始執行，或被拒絕／失敗）。逾時就回目前的樣子。"""
+        deadline = time.monotonic() + timeout
+        job = self.state.get_job(job_id)
+        while job.get("status") == "pending" and time.monotonic() < deadline:
+            time.sleep(0.1)
+            job = self.state.get_job(job_id)
+        return job
 
     def cancel_job(self, job_id: str) -> bool:
         """要求取消進行中的動作"""

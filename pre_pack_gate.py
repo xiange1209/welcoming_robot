@@ -9,7 +9,7 @@
 本腳本把已有的替身測試與語法檢查串在一起，**任何一項失敗就以非 0 結束**。
 
 檢查項目（找不到測試檔會標「缺」並視為失敗，避免因為檔案搬走而靜默變成「全過」）：
-  1. 探索基準 206／審查基準 100／知識庫 122（測試檔放在 cloud_workspace/tests/nav_stub 或 專題/scripts/explore_watchdog）
+  1. 探索基準 206／審查基準 100（測試檔放在 cloud_workspace/tests/nav_stub 或 專題/scripts/explore_watchdog）
   2. maprun/tools_1015 的測試（G5 同處卡住修補、num_ctx 接線、轉向診斷分析、曲率）與 tools_0930 的 scan_self_echo；
      tools_1021（10/21：帶位判斷、LLM 接線、導航修補、ASR 修補；10/22：雷射偏移、雙板、朗讀數字、HMI 版本簽章、車上 agent 的身分權限／電源／喊停／ASR 併回）
   3. 全部 .py 語法（ast.parse）與 maprun 內全部 .sh 語法（bash -n）
@@ -46,21 +46,22 @@ def find_test(name: str):
 CHECKS = [
     ("探索基準（期望 206）", find_test("test_explore_fixes.py")),
     ("審查基準（期望 100）", find_test("test_review_fixes.py")),
-    ("知識庫（期望 122）", find_test("test_knowledge_base.py")),
     ("G5 同處反覆卡住修補（16）", REPO / "maprun/tools_1015/test_g5_stall_site.py"),
     ("LLM num_ctx 接線（6）", REPO / "maprun/tools_1015/test_num_ctx.py"),
     ("轉向診斷分析（52）", REPO / "maprun/tools_1015/test_analyze.py"),
     ("曲率分析（車子版，第 8 節跳過）", REPO / "maprun/tools_1015/curvature/test_curvature.py"),
     ("scan_self_echo", REPO / "maprun/tools_0930/test_scan_self_echo.py"),
     # ★ 2026-10-21：10/20 實車之後的修補
-    ("帶位判斷 nav_intent（56）", REPO / "maprun/tools_1021/test_nav_intent.py"),
-    ("LLM 接線：常駐／FAQ 併入／工具精簡／帶位防呆（31）", REPO / "maprun/tools_1021/test_llm_wiring.py"),
+    ("帶位判斷 nav_intent（61）", REPO / "maprun/tools_1021/test_nav_intent.py"),
+    ("知識庫檢索 RAG（Chroma 那節沒裝 chromadb 會跳過）（31）", REPO / "maprun/tools_1021/test_rag.py"),
+    ("每輪工具篩選 tool_gate（64）", REPO / "maprun/tools_1021/test_tool_gate.py"),
+    ("LLM 接線：常駐／FAQ 併入／職責邊界（只經 nav_arbiter 帶位）（56）", REPO / "maprun/tools_1021/test_llm_wiring.py"),
     ("導航修補：硬停事件／重規劃重試／逐拍紀錄／每趟重讀的等待時間（28）", REPO / "maprun/tools_1021/test_nav_replan.py"),
     ("雷射左右偏移 laser_y_offset_m 的車身幾何（17）", REPO / "maprun/tools_1021/test_laser_offset.py"),
     ("雙板：A 的 HMI 不碰 B 的單元、狀態看節點圖（27）", REPO / "maprun/tools_1021/test_dualboard_hmi.py"),
     ("雙板：環境覆蓋層 env.sh／overlay／dualboard_mode（19）", REPO / "maprun/tools_1021/test_dualboard_env.py"),
     ("朗讀前的數字整理 forSpeech：電話逐字、日期、時間範圍、「-」唸成到、銀行金額範圍不能唸壞（87，需要 Node 22.6+，沒有就跳過）", REPO / "maprun/tools_1021/test_tts_forspeech.py"),
-    ("車上 agent 10/22 改動併回：身分權限兩份規則一致、喊停、all_off、電源／唸字要登入、ASR decoder fp32（66）", REPO / "maprun/tools_1021/test_car_changes_1022.py"),
+    ("車上 agent 10/22 改動併回：身分權限單一規則、喊停、all_off、電源／唸字要登入、ASR decoder fp32（61）", REPO / "maprun/tools_1021/test_car_changes_1022.py"),
     ("HMI 前端版本簽章 /api/version（13）", REPO / "maprun/tools_1021/test_hmi_version.py"),
     ("ASR 修補：觸發塊重送／收音緩衝／除錯錄音／launch", REPO / "maprun/tools_1021/test_asr_fixes.py"),
 ]

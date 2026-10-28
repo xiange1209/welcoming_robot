@@ -14,8 +14,10 @@ find_package(builtin_interfaces REQUIRED)
 
 # Generate message files
 set(msg_files
+  "msg/AccessContext.msg"
   "msg/AudioData.msg"
   "msg/FaceEmbedding.msg"
+  "msg/GuideDestination.msg"
   "msg/MapInfo.msg"
   "msg/RegistrationProgress.msg"
   "msg/UserIdentity.msg"
@@ -34,6 +36,7 @@ set(srv_files
   "srv/DeleteWaypoint.srv"
   "srv/ExtractFaceEmbedding.srv"
   "srv/GetWaypoint.srv"
+  "srv/ListGuideDestinations.srv"
   "srv/ListMaps.srv"
   "srv/ListTaughtPaths.srv"
   "srv/ListUsers.srv"
@@ -52,6 +55,7 @@ set(action_files
   "action/FollowTaughtPath.action"
   "action/GlobalLocalization.action"
   "action/Navigate.action"
+  "action/RequestNavigation.action"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

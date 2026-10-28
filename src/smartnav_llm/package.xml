@@ -3,7 +3,7 @@
 <package format="3">
   <name>smartnav_llm</name>
   <version>0.0.1</version>
-  <description>SmartNav LLM 功能包 - 聊天對話、指令解析</description>
+  <description>SmartNav 迎賓對話：聽懂客人的話並回話，需要動作時向 nav_arbiter／bank_reception 提出請求</description>
   <maintainer email="swient@todo.todo">swient</maintainer>
   <license>MIT</license>
 

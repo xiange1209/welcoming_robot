@@ -107,12 +107,9 @@
 
 | 工具 | 回答 |
 |---|---|
-| `tools_0814/llm_tool_bench.py` | 工具選擇準確率（只發 `user_text`，不碰動作） |
-| `tools_0814/offline_probe.py` | 不啟 ROS，直接拿節點的工具定義問 ollama |
-| `tools_0814/compare_prompts.py` | 離線比較不同 system prompt |
 | `tools_0810/llm_bench.py` | 端到端延遲 |
 
-★ ollama 在筆電 `192.168.137.1:11434`，模型 `qwen2.5:3b`。
+★ ollama 預設在 `192.168.11.156:11434`（`llm_service_node` 的 `ollama_base_url` 參數），模型 `llama3.1:8b`。
 
 ---
 

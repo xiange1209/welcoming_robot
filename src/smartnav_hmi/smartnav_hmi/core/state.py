@@ -193,6 +193,10 @@ class HmiState:
             if changed:
                 self._bump()
 
+    def get_job(self, job_id: str) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self.jobs.get(job_id, {}))
+
     def set_job(self, job_id: str, **kwargs) -> None:
         with self._lock:
             job = self.jobs.setdefault(job_id, {"job_id": job_id})

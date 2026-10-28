@@ -12,8 +12,8 @@ qwen2.5:3b **一次都沒呼叫導航工具**——1 次照抄上一題的失敗
 import re
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-# 這兩個工具會讓車子實際移動。「答應帶路」之後若這一輪沒呼叫過它們，就是嘴上答應。
-NAV_TOOL_NAMES = frozenset({"navigate_tool", "guide_to_vip_room_tool"})
+# 這個工具會讓車子實際移動。「答應帶路」之後若這一輪沒呼叫過它，就是嘴上答應。
+NAV_TOOL_NAMES = frozenset({"navigate_tool"})
 
 # 帶路的說法（命令句）。「去」單獨出現太泛（「我去櫃檯辦」也算），所以只收帶主詞或動詞的組合。
 _GO = re.compile(
@@ -140,11 +140,6 @@ def unconfigured_place(text: str, names: Iterable[str]) -> Optional[str]:
         if w in s and w not in on_map and normalize(say) not in on_map:
             return say
     return None
-
-
-def mentions_place(text: str, name: str) -> bool:
-    """句子有沒有提到這個地點（同一套正規化與錯一字容忍）。給「叫錯帶位工具」防呆用。"""
-    return _name_score(normalize(name), normalize(text)) > 0
 
 
 # 只收「把人帶到某處」的說法。單獨的「我帶您」不收：「我帶您了解一下開戶流程」是正常回答。

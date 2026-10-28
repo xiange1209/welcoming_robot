@@ -92,7 +92,7 @@ def build_app(node) -> FastAPI:
     app.include_router(jobs_router.build_router(node, admin_only))
     app.include_router(users_router.build_router(node, admin_only))
     app.include_router(chat_router.build_router(node, admin_only))
-    # ★ 2026-10-22：迎賓頁的帶位（不用登入，依人臉身分決定能去哪裡，見 modules/guide/policy.py）
+    # ★ 2026-10-22：迎賓頁的帶位（不用登入，依人臉身分決定能去哪裡，規則在 smartnav_brain 的 access_policy.py，由 nav_arbiter 判斷）
     app.include_router(guide_router.build_router(node, admin_only))
 
     return app

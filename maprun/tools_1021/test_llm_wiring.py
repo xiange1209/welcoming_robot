@@ -6,8 +6,8 @@
 雜訊觸發股價工具；機器人自己的播報被當成使用者輸入。
 
 測什麼
-  ✓ 新參數與預設：keep_alive "-1"、warmup_on_start、inline_bank_faq、bank_hide_map_tools、direct_nav、nav_guard、robot_echo_sec
-  ✓ 股價／天氣在銀行模式預設關（預設值不是常數 True）
+  ✓ 參數與預設：keep_alive "-1"、warmup_on_start、direct_nav、nav_guard、robot_echo_sec；已移除的模式開關不可復活
+  ✓ 工具集在 tools.py：只有迎賓需要的工具，LLM 不改地圖、不碰 /navigate
   ✓ ChatOllama 只在 _make_chat_llm 建構一次，仍帶 num_ctx=self.num_ctx、num_predict，並展開 _ollama_extra_kwargs()
   ✓ _run_agent_loop：迴圈前先試程式端帶位；空白／答應帶路的防呆在 flush_held 之前；工具迴圈會記錄 nav_called
   ✓ /llm_response 只從 _publish_reply 發（才會記進「機器人講過的話」給回音判斷用）
@@ -28,7 +28,8 @@ except Exception:  # noqa: BLE001
 
 CAR = Path(os.environ.get("SMARTNAV_REPO") or Path(__file__).resolve().parents[2])
 NODE = CAR / "src/smartnav_llm/smartnav_llm/llm_service_node.py"
-PROMPT = CAR / "src/smartnav_llm/config/system_prompt_bank.txt"
+PROMPT = CAR / "src/smartnav_llm/config/system_prompt.txt"
+TOOLS = (CAR / "src/smartnav_llm/smartnav_llm/tools.py").read_text(encoding="utf-8")
 SRC = NODE.read_text(encoding="utf-8")
 tree = ast.parse(SRC)
 results = []
@@ -59,12 +60,12 @@ def func(name):
 
 print("── 1. 參數 ──")
 check(const("keep_alive") == "-1", f"keep_alive 預設 \"-1\"（實際 {const('keep_alive')!r}）")
-for p in ("warmup_on_start", "inline_bank_faq", "bank_hide_map_tools", "direct_nav", "nav_guard"):
+for p in ("warmup_on_start", "direct_nav", "nav_guard"):
     check(const(p) is True, f"{p} 預設 True")
+for p in ("enable_bank_tools", "inline_bank_faq", "bank_hide_map_tools", "enable_stock_weather_tools",
+          "vip_room_waypoint_name", "system_prompt_file", "knowledge_dir"):
+    check(decl(p) is None, f"{p} 已移除（單一模式，不留舊開關）")
 check(const("robot_echo_sec") == 20.0, "robot_echo_sec 預設 20 秒")
-sw = decl("enable_stock_weather_tools")
-check(sw is not None and not (isinstance(sw, ast.Constant) and sw.value is True),
-      "enable_stock_weather_tools 不再寫死 True（銀行模式預設關）")
 check(const("num_ctx") == 8192 and const("num_predict") == 256, "num_ctx 8192、num_predict 256 沒被動到")
 
 print("── 2. ChatOllama ──")
@@ -95,12 +96,14 @@ check(0 <= i_empty < i_flush and 0 <= i_prom < i_flush, "空白與「答應帶�
 check("force_intent=True" in lsrc, "答應帶路卻沒導航 → 改由程式依地點直接帶（force_intent）")
 check("nav_intent.NAV_TOOL_NAMES" in lsrc and "nav_called = True" in lsrc, "工具迴圈記錄這一輪有沒有呼叫導航")
 
-i_vip = lsrc.find('tool_name == "guide_to_vip_room_tool" and self.nav_guard')
-i_exec = lsrc.find("elif tool_name in self.tools_map:")
-check(0 <= i_vip < i_exec and "nav_intent.mentions_place(user_input, self.vip_room_waypoint_name)" in lsrc,
-      "叫錯帶位工具防呆：客人沒提到貴賓室就不執行（在真正執行工具之前）")
+i_exec = lsrc.find("if tool_name in self.tools_map:")
 i_nc = lsrc.find("nav_called = True")
-check(i_exec < i_nc, "nav_called 只在真的執行導航工具時才設（被擋下的不算，答應帶路防呆照樣有效）")
+check(0 <= i_exec < i_nc, "nav_called 只在真的執行導航工具時才設")
+i_try = lsrc.find("        try:\n")
+check(0 <= i_try < lsrc.find("self._chain_for(user_input)") and 0 <= i_try < lsrc.find("self._load_system_prompt()"),
+      "準備工作（讀提示詞、建 chain）都在 try 裡：例外要走到 finally 清除 is_agent_running，否則節點會永遠回「正在處理上一個指令」")
+check("self.is_agent_running = False" in lsrc.split("finally:")[-1], "finally 會清除 is_agent_running")
+check("guide_to_vip_room" not in SRC and "vip_room_waypoint_name" not in SRC, "貴賓室沒有專用工具與專用參數（它是一般地點，權限由 nav_arbiter 判斷）")
 dn = func("_try_direct_navigation")
 dsrc = ast.get_source_segment(SRC, dn) if dn else ""
 check("nav_intent.unconfigured_place(user_input, names)" in dsrc and "示範場地沒有設定" in dsrc,
@@ -117,15 +120,28 @@ cb = func("user_text_callback")
 check(cb is not None and "_is_robot_echo(user_input)" in ast.get_source_segment(SRC, cb), "使用者輸入先擋回音")
 check('create_subscription(\n            String, "speech_text", self._robot_speech_cb' in SRC, "訂閱 speech_text 記下機器人講過的話")
 
-print("── 5. 系統提示（銀行版） ──")
+print("── 4b. 職責邊界 ──")
+check("request_navigation_client" in SRC and '"navigate"' not in SRC and "Navigate," not in SRC,
+      "只持有 request_navigation 的 client，不碰 /navigate")
+for banned in ("CreateMap", "SwitchMap", "CreateWaypoint", "ListMaps", "GlobalLocalization", "UserIdentity", "access_policy"):
+    check(banned not in SRC, f"節點不引用 {banned}（地圖管理在 HMI、身分判斷在 brain）")
+for name in ("list_waypoints_tool", "navigate_tool", "notify_staff_tool"):
+    check(f"def {name}" in TOOLS, f"tools.py 有 {name}")
+for name in ("create_map_tool", "switch_map_tool", "create_waypoint_tool", "query_stock_price_tool", "query_weather_tool",
+             "search_bank_knowledge_tool", "query_bank_faq_tool", "guide_to_vip_room_tool"):
+    check(f"def {name}" not in TOOLS, f"tools.py 沒有 {name}")
+
+print("── 5. 系統提示 ──")
 P = PROMPT.read_text(encoding="utf-8")
-check("本行知識庫的全文附在這份提示的最後" in P, "改成依附在最後的知識庫回答")
+check("系統針對客戶這一題檢索出來的相關片段" in P, "提示詞寫明：最後附的知識庫是針對這一題檢索出的片段（不是全文）")
 check("你**必須先呼叫「查詢本行業務規定」工具**" not in P, "不再無條件要求先呼叫 FAQ 工具（工具已拿掉）")
 check("帶路一定要真的呼叫工具" in P, "寫明帶路一定要真的呼叫工具")
-check("協助管理地圖資料" not in P, "角色不再包含管理地圖（建圖等工具在銀行模式已拿掉）")
+check("協助管理地圖資料" not in P and "建立地點" not in P, "角色不包含管理地圖")
+check("查詢本行業務規定" not in P and "股價" not in P.split("匯率：")[0], "提示詞不提已移除的工具")
 check("本行營業到下午三點半」" not in P and "本行週一到週五上午九點到下午三點半營業" in P,
       "回覆長度的範例句改成完整答案（筆電評估：模型照抄範例，漏了星期與開始時間）")
-check("# 本行知識庫（全文；回答本行業務問題只能依據這一節）" in SRC, "_load_system_prompt 附上的節名與提示文字一致")
+check("# 本行知識庫（全文；回答本行業務問題只能依據這一節）" in SRC and "依客戶這一題檢索出的片段" in (CAR / "src/smartnav_llm/smartnav_llm/knowledge_base.py").read_text(encoding="utf-8"),
+      "知識庫一節的標題：檢索版（片段）與備援版（全文）都在，且提示詞稱呼一致")
 
 print(f"\n{sum(results)}/{len(results)} 通過")
 sys.exit(0 if all(results) else 1)

@@ -23,7 +23,7 @@ setup(
     zip_safe=True,
     maintainer="swient",
     maintainer_email="swient@todo.todo",
-    description="SmartNav 人機介面功能包 - 影像串流、地圖點擊建點/導航、使用者管理、對話流",
+    description="SmartNav 人機介面：影像串流、管理者的地圖與使用者管理、迎賓頁、系統控制與緊急停止（導航一律經 nav_arbiter）",
     license="MIT",
     extras_require={
         "test": [

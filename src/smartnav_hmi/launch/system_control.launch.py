@@ -48,6 +48,7 @@ def _actions(context):
         "face": ("smartnav_vision", "face_embedding", {"enable_gpu": False}),
         "user_auth": ("smartnav_brain", "user_auth", {}),
         "bank_reception": ("smartnav_brain", "bank_reception", {}),
+        "nav_arbiter": ("smartnav_brain", "nav_arbiter", {}),
         "llm": ("smartnav_llm", "llm_service", {}),
         "speech_synthesizer": ("smartnav_audio", "speech_synthesizer", {}),
         "voice_playback": ("smartnav_audio", "voice_playback", {}),

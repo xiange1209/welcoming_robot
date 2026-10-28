@@ -60,7 +60,7 @@ from std_msgs.msg import String
 
 from smartnav_msgs.msg import UserIdentity
 
-from smartnav_brain.user_manager import UserType
+from smartnav_brain.user_types import UserType
 
 
 class BankReceptionNode(Node):
