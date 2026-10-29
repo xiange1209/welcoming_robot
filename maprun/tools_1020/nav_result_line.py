@@ -5,9 +5,9 @@
 偏離量取同一段時間的 ~/maprun/logs/replay_*_live_*.csv（xte_m 欄）。
 
 用法：
-    python3 ~/maprun/tools_1020/nav_result_line.py                 # 最近一趟
-    python3 ~/maprun/tools_1020/nav_result_line.py --since 1793000000   # 這個時間（epoch 秒）之後的每一趟
-    python3 ~/maprun/tools_1020/nav_result_line.py --log <nav_*.log> --all   # 指定某一份 log 的全部
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/nav_result_line.py                 # 最近一趟
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/nav_result_line.py --since 1793000000   # 這個時間（epoch 秒）之後的每一趟
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/nav_result_line.py --log <nav_*.log> --all   # 指定某一份 log 的全部
     ... --tsv 檔案 --tag 新   # 另外把每一趟附加成一列 TSV（day_test.sh 用）
 
 ★ 2026-10-26 車上新寫；用 10/20 實車 log 驗過解析。

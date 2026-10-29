@@ -2,13 +2,13 @@
 """ASR 實際辨識準確度（交接文件第 9 項・語音部分）：使用者照稿唸 10 句，逐字比對 /user_text，算 CER。
 
 用法（車上；語音輸入單元要開著。★ LLM 單元要關，理由見下面「⚠ 安全」）：
-    source ~/maprun/env.sh
-    python3 ~/maprun/tools_1020/asr_cer.py --print-script          # 印出要唸的稿子（★＝含熱詞）
-    python3 ~/maprun/tools_1020/asr_cer.py --print-script --paced  # 稿子一句一句出現（每句唸完留 3 秒）
-    python3 ~/maprun/tools_1020/asr_cer.py                         # 錄 180 秒（--secs 改），結束自動比對
-    python3 ~/maprun/tools_1020/asr_cer.py --start-after 15:42:10  # 這個時刻之前收到的不算（使用者還沒開始唸）
-    python3 ~/maprun/tools_1020/asr_cer.py --from-csv ~/maprun/verify_out/asr_cer_1542.csv [--skip 8]
-    python3 ~/maprun/tools_1020/asr_cer.py --from-log --start-after 15:42:10 --until 15:45:00
+    source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/asr_cer.py --print-script          # 印出要唸的稿子（★＝含熱詞）
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/asr_cer.py --print-script --paced  # 稿子一句一句出現（每句唸完留 3 秒）
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/asr_cer.py                         # 錄 180 秒（--secs 改），結束自動比對
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/asr_cer.py --start-after 15:42:10  # 這個時刻之前收到的不算（使用者還沒開始唸）
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/asr_cer.py --from-csv ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/asr_cer_1542.csv [--skip 8]
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/asr_cer.py --from-log --start-after 15:42:10 --until 15:45:00
         # 補救：這支沒開著的時候，直接拿 asr_chain log 的「✓ 最終結果」行算（★ 那是後處理「之前」的原始結果）
 錄音中 Ctrl-C（或 kill -INT）會提早結束，照樣比對、寫檔。
 
@@ -16,7 +16,7 @@
     訂 /user_text（最終結果＝後處理＋回音過濾之後、真正送進 LLM 的字串）與 /partial_text；
     另外旁聽 /speech_text（機器人要講的話）與 /playback_status（平板真的在唸），只為了標出
     「測試期間機器人有沒有出聲」。全部唯讀：只建訂閱，不建任何發布者（rclpy 內建的 /parameter_events 除外）。
-    每一則都即時寫進 ~/maprun/verify_out/asr_cer_<HHMM>.csv（kind＝final/partial/speech_text/playback），
+    每一則都即時寫進 ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/asr_cer_<HHMM>.csv（kind＝final/partial/speech_text/playback），
     結束後寫 asr_cer_<HHMM>.txt（就是螢幕上那張表）。
 
 怎麼比對：
@@ -76,7 +76,7 @@ HOTWORD_FILES = [
     os.path.expanduser("~/welcoming_robot_ws/install/smartnav_audio/share/smartnav_audio/config/hotwords.txt"),
     os.path.expanduser("~/welcoming_robot_ws/src/smartnav_audio/config/hotwords.txt"),
 ]
-OUT_DIR = os.path.expanduser("~/maprun/verify_out")
+OUT_DIR = os.path.expanduser("~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out")
 LOG_DIR = os.path.expanduser("~/.smartnav/logs/system_control")
 PAUSE_S = 3.0  # 稿子：每句之間停幾秒（VAD 靜音 0.5 s＋sherpa 端點 1.2 s，留足）
 PRE_MARGIN_S = 2.0  # overflow 視窗：第一則 partial 往前多少秒
@@ -569,7 +569,7 @@ def main():
             elif k < len(SENTENCES):
                 print(f"    （停 {PAUSE_S:.0f} 秒）")
         print(f"\n★＝含熱詞（依 {hw_src}）。⚠ 今天的 log 寫「未提供熱詞檔，跳過熱詞」——熱詞其實沒生效，"
-              "詳見 ~/maprun/verify_out/voice_notes_20261020.md。")
+              "詳見 ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/voice_notes_20261020.md。")
         return
 
     os.makedirs(args.out_dir, exist_ok=True)

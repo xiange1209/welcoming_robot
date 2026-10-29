@@ -172,6 +172,13 @@ class NavigationActionCcNode(Node):
         self.declare_parameter("blocked_poll_sec", 4.0)
         self.declare_parameter("blocked_speech_wait", "前面的路被擋住了，我在這裡等，通了就繼續")
         self.declare_parameter("blocked_speech_resume", "路通了，繼續前進")
+        # ★ 2026-10-29：被「地圖上沒有的障礙」擋住（多半是人）時先開口請讓路，等一下再重新規劃；
+        #   重試前也不清障礙層（keep_new_obstacles_on_replan），新路線才會繞開它。
+        #   10/28 晚上貴賓室那趟：路線一直規劃得出來（所以從沒進「等通道」、從沒開口），3 次都撞同一處。
+        self.declare_parameter("new_obstacle_speech", "不好意思，請讓我過一下。")
+        self.declare_parameter("new_obstacle_speech_wait_sec", 4.0)      # 講完等幾秒再重新規劃（0＝不等）
+        self.declare_parameter("new_obstacle_speech_min_gap_sec", 20.0)  # 同一趟裡兩次請讓路至少隔幾秒
+        self.declare_parameter("keep_new_obstacles_on_replan", True)
         # ★ 2026-10-27：出發前確認第一段行進方向淨空（客人講完話常站在車前；路徑三成先倒車）。見 depart_gate.py。
         #   depart_gate_enable:=false＝舊行為（規劃完直接起跑）。
         self.declare_parameter("depart_gate_enable", True)
@@ -198,6 +205,10 @@ class NavigationActionCcNode(Node):
         self.blocked_poll_sec = max(1.0, float(self.get_parameter("blocked_poll_sec").value))
         self.blocked_speech_wait = str(self.get_parameter("blocked_speech_wait").value)
         self.blocked_speech_resume = str(self.get_parameter("blocked_speech_resume").value)
+        self.new_obstacle_speech = str(self.get_parameter("new_obstacle_speech").value).strip()
+        self.new_obstacle_speech_wait = max(0.0, float(self.get_parameter("new_obstacle_speech_wait_sec").value))
+        self.new_obstacle_speech_gap = max(0.0, float(self.get_parameter("new_obstacle_speech_min_gap_sec").value))
+        self.keep_new_obstacles_on_replan = bool(self.get_parameter("keep_new_obstacles_on_replan").value)
         self._taught_seq = 0
         # 重試迴圈用來判斷「上一輪有沒有真的移動」。由 /amcl_pose 更新。
         self._pose_lock = threading.Lock()
@@ -520,6 +531,7 @@ class NavigationActionCcNode(Node):
         attempt = 0              # 一般失敗用掉的重試次數（被新障礙擋住的不算）
         runs = 0                 # 實際起跑過幾次
         last_dyn = False         # 上一次失敗是不是「[新障礙]」
+        make_way_said = -1e9     # 上一次開口請讓路的時間（見 new_obstacle_speech_min_gap_sec）
         blocked_since = None     # 這一處被新障礙擋住的起始時間（等待耐心從這裡起算）
         blocked_xy = None
 
@@ -540,7 +552,20 @@ class NavigationActionCcNode(Node):
                 # 不清的話重新規劃看到的還是同一張被污染的地圖，等於白試。
                 # ★ 2026-10-01：path_teach 的規劃服務清完會等障礙層把「現在」看得到的
                 #   東西標回去（plan_clear_settle_sec），站在路上的人不會被清成透明。
-                self._clear_costmap_quiet()
+                # ★ 2026-10-29：被新障礙擋住的那一次例外——先請讓路、等一下，再**保留**障礙層重新規劃（見參數說明）。
+                if last_dyn:
+                    if self.new_obstacle_speech and (
+                            time.monotonic() - make_way_said > self.new_obstacle_speech_gap):
+                        make_way_said = time.monotonic()
+                        self.speech_text_pub.publish(String(data=self.new_obstacle_speech))
+                        self.get_logger().info(f"被新障礙擋住：請讓路（等 {self.new_obstacle_speech_wait:.0f} 秒）")
+                        t_wait = time.monotonic() + self.new_obstacle_speech_wait
+                        while time.monotonic() < t_wait:
+                            if goal_handle.is_cancel_requested:
+                                return self._canceled(goal_handle, result)
+                            time.sleep(0.2)
+                if not (last_dyn and self.keep_new_obstacles_on_replan):
+                    self._clear_costmap_quiet()
                 if last_dyn:
                     self.get_logger().warn(f"被新障礙擋住，重新規劃看能不能繞過去（{last_why}）")
                 else:

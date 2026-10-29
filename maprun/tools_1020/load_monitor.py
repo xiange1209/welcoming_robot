@@ -2,16 +2,16 @@
 """多工負載時間序列（唯讀；不發任何指令、不改任何東西）。
 
 用法：
-    source ~/maprun/env.sh
-    python3 ~/maprun/tools_1020/load_monitor.py --label 人臉+語音 --secs 300            # 每 10 秒一列
-    python3 ~/maprun/tools_1020/load_monitor.py --label 全開 --secs 600 --interval 5
+    source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/load_monitor.py --label 人臉+語音 --secs 300            # 每 10 秒一列
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/load_monitor.py --label 全開 --secs 600 --interval 5
 
 每一列記：CPU 閒置%、load1、可用記憶體、溫度、降頻旗標（sysfs）、這段時間內 ASR log 新增的 input overflow 次數、
 各話題收到幾則（/user_identity、/face_embedding、/camera/color/camera_info、/scan、/user_text、/llm_response、/cmd_vel），
 以及吃 CPU 最多的 6 個行程（依行程名稱加總，% of 1 核）。
 ★ 影像只訂 camera_info（與影像同頻、幾十 bytes），不訂原始影像——訂 640x480 影像本身就會吃掉一大塊 CPU，量測會干擾被量的東西。
 ★ 話題數字是「這段時間收到幾則」，訂閱端自己漏收也會算少；要的是相對變化，不是絕對頻率。
-輸出：~/maprun/verify_out/load_<標籤>_<HHMM>.csv；結束時印平均／最差。
+輸出：~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/load_<標籤>_<HHMM>.csv；結束時印平均／最差。
 ★ 2026-10-20 車上新寫。
 """
 import argparse
@@ -83,7 +83,7 @@ def main():
     ap.add_argument("--secs", type=float, default=300)
     ap.add_argument("--interval", type=float, default=10)
     a = ap.parse_args()
-    out = os.path.expanduser(f"~/maprun/verify_out/load_{re.sub(r'[^0-9A-Za-z一-龥+_-]', '_', a.label)}_{time.strftime('%H%M')}.csv")
+    out = os.path.expanduser(f"~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/load_{re.sub(r'[^0-9A-Za-z一-龥+_-]', '_', a.label)}_{time.strftime('%H%M')}.csv")
 
     rclpy.init()
     n = Node("load_monitor_cc")

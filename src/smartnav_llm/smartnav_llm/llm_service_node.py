@@ -38,6 +38,7 @@ from smartnav_msgs.action import RequestNavigation
 from smartnav_llm.llm_utils import get_config_path
 from smartnav_llm import customer_prompt, nav_intent, tool_gate
 from smartnav_llm.knowledge_base import KnowledgeBase, OllamaEmbedder
+from smartnav_llm.ollama_locator import OllamaLocator, candidate_url
 from smartnav_llm.tools import make_tools
 
 
@@ -234,13 +235,30 @@ class LLMServiceNode(Node):
         super().__init__("llm_service_node")
 
         # 宣告與讀取參數
-        # 預設是目前跑 Ollama 的那台機器（192.168.11.156）。換網路或換機器時用
-        # `-p ollama_base_url:=http://<IP>:11434` 覆寫；網段不同就連不到（節點仍會啟動，對話時才失敗）。
-        # ★ 沒有 launch 檔會覆寫這個值 —— HMI 經 run_node_cc.sh 直接 `ros2 run` 啟動，
-        #   參數來源鏈上只有這一環，所以這個預設值就是實際生效的值。
+        # ★ 2026-10-29：預設 "auto"＝自動找 Ollama（見 ollama_locator.py）。Ollama 跑在筆電，筆電的 IP 跟著網路變
+        #   （自己的熱點 192.168.137.1、同學那邊 192.168.11.156），寫死就是換網路整個 LLM 連不到。
+        #   依 ollama_candidates 的順序同時探測 /api/tags，取有回應者裡排最前面的；啟動時找不到就背景每 15 秒重找，
+        #   用到一半連不上（換網路）也會重找。要固定位址照舊給完整網址：`-p ollama_base_url:=http://<IP>:11434`。
+        # ★ 沒有 launch 檔會覆寫這兩個值（system_control.launch.py 的 llm 單元不帶參數），預設值就是實際生效的值。
         self.ollama_base_url = (
-            self.declare_parameter("ollama_base_url", "http://192.168.11.156:11434").get_parameter_value().string_value
+            self.declare_parameter("ollama_base_url", "auto").get_parameter_value().string_value.strip()
         )
+        #   MSI＝筆電的電腦名稱：Windows 熱點把它登記成 MSI.mshome.net（車上實測），其他網路靠 mDNS 的 MSI.local；
+        #   gateway＝車子目前的預設閘道（開筆電熱點時就是筆電）；最後是用過的固定 IP。
+        self.ollama_candidates = list(self.declare_parameter(
+            "ollama_candidates", ["MSI.mshome.net", "MSI.local", "gateway", "192.168.137.1", "192.168.11.156"]).value)
+        self._embedder = None
+        self._ollama_locator = None
+        if self.ollama_base_url.lower() == "auto":
+            self._ollama_locator = OllamaLocator(
+                self.ollama_candidates, self._on_ollama_url,
+                self.get_logger().info, self.get_logger().warning)
+            if not self._ollama_locator.resolve_now():
+                fallback = next((u for u in map(candidate_url, self.ollama_candidates) if u), "http://127.0.0.1:11434")
+                self.ollama_base_url = fallback
+                self.get_logger().warning(
+                    f"Ollama：啟動時沒找到（候選 {self.ollama_candidates}），先用 {fallback}，背景會繼續找")
+            self._ollama_locator.start_background()
         # ★ 2026-08-31：等導航堆疊的**總期限**（見 _wait_for_services）。
         #   等不到就降級啟動——對話一定可用，只有導航工具會在被呼叫時失敗。
         #   設 0 或負數＝無限等（舊行為，不建議）。
@@ -387,9 +405,10 @@ class LLMServiceNode(Node):
         self._robot_said = deque(maxlen=20)  # (monotonic 時刻, 文字)
         self._robot_said_lock = threading.Lock()
         faq_path = get_config_path("bank_faq.txt")
+        self._embedder = OllamaEmbedder(self.ollama_base_url, self.embed_model) if self.enable_rag else None
         self.knowledge = KnowledgeBase(
             faq_path or Path("bank_faq.txt"),
-            OllamaEmbedder(self.ollama_base_url, self.embed_model) if self.enable_rag else None,
+            self._embedder,
             self.embed_model,
             db_dir=Path(knowledge_db) if knowledge_db else Path.home() / ".smartnav" / "knowledge_db",
             top_k=self.rag_top_k,
@@ -704,6 +723,13 @@ class LLMServiceNode(Node):
             return {"keep_alive": int(ka)}
         except ValueError:
             return {"keep_alive": ka}
+
+    def _on_ollama_url(self, url: str) -> None:
+        """自動找到（或換網路後重新找到）Ollama：之後建的 ChatOllama、保溫請求、知識庫向量都改用這個位址。"""
+        self.ollama_base_url = url
+        emb = getattr(self, "_embedder", None)
+        if emb is not None:
+            emb.base_url = url.rstrip("/")
 
     def _make_chat_llm(self, callbacks: list):
         """唯一的 ChatOllama 建構處（主迴圈與暖機共用：參數一致，暖機才會把同一份提示載進去）"""

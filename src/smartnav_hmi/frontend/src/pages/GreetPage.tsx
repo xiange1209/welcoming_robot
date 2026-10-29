@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { PointerEvent as RPointerEvent } from "react";
 import { IconSend } from "../components/icons";
+import { MapCanvas } from "../components/MapCanvas";
 import { Button, Card, Field, Hint, Select } from "../components/ui";
 import { cx } from "../lib/cx";
 import { useStoreSelector, useStoreValue } from "../hooks/useStore";
@@ -311,8 +313,162 @@ function LlmModel() {
   return <Hint className="mt-2">模型 {model || "— 未連線"}</Hint>;
 }
 
+/* ── 現場影像／帶位地圖（★ 2026-10-29）────────────────────────
+   帶位中（後端 system.navigating，來自 /navigation_active）：左卡換成地圖、放大到路線，
+   相機縮成可以拖動的小窗（× 可以先藏起來，藏起來時影像串流也停）；到點自動換回相機大畫面。
+   <img> 從頭到尾是同一個元素，只換外框樣式——useVideoStream 綁的是這個元素，重新掛載會斷串流。
+   小窗的位置與隱藏只記在這台平板（localStorage；讀不到就用右下角）。 */
+const PIP_KEY = "greet.pip.v1";
+
+interface PipState {
+  x: number; // 0～1：在可移動範圍內的水平位置
+  y: number;
+  hidden: boolean;
+}
+
+function clamp01(v: number) {
+  return Math.min(1, Math.max(0, v));
+}
+
+function loadPip(): PipState {
+  try {
+    const v = JSON.parse(localStorage.getItem(PIP_KEY) ?? "null") as Partial<PipState> | null;
+    if (v && typeof v.x === "number" && typeof v.y === "number") {
+      return { x: clamp01(v.x), y: clamp01(v.y), hidden: !!v.hidden };
+    }
+  } catch {
+    /* 無痕模式或儲存被擋：用預設位置 */
+  }
+  return { x: 1, y: 1, hidden: false };
+}
+
+function savePip(p: PipState) {
+  try {
+    localStorage.setItem(PIP_KEY, JSON.stringify(p));
+  } catch {
+    /* 存不了就只在這次有效 */
+  }
+}
+
+function LiveView({ active }: { active: boolean }) {
+  const navigating = useStoreSelector(telemetryStore, (t) => !!t.snap.system?.navigating);
+  const [routeView, setRouteView] = useState(true); // true＝放大到路線、false＝整張地圖
+  const [pip, setPip] = useState<PipState>(loadPip);
+  const videoRef = useVideoStream(active && !(navigating && pip.hidden));
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  const drag = useRef<{ px: number; py: number; left: number; top: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    const measure = () => setBox({ w: el.clientWidth, h: el.clientHeight });
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    measure();
+    return () => ro.disconnect();
+  }, []);
+
+  const pw = Math.min(box.w * 0.34, 260);
+  const ph = pw * 0.75;
+  const freeW = Math.max(0, box.w - pw);
+  const freeH = Math.max(0, box.h - ph);
+  const left = pip.x * freeW;
+  const top = pip.y * freeH;
+
+  const onDown = (e: RPointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    drag.current = { px: e.clientX, py: e.clientY, left, top };
+  };
+  const onMove = (e: RPointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    if (!d) return;
+    const x = freeW > 0 ? clamp01((d.left + e.clientX - d.px) / freeW) : 0;
+    const y = freeH > 0 ? clamp01((d.top + e.clientY - d.py) / freeH) : 0;
+    setPip((p) => ({ ...p, x, y }));
+  };
+  const onUp = () => {
+    if (!drag.current) return;
+    drag.current = null;
+    setPip((p) => {
+      savePip(p);
+      return p;
+    });
+  };
+  const setHidden = (hidden: boolean) =>
+    setPip((p) => {
+      const next = { ...p, hidden };
+      savePip(next);
+      return next;
+    });
+
+  return (
+    <Card
+      title={navigating ? "帶位中" : "現場影像"}
+      bodyClassName="min-h-[200px]"
+      actions={
+        navigating ? (
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={() => setRouteView((v) => !v)}>
+              {routeView ? "全圖" : "放大路線"}
+            </Button>
+            {pip.hidden && (
+              <Button variant="ghost" onClick={() => setHidden(false)}>
+                顯示相機
+              </Button>
+            )}
+          </div>
+        ) : undefined
+      }
+    >
+      <div
+        ref={boxRef}
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-ios bg-black"
+      >
+        {navigating && (
+          <div className="absolute inset-0">
+            <MapCanvas active={active} focusRoute={routeView} className="size-full" placeholder="帶位中…" />
+          </div>
+        )}
+        <div
+          className={
+            navigating
+              ? cx(
+                  "absolute z-10 touch-none overflow-hidden rounded-ios border-2 border-white/80 bg-black shadow-lg",
+                  pip.hidden && "hidden",
+                )
+              : "flex size-full items-center justify-center"
+          }
+          style={navigating ? { left, top, width: pw, height: ph } : undefined}
+          onPointerDown={navigating ? onDown : undefined}
+          onPointerMove={navigating ? onMove : undefined}
+          onPointerUp={navigating ? onUp : undefined}
+          onPointerCancel={navigating ? onUp : undefined}
+        >
+          <img
+            ref={videoRef}
+            alt="現場影像"
+            draggable={false}
+            className="pointer-events-none size-full object-contain"
+          />
+          {navigating && (
+            <button
+              type="button"
+              aria-label="先把相機小窗藏起來"
+              className="absolute right-1 top-1 rounded-full bg-black/60 px-2 text-[13px] leading-5 text-white"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setHidden(true)}
+            >
+              ×
+            </button>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 export function GreetPage({ active }: { active: boolean }) {
-  const videoRef = useVideoStream(active);
   const [text, setText] = useState("");
 
   const send = () => {
@@ -342,15 +498,7 @@ export function GreetPage({ active }: { active: boolean }) {
        原本兩張卡平分高度，對話只剩 311 px（約四則訊息），影像卡反而左右留黑邊。
        只在直向且未達 lg 時套用，橫放與寬螢幕維持左右兩欄。 */
     <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[1.1fr_1fr] portrait:max-lg:grid-rows-[minmax(0,2fr)_minmax(0,3fr)]">
-      <Card title="現場影像" bodyClassName="min-h-[200px]">
-        <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-ios bg-black">
-          <img
-            ref={videoRef}
-            alt="現場影像"
-            className="size-full object-contain"
-          />
-        </div>
-      </Card>
+      <LiveView active={active} />
 
       <Card title="對話">
         <ChatScroller />

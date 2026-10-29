@@ -3,11 +3,11 @@
 # 事後分析工具靠它把 log 切成階段、把「人看到的事」對到「log 的時間」。
 #
 # 用法：
-#   ~/maprun/trip_mark.sh "T0 開始" "電量 24.1V、第 1 輪"
-#   ~/maprun/trip_mark.sh "T0 第3輪：車子在門口停住"
-#   ~/maprun/trip_mark.sh show                 # 看今天記了什麼
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/trip_mark.sh "T0 開始" "電量 24.1V、第 1 輪"
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/trip_mark.sh "T0 第3輪：車子在門口停住"
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/trip_mark.sh show                 # 看今天記了什麼
 # 檔案：~/maprun/logs/trip_<日期>.csv（欄位 iso_time,phase,note）；collect_data.sh 會收走。
-# 建議在 ~/.bashrc 加一行：alias trip='~/maprun/trip_mark.sh'
+# 建議在 ~/.bashrc 加一行：alias trip='~/welcoming_robot_ws/src/smartnav_ws/maprun/trip_mark.sh'
 #
 # ★ Pi 沒有 RTC，開機後要等 NTP 同步，時鐘才對。未同步時這裡仍會記錄，但在備註加「（時鐘未同步）」。
 set -u

@@ -29,7 +29,7 @@ mkdir -p "$LOGDIR"
 # 所有 run_*.sh、verify_*.sh 都 source 這個檔，所以只在這裡判斷一次。
 # 回到單板：~/maprun/dualboard/dualboard_mode.sh off（不存在標記檔時這段什麼都不做＝完全是單板行為）。
 _DB_ROLE_FILE="${SMARTNAV_ROLE_FILE:-/home/user/.smartnav/dualboard_role}"
-_DB_DIR="${DUALBOARD_DIR:-/home/user/maprun/dualboard}"
+_DB_DIR="${DUALBOARD_DIR:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/dualboard}"   # ★ 10/29：repo 裡的 dualboard/
 if [ -f "$_DB_ROLE_FILE" ] && [ -f "$_DB_DIR/overlay.sh" ]; then
   source "$_DB_DIR/overlay.sh"
 fi

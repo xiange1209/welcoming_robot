@@ -6,9 +6,9 @@
   現在：腳本自己發導航（HMI /api/navigate，跟平板同一條路）、等作業結束、用 nav_result_line.py 把這趟寫進 TSV。
 
 用法（導航單元要在跑、而且已經定位）：
-    python3 nav_ab_auto.py --goto 起點                                   # 先開到起點（不記錄）
-    python3 nav_ab_auto.py --a 起點 --b 門口 --trips 4 --tag 新 --tsv nav_ab.tsv   # A→B→A→B，每趟記一列
-    python3 nav_ab_auto.py --a 起點 --b 門口 --estop-trip --tag 急停 --tsv nav_ab.tsv   # 開到 B 途中自動按急停
+    python3 nav_ab_auto.py --goto 櫃台                                   # 先開到起點（不記錄）
+    python3 nav_ab_auto.py --a 櫃台 --b 大廳 --trips 4 --tag 新 --tsv nav_ab.tsv   # A→B→A→B，每趟記一列
+    python3 nav_ab_auto.py --a 櫃台 --b 大廳 --estop-trip --tag 急停 --tsv nav_ab.tsv   # 開到 B 途中自動按急停
 ★ 安全：車會自己連續跑。路線淨空、旁邊一定有人拿平板急停。這個視窗按 Ctrl-C＝立刻急停並結束（結束碼 130）。
 """
 import argparse

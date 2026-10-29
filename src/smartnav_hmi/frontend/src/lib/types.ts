@@ -49,6 +49,8 @@ export interface ChatMessage {
 
 export interface SystemStats {
   camera_fps?: number;
+  /** 導航（帶位）進行中：後端訂 /navigation_active（★ 2026-10-29，迎賓頁切換地圖放大用） */
+  navigating?: boolean;
   voltage?: number;
   charging?: boolean;
   charge_current?: number;
@@ -211,17 +213,6 @@ export interface Scenario {
   start: string[];
   /** 會先停掉的單元 */
   stop: string[];
-}
-
-/** 一鍵驗證項目（後端 SystemControlManager.VERIFY_SCRIPTS） */
-export interface VerifyItem {
-  key: string;
-  label: string;
-  why: string;
-  note?: string;
-  /** false＝要讀鍵盤輸入（捲尺、量角器讀數），網頁跑不了，只能給指令 */
-  runnable: boolean;
-  script: string;
 }
 
 export interface HealthNode {

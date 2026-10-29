@@ -2,7 +2,7 @@
 # V0 開工前檢查 —— 電池、裝置、時鐘、程式版本。
 # 這一關沒過就不要往下做，後面量到的數字都不可信。
 #
-# 用法：~/maprun/verify/verify_0_preflight.sh
+# 用法：~/welcoming_robot_ws/src/smartnav_ws/maprun/verify/verify_0_preflight.sh
 
 source "$(dirname "$0")/_lib.sh"
 
@@ -130,7 +130,7 @@ SRC="$WS/src"
 hdr "目錄結構"
 if [ -d "$SRC/smartnav_ws" ]; then
   rec "舊巢狀目錄" FAIL "src/smartnav_ws/ 還在" \
-      "新舊兩份套件並存 → colcon 會報 Duplicate package names。先跑 ~/maprun/verify/migrate_layout.sh"
+      "新舊兩份套件並存 → colcon 會報 Duplicate package names。先跑 ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify/migrate_layout.sh"
 else
   rec "舊巢狀目錄" PASS "已清除" ""
 fi
@@ -221,7 +221,7 @@ chk "修正25 通道被擋住就等它淨空"   "$NCC/navigation_action_cc_node.
 chk "修正26 規劃前等障礙標回去"     "$NCC/path_teach_cc_node.py"                               "plan_clear_settle_sec"
 chk "修正27 車頭車尾貼住直線拉開"   "$NCC/path_teach_cc_node.py"                               "_unwedge_straight"
 chk "修正28 日誌不在同一行換等級"     "$NCC/map_service_cc_node.py"                              "Logger severity cannot be changed"
-[ -x "$HOME/maprun/run_camera_face_cc.sh" ] \
+[ -x "$(dirname "$(readlink -f "$0")")/../run_camera_face_cc.sh" ] \
   && rec "修正5 人臉相機啟動入口" PASS "run_camera_face_cc.sh 可執行" "" \
   || rec "修正5 人臉相機啟動入口" FAIL "缺少或沒有執行權限" "chmod +x ~/maprun/run_camera_face_cc.sh"
 

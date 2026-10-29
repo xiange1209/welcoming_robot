@@ -9,10 +9,10 @@
   離線自我測試 25 次：23 次判定且全對、2 次說不確定、0 次錯；中位誤差 1.4 cm／0.3°，每次約 2.3 秒）。
 
 用法（導航單元要在跑）：
-    python3 ~/maprun/tools_1020/localize_here.py          # 直接 Enter＝自動判斷；或輸入地點編號／名稱
-    python3 ~/maprun/tools_1020/localize_here.py --auto   # 自動判斷（不問）
-    python3 ~/maprun/tools_1020/localize_here.py 櫃台      # 設到這個地點（名稱或清單編號；車頭要朝存點時的方向）
-    python3 ~/maprun/tools_1020/localize_here.py --save 起點   # 用車子現在的位置與朝向存成地點
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/localize_here.py          # 直接 Enter＝自動判斷；或輸入地點編號／名稱
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/localize_here.py --auto   # 自動判斷（不問）
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/localize_here.py 櫃台      # 設到這個地點（名稱或清單編號；車頭要朝存點時的方向）
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/localize_here.py --save 起點   # 用車子現在的位置與朝向存成地點
 結束碼：0＝定位確認、2＝吻合度偏低／不確定／方向不對、1＝失敗。
 吻合度門檻 80% 的依據：正確 90.8~100% 對錯誤 41~62.6% 完全分開（記憶 localization-verify-score-distribution）。
 """
@@ -72,7 +72,8 @@ def ensure_ros_env():
     if os.environ.get("CYCLONEDDS_URI") or os.environ.get("_LOCALIZE_REEXEC"):
         return
     os.environ["_LOCALIZE_REEXEC"] = "1"
-    os.execvp("bash", ["bash", "-c", 'source /home/user/maprun/env.sh >/dev/null 2>&1; exec python3 "$0" "$@"',
+    env_sh = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "env.sh")   # ★ 10/29：repo 的 maprun/env.sh
+    os.execvp("bash", ["bash", "-c", f'source "{env_sh}" >/dev/null 2>&1; exec python3 "$0" "$@"',
                        os.path.abspath(__file__)] + sys.argv[1:])
 
 

@@ -28,8 +28,11 @@ export function MapCanvas({
   onPickEnd,
   className,
   placeholder = "等待地圖…",
+  focusRoute,
 }: {
   active: boolean;
+  /** 放大到路線＋車子（迎賓頁帶位用）；沒給＝整張圖 */
+  focusRoute?: boolean;
   /** 小地圖：只畫地圖與車子，不畫地點名稱與目標點 */
   minimal?: boolean;
   picked?: PickedPose | null;
@@ -79,6 +82,7 @@ export function MapCanvas({
         waypoints: waypointsStore.get(),
         picked: pickedRef.current,
         minimal,
+        focusRoute,
       });
 
       // 提示文字直接寫 DOM。走 React 的話這一行會讓整頁每秒重繪十次，
@@ -105,7 +109,7 @@ export function MapCanvas({
       observer.disconnect();
       for (const off of unsubscribes) off();
     };
-  }, [active, minimal]);
+  }, [active, minimal, focusRoute]);
 
   const toWorld = (ev: { clientX: number; clientY: number }) => {
     const canvas = canvasRef.current;

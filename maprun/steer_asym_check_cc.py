@@ -30,9 +30,9 @@
 
     # 空曠處（大廳），前後左右各留 1.5 m 以上
     ~/maprun/run_sensors_cc.sh false
-    python3 ~/maprun/steer_asym_check_cc.py
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/steer_asym_check_cc.py
 
-    python3 ~/maprun/steer_asym_check_cc.py --dry   # 只印計畫不開車
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/steer_asym_check_cc.py --dry   # 只印計畫不開車
 
 ★ 車子會自己動。開始前會檢查前方淨空，但**側向要你自己看**。
 """

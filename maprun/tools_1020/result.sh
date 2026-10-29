@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 手動測試結果登記：一行一項，PASS／FAIL／WARN／未做 + 數字或備註。
-# 結果寫進 ~/maprun/verify_out/manual_results_<日期>.tsv，同時用 trip_mark.sh 在上車日誌留一行（兩邊都會被 collect_data.sh --all 帶走）。
+# 結果寫進 ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/manual_results_<日期>.tsv，同時用 trip_mark.sh 在上車日誌留一行（兩邊都會被 collect_data.sh --all 帶走）。
 #
 # 用法：
-#   ~/maprun/tools_1020/result.sh <項目編號> <PASS|FAIL|WARN|未做> "<數字或備註>"
-#   ~/maprun/tools_1020/result.sh 1 PASS "V0 全過、throttled 0x0、電池 24.1V"
-#   ~/maprun/tools_1020/result.sh 4 FAIL "急停後車子還滑了 2 秒；數字見 estop_timing 輸出"
-#   ~/maprun/tools_1020/result.sh show            # 看今天登記了什麼
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/result.sh <項目編號> <PASS|FAIL|WARN|未做> "<數字或備註>"
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/result.sh 1 PASS "V0 全過、throttled 0x0、電池 24.1V"
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/result.sh 4 FAIL "急停後車子還滑了 2 秒；數字見 estop_timing 輸出"
+#   ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/result.sh show            # 看今天登記了什麼
 #
 # 項目編號（對應 ~/car_docs/今日手動測試步驟_20261020.md）：
 #   0 開機檢查  1 V0  2 標地點  3 自身回波  4 平板急停  5 轉向實驗  6 故事線(每輪一行，備註寫第幾輪)
@@ -29,7 +29,8 @@ SYNC=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)
 # 備註裡的 Tab／換行換成空白，避免破壞表格
 CLEAN=$(printf '%s' "$NOTE" | tr '\t\n' '  ')
 printf '%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$ITEM" "$STATUS" "$CLEAN" >> "$F"
-[ -x "$HOME/maprun/trip_mark.sh" ] && "$HOME/maprun/trip_mark.sh" "結果 項目$ITEM $STATUS" "$CLEAN" >/dev/null 2>&1
+_TM="$(dirname "$(readlink -f "$0")")/../trip_mark.sh"   # ★ 10/29：repo 的 maprun/trip_mark.sh
+[ -x "$_TM" ] && "$_TM" "結果 項目$ITEM $STATUS" "$CLEAN" >/dev/null 2>&1
 echo "✓ 已登記：項目 $ITEM  $STATUS  $CLEAN"
 [ "$SYNC" != yes ] && echo "⚠ 時鐘還沒同步，這筆時間可能不準，已在備註標記"
 exit 0

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Badge, Button, Card, Hint, Row } from "../components/ui";
+import { Button, Card, Hint } from "../components/ui";
 import { cx } from "../lib/cx";
 import { useVisibleInterval } from "../hooks/useVisibleInterval";
 import { api, post, run } from "../lib/api";
 import { confirmDialog } from "../lib/dialog";
-import type { ApiResult, Scenario, SysUnit, VerifyItem } from "../lib/types";
+import type { ApiResult, Scenario, SysUnit } from "../lib/types";
 
 /* 十個開關擠成一列很難找，照迎賓流程的順序分三組。
 
@@ -149,18 +149,6 @@ function ScenarioCard({
   );
 }
 
-/* ── 一鍵驗證（2026-09-24）─────────────────────────────────
-   跟「測試情境」分開是刻意的：情境是「把東西開起來」，驗證是「證明它
-   真的在做事」。9/17 的教訓就是節點全亮綠燈、話題也都在，但 ASR 從沒
-   建立過辨識器、相機降幀從未生效。
-
-   ★ 按下去是實際「量」，不是讀設定值——ros2 param get 不算驗證。
-   ★ 有兩項要輸入捲尺／量角器讀數，網頁沒有鍵盤輸入，那兩顆只給指令，
-     不假裝能跑。
-   ★ 同一時間只跑一支：V1 要量 12 秒的幀率，兩支同時跑會互相搶 CPU，
-     量到的數字就不準了。 */
-const VERDICT = /^\s*(PASS|FAIL|WARN)\b/;
-
 /* ★ 2026-10-22：電源。展示收尾不用再 SSH：後端會先把所有功能單元依序關掉（同「全部關閉」情境），
    再交給 systemd 關機／重開機。 */
 function PowerCard() {
@@ -190,133 +178,6 @@ function PowerCard() {
         </Button>
         <Button onClick={() => void act("reboot")}>重新開機</Button>
       </div>
-    </Card>
-  );
-}
-
-function VerifyCard({ active }: { active: boolean }) {
-  const [list, setList] = useState<VerifyItem[]>([]);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [waited, setWaited] = useState(0);
-  const [out, setOut] = useState<{ title: string; text: string } | null>(null);
-  const loaded = useRef(false);
-
-  useEffect(() => {
-    if (!active || loaded.current) return;
-    loaded.current = true;
-    void api<ApiResult & { items?: VerifyItem[] }>("/api/verify").then((r) =>
-      setList(r.items || []),
-    );
-  }, [active]);
-
-  // 「已等 N 秒」用計數器每秒 +1，不碰 Date.now()——事件處理裡呼叫也會被
-  // react-hooks/purity 當成算繪期間的不純函式擋下來
-  useVisibleInterval(() => setWaited((w) => w + 1), 1000, active && !!busy);
-
-  // 平板上一眼看出有沒有紅字，不用逐行讀
-  const tally = useMemo(() => {
-    const t = { PASS: 0, FAIL: 0, WARN: 0 };
-    for (const line of out?.text.split("\n") ?? []) {
-      const m = VERDICT.exec(line);
-      if (m) t[m[1] as keyof typeof t] += 1;
-    }
-    return t;
-  }, [out]);
-
-  const run = async (v: VerifyItem) => {
-    if (!v.runnable) {
-      setOut({
-        title: v.label,
-        text: `這支要輸入現場量到的數值，網頁沒有鍵盤輸入。\n請在車上的終端機執行：\n\n  ${v.script}`,
-      });
-      return;
-    }
-    setBusy(v.key);
-    setWaited(0);
-    setOut({ title: v.label, text: "" });
-    const r = await post<ApiResult & { output?: string }>(
-      `/api/verify/${v.key}`,
-    );
-    setOut({ title: v.label, text: r.output || r.message || "(沒有輸出)" });
-    setBusy(null);
-  };
-
-  if (!list.length) return null;
-
-  return (
-    <Card title="一鍵驗證" className="flex-none">
-      <Hint className="mb-2.5">
-        按下去會實際<b className="text-label-2">量</b>，不是讀設定值。從 V0
-        依序往下，
-        <b className="text-label-2">有 FAIL 就停下來</b>——後面量到的數字不可信。
-      </Hint>
-
-      <div className="flex flex-col gap-1.5">
-        {list.map((v) => (
-          <Row key={v.key}>
-            <div className="min-w-0 flex-1">
-              <div className="font-semibold">
-                {v.label}
-                {!v.runnable && (
-                  <span className="ml-1.5 text-[12px] font-normal text-label-3">
-                    （要鍵盤輸入）
-                  </span>
-                )}
-              </div>
-              <div className="text-[12px] text-label-3">{v.why}</div>
-              {v.note && (
-                <div className="text-[12px] text-label-3">{v.note}</div>
-              )}
-            </div>
-            <Button
-              variant={v.runnable ? "primary" : "ghost"}
-              disabled={!!busy}
-              onClick={() => void run(v)}
-            >
-              {busy === v.key ? "執行中…" : v.runnable ? "執行" : "看指令"}
-            </Button>
-          </Row>
-        ))}
-      </div>
-
-      {out && (
-        <div className="mt-2.5">
-          <div className="mb-1.5 flex flex-wrap items-center gap-1.5 text-[12px] text-label-2">
-            <span className="font-semibold">{out.title}</span>
-            {busy ? (
-              <Badge tone="run">
-                <span className="tnum">執行中… 已等 {waited} 秒</span>
-              </Badge>
-            ) : (
-              <>
-                {tally.FAIL > 0 && <Badge tone="bad">FAIL {tally.FAIL}</Badge>}
-                {tally.WARN > 0 && <Badge tone="warn">WARN {tally.WARN}</Badge>}
-                {tally.PASS > 0 && <Badge tone="ok">PASS {tally.PASS}</Badge>}
-              </>
-            )}
-          </div>
-          {/* 用 div 不用 <pre>：<pre> 只能裝行內元素，逐行上色需要塊級的 div */}
-          {out.text && (
-            <div className="max-h-[420px] overflow-auto rounded-ios border border-[var(--color-outline-variant)] bg-[var(--color-well)] p-2.5 font-mono text-[12px] leading-relaxed break-all whitespace-pre-wrap">
-              {out.text.split("\n").map((line, i) => {
-                const verdict = VERDICT.exec(line)?.[1];
-                return (
-                  <div
-                    key={i}
-                    className={cx(
-                      verdict === "FAIL" && "text-red",
-                      verdict === "WARN" && "text-orange",
-                      verdict === "PASS" && "text-green",
-                    )}
-                  >
-                    {line || " "}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
     </Card>
   );
 }
@@ -419,7 +280,7 @@ export function SystemPage({ active }: { active: boolean }) {
   }, [ungrouped]);
 
   return (
-    /* 寬螢幕：左欄放「任務」（情境＋驗證）、右欄放「節點」，各自內部捲動。
+    /* 寬螢幕：左欄放「任務」（情境＋電源）、右欄放「節點」，各自內部捲動。
        窄螢幕：由上而下堆疊、整頁捲動——<main> 本身不捲，這層要自己處理。
        ★ 左欄的卡要 flex-none：Card 預設帶 min-h-0，放在會捲動的 flex-col 裡
          會被壓扁、內容在卡片裡被裁掉，而不是讓外層捲動。
@@ -428,7 +289,6 @@ export function SystemPage({ active }: { active: boolean }) {
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto xl:grid xl:grid-cols-[1fr_1.15fr] xl:grid-rows-[minmax(0,1fr)] xl:overflow-hidden portrait:max-xl:grid portrait:max-xl:grid-cols-[1fr_1.15fr] portrait:max-xl:grid-rows-[minmax(0,1fr)] portrait:max-xl:overflow-hidden">
       <div className="flex flex-none flex-col gap-3 empty:hidden xl:min-h-0 xl:overflow-y-auto portrait:max-xl:min-h-0 portrait:max-xl:overflow-y-auto">
         <ScenarioCard active={active} onApplied={() => void refresh()} />
-        <VerifyCard active={active} />
         <PowerCard />
       </div>
 

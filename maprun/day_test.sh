@@ -2,23 +2,26 @@
 # 一鍵測試（★ 2026-10-26 車上 agent）：上機當天照提示做，結果全部自動記錄。不必開 VS Code。
 #
 #   筆電 cmd.exe：ssh user@192.168.137.106
-#   進去之後打：  ~/maprun/day_test.sh
+#   進去之後打：  ~/welcoming_robot_ws/src/smartnav_ws/maprun/day_test.sh
 #
 # 流程（對照報告與 下週上車測試清單_20261023.md）：
 #   1 開工檢查 V0 → 2 語音錯字率 → 3 舵機確認 → 4 故事線＋CPU＋整體延遲 → 5 導航新舊 A/B＋急停計時
 #   → 6 LLM 十題 → 7 人臉×距離 → 8 操作步驟錄影 → 9 收工打包
 # 每一步開始前會說明要做什麼：Enter＝開始、s＝跳過、x＝先離開（不收工）、q＝直接收工（會自動打包）。
-# 做過的步驟記在 ~/maprun/verify_out/day_<月日>/done.txt；斷線後再打一次同一個指令，會從沒做的地方接。
+# 做過的步驟記在 ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/day_<月日>/done.txt；斷線後再打一次同一個指令，會從沒做的地方接。
 # 結果：同一個資料夾（每步的輸出、CSV、session.log），重點數字另外用 result.sh 登記（manual_results_<日期>.tsv）。
 # ★ 會讓車子動的步驟要打 yes；平板急停隨時可按。轉向量測（第 3 步）例外：平板急停停不了，只能在這個視窗按 Ctrl-C。
 # ★ 任何一步跑到一半按 Ctrl-C，只會停掉那一步、回到流程。
 # ★ 背景記錄（CPU、整體延遲、急停計時）用 SIGTERM 停：bash 背景工作會忽略 Ctrl-C。
 # 不要 set -u（source ROS 會靜默中止，見記憶 set-u-breaks-ros-source）。
 
-source /home/user/maprun/env.sh >/dev/null 2>&1
+# ★ 2026-10-29：程式在 repo 裡（~/welcoming_robot_ws/src/smartnav_ws/maprun，就是這支所在的資料夾），
+#   資料照舊寫在 ~/maprun（verify_out、logs；不進 git）。
+R="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+source "$R/env.sh" >/dev/null 2>&1
 export PYTHONUNBUFFERED=1
 M=/home/user/maprun
-T=$M/tools_1020
+T=$R/tools_1020
 D=${DAY_TEST_DIR:-$M/verify_out/day_$(date +%m%d)}
 PACK_DIR=${DAY_TEST_PACK_DIR:-/home/user}
 mkdir -p "$D"
@@ -161,7 +164,7 @@ step_v0() {
   hmi start sensors
   sleep 5   # 行程出現 ≠ 已經在發 /PowerVoltage
   local nf bad vf="$D/v0_$(date +%H%M%S).txt"   # ★ 10/27：每次一個檔（以前 v0.txt 每跑一次就蓋掉上一次）
-  "$M/verify/verify_0_preflight.sh" 2>&1 | teeq "$vf"
+  "$R/verify/verify_0_preflight.sh" 2>&1 | teeq "$vf"
   cp "$vf" "$D/v0.txt"
   # WARN 也算沒過（電池讀不到、時鐘沒同步、找不到編譯產物）
   bad=$(sed -E 's/\x1b\[[0-9;]*m//g' "$D/v0.txt" | grep -E "^\s+(FAIL|WARN)" | sed -E 's/^\s+//; s/\s{2,}/ /g')
@@ -231,9 +234,9 @@ steer_run() {   # $1＝before／after
   hmi stop nav
   hmi start sensors
   sleep 12
-  python3 "$M/steer_asym_check_cc.py" --dry
+  python3 "$R/steer_asym_check_cc.py" --dry
   confirm "★ 車子要動了（直走＋左右打滿；地上、四周 1.5 m 淨空；平板急停停不了，只能在這裡 Ctrl-C）。人站在旁邊了嗎？" || return
-  soft_on; python3 "$M/steer_asym_check_cc.py" 2>&1 | teeq "$D/steer_$1.txt"; soft_off   # Ctrl-C＝停車（平板急停停不了它）
+  soft_on; python3 "$R/steer_asym_check_cc.py" 2>&1 | teeq "$D/steer_$1.txt"; soft_off   # Ctrl-C＝停車（平板急停停不了它）
   local r tr
   r=$(grep -E "左右不對稱：" "$D/steer_$1.txt" | head -1 | sed -E 's/^\s+//')
   tr=$(grep -oE "trim_rad_per_m 設 [-+0-9.]+" "$D/steer_$1.txt" | head -1)
@@ -250,7 +253,7 @@ step_servo() {
   1. 整台車架高（後輪也要離地，不然車會跑掉），四周清空，手遠離輪子。
      （底盤如果是剛剛才開的，先等 20 秒讓 IMU 校準完再搬車）
   2. 另開一個 SSH 視窗（跟這個一樣連進來），打這兩行，用鍵盤遙控：
-       source ~/maprun/env.sh
+       source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
        ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p speed:=0.15 -p turn:=1.0
      按住 u＝慢慢前進＋打滿左；按住 o＝慢慢前進＋打滿右；k 或空白鍵＝停；Ctrl-C＝結束（會自動送停止）。
      ★ 車速 0 時韌體會把舵機扳正，所以一定要用 u／o（邊前進邊轉）；j、l 是原地轉，舵機會回正。
@@ -357,8 +360,8 @@ step_navab() {
   hmi start sensors nav:localization   # ★ 10/27：只寫 nav 會被拒絕（要指定啟動方式）
   sleep 5
   localize_step || return
-  ask a "來回的兩個地點（Enter＝起點 門口；或輸入「地點A 地點B」，中間空一格）：" || { STEP_ABORT=1; return; }
-  read -r pa pb _ <<< "${a:-起點 門口}"
+  ask a "來回的兩個地點（Enter＝櫃台 大廳；或輸入「地點A 地點B」，中間空一格）：" || { STEP_ABORT=1; return; }
+  read -r pa pb _ <<< "${a:-櫃台 大廳}"
   [ -n "$pb" ] || { say "要兩個地點"; STEP_ABORT=1; return; }
   ask n "每組幾趟（Enter＝4；偶數＝兩組都從「$pa」出發、最後回到「$pa」）：" || n=4
   case "$n" in ''|*[!0-9]*) n=4 ;; esac
@@ -472,7 +475,6 @@ step_wrap() {
   say "✓ 今天的資料：$out（$(tar tzf "$out" 2>/dev/null | wc -l) 檔，$(du -h "$out" | cut -f1)）"
   echo "筆電 cmd.exe 貼這一行："
   echo "scp user@192.168.137.106:$out \"%USERPROFILE%\\Desktop\\專題\\backups\\研究數據\\$(basename "$out")\""
-  echo "（要連前幾天的全部資料：~/maprun/car_menu.sh 選 14）"
   echo "今天登記的結果："
   cat "$D/results_today.txt"
 }
@@ -499,7 +501,7 @@ main() {
       ask g "Enter＝開始、s＝跳過、x＝先離開（不收工）、q＝直接收工：" || g=x   # ★ 10/27：Ctrl-C＝離開（以前＝跳過，連按會跳到收工）
       case "$g" in
         s|S) log "跳過 ${TITLES[$i]}"; continue ;;
-        x|X) say "先離開（沒有收工）。要重做某一步：再打 ~/maprun/day_test.sh，問從第幾步開始時輸入那一步的號碼"; return ;;
+        x|X) say "先離開（沒有收工）。要重做某一步：再打 ~/welcoming_robot_ws/src/smartnav_ws/maprun/day_test.sh，問從第幾步開始時輸入那一步的號碼"; return ;;
         q|Q) step_wrap; return ;;
         w|W) apt_wait ;;   # 每一步自己會開需要的功能，所以等完直接開始這一步就好
       esac

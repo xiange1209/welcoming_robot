@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """平板急停計時（交接文件 §5-2：重播中按平板急停，車要在 ≤1.3 s 內停下）。
 
-用法（車上；腳本自己會 source 不到環境，請先 source ~/maprun/env.sh）：
-    source ~/maprun/env.sh
-    python3 ~/maprun/tools_1020/estop_timing.py            # 一直等；Ctrl-C 結束並印總表
-    python3 ~/maprun/tools_1020/estop_timing.py --limit 1.3
+用法（車上；腳本自己會 source 不到環境，請先 source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh）：
+    source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/estop_timing.py            # 一直等；Ctrl-C 結束並印總表
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/estop_timing.py --limit 1.3
 然後：讓車在重播（或脫困）中，去平板按「急停」。每按一次印一行結果。
 
 t0 是什麼：HMI 處理 /api/estop 時，會先送零速、接著發一則 /unwedge_abort（std_msgs/Empty）。
@@ -139,7 +139,7 @@ class EstopTiming(Node):
             with open(self.out_tsv, "a", encoding="utf-8") as fh:
                 fh.write("\t".join([time.strftime("%Y-%m-%dT%H:%M:%S"), str(p["n"]),
                                     "" if vmax is None else f"{vmax:.3f}", f(last_nz), f(first_z), f(stable), verdict]) + "\n")
-            trip = os.path.expanduser("~/maprun/trip_mark.sh")
+            trip = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trip_mark.sh")
             if os.path.exists(trip):
                 try:
                     subprocess.run([trip, f"T4 急停計時 #{p['n']}", line], capture_output=True, timeout=5)
@@ -153,7 +153,7 @@ def main():
     ap = argparse.ArgumentParser(description="平板急停計時")
     ap.add_argument("--limit", type=float, default=1.3, help="過關門檻（秒），預設 1.3")
     ap.add_argument("--out", default=os.path.expanduser(
-        f"~/maprun/verify_out/estop_timing_{time.strftime('%Y%m%d')}.tsv"))
+        f"~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/estop_timing_{time.strftime('%Y%m%d')}.tsv"))
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     rclpy.init()

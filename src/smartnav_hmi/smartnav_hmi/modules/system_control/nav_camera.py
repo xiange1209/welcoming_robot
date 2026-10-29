@@ -36,7 +36,9 @@ class NavCameraPause:
         self._node = node
         self._sup = supervisor
         self._face_needle = face_needle          # 指令列裡認得出「人臉模式」的字串（camera_face_cc.launch）
-        node.declare_parameter("pause_camera_while_navigating", True)
+        # ★ 2026-10-29：預設改成**不暫停**（使用者決定）：帶位時迎賓頁的相機縮成小窗、地圖放大，小窗要有即時畫面；
+        #   暫停的代價是到點後約 4~18 秒看不到、認不了人。CPU 不夠時再打開（ros2 param set … true，即時生效）。
+        node.declare_parameter("pause_camera_while_navigating", False)
         node.declare_parameter("camera_resume_delay_sec", 3.0)
         self._delay = max(0.0, float(node.get_parameter("camera_resume_delay_sec").value))
         self._lock = threading.Lock()
@@ -71,6 +73,10 @@ class NavCameraPause:
             if nav == self._nav:
                 return
             self._nav = nav
+            # 迎賓頁靠這個旗標切換「地圖放大＋相機小窗」（system.navigating）
+            st = getattr(self._node, "state", None)
+            if st is not None:
+                st.set_system(navigating=nav)
             if nav:
                 self._check = True
             else:
@@ -140,5 +146,11 @@ class NavCameraPause:
         return any("astra_camera_node" in c for c in self._cmds())
 
     def _face_camera_running(self) -> bool:
+        # ★ 2026-10-29 修正：HMI 開相機的指令列是
+        #     ros2 launch smartnav_hmi system_control.launch.py unit:=camera variant:=face
+        #   裡面**沒有** camera_face_cc.launch 這個字（那是 launch 檔內部 include 的）——10/28 版只比對它，
+        #   所以從平板開的相機永遠不會被暫停（10/28 晚上 23:34 那趟相機開著、沒有任何暫停紀錄）。兩種寫法都認。
         cmds = self._cmds()
-        return any("astra_camera_node" in c for c in cmds) and any(self._face_needle in c for c in cmds)
+        if not any("astra_camera_node" in c for c in cmds):
+            return False
+        return any(self._face_needle in c or {"unit:=camera", "variant:=face"} <= set(c.split()) for c in cmds)

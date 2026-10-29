@@ -37,10 +37,16 @@ def _actions(context):
         }
         if variant in modes:
             mode, explore = modes[variant]
-            return [_include("smartnav_navigation_cc", "nav_bringup_cc.launch.py", {
-                "use_sim_time": "false", "use_rviz": "false", "start_mode": mode,
-                "use_exploration": explore, "auto_start_exploration": explore,
-            })]
+            # ★ 2026-10-29：導航仲裁跟導航堆疊一起起、一起停（以前是獨立單元，忘了開＝客人與管理者帶位一律被拒）。
+            #   三種模式都起：建圖存檔後 map_service 會自己切到定位模式，那時候也要能帶位。節點名維持 nav_arbiter_node
+            #   （HMI 的節點健康表 core/constants.py 認這個名字）。
+            return [
+                _include("smartnav_navigation_cc", "nav_bringup_cc.launch.py", {
+                    "use_sim_time": "false", "use_rviz": "false", "start_mode": mode,
+                    "use_exploration": explore, "auto_start_exploration": explore,
+                }),
+                Node(package="smartnav_brain", executable="nav_arbiter", name="nav_arbiter_node", output="screen"),
+            ]
     if unit == "asr_chain":
         return [_include("smartnav_audio", "asr_chain.launch.py")]
 
@@ -48,7 +54,6 @@ def _actions(context):
         "face": ("smartnav_vision", "face_embedding", {"enable_gpu": False}),
         "user_auth": ("smartnav_brain", "user_auth", {}),
         "bank_reception": ("smartnav_brain", "bank_reception", {}),
-        "nav_arbiter": ("smartnav_brain", "nav_arbiter", {}),
         "llm": ("smartnav_llm", "llm_service", {}),
         "speech_synthesizer": ("smartnav_audio", "speech_synthesizer", {}),
         "voice_playback": ("smartnav_audio", "voice_playback", {}),

@@ -8,8 +8,8 @@
   10/28 的修正：slam transform_timeout 0.2→1.0、探索期間規劃半徑暫時 0.95（map_service_cc 的 explore_planner_radius_m）。
 
 用法：
-    python3 ~/maprun/tools_1020/explore_summary.py                 # 最新一個有探索的導航 log
-    python3 ~/maprun/tools_1020/explore_summary.py <導航 log 路徑>   # 指定（例如拿 10/27 那份當對照）
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/explore_summary.py                 # 最新一個有探索的導航 log
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/explore_summary.py <導航 log 路徑>   # 指定（例如拿 10/27 那份當對照）
 """
 import datetime
 import glob

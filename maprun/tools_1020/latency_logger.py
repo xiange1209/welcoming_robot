@@ -9,11 +9,11 @@
     /user_identity 認出人 → /speech_text 迎賓句
 
 用法（車上；跟故事線、平板操作一起開著就好）：
-    source ~/maprun/env.sh
-    python3 ~/maprun/tools_1020/latency_logger.py              # 一直記，Ctrl-C 結束並印統計
-    python3 ~/maprun/tools_1020/latency_logger.py --secs 1800  # 30 分鐘自動結束
+    source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/latency_logger.py              # 一直記，Ctrl-C 結束並印統計
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/latency_logger.py --secs 1800  # 30 分鐘自動結束
 
-輸出：~/maprun/verify_out/latency_<MMDD_HHMM>/events.csv（每個事件）、turns.csv（每一輪）、summary.txt
+輸出：~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/latency_<MMDD_HHMM>/events.csv（每個事件）、turns.csv（每一輪）、summary.txt
 ★ 「說完話」＝這一段音訊裡**最後一塊有聲音**的收到時間（每塊 32 ms 算音量，門檻＝這段最大音量的 12%
   與底噪 ×2 取大者）。不用「VAD 結束 − 靜音門檻」推，因為 VAD 觸發後前 3 秒連靜音也照送，短句會推錯。
   VAD 的 is_final 時間另外記（「最後音訊→文字」），靜音門檻從 asr log 讀「靜音結束檢測: N ms」。
@@ -298,7 +298,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--secs", type=float, default=0.0, help="記這麼久自動結束（0＝直到 Ctrl-C）")
     ap.add_argument("--silence-ms", type=int, default=None, help="VAD 靜音門檻（預設從 asr log 讀）")
-    ap.add_argument("--out", default=os.path.expanduser(f"~/maprun/verify_out/latency_{time.strftime('%m%d_%H%M')}"))
+    ap.add_argument("--out", default=os.path.expanduser(f"~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/latency_{time.strftime('%m%d_%H%M')}"))
     # 測試用：把音訊／身分／速度改聽別的話題（驗證這支工具時不必碰真的話題）
     ap.add_argument("--audio-topic", default="/audio_in")
     ap.add_argument("--identity-topic", default="/user_identity")

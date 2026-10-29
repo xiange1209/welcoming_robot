@@ -7,8 +7,6 @@
 
 import importlib.util
 import os
-import re
-import subprocess
 from typing import Dict, Optional
 
 from std_srvs.srv import Trigger
@@ -89,7 +87,7 @@ class SystemControlManager:
         "nav": {
             "label": "導航堆疊",
             "detect": ["map_service_cc"],
-            "start_hint": "啟動約需 60 秒。模式請看建圖頁的狀態列",
+            "start_hint": "啟動約需 60 秒。模式請看建圖頁的狀態列。★ 導航仲裁（身分／權限，帶位的唯一入口）跟著一起起、一起停",
             "variants": {
                 "mapping": {
                     "label": "建圖（遙控）",
@@ -137,11 +135,6 @@ class SystemControlManager:
             "detect": ["user_auth"],
             "start_hint": "辨識到人之後決定要不要迎賓、走哪個流程",
         },
-        "nav_arbiter": {
-            "label": "導航仲裁（身分／權限）",
-            "detect": ["nav_arbiter"],
-            "start_hint": "LLM 與迎賓頁帶位的唯一入口：依身分決定准不准，再轉給導航；沒開就不能帶位（預設拒絕）。需先開「使用者認證 / 決策」才認得出貴賓",
-        },
         "bank_reception": {
             "label": "迎賓劇本（銀行）",
             "detect": ["bank_reception"],
@@ -150,7 +143,7 @@ class SystemControlManager:
         "llm": {
             "label": "LLM 對話",
             "detect": ["llm_service"],
-            "start_hint": "連遠端 Ollama（預設 192.168.137.1:11434 = 筆電），不是跑在這台 Pi 上",
+            "start_hint": "連遠端 Ollama（筆電，不是這台 Pi）：自動找 MSI.mshome.net／MSI.local／預設閘道／已知 IP；筆電的 Ollama 要聽區網（OLLAMA_HOST=0.0.0.0）",
         },
         # ★★ 語音喚醒與辨識必須一起運作，且由 asr_chain.launch.py 統一管理。
         #
@@ -232,7 +225,7 @@ class SystemControlManager:
         "mapping": {
             "label": "建圖（遙控）",
             "why": "底盤雷達 + 導航堆疊（建圖模式）。人用遙控把環境走一遍。其餘全關，把 CPU 讓出來",
-            "stop": ["face", "user_auth", "bank_reception", "nav_arbiter", "llm", "asr_chain", "camera", "nav"],
+            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
             "start": ["sensors", "nav:mapping"],
             "note": "導航堆疊會先停掉、再用建圖模式重啟（換模式一定要重啟）。"
             "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
@@ -242,14 +235,14 @@ class SystemControlManager:
         "auto_mapping": {
             "label": "建圖（自動探索）",
             "why": "同上，但啟動 frontier explorer，車子會自己找沒去過的地方開過去",
-            "stop": ["face", "user_auth", "bank_reception", "nav_arbiter", "llm", "asr_chain", "camera", "nav"],
+            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
             "start": ["sensors", "nav:explore"],
             "note": "⚠ 車子會自己跑動，旁邊要有人顧著。導航堆疊會先停掉、再用探索模式重啟；"
             "全綠後（約 80 秒）到「遙控建圖」分頁按「開始建圖」才會開始探索。"
             "四種情況會自動存圖：探索完成、4 分鐘地圖沒有長大、同一處卡住 3 次（疑似有低於雷達的障礙，清掉再建）、30 分鐘上限。"
             "想提早結束按同一頁的「完成存檔」（會存圖；「取消」會丟掉這張圖）。"
             "★ 緊急狀況照樣直接按緊急停止 —— 安全優先，圖可以重建。"
-            "結束後到「一鍵驗證」按 V5 看這趟卡在哪一類",
+            "結束後在 SSH 跑 python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/explore_summary.py 看這趟卡在哪一類",
         },
         "teach": {
             "label": "教導路徑 錄製 / 重播",
@@ -272,7 +265,7 @@ class SystemControlManager:
         "all_off": {
             "label": "全部關閉",
             "why": "展示結束、或換情境之前：把所有功能單元依序關掉。HMI 本身照常（平板不會斷線）",
-            "stop": ["llm", "asr_chain", "speech_synthesizer", "voice_playback", "nav_arbiter", "bank_reception", "user_auth",
+            "stop": ["llm", "asr_chain", "speech_synthesizer", "voice_playback", "bank_reception", "user_auth",
                      "face", "camera", "nav", "sensors"],
             "start": [],
             "note": "本來就沒開的單元會直接跳過。要關機請用下方「電源」卡（關機前也會先做這一步）",
@@ -289,7 +282,6 @@ class SystemControlManager:
                 "face",
                 "user_auth",
                 "bank_reception",
-                "nav_arbiter",
                 "asr_chain",
                 "llm",
             ],
@@ -309,7 +301,6 @@ class SystemControlManager:
                 "face:eco",
                 "user_auth",
                 "bank_reception",
-                "nav_arbiter",
                 "asr_chain",
                 "llm",
             ],
@@ -317,69 +308,6 @@ class SystemControlManager:
         },
     }
 
-    # ------------------------------------------------------------------
-    # 一鍵驗證（2026-09-21 新增，2026-09-24 搬進模組化結構）
-    # ------------------------------------------------------------------
-    # 跟上面的「測試情境」分開是刻意的：情境是「把東西開起來」，
-    # 驗證是「證明它真的在做事」。9/17 的教訓就是節點全亮綠燈、話題也都在，
-    # 但 ASR 從沒建立過辨識器、相機降幀從未生效。
-    #
-    # runnable=False 的兩支要讀鍵盤輸入（捲尺／量角器量到的值），
-    # 網頁沒有 stdin，所以只回傳指令讓人去終端機貼，不假裝能跑。
-    VERIFY_SCRIPTS = {
-        "v0": {
-            "label": "V0 開工前檢查",
-            "why": "電池、裝置、時鐘、目錄結構，以及各項修正有沒有部署到車上",
-            "script": "/home/user/maprun/verify/verify_0_preflight.sh",
-            "runnable": True,
-            "note": "這關沒過就別往下做，後面量到的數字都不可信",
-        },
-        "v1": {
-            "label": "V1 修正生效驗證",
-            "why": "量相機實際幀率、人臉 CPU、模型載入、麥克風增益",
-            "script": "/home/user/maprun/verify/verify_1_fixes.sh",
-            "runnable": True,
-            "note": "★ 先套用「測人臉辨識 / 註冊」情境把相機與人臉開起來，再按這個。"
-            "ros2 param get 不算驗證，這支量的是實際輸出",
-        },
-        "v2": {
-            "label": "V2 建圖後記錄",
-            "why": "確認地圖存了，並記下門口／走廊／最窄處三個淨寬",
-            "script": "/home/user/maprun/verify/verify_2_map.sh",
-            "runnable": False,
-            "note": "要輸入捲尺量到的寬度，請在終端機跑",
-        },
-        "v3": {
-            "label": "V3 舵機量測",
-            "why": "前輪離地打滿舵，量實際角度（是量測，不是校準）",
-            "script": "/home/user/maprun/verify/verify_3_steer.sh",
-            "runnable": False,
-            "note": "要輸入量角器讀數，請在終端機跑",
-        },
-        "v4": {
-            "label": "V4 循跡誤差統計",
-            "why": "當場算出今天重現幾趟的 95 百分位，不必等回電腦",
-            "script": "/home/user/maprun/verify/verify_4_replay.sh",
-            "runnable": True,
-            "note": "教導錄一條、重現 4 趟之後再按",
-        },
-        "v5": {
-            "label": "V5 自動探索報告",
-            "why": "解析最近一趟自動探索的導航 log，把卡住分成 CPU／TF、幾何、實體三類",
-            # 不帶參數 = report 模式（watch 模式會一直記到 Ctrl-C，網頁跑不了）
-            "script": "/home/user/maprun/verify/verify_5_explore.sh",
-            "runnable": True,
-            "note": "探索結束（自動存圖或按「完成存檔」）後再按。"
-            "想一併記 CPU 的話，探索開始前另開終端機跑 verify_5_explore.sh watch",
-        },
-        "collect": {
-            "label": "打包回傳",
-            "why": "把驗證結果與原始數據打包，並印出 scp 指令",
-            "script": "/home/user/maprun/verify/collect_data.sh",
-            "runnable": True,
-            "note": "★ 已排除 secrets 與 face_database，打包前會自我複查",
-        },
-    }
 
     def __init__(self, node, jobs):
         self._node = node
@@ -504,52 +432,6 @@ class SystemControlManager:
             )
         return out
 
-    def verify_run(self, key: str) -> tuple:
-        """跑一支驗證腳本，把畫面輸出原封不動回傳給前端。
-
-        ★ 會阻塞到腳本結束（V1 光量幀率就要 12 秒），router 一定要丟執行緒。
-        """
-        spec = self.VERIFY_SCRIPTS.get(key)
-        if spec is None:
-            return False, f"沒有這個驗證項目：{key}"
-        if not spec.get("runnable", True):
-            return False, f"這支要讀鍵盤輸入，網頁跑不了。請在終端機執行：\n  {spec['script']}"
-        try:
-            # 逾時放寬到 300 秒：V1 量幀率 12 秒，V4 要掃當天全部 CSV
-            r = subprocess.run(
-                [spec["script"]],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env={**os.environ, "TERM": "dumb"},
-            )
-            out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
-            # 去掉 ANSI 色碼，平板上看才不會一堆亂碼
-            out = re.sub(r"\x1b\[[0-9;]*m", "", out)
-            return r.returncode == 0, out.strip() or "(沒有輸出)"
-        except subprocess.TimeoutExpired:
-            return False, "逾時（300 秒）—— 腳本可能卡在等輸入，改到終端機跑"
-        except FileNotFoundError:
-            return False, (f"找不到腳本 {spec['script']} —— 車上還沒有這批檔案，需要先把 maprun 解壓上去")
-        except PermissionError:
-            return False, f"腳本沒有執行權限：chmod +x {spec['script']}"
-        except Exception as exc:  # noqa: BLE001
-            return False, f"執行失敗：{exc}"
-
-    def verify_list(self) -> list:
-        """給前端畫按鈕用"""
-        return [
-            {
-                "key": k,
-                "label": v["label"],
-                "why": v["why"],
-                "runnable": v.get("runnable", True),
-                "script": v["script"],
-                "note": v.get("note", ""),
-            }
-            for k, v in self.VERIFY_SCRIPTS.items()
-        ]
-
     def _graph_node_names(self) -> set:
         """ROS 節點圖上看得到的節點名（跨板；DDS 發現對方約 10 秒、對方消失約 12 秒才反映）。取不到回空集合。"""
         try:
@@ -591,7 +473,10 @@ class SystemControlManager:
             mode = ""
             if not is_remote:
                 for vk, needle in (spec.get("variant_detect") or {}).items():
-                    if any(needle in cmd for pid, cmd in procs if pid != mypid):
+                    # ★ 2026-10-29：HMI 自己開的單元指令列是 `system_control.launch.py unit:=X variant:=Y`，
+                    #   看不到 launch 檔內部 include 的檔名／參數 → 以前相機、人臉的模式在面板上永遠是空的。兩種都認。
+                    tokens = {f"unit:={key}", f"variant:={vk}"}
+                    if any(needle in cmd or tokens <= set(cmd.split()) for pid, cmd in procs if pid != mypid):
                         mode = spec.get("variants", {}).get(vk, {}).get("label", vk)
                         break
             blocked = self._check_requires(spec.get("requires"))

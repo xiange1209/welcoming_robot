@@ -680,6 +680,11 @@ class PathTeachNode(Node):
         # global_costmap 的 update_frequency 是 1.0 Hz：等 2 秒，下一次更新就會把
         # 雷達「現在看得到」的東西重新標回去，看不到的殘影則不會回來。
         self.declare_parameter("plan_clear_settle_sec", 2.0)
+        # ★ 2026-10-29：剛被「地圖上沒有的障礙」擋住（[新障礙]）的這段時間內，規劃前**不清**全域成本地圖。
+        #   10/28 晚上貴賓室那趟：被擋住 → 重試前清掉障礙層 → 新路線照樣穿過擋路的東西 → 又被擋，3 次全失敗。
+        #   清掉再等 plan_clear_settle 秒本來是要讓「現在看得到」的東西標回去，但貼在保險桿前幾公分的東西
+        #   不一定標得回去。保留＝規劃器看得到它、路線會繞開；殘影會被雷射的穿透清除自己清掉。0＝舊行為（每次都清）。
+        self.declare_parameter("keep_new_obstacles_sec", 30.0)
         # ★★ 2026-10-24：規劃「多候選擇優」（車上 agent；依據 ~/maprun/verify_out/path_planning_progress_20261024.md）★★
         #
         # SmacPlannerHybrid 給的路徑有兩種毛病，都會讓車子離開「原先規劃的路徑」：
@@ -955,6 +960,8 @@ class PathTeachNode(Node):
         self.new_obstacle_min_ratio = float(p("new_obstacle_min_ratio").value)
         self.new_obstacle_speech = str(p("new_obstacle_speech").value)
         self.plan_clear_settle = float(p("plan_clear_settle_sec").value)
+        self.keep_new_obstacles_sec = max(0.0, float(p("keep_new_obstacles_sec").value))
+        self._new_obstacle_mono = -1e9      # 最近一次以 [新障礙] 結束的時間（見 keep_new_obstacles_sec）
         self.cm_brake_wait = float(p("cm_brake_wait_sec").value)
         self.cm_brake_release = float(p("cm_brake_release_m").value)
         self.cm_brake_abort = float(p("cm_brake_abort_sec").value)
@@ -3928,6 +3935,7 @@ class PathTeachNode(Node):
                     goal_handle.abort()
                     result.success = False
                     if _new_blk:
+                        self._new_obstacle_mono = time.monotonic()
                         result.message = (
                             f"{NEW_OBSTACLE_TAG} 車身外緣被地圖上沒有的障礙貼住"
                             f"（行進方向只剩 {dir_margin * 100:.0f} cm，{_why_blk}）"
@@ -4020,6 +4028,7 @@ class PathTeachNode(Node):
                             self._stop()
                             goal_handle.abort()
                             result.success = False
+                            self._new_obstacle_mono = time.monotonic()
                             result.message = (
                                 f"{NEW_OBSTACLE_TAG} 前方被地圖上沒有的障礙擋住 {waited:.0f} 秒"
                                 f"（{blocker_why}）—— 交回導航層：重新規劃繞過，或等通道淨空")
@@ -5208,7 +5217,10 @@ class PathTeachNode(Node):
 
         # ★ 規劃前先清一次全域成本地圖 —— 見 __init__ 裡的說明。
         # 失敗不擋下規劃：清空是最佳化不是前提。
-        if self._clear_global_costmap() and self.plan_clear_settle > 0.0:
+        if self.keep_new_obstacles_sec > 0.0 and time.monotonic() - self._new_obstacle_mono < self.keep_new_obstacles_sec:
+            self.get_logger().info(
+                f"剛被新障礙擋住（{time.monotonic() - self._new_obstacle_mono:.0f} 秒前）：這次規劃不清全域成本地圖，讓路線繞開它")
+        elif self._clear_global_costmap() and self.plan_clear_settle > 0.0:
             # ★ 2026-10-01：等障礙層把「現在看得到」的東西標回去再規劃
             #   （站在路上的人），否則重新規劃永遠從人身上穿過（見 plan_clear_settle_sec）
             time.sleep(self.plan_clear_settle)

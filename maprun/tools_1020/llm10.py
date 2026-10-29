@@ -2,10 +2,10 @@
 """LLM 銀行模式 10 題（交接文件 §5-8）：自動送題、收答案、量延遲、存 CSV。
 
 用法（車上；LLM 單元要開著，Ollama 在筆電上要開著；★語音輸入單元要先關掉，否則麥克風雜音會餵進 LLM，9/17 就是這樣）：
-    source ~/maprun/env.sh
-    python3 ~/maprun/tools_1020/llm10.py              # 逐題送，②③⑩ 會先停下來等你確認
-    python3 ~/maprun/tools_1020/llm10.py --dry-run    # 只印題目與預期，不連 ROS
-    python3 ~/maprun/tools_1020/llm10.py --clear-each --repeat 2 --nav-down-ok
+    source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/llm10.py              # 逐題送，②③⑩ 會先停下來等你確認
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/llm10.py --dry-run    # 只印題目與預期，不連 ROS
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/llm10.py --clear-each --repeat 2 --nav-down-ok
         # 每題前清對話記憶（避免前一題污染）、整套跑兩輪；導航堆疊沒開時②③⑩直接送（車不會動，只驗工具選擇）
 
 ★ 第 ②③④⑩ 題（櫃檯在哪、貴賓室怎麼去、洗手間在哪〔地圖有廁所時〕、帶我去大廳）會觸發「帶位／導航」——導航堆疊開著而且地點標好時，
@@ -13,7 +13,7 @@
   送出後腳本不會等車到達；車到了或你按了急停，再按 Enter 才會送下一題。
 
 題目、預期都是**虛構示範資料**（地圖要先標好「大廳、門口、櫃檯、貴賓室、起點」，名稱一字不差）。
-輸出：~/maprun/verify_out/llm10_<HHMM>.csv（序號、題目、預期、答案、延遲秒數、旗標）。
+輸出：~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/llm10_<HHMM>.csv（序號、題目、預期、答案、延遲秒數、旗標）。
 ★ 旗標 BUSY＝LLM 回「系統目前正在處理上一個指令」（還有別的輸入在餵它）；TIMEOUT＝等 90 秒沒有回應。
 ★ 答案對不對由人（或筆電端）依「預期」欄判，這支不判對錯。
 ★ 2026-10-20 車上新寫，只用假 LLM（隔離網域）驗證過流程，沒有在實車驗證過。
@@ -83,7 +83,7 @@ def main():
     ap.add_argument("--nav-timeout", type=float, default=330.0, help="--auto-nav 時帶位題最多等幾秒")
     ap.add_argument("--nav-down-ok", action="store_true",
                     help="導航堆疊沒開時，②③⑩不停下來問、直接送（車不會動，只驗工具選擇）；導航開著照樣會問")
-    ap.add_argument("--out", default=os.path.expanduser(f"~/maprun/verify_out/llm10_{time.strftime('%H%M')}.csv"))
+    ap.add_argument("--out", default=os.path.expanduser(f"~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/llm10_{time.strftime('%H%M')}.csv"))
     a = ap.parse_args()
 
     if a.dry_run:
@@ -137,7 +137,7 @@ def main():
         return 1
 
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    trip = os.path.expanduser("~/maprun/trip_mark.sh")
+    trip = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trip_mark.sh")
     if os.path.exists(trip):
         subprocess.run([trip, "T7 LLM 十題開始", f"csv={a.out}"], capture_output=True, timeout=5)
     rows, spans = [], []   # spans[k]＝第 k 列的（送出時間, 收到答案或逾時的時間），事後拿去 llm log 撈工具呼叫

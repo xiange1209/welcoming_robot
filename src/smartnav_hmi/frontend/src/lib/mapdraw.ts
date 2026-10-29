@@ -38,8 +38,28 @@ export function fitCanvas(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext
   return { w, h };
 }
 
-/** 目前地圖圖片在畫布上的縮放與位移（等比置中） */
-export function mapTransform(view: Viewport, img: HTMLImageElement): Transform {
+/** 圖片像素座標的一塊範圍（見 mapTransform 的 focus） */
+export interface PixelBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** 目前地圖圖片在畫布上的縮放與位移（等比置中）。
+    focus：只看這一塊（圖片像素座標），放大到填滿畫布——迎賓頁帶位時放大到路線用（★ 2026-10-29）。
+    沒給就是整張圖；地圖頁點選位置（eventToWorld）一律不給，點擊換算不受影響。 */
+export function mapTransform(view: Viewport, img: HTMLImageElement, focus?: PixelBox | null): Transform {
+  if (focus) {
+    const fw = Math.max(1, focus.x1 - focus.x0);
+    const fh = Math.max(1, focus.y1 - focus.y0);
+    const s = Math.min(view.w / fw, view.h / fh);
+    return {
+      scale: s,
+      offX: view.w / 2 - ((focus.x0 + focus.x1) / 2) * s,
+      offY: view.h / 2 - ((focus.y0 + focus.y1) / 2) * s,
+    };
+  }
   const scale = Math.min(view.w / img.width, view.h / img.height);
   return {
     scale,
@@ -263,6 +283,30 @@ export interface SceneInput {
   picked: { x: number; y: number; yaw: number } | null;
   /** 小地圖不畫地點名稱與目標點，只要「地圖 + 車在哪」 */
   minimal?: boolean;
+  /** 放大到「路線＋車子」的範圍（沒有路線就看車子附近）；false／沒給＝整張圖 */
+  focusRoute?: boolean;
+}
+
+/* 路線放大的範圍：路線上每一點＋車子，外加邊界；太短的路線也至少看這麼大一塊，車子才不會大到失真 */
+const ROUTE_MARGIN_M = 1.2;
+const ROUTE_MIN_SPAN_M = 4.0;
+
+function routeFocus(input: SceneInput, meta: MapMeta): PixelBox | null {
+  const pts: [number, number][] = [...(input.navPath?.points ?? [])];
+  if (input.pose) pts.push([input.pose.x, input.pose.y]);
+  if (pts.length === 0) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [wx, wy] of pts) {
+    const p = worldToPixel(meta, wx, wy);
+    x0 = Math.min(x0, p.px); x1 = Math.max(x1, p.px);
+    y0 = Math.min(y0, p.py); y1 = Math.max(y1, p.py);
+  }
+  const m = ROUTE_MARGIN_M / meta.resolution;
+  const half = ROUTE_MIN_SPAN_M / meta.resolution / 2;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  const hw = Math.max((x1 - x0) / 2 + m, half);
+  const hh = Math.max((y1 - y0) / 2 + m, half);
+  return { x0: cx - hw, y0: cy - hh, x1: cx + hw, y1: cy + hh };
 }
 
 /**
@@ -282,7 +326,7 @@ export function drawScene(
     return "等待地圖…（需啟動 SLAM 建圖，或切換到已存在的地圖）";
   }
 
-  const t = mapTransform(view, image);
+  const t = mapTransform(view, image, input.focusRoute ? routeFocus(input, meta) : null);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(image, t.offX, t.offY, image.width * t.scale, image.height * t.scale);
 

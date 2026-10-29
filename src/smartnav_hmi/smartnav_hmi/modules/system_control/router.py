@@ -10,7 +10,6 @@
   這裡把它接回真正在用的 router，恢復成可用狀態。
 """
 
-import asyncio
 import subprocess
 import threading
 import time
@@ -83,25 +82,5 @@ def build_router(node, admin_only) -> APIRouter:
 
         threading.Thread(target=work, daemon=True).start()
         return JSONResponse({"success": True, "message": f"正在關閉所有功能，接著{label}"}, status_code=202)
-
-    # ── 一鍵驗證（2026-09-24）────────────────────────
-    # 同樣避開 /api/system/{unit}/{action:path} 萬用路由，用獨立前綴。
-
-    @router.get("/api/verify", dependencies=admin_only)
-    async def api_verify_list() -> JSONResponse:
-        return JSONResponse({"items": node.system_control.verify_list()})
-
-    @router.post("/api/verify/{key}", dependencies=admin_only)
-    async def api_verify_run(key: str) -> JSONResponse:
-        # 一樣丟執行緒——V1 量幀率就要 12 秒，在事件迴圈裡跑會把 HMI 凍住
-        ok, out = await asyncio.to_thread(node.system_control.verify_run, key)
-        # 前端的 api() 在非 2xx 時會把 message 跳成 toast。沒給的話畫面只會出現
-        # 「機器人回報錯誤 (HTTP 400)」，看不出是哪裡壞。短的錯誤直接給，
-        # 長的（整段腳本輸出）就指回下方輸出框。
-        msg = "" if ok else (out if len(out) < 200 and "\n" not in out else "驗證腳本回報失敗，詳見下方輸出")
-        return JSONResponse(
-            {"success": ok, "output": out, "message": msg},
-            status_code=200 if ok else 400,
-        )
 
     return router

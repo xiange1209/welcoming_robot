@@ -3,16 +3,16 @@
 
 用法（車上。平板「測試情境」選「測人臉辨識 / 註冊」＝相機人臉模式＋人臉辨識＋使用者認證；
 導航一定要關——導航中人臉節點完全不推論）：
-    source ~/maprun/env.sh
+    source ~/welcoming_robot_ws/src/smartnav_ws/maprun/env.sh
     # ① 註冊時開著（建議）：記下「這次新註冊的是哪一筆」的雜湊，之後才分得出本人／別的已註冊者（例如舊場地的舊檔）
-    python3 ~/maprun/tools_1020/face_test.py --watch-registration          # 先開這個，再去平板按「開始註冊」
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/face_test.py --watch-registration          # 先開這個，再去平板按「開始註冊」
     # ② 每個距離一輪（人先站好、正對鏡頭，再開始）
-    python3 ~/maprun/tools_1020/face_test.py --label 1.0m --secs 20 --expect-registered
-    python3 ~/maprun/tools_1020/face_test.py --label stranger --secs 20    # 不加 --expect-registered＝這個人「應該認不出來」
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/face_test.py --label 1.0m --secs 20 --expect-registered
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/face_test.py --label stranger --secs 20    # 不加 --expect-registered＝這個人「應該認不出來」
     # ③ 今天所有輪的總表（--date 20261020 指定日期、--date all 全部）
-    python3 ~/maprun/tools_1020/face_test.py --summary
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/face_test.py --summary
     # ④ 某個名字對應哪個名字雜湊（名字用不回顯的方式輸入，不進 shell 歷史、不上螢幕）
-    python3 ~/maprun/tools_1020/face_test.py --hash-name
+    python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/face_test.py --hash-name
 
 讀什麼（全部唯讀：只訂閱，不發話題、不呼叫服務、不碰 HMI API、不讀人臉資料庫）：
     /user_identity   smartnav_msgs/UserIdentity，user_auth_node 發。★ 只有偵測到臉才發（face_embedding 每 2 秒一幀 → 最多約
@@ -28,8 +28,8 @@
     標籤是距離（1.0m、50cm…）的輪次，總表另算「推算臉寬」＝標稱距離 × bbox 寬 ÷ fx：各輪一致（差 10% 內）表示估計可信，
     也可以拿 1 m 那輪的值重設 --face-width-m。
 
-輸出：每則一列  ~/maprun/verify_out/face_test_<YYYYMMDD>/<HHMMSS>_<標籤>.csv
-      每輪一列  ~/maprun/verify_out/face_test_<YYYYMMDD>.tsv（註冊另記 face_test_<YYYYMMDD>_reg.tsv）
+輸出：每則一列  ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/face_test_<YYYYMMDD>/<HHMMSS>_<標籤>.csv
+      每輪一列  ~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out/face_test_<YYYYMMDD>.tsv（註冊另記 face_test_<YYYYMMDD>_reg.tsv）
 分類（只記這幾種，**不記名字**）：
     registered_match  認出（recognized=True）且是 ① 記下的那筆；沒有 ① 的雜湊時分不出是誰，認出就記這個
     other_registered  認出，但不是 ① 記下的那筆（例如舊場地的舊檔比新檔還像）
@@ -58,7 +58,7 @@ import sys
 import time
 import unicodedata
 
-OUT_DIR = os.path.expanduser("~/maprun/verify_out")
+OUT_DIR = os.path.expanduser("~/welcoming_robot_ws/src/smartnav_ws/maprun/verify_out")
 LOG_DIR = os.path.expanduser("~/.smartnav/logs/system_control")
 # 只在收不到 camera_info 又沒給 --fx 時用：Astra S 彩色規格 HFOV 60°、寬 640 px → 320 / tan 30°
 DEFAULT_FX = 554.3
