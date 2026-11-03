@@ -59,6 +59,31 @@ export interface SystemStats {
   cpu_load?: number;
   map_id?: string;
   llm_model?: string;
+  /** ★ 2026-11-03 語音輸出：browser＝平板 speechSynthesis、robot＝機器人 TTS 模型＋喇叭（全系統一致，存在機器人上） */
+  voice_output?: VoiceMode;
+  /** ★ 2026-11-03 語音輸入：robot＝機器人麥克風、browser＝平板錄音（辨識一律在機器人上） */
+  voice_input?: VoiceMode;
+  /** voice_trigger 回報的實際收音狀態："robot:ok" / "robot:error:<原因>" / "browser" */
+  voice_input_status?: string;
+  /** 目前有沒有平板麥克風連在 /ws/mic 上 */
+  mic_connected?: boolean;
+  /** ★ 2026-11-03 機器人朗讀開關（語音輸出＝robot 時的「朗讀」鈕）。關＝機器人不合成、不播 */
+  robot_tts_on?: boolean;
+  /** ★ 2026-11-03 只給行員聽的語音提示（黑名單）。只有登入的平板才唸（lib/staffAlert.ts） */
+  staff_alert?: { seq: number; text: string; ts: number };
+  /** https 連接埠（0＝沒開）。平板錄音只能在 https 下拿到麥克風 */
+  https_port?: number;
+  /** 機器人本機的音訊硬體（只讀 /proc/asound）。喇叭：usb＝偵測到、jack＝只有耳機孔（無法確認）、none＝沒有 */
+  audio_hw?: AudioHw;
+}
+
+export type VoiceMode = "browser" | "robot";
+
+export interface AudioHw {
+  mic: boolean;
+  mic_detail: string;
+  speaker: "usb" | "jack" | "none";
+  speaker_detail: string;
 }
 
 export interface MapMeta {
@@ -92,6 +117,8 @@ export type JobStatus =
 
 export interface Job {
   job_id: string;
+  /** 後端的 action 名稱（navigate、follow_taught_path、create_map…） */
+  action?: string;
   label: string;
   status: JobStatus | string;
   message?: string;
@@ -153,6 +180,8 @@ export interface MapStatus extends ApiResult {
   map_meta?: MapMeta;
   mapping_job?: { label?: string } | null;
   last_failed_job?: { message?: string } | null;
+  /** ★ 2026-11-03 建圖中是不是自動探索（false＝遙控） */
+  exploring?: boolean;
 }
 
 export interface TaughtPath {
@@ -201,6 +230,12 @@ export interface SysUnit {
   remote?: string;
   variants?: SysVariant[];
   transition?: SysTransition | null;
+  /** ★ 2026-11-03 啟動中：launch 已經起來、節點還在載入（transition 結束後到節點全上線之間） */
+  starting?: boolean;
+  /** 啟動中的起算時間（伺服器 epoch 秒） */
+  starting_since?: number | null;
+  /** launch 還活著，但超過時限節點仍沒全部上線（卡住） */
+  start_stuck?: boolean;
 }
 
 /** 測試情境：一鍵把該開的開、該關的關（後端 SystemControlManager.SCENARIOS） */

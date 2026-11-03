@@ -11,6 +11,9 @@ import { post, run } from "../lib/api";
 import { confirmDialog } from "../lib/dialog";
 import { resetCachedMessages, telemetryStore } from "../lib/telemetry";
 import * as tts from "../lib/tts";
+import { micStore, startMic, stopMic } from "../lib/mic";
+import { useNavBusy } from "../lib/navBusy";
+import { RobotTtsToggle } from "./VoicePage";
 import type { ChatMessage, ChatStats } from "../lib/types";
 
 const EMPTY: ChatMessage[] = [];
@@ -196,8 +199,67 @@ function TtsControls() {
   );
 }
 
+/** ★ 2026-11-03：語音輸入＝平板錄音 時才出現。錄音送回機器人辨識（見 lib/mic.ts） */
+function MicButton() {
+  const mic = useStoreValue(micStore);
+  const input = useStoreSelector(
+    telemetryStore,
+    (t) => t.snap.system?.voice_input ?? "browser",
+  );
+  const httpsPort = useStoreSelector(
+    telemetryStore,
+    (t) => t.snap.system?.https_port ?? 0,
+  );
+
+  // 設定被切回「機器人麥克風」就收掉，不要讓平板一直錄
+  useEffect(() => {
+    if (input !== "browser" && micStore.get().on) stopMic();
+  }, [input]);
+
+  if (input !== "browser") return null;
+
+  const label =
+    mic.status === "listening"
+      ? "🎤 聆聽中"
+      : mic.status === "connecting"
+        ? "🎤 連線中…"
+        : mic.status === "error"
+          ? "⚠ 麥克風"
+          : "🎤 開始聆聽";
+
+  return (
+    <Button
+      variant={
+        mic.status === "error" ? "danger" : mic.on ? "primary" : "plain"
+      }
+      title={mic.error || "用這台平板的麥克風對機器人說話（在機器人上辨識，不經雲端）"}
+      onClick={() => {
+        if (mic.on) stopMic();
+        else void startMic(httpsPort);
+      }}
+      className="relative overflow-hidden"
+    >
+      {label}
+      {mic.status === "listening" && (
+        <span
+          aria-hidden
+          className="absolute bottom-0 left-0 h-[3px] bg-green transition-[width] duration-100"
+          style={{ width: `${Math.round(mic.level * 100)}%` }}
+        />
+      )}
+    </Button>
+  );
+}
+
 function TtsButton() {
   const state = useStoreValue(tts.ttsStore);
+  const output = useStoreSelector(
+    telemetryStore,
+    (t) => t.snap.system?.voice_output ?? "browser",
+  );
+
+  // ★ 2026-11-03：語音輸出切到機器人時，平板不唸（tts.onChatUpdate 也會擋），這顆改成「機器人朗讀」開關
+  if (output === "robot") return <RobotTtsToggle compact />;
 
   if (!tts.ttsSupported) {
     return (
@@ -251,6 +313,8 @@ interface GuideInfo {
    導航沒開（地點服務沒起來）時整列不出現，不跳錯誤提示：迎賓頁不是除錯的地方。 */
 function GuideChips({ active }: { active: boolean }) {
   const [info, setInfo] = useState<GuideInfo | null>(null);
+  // ★ 2026-11-03：info.busy 是輪詢來的（會晚幾秒）；再併上即時的導航狀態，按下去的那一刻就鎖住
+  const navBusy = useNavBusy();
   const identityKey = useStoreSelector(telemetryStore, (t) => {
     const i = t.snap.identity || {};
     return `${!!i.recognized}|${i.user_type || ""}|${i.user_name || ""}`;
@@ -292,14 +356,14 @@ function GuideChips({ active }: { active: boolean }) {
       {info.destinations.map((d) => (
         <Button
           key={d.waypoint_id}
-          disabled={info.busy}
+          disabled={info.busy || navBusy}
           variant={d.vip_only ? "primary" : "plain"}
           onClick={() => void go(d)}
         >
           {d.vip_only ? `★ ${d.name}` : d.name}
         </Button>
       ))}
-      {info.busy && <span className="text-[12px] text-label-3">帶位中…</span>}
+      {(info.busy || navBusy) && <span className="text-[12px] text-label-3">帶位中…</span>}
     </div>
   );
 }
@@ -518,6 +582,7 @@ export function GreetPage({ active }: { active: boolean }) {
           <Button variant="primary" onClick={send} aria-label="送出">
             <IconSend className="size-[18px]" />
           </Button>
+          <MicButton />
           <TtsButton />
           <Button variant="danger" onClick={clearChat}>
             清除

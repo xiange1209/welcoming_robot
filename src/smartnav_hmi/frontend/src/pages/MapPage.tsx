@@ -24,6 +24,7 @@ import {
 } from "../lib/mapdata";
 import { telemetryStore } from "../lib/telemetry";
 import { toast } from "../lib/toast";
+import { useNavBusy } from "../lib/navBusy";
 import type { Job } from "../lib/types";
 
 type Mode = "view" | "waypoint" | "navigate";
@@ -31,7 +32,7 @@ type Mode = "view" | "waypoint" | "navigate";
 const MODES: { value: Mode; label: string }[] = [
   { value: "view", label: "檢視" },
   { value: "waypoint", label: "建立地點" },
-  { value: "navigate", label: "導航到此" },
+  { value: "navigate", label: "定點導航" },
 ];
 
 /** 進行中的作業。由推播驅動，所以取消之後會自己更新，不必手動重整 */
@@ -98,8 +99,13 @@ export function MapPage({ active }: { active: boolean }) {
   const [pickedMap, setSelectedMap] = useState("");
 
   const waypoints = useStoreValue(waypointsStore);
+  // ★ 2026-11-03：導航中「導航」鈕改成「導航中…」並停用（後端 /api/navigate 也會回 409）
+  const navBusy = useNavBusy();
   const maps = useStoreValue(mapsStore);
-  const currentMapId = useStoreSelector(telemetryStore, (t) => t.snap.system?.map_id);
+  const currentMapId = useStoreSelector(
+    telemetryStore,
+    (t) => t.snap.system?.map_id,
+  );
 
   /* 清單是非同步載入的，所以「還沒選」與「選了但那張圖被刪了」都要退回預設。
      用衍生值而不是 effect：effect 會先繪一次空的下拉選單再補上。
@@ -142,6 +148,10 @@ export function MapPage({ active }: { active: boolean }) {
       return;
     }
 
+    if (navBusy) {
+      toast.error("正在導航中，請等目前的導航結束，或先按緊急停止");
+      return;
+    }
     const ok = await confirmDialog({
       title: "確定導航到這個位置？",
       message: `(${picked.x.toFixed(2)}, ${picked.y.toFixed(2)}) 朝向 ${((picked.yaw * 180) / Math.PI).toFixed(0)}°`,
@@ -207,14 +217,19 @@ export function MapPage({ active }: { active: boolean }) {
         )}
       </Card>
 
-      <Card title="地點" className="overflow-y-auto" bodyClassName="gap-4 portrait:max-xl:gap-3">
+      <Card
+        title="地點"
+        className="overflow-y-auto"
+        bodyClassName="gap-4 portrait:max-xl:gap-3"
+      >
         {/* ★ 2026-10-21：補 shrink-0（10/20 車上直接改過 dist，這裡補回原始碼）——min-h 取代了 flex 子項的
             min-height:auto，清單被壓到 120 px、地點卡溢出蓋到「地圖管理」（平板截圖「破圖」） */}
         {/* ★ 2026-10-22：直放時地點排兩欄（820 寬一列只放一個地點太浪費，6 個地點要捲才看得到「地圖管理」） */}
         <div
           className={cx(
             "flex min-h-[120px] shrink-0 flex-col gap-1.5",
-            waypoints.length > 0 && "portrait:max-xl:grid portrait:max-xl:grid-cols-2 portrait:max-xl:content-start",
+            waypoints.length > 0 &&
+              "portrait:max-xl:grid portrait:max-xl:grid-cols-2 portrait:max-xl:content-start",
           )}
         >
           {waypoints.length === 0 && (
@@ -233,6 +248,7 @@ export function MapPage({ active }: { active: boolean }) {
               </span>
               <Button
                 variant="primary"
+                disabled={navBusy}
                 onClick={() =>
                   void run(
                     post("/api/navigate", {
@@ -242,7 +258,7 @@ export function MapPage({ active }: { active: boolean }) {
                   )
                 }
               >
-                導航
+                {navBusy ? "導航中…" : "導航"}
               </Button>
               {/* 刪除要跟「導航」隔開來看：這兩顆並排、誤觸的代價差很多，
                   所以刪除走確認並把座標一起寫進提示，讓人確認刪的是不是同名的另一個點。 */}
@@ -294,14 +310,17 @@ export function MapPage({ active }: { active: boolean }) {
                     return;
                   }
                   // ★ 2026-10-21：切換前確認（10/20 車上回報沒有確認框，按錯就切到別張圖、地點與路徑跟著換）
-                  const name = maps.find((m) => m.map_id === selectedMap)?.map_name || selectedMap;
+                  const name =
+                    maps.find((m) => m.map_id === selectedMap)?.map_name ||
+                    selectedMap;
                   if (selectedMap === currentMapId) {
                     toast.error(`「${name}」已經是使用中的地圖`);
                     return;
                   }
                   const ok = await confirmDialog({
                     title: `切換到地圖「${name}」？`,
-                    message: "地點與教導路徑會跟著換成這張圖的；切換後請確認定位。",
+                    message:
+                      "地點與教導路徑會跟著換成這張圖的；切換後請確認定位。",
                     confirmLabel: "切換",
                   });
                   if (!ok) return;
@@ -329,17 +348,26 @@ export function MapPage({ active }: { active: boolean }) {
                     toast.error("請先輸入地圖名稱");
                     return;
                   }
-                  void run(post("/api/maps/create", { map_name: name }), () =>
-                    setNewMapName(""),
+                  void run(
+                    post("/api/maps/create", {
+                      map_name: name,
+                      explore: false,
+                    }),
+                    () => setNewMapName(""),
                   );
                 }}
+                title="遙控建圖。要自動探索請到「遙控建圖」分頁（那裡可以途中切換）"
               >
-                開始建圖
+                開始建圖（遙控）
               </Button>
             </div>
 
-            <Button block onClick={() => void run(post("/api/localize"))}>
-              全域定位
+            <Button
+              block
+              disabled={navBusy}
+              onClick={() => void run(post("/api/localize"))}
+            >
+              {navBusy ? "導航／定位中…" : "全域定位"}
             </Button>
           </div>
         </div>

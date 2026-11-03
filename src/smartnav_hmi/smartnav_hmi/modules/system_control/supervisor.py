@@ -114,6 +114,23 @@ class LaunchSupervisor:
                 "message": op["message"],
             }
 
+    def session_started_at(self, unit: str) -> Optional[float]:
+        """受管 launch session 還活著就回傳它的啟動時間（狀態檔寫入時間，epoch 秒），否則 None。
+
+        ★ 2026-11-03：給 system_status 判斷「啟動中」用——start 操作在 launch 行程出現約 0.5 秒
+          （SESSION_READY_SEC）就算成功、transition 消失，但節點要 10~60 秒才上線，中間這段面板
+          以前會跳回「啟動」鈕。這裡只讀狀態檔＋驗證那一個 PID，**不掃 /proc**
+          （system_status 每 1~4 秒呼叫一次；managed_state 沒有狀態檔時會整個掃 /proc）。
+        """
+        data = self._read_state(unit)
+        if not data:
+            return None
+        try:
+            self._validate(data, unit, None)
+            return self._state_path(unit).stat().st_mtime
+        except (OSError, PermissionError, ProcessLookupError, RuntimeError, KeyError, ValueError):
+            return None
+
     def run_unit_sync(self, unit: str, action: str, variant: str | None = None) -> tuple[bool, str]:
         """供 scenario worker 使用；不要直接從 HTTP request 呼叫。"""
         op = self._new_operation("unit", unit, action, variant)

@@ -1,7 +1,7 @@
 <!--
   navigate_to_pose_akm_cc.xml
   以 Nav2 預設的 navigate_to_pose_w_replanning_and_recovery.xml 為基礎，
-  針對 wheeltec senior_akm 阿克曼底盤做兩處修改：
+  針對 wheeltec senior_akm 阿克曼底盤做以下修改：
 
   1. 恢復行為拿掉 <Spin>。
      阿克曼車不能原地旋轉，Spin 一定會走到逾時才失敗
@@ -13,50 +13,104 @@
      車身 0.46 m，倒 0.30 m 常常還留在原本的窄縫裡；
      慢速倒車也比較不會在後方無感測器的情況下撞到東西。
 
+  3. ★ 2026-11-03：全域路徑「最多沿用 3 秒、需要時立刻重規劃」，不再每秒無條件跑 Hybrid-A* ★
+     舊行為：RateController 1 Hz 每次都 ComputePathToPose。
+     問題：Hybrid-A* 是離散搜尋，起點差幾公分折返點就可能換位置／多一個少一個。
+       每秒換一次路徑，K-turn 做到一半，下一條路徑的折返點就變了，RPP 只能照新的走
+       -> 折返被打斷。path_teach「規劃一次就不換」能到 11~12 cm 正是因為這點。
+       另外 Pi 4 上一次最多 2 秒，每秒一次等於 planner_server 幾乎一直在算。
+     新行為：每秒只**檢查**（IsPathValid，便宜），以下情況才重新規劃：
+       a. force_replan 旗標為真 —— 每趟導航開始、RPP 失敗後、恢復動作做完後
+       b. 目標更新（GlobalUpdatedGoal，探索時常發生）
+       c. 目前路徑上出現障礙（IsPathValid 失敗）
+       d. 路徑已經用了 3 秒（PathExpiringTimer）
+     ★★ 為什麼一定要有 d（閉迴路模擬實測，假車＋同一份 yaml＋RPP，每情境一趟）★★
+       第一版只有 a~c（「路徑沒問題就一直用」），結果比每秒重規劃**更差**：
+                          每秒重規劃(舊)      只有 a~c            a~d（現行）
+         S1 正常行駛       7.4 s / 7 次        7.3 s / 2 次        7.3 s / 3 次
+         S2 同目標換起點   25.9 s / 25 次      24.3 s / 2 次       24.6 s / 7 次
+         S3 路上出現障礙   38.3 s / 0 恢復     90.1 s / 6 恢復 ✗   41.6 s / 1 恢復
+         S4 中途換目標     22.5 s / 0 恢復     68.8 s / 3 恢復 ✗   21.5 s / 0 恢復
+       S4 沒有任何障礙也卡了兩次「Failed to make progress」（各 27 秒）。推測是 RPP 在阿克曼車上的弱點：
+       接近折返點時前視點被截在折返點上，車子有橫向偏差（不能原地修）時就繞小圈追不到。
+       每秒重規劃等於一直從「車子現在的位置」重給一條路，剛好把這個弱點蓋掉。
+       所以路徑不能無限期沿用；3 秒是「規劃次數少約 70%、行為跟舊版同級」的折衷。
+       仍要退回舊行為：把 KeepCurrentPath 那個 ReactiveSequence 整段刪掉。
+     ★ 為什麼要 force_replan、不能只靠 GlobalUpdatedGoal（nav2 範本的做法）：
+       {path} 留在黑板上，換新目標時不會被清掉。新目標若與上一趟相同（navigation_action
+       失敗後對同一地點重送），範本可能判定「舊路徑仍有效」而沿著上一趟、不同起點的舊路走。
+     ★ 為什麼 RPP 失敗要強制重規劃：IsPathValid 只看路徑本身；人站在路徑**旁邊**、
+       車身會擦到時路徑仍「有效」，RPP 的車形碰撞檢查會讓它停車失敗。
+       範本只清 local costmap 再重試同一條路，會一直重試到次數用完。
+     2026-11-03 離線確認（plan_bench + is_path_valid）：新規劃出的路徑 14/16 判有效
+       （另 2 條終點在「廁所」，該地點本身在膨脹區內 —— 那兩條會跟以前一樣每秒重規劃）；
+       穿牆直線 11/16 判無效（另 5 條是大廳一帶不穿牆的直線，正確）。
+
   注意：backup_dist 為正值代表往後退的距離 (Nav2 內部自行轉成負向速度)。
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="10" name="NavigateRecovery">
-      <PipelineSequence name="NavigateWithReplanning">
-        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
-        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-        <RateController hz="1.0">
-          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+    <Sequence name="NavigateToPoseRoot">
+      <!-- 每趟導航開始時第一件事：一定要重新規劃（見檔頭 3 的 force_replan 說明） -->
+      <Script code="force_replan := true"/>
+      <RecoveryNode number_of_retries="10" name="NavigateRecovery">
+        <PipelineSequence name="NavigateWithReplanning">
+          <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+          <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+          <RateController hz="1.0">
+            <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+              <Fallback name="ReplanOnlyIfNeeded">
+                <!-- 全部成立才沿用目前路徑：沒被要求強制重規劃、路徑還不到 3 秒、目標沒變、路徑上沒障礙 -->
+                <ReactiveSequence name="KeepCurrentPath">
+                  <ScriptCondition code="force_replan == false"/>
+                  <Inverter>
+                    <PathExpiringTimer seconds="3.0" path="{path}"/>
+                  </Inverter>
+                  <Inverter>
+                    <GlobalUpdatedGoal/>
+                  </Inverter>
+                  <IsPathValid path="{path}"/>
+                </ReactiveSequence>
+                <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" _onSuccess="force_replan := false"/>
+              </Fallback>
+              <Sequence>
+                <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+                <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+              </Sequence>
+            </RecoveryNode>
+          </RateController>
+          <RecoveryNode number_of_retries="1" name="FollowPath">
+            <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
             <Sequence>
-              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
-              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+              <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+              <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <!-- RPP 失敗（多半是車形預測會撞）：換一條路再試，而不是重試同一條 -->
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" _onSuccess="force_replan := false"/>
             </Sequence>
           </RecoveryNode>
-        </RateController>
-        <RecoveryNode number_of_retries="1" name="FollowPath">
-          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
-          <Sequence>
+        </PipelineSequence>
+        <Sequence>
+          <Fallback>
             <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
-          </Sequence>
-        </RecoveryNode>
-      </PipelineSequence>
-      <Sequence>
-        <Fallback>
-          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
-        </Fallback>
-        <ReactiveFallback name="RecoveryFallback">
-          <GoalUpdated/>
-          <RoundRobin name="RecoveryActions">
-            <Sequence name="ClearingActions">
-              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
-              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
-            </Sequence>
-            <BackUp backup_dist="0.40" backup_speed="0.08" error_code_id="{backup_code_id}"/>
-            <DriveOnHeading dist_to_travel="0.25" speed="0.10" error_code_id="{drive_error_code}"/>
-            <BackUp backup_dist="0.25" backup_speed="0.08" error_code_id="{backup_code_id}"/>
-            <Wait wait_duration="3.0"/>
-          </RoundRobin>
-        </ReactiveFallback>
-      </Sequence>
-    </RecoveryNode>
+            <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+          </Fallback>
+          <ReactiveFallback name="RecoveryFallback">
+            <GoalUpdated/>
+            <RoundRobin name="RecoveryActions">
+              <Sequence name="ClearingActions">
+                <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+                <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+              </Sequence>
+              <BackUp backup_dist="0.40" backup_speed="0.08" error_code_id="{backup_code_id}"/>
+              <DriveOnHeading dist_to_travel="0.25" speed="0.10" error_code_id="{drive_error_code}"/>
+              <BackUp backup_dist="0.25" backup_speed="0.08" error_code_id="{backup_code_id}"/>
+              <Wait wait_duration="3.0"/>
+            </RoundRobin>
+          </ReactiveFallback>
+          <!-- 恢復動作做完（車子位置變了／costmap 清過了）：下一輪從新位置重新規劃 -->
+          <Script code="force_replan := true"/>
+        </Sequence>
+      </RecoveryNode>
+    </Sequence>
   </BehaviorTree>
 </root>

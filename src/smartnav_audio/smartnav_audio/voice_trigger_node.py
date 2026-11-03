@@ -16,9 +16,9 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 from smartnav_msgs.msg import AudioData
 from smartnav_audio.voice_utils import AudioCodec, get_model_path, validate_audio_data
@@ -242,10 +242,9 @@ class VoiceTriggerNode(Node):
         self._command_wait_frames: int = 0
         self._in_command_initial_wait: bool = False
 
-        # 麥克風錄製器初始化
+        # 麥克風錄製器初始化（★ 2026-11-03：改到發布器建好、知道收音來源之後才開，見下方「收音來源」）
         self._audio_buffer = deque(maxlen=15)
         self._recorder: Optional[AudioRecorder] = None
-        self._init_recorder()
 
         # 建立 QoS 配置檔
         # ★★ 2026-10-28：depth 5 -> 40 ★★
@@ -261,6 +260,45 @@ class VoiceTriggerNode(Node):
 
         self.audio_pub = self.create_publisher(AudioData, audio_topic, audio_qos)
         self.triggered_pub = self.create_publisher(Bool, triggered_topic, 10)
+
+        # ── 收音來源（★ 2026-11-03，HMI 的「語音輸入」開關）──────────────────
+        #   robot   = 本機麥克風（原本的行為）
+        #   browser = 平板錄音：HMI 的 /ws/mic 轉成 remote_mic_audio（16 kHz、pcm_s16le），
+        #             切成跟麥克風一樣的 chunk_size 塊、餵進同一個 process_audio_chunk ——
+        #             VAD 斷句、預錄緩衝、TTS 邊界切句全部共用，兩種來源行為一致。
+        #             這個模式下**不開**本機麥克風（機器人沒接麥克風也能用）。
+        #   模式由 latched 話題 voice_input_mode 決定；啟動時最多等 input_mode_wait_sec，
+        #   等不到（HMI 沒在跑）就照舊用本機麥克風。
+        self.declare_parameter("input_mode_wait_sec", 3.0)
+        # 平板斷線（關分頁、WiFi 掉）時 COMMAND 狀態等不到靜音而卡住：超過這麼久沒收到音訊就強制收句
+        self.declare_parameter("remote_audio_timeout_sec", 1.0)
+        self._remote_timeout = float(self.get_parameter("remote_audio_timeout_sec").value)
+        latched = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.status_pub = self.create_publisher(String, "voice_input_status", latched)
+        self._input_mode: Optional[str] = None      # 收到的設定
+        self._active_mode: Optional[str] = None     # 實際生效的來源
+        self._remote_buf = np.zeros(0, dtype=np.float32)
+        self._remote_last = 0.0
+        self._remote_warned = False
+        self.create_subscription(String, "voice_input_mode", self._input_mode_cb, latched)
+        # ★ 2026-11-03：語音輸入波形（HMI 語音頁的測試用）。每 4 塊發一則，每塊 [峰值, VAD 有聲, 收句中]
+        self.monitor_pub = self.create_publisher(
+            Float32MultiArray, "voice_input_monitor",
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20))
+        self._mon_buf: list = []
+        self.create_subscription(AudioData, "remote_mic_audio", self._remote_audio_cb, audio_qos)
+        self.create_timer(0.5, self._remote_watchdog)
+
+        wait = float(self.get_parameter("input_mode_wait_sec").value)
+        deadline = time.monotonic() + max(0.0, wait)
+        while self._input_mode is None and time.monotonic() < deadline and rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+        mode = self._input_mode or "robot"
+        if self._input_mode is None:
+            self.get_logger().info(f"{wait:.0f} 秒內沒收到 voice_input_mode（HMI 沒在跑？），照舊用本機麥克風")
+        # 啟動時的本機麥克風照舊「開不起來就讓節點失敗」（不能顯示 ASR 已啟動、實際上沒在收音）
+        self._apply_input_mode(mode, fail_loud=True)
 
         self.get_logger().info("✓ 語音喚醒觸發節點已初始化")
         self.get_logger().info(f"  發布話題: {audio_topic}")
@@ -450,6 +488,85 @@ class VoiceTriggerNode(Node):
             except Exception as e:
                 self.get_logger().error(f"✗ 停止麥克風錄製失敗: {e}")
 
+    # ── 收音來源切換（★ 2026-11-03）──────────────────────────────
+
+    def _publish_status(self, text: str) -> None:
+        self.status_pub.publish(String(data=text))
+
+    def _input_mode_cb(self, msg: String) -> None:
+        mode = msg.data.strip().lower()
+        if mode not in ("browser", "robot"):
+            self.get_logger().warning(f"voice_input_mode 收到不認得的值：{msg.data!r}")
+            return
+        first = self._input_mode is None
+        self._input_mode = mode
+        if not first and self._active_mode is not None:
+            self._apply_input_mode(mode, fail_loud=False)
+
+    def _cut_current_utterance(self) -> None:
+        """正在收句時強制收尾（送 is_final），回到 IDLE"""
+        with self._lock:
+            in_command = self._state == TriggerState.COMMAND
+        if in_command:
+            self._publish_audio(np.zeros(self.chunk_size, dtype=np.float32), is_final=True)
+            self._set_state(TriggerState.IDLE)
+
+    def _apply_input_mode(self, mode: str, fail_loud: bool) -> None:
+        if mode == self._active_mode:
+            return
+        self._cut_current_utterance()
+        if mode == "browser":
+            self._stop_recorder()
+            self._recorder = None
+            self._remote_buf = np.zeros(0, dtype=np.float32)
+            self._active_mode = "browser"
+            self.get_logger().info("收音來源：平板錄音（remote_mic_audio），本機麥克風已關閉")
+            self._publish_status("browser")
+            return
+        try:
+            self._init_recorder()
+        except Exception as exc:  # noqa: BLE001
+            self._active_mode = "robot"
+            self._publish_status(f"robot:error:{exc}")
+            if fail_loud:
+                raise
+            self.get_logger().error(f"切到本機麥克風失敗：{exc}")
+            return
+        self._active_mode = "robot"
+        self.get_logger().info("收音來源：本機麥克風")
+        self._publish_status("robot:ok")
+
+    def _remote_audio_cb(self, msg: AudioData) -> None:
+        if self._active_mode != "browser":
+            return
+        if msg.format != "pcm_s16le" or msg.channels != 1 or msg.sample_rate != self.sample_rate:
+            if not self._remote_warned:
+                self._remote_warned = True
+                self.get_logger().warning(
+                    f"平板音訊格式不對（{msg.format}、{msg.channels} 聲道、{msg.sample_rate} Hz），"
+                    f"要 pcm_s16le、1 聲道、{self.sample_rate} Hz —— 丟棄")
+            return
+        audio = AudioCodec.decode_pcm_s16le(bytes(msg.data))
+        self._remote_last = time.monotonic()
+        buf = np.concatenate([self._remote_buf, audio.astype(np.float32).reshape(-1)])
+        n = self.chunk_size
+        while len(buf) >= n:
+            self.process_audio_chunk(buf[:n].copy())
+            buf = buf[n:]
+        self._remote_buf = buf
+
+    def _remote_watchdog(self) -> None:
+        if self._active_mode != "browser" or self._remote_last == 0.0:
+            return
+        if time.monotonic() - self._remote_last > self._remote_timeout:
+            with self._lock:
+                in_command = self._state == TriggerState.COMMAND
+            if in_command:
+                self.get_logger().info("平板音訊中斷，強制收句")
+                self._cut_current_utterance()
+            self._remote_buf = np.zeros(0, dtype=np.float32)
+            self._remote_last = 0.0
+
     def _playback_cb(self, msg: Bool) -> None:
         """機器人開始／結束講話。★ 在**邊界**強制切句，不丟音訊。"""
         active = bool(msg.data)
@@ -586,6 +703,21 @@ class VoiceTriggerNode(Node):
         # Idle 階段
         with self._lock:
             current_state = self._state
+
+        # ★ 2026-11-03：波形監看（便宜：一個 max、三個 float；沒人訂閱時 DDS 也不送出去）
+        mon = getattr(self, "_mon_buf", None)
+        if mon is not None:
+            mon.extend((float(np.max(np.abs(audio))) if audio.size else 0.0,
+                        1.0 if speech_detected else 0.0,
+                        1.0 if current_state == TriggerState.COMMAND else 0.0))
+            if len(mon) >= 12:
+                self._mon_buf = []
+                # 麥克風回呼在 sounddevice 自己的執行緒：關機時 context 先收掉、回呼還會再跑幾拍
+                if self.context.ok():
+                    try:
+                        self.monitor_pub.publish(Float32MultiArray(data=mon))
+                    except Exception:  # noqa: BLE001 —— 監看資料掉了無所謂，不能影響收音
+                        pass
 
         if current_state == TriggerState.IDLE:
             self._audio_buffer.append(audio)

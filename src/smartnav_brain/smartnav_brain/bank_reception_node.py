@@ -44,7 +44,8 @@
     一般訪客      統一用 "visitor" 當 key，冷卻 300 秒
 
 訪客不分人是刻意的：大廳人來人往，若每個路人都觸發一次問候，
-機器人會變成不停說話的噪音源。
+機器人會變成不停說話的噪音源。但鏡頭前「沒人」（user_auth 的無人訊息）
+時會解除訪客冷卻，下一位走進來的人一定會被問候（2026-11-03）。
 """
 
 import json
@@ -77,11 +78,10 @@ class BankReceptionNode(Node):
         # 額外的保守門檻。user_auth_node 的 recognized 已經判斷過一次，
         # 這裡只是再收緊一點，避免遠距離的低品質辨識觸發劇本。
         self.min_confidence = self.declare_parameter("min_confidence", 0.5).get_parameter_value().double_value
-        # ★ 2026-08-26：黑名單專用門檻（理由見 identity_callback 的長註解）。
-        #   0.80 = 刻意保守：寧可漏報，也不要對無辜的人叫行員。
-        self.blacklist_min_confidence = (
-            self.declare_parameter("blacklist_min_confidence", 0.80).get_parameter_value().double_value
-        )
+        # ★ 2026-11-03：黑名單專用門檻 blacklist_min_confidence（0.80）已移除。
+        #   黑名單與 VIP 一樣只看 user_auth_node 的 recognition_threshold（0.70）——
+        #   全系統只有一個辨識門檻，要調就調那一個。
+        #   0.80 的實測問題：黑名單本人站在鏡頭前相似度 0.747~0.795，一次都沒通報。
 
         self.notify_backend = self.declare_parameter("notify_backend", "none").get_parameter_value().string_value
         self.telegram_bot_token = self.declare_parameter("telegram_bot_token", "").get_parameter_value().string_value
@@ -129,13 +129,17 @@ class BankReceptionNode(Node):
             .get_parameter_value()
             .string_value
         )
-        self.blacklist_announce = (
-            self.declare_parameter(
-                "blacklist_announce",
-                "已通知行員前來協助",
-            )
-            .get_parameter_value()
-            .string_value
+        # ★ 2026-11-03（使用者決定）：登入的平板是**另一台、放在別處給服務人員看的**，
+        #   它只唸「出現了誰」，不唸客人那一側的迎賓詞／對話（前端 lib/tts.ts、lib/staffAlert.ts）。
+        #   {name} 會換成辨識出的名字。空字串＝這一類不提示。
+        self.staff_alert_vip = (
+            self.declare_parameter("staff_alert_vip", "出現貴賓{name}").get_parameter_value().string_value
+        )
+        self.staff_alert_blacklist = (
+            self.declare_parameter("staff_alert_blacklist", "出現黑名單{name}").get_parameter_value().string_value
+        )
+        self.staff_alert_visitor = (
+            self.declare_parameter("staff_alert_visitor", "出現訪客").get_parameter_value().string_value
         )
 
         # ── 狀態 ──────────────────────────────────────────────
@@ -146,6 +150,9 @@ class BankReceptionNode(Node):
 
         # ── 介面 ──────────────────────────────────────────────
         self.speech_pub = self.create_publisher(String, "speech_text", 10)
+        # ★ 2026-11-03：只給行員聽的語音提示。speech_text 會被**每一台平板與機器人喇叭**唸出來（客人聽得到），
+        #   所以黑名單提示改走這個話題：HMI 轉給「已登入的平板」才唸，機器人喇叭與迎賓平板都不出聲。
+        self.staff_alert_pub = self.create_publisher(String, "staff_alert_speech", 10)
         self.event_pub = self.create_publisher(String, "brain_event", 10)
         self.identity_sub = self.create_subscription(UserIdentity, self.identity_topic, self.identity_callback, 10)
         # LLM 的通報工具走這個話題進來，讓「通報」只有一個出口
@@ -242,6 +249,17 @@ class BankReceptionNode(Node):
         #   上機前一天不值得冒這個險。
         if len(msg.bbox) >= 4 and (msg.bbox[2] - msg.bbox[0]) <= 0.0 and (msg.bbox[3] - msg.bbox[1]) <= 0.0:
             self._state = "IDLE"
+            # ★★ 2026-11-03：鏡頭前沒人了 -> 解除一般訪客的冷卻 ★★
+            #
+            # 一般訪客共用一個 "visitor" 冷卻 300 秒，原意是「同一群人站著不要
+            # 一直重複問候」。但它不分人，於是第一位陌生人被問候後，**接下來
+            # 5 分鐘走進來的每一位陌生人都沒有迎賓語音**。實機 log（11/03）：
+            # 41 次未認出的人臉只播了 2 次迎賓詞，中間鏡頭已經空過 4 次。
+            #
+            # 「無人」訊息是 user_auth 連續 identity_timeout 秒沒看到臉才發的，
+            # 代表上一位已經離開 —— 下一位出現就是新訪客，應該要問候。
+            # 有人一直站在鏡頭前時不會發「無人」，300 秒冷卻照樣擋住重複問候。
+            self._last_seen.pop("visitor", None)
             return
 
         name = msg.user_name or "Unknown"
@@ -255,47 +273,10 @@ class BankReceptionNode(Node):
         if not msg.recognized:
             ptype = "GUEST"
 
-        # VIP 與黑名單是會觸發「說出名字」與「通報行員」的動作，
-        # 誤判的代價比一般問候高得多，所以再加一道保守門檻。
-        #
-        # ★★ 2026-08-26：黑名單改用自己的門檻 ★★
-        #
-        # 原本兩者共用 min_confidence，但**誤判的後果差很多**：
-        #   VIP 誤判   -> 叫錯名字，尷尬，當場可以打圓場
-        #   黑名單誤判 -> 自動送出 Telegram 通報，**沒有任何人工複核**，
-        #                 行員會被叫到現場面對一位無辜的客人
-        #
-        # 而且 min_confidence 預設 0.5 其實**擋不住任何東西**：
-        # user_auth_node 的 recognition_threshold 是 0.70，過得了那一關的
-        # similarity 一定 > 0.5，所以這道門在黑名單上等於不存在。
-        #
-        # 0.80 的依據（來自 user_auth_node.py 的實測註解）：
-        #   同一人 1 m   平均 0.7603（0.7215~0.8636）
-        #   兩個不同的人 0.515
-        # 0.80 落在「同一人分布」的上緣，會漏掉一部分真黑名單（偏保守），
-        # 但把誤報壓到很低。**這個取捨是刻意的** —— 漏報一次頂多是沒通報，
-        # 誤報一次是對著無辜的人叫行員。
-        #
-        # ⚠ 誤認率至今沒有量過（資料庫長期只有一個人），有第二個人可以測時
-        #   要重新檢視這個值。E2 實驗就是要補這一格。
-        if ptype == "BLACKLIST" and msg.similarity < self.blacklist_min_confidence:
-            # ★★ 2026-08-31 修正：原本這裡直接 return，於是這位訪客**整段劇本
-            #    都被跳過** —— 不問候、不發事件、也不寫 visit_log。★★
-            #
-            #    現場看到的是「有人站在鏡頭前，機器人完全不出聲」，
-            #    那看起來就是人臉系統壞了，而不是「保守地不通報」。
-            #    到訪統計頁也會少一筆。
-            #
-            #    降級成一般訪客才符合本檔自己的既定原則
-            #    （「不可以把認不出來的人當成黑名單」）：
-            #    通報照樣抑制（誤報的代價最高，這點不變），
-            #    但問候與紀錄照常，劇本不會斷在這裡。
-            self.get_logger().info(
-                f"黑名單命中但相似度 {msg.similarity:.3f} 未達 "
-                f"{self.blacklist_min_confidence:.2f}，"
-                f"不通報（避免誤報），改以一般訪客接待"
-            )
-            ptype = "GUEST"
+        # 黑名單：recognized=True 就通報，門檻統一由 user_auth_node 的
+        # recognition_threshold（0.70）決定（2026-11-03 移除 0.80 專用門檻，見 __init__）。
+        # 實測依據（user_auth_node.py）：同一人 1 m 平均 0.7603、兩個不同的人 0.515；
+        # 11/03 未認出者的最高分落在 0.586~0.639，都在 0.70 之下。
         if ptype == "VIP" and msg.similarity < self.min_confidence:
             return
 
@@ -313,18 +294,26 @@ class BankReceptionNode(Node):
         if ptype == "VIP":
             self._state = "GREETING"
             self._say(self.vip_greeting.format(name=name))
+            self._staff_alert(self.staff_alert_vip, name)
             self._emit_event("vip_greeting", name, msg.similarity)
         elif ptype == "BLACKLIST":
             self._state = "ALERTING"
-            # 現場只說中性的話 —— 當著本人的面播報「偵測到黑名單」
-            # 會讓情況立刻升溫，而且對誤判的人是嚴重冒犯。
-            # 真正的細節只送給行員。
-            self._say(self.blacklist_announce)
+            # ★ 2026-11-03：以前現場播中性的「已通知行員前來協助」（speech_text，客人聽得到）。
+            #   使用者決定改成「出現黑名單」、而且只在已登入（行員）的平板上唸 —— 客人那一側完全不出聲：
+            #   當著本人的面播報會讓情況升溫，對誤判的人也是冒犯，所以絕不能走 speech_text／機器人喇叭。
+            self._staff_alert(self.staff_alert_blacklist, name)
+            # ★ 2026-11-03（使用者決定）：客人那一側要跟「未知訪客」聽起來一模一樣 ——
+            #   播一般訪客的迎賓詞（speech_text：迎賓平板＋機器人喇叭），而且遵守同一個「visitor」冷卻：
+            #   前一位訪客剛被問候過的 5 分鐘內就不播，跟一般陌生人的行為完全相同，旁人聽不出差別。
+            if now - self._last_seen.get("visitor", -1e9) >= self.visitor_cooldown_sec:
+                self._last_seen["visitor"] = now
+                self._say(self.visitor_greeting)
             self._send_notification(f"⚠️ 偵測到黑名單人員：{name}（相似度 {msg.similarity:.2f}）" f"請行員立即前往現場")
             self._emit_event("blacklist_alert", name, msg.similarity)
         else:
             self._state = "GREETING"
             self._say(self.visitor_greeting)
+            self._staff_alert(self.staff_alert_visitor, name)
             self._emit_event("visitor_greeting", name, msg.similarity)
 
         self._log_visit(msg, ptype)
@@ -339,6 +328,14 @@ class BankReceptionNode(Node):
     def _say(self, text: str) -> None:
         self.speech_pub.publish(String(data=text))
         self.get_logger().info(f"🗣️ 迎賓語音: {text}")
+
+    def _staff_alert(self, template: str, name: str) -> None:
+        """只給服務人員平板（已登入）唸的提示；客人那一側聽不到（見 staff_alert_pub）"""
+        if not template:
+            return
+        text = template.format(name=name if name and name != "Unknown" else "")
+        self.staff_alert_pub.publish(String(data=text))
+        self.get_logger().info(f"🔒 行員提示（只在已登入的平板唸）: {text}")
 
     def _emit_event(self, event: str, name: str, confidence: float) -> None:
         payload = json.dumps(

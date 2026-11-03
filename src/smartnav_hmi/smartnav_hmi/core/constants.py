@@ -81,7 +81,9 @@ ACTION_TIMEOUTS = {
     #   + 切回定位模式（lifecycle 轉換各 25 秒）+ 餘裕。
     #   以後改 exploration_timeout_sec 要同步改這裡。
     "create_map": 1920.0,
-    "global_localization": 260.0,  # 節點內建 200 秒
+    # ★ 2026-11-03：全域定位完會開回起點（經 nav_arbiter），等結果的上限要加上一趟導航：
+    #   定位 global_localization_timeout_sec 240 + RequestNavigation CLIENT_WAIT_SEC 360 + 餘裕
+    "global_localization": 640.0,
     # "navigate" 指的是對 nav_arbiter 的 request_navigation（HMI 不直接呼叫 /navigate）；
     # 時限的單一來源是 RequestNavigation.action，與 LLM 端等結果的上限同值。
     "navigate": RequestNavigation.Goal.CLIENT_WAIT_SEC,

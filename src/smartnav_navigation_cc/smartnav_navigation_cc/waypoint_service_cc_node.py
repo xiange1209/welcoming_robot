@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import rclpy
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -53,7 +53,7 @@ from std_srvs.srv import Empty as EmptySrv
 from std_srvs.srv import Trigger
 from smartnav_navigation_cc.lazy_tf import LazyTf, spin_resilient
 
-from smartnav_msgs.action import GlobalLocalization
+from smartnav_msgs.action import GlobalLocalization, RequestNavigation
 from smartnav_msgs.msg import WaypointInfo
 from smartnav_msgs.srv import CreateWaypoint, DeleteWaypoint, GetWaypoint, ListWaypoints
 
@@ -118,6 +118,13 @@ class WaypointServiceCcNode(Node):
         # 前方障礙物距離小於這個值就換方向
         self.declare_parameter("front_clearance_m", 0.7)
         self.declare_parameter("robot_base_frame", "base_footprint")
+        # ★ 2026-11-03：全域定位收斂後開回「按下全域定位時的位置」。
+        #   定位前不知道自己在地圖的哪裡，但里程計（odom_combined）一直連續：先記下起點在 odom 的位姿，
+        #   收斂後用 map->odom 換算出起點在地圖上的位置，再經 nav_arbiter（OPERATOR）導航回去。
+        #   繞一兩公尺的里程計誤差只有幾公分。離起點不到 return_min_dist_m 就不回（已經在附近）。
+        self.declare_parameter("return_to_start_after_localize", True)
+        self.declare_parameter("return_min_dist_m", 0.30)
+        self.declare_parameter("odom_frame", "odom_combined")
 
         self.max_covariance_norm = float(self.get_parameter("max_covariance_norm").value)
         self.global_localization_timeout_sec = float(
@@ -126,6 +133,9 @@ class WaypointServiceCcNode(Node):
         self.localize_verify_min_score = float(
             self.get_parameter("localize_verify_min_score").value
         )
+        self.return_to_start = bool(self.get_parameter("return_to_start_after_localize").value)
+        self.return_min_dist = float(self.get_parameter("return_min_dist_m").value)
+        self.odom_frame = str(self.get_parameter("odom_frame").value)
         self.relocalize_linear_speed = float(self.get_parameter("relocalize_linear_speed").value)
         self.relocalize_angular_speed = float(self.get_parameter("relocalize_angular_speed").value)
         self.front_clearance_m = float(self.get_parameter("front_clearance_m").value)
@@ -163,6 +173,9 @@ class WaypointServiceCcNode(Node):
         # ------------------------------------------------------------------
         # 客戶端
         # ------------------------------------------------------------------
+        # 導航一律經 nav_arbiter（系統唯一的導航入口；身分判斷、單一進行中、取消都在那裡）
+        self.request_nav_client = ActionClient(
+            self, RequestNavigation, "request_navigation", callback_group=self.client_cb_group)
         self.reinit_global_localization_client = self.create_client(
             EmptySrv, "/reinitialize_global_localization", callback_group=self.client_cb_group
         )
@@ -458,6 +471,10 @@ class WaypointServiceCcNode(Node):
 
             if not self.reinit_global_localization_client.wait_for_service(timeout_sec=10.0):
                 return self._abort_localization(goal_handle, result, "AMCL 全域定位服務不在線上")
+            # ★ 2026-11-03：記下起點（odom 座標，跟 AMCL 無關、繞的過程中也連續）
+            start_odom = self._lookup_xyyaw(self.odom_frame, self.robot_base_frame) if self.return_to_start else None
+            if self.return_to_start and start_odom is None:
+                self.get_logger().warn("全域定位：讀不到起點的里程計位姿，這次定位完不會開回起點")
 
             try:
                 wait_for_future(
@@ -536,11 +553,21 @@ class WaypointServiceCcNode(Node):
             if score >= 0.0:
                 self.get_logger().info(f"　收斂後驗證：雷射吻合度 {score * 100:.0f}%")
 
+            result.message = "全域定位成功"
+            self.get_logger().info("✓ 全域定位成功")
+            if start_odom is not None:
+                back = self._return_to_start(goal_handle, start_odom)
+                if back == "cancel":
+                    result.success = False
+                    result.message = "全域定位成功，但開回起點時被取消（車子停在原地，定位仍然有效）"
+                    goal_handle.canceled()
+                    self.get_logger().info(result.message)
+                    return result
+                result.message += back
+            self._update_current_pose()
             result.pose = copy.deepcopy(self.current_pose)
             result.success = True
-            result.message = "全域定位成功"
             goal_handle.succeed()
-            self.get_logger().info("✓ 全域定位成功")
             return result
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"全域定位錯誤: {exc}")
@@ -646,6 +673,72 @@ class WaypointServiceCcNode(Node):
             time.sleep(0.1)
 
         return "cancel"
+
+    def _lookup_xyyaw(self, parent: str, child: str):
+        """查 parent -> child 的 (x, y, yaw)；失敗回 None"""
+        try:
+            buf = self._tf.buffer(wait_for=(parent, child))
+            tf = buf.lookup_transform(parent, child, Time())
+        except Exception:  # noqa: BLE001
+            return None
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return tf.transform.translation.x, tf.transform.translation.y, yaw
+
+    @staticmethod
+    def _compose(a, b):
+        """2D 位姿合成：a ⊕ b（b 在 a 的座標系裡）"""
+        ax, ay, ath = a
+        bx, by, bth = b
+        c, s = math.cos(ath), math.sin(ath)
+        return ax + c * bx - s * by, ay + s * bx + c * by, math.atan2(math.sin(ath + bth), math.cos(ath + bth))
+
+    def _return_to_start(self, goal_handle, start_odom) -> str:
+        """★ 2026-11-03：收斂後開回起點。回傳附加到結果訊息的說明；被取消回 "cancel"。
+
+        起點在地圖上的位置 = (map -> odom 現在的值) ⊕ (起點在 odom 的位姿)。
+        導航失敗／被拒／nav_arbiter 沒在跑都不算定位失敗：定位本身已經好了，只是車子停在原地。
+        """
+        map_odom = self._lookup_xyyaw("map", self.odom_frame)
+        now_map = self._lookup_xyyaw("map", self.robot_base_frame)
+        if map_odom is None or now_map is None:
+            return "（讀不到 map -> odom，沒有開回起點）"
+        sx, sy, syaw = self._compose(map_odom, start_odom)
+        dist = math.hypot(sx - now_map[0], sy - now_map[1])
+        if dist < self.return_min_dist:
+            self.get_logger().info(f"全域定位：離起點只有 {dist:.2f} m，不必開回")
+            return "（已在起點附近）"
+        if not self.request_nav_client.wait_for_server(timeout_sec=3.0):
+            return "（導航仲裁沒在跑，沒有開回起點）"
+        g = RequestNavigation.Goal()
+        g.source = RequestNavigation.Goal.SOURCE_OPERATOR   # HMI 的全域定位按鈕要登入（管理者）
+        g.use_target_pose = True
+        g.target_pose.position.x, g.target_pose.position.y = sx, sy
+        g.target_pose.orientation.z, g.target_pose.orientation.w = math.sin(syaw / 2.0), math.cos(syaw / 2.0)
+        g.target_name = "全域定位起點"
+        g.quiet = True        # ★ 系統自己的歸位，不對客人播「開始導航到 全域定位起點」
+        self.get_logger().info(
+            f"全域定位：開回起點 ({sx:.2f}, {sy:.2f}, {math.degrees(syaw):.0f}°)，距離 {dist:.2f} m")
+        try:
+            nav_gh = wait_for_future(self.request_nav_client.send_goal_async(g), timeout_sec=10.0)
+        except Exception as exc:  # noqa: BLE001
+            return f"（開回起點的請求失敗：{exc}）"
+        if nav_gh is None or not nav_gh.accepted:
+            return "（導航仲裁拒絕了開回起點的請求）"
+        res_fut = nav_gh.get_result_async()
+        t_end = time.monotonic() + RequestNavigation.Goal.CLIENT_WAIT_SEC
+        while not res_fut.done() and time.monotonic() < t_end:
+            if goal_handle.is_cancel_requested:
+                nav_gh.cancel_goal_async()
+                return "cancel"
+            time.sleep(0.1)
+        if not res_fut.done():
+            nav_gh.cancel_goal_async()
+            return "（開回起點逾時，已取消）"
+        r = res_fut.result().result
+        if r.success:
+            return "，已開回起點"
+        return f"（沒有開回起點：{r.message}）"
 
     def _stop_robot(self) -> None:
         for _ in range(3):

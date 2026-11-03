@@ -117,7 +117,13 @@ class NavigationActionCcNode(Node):
         #
         # 流程：/plan_taught_path（內部逐段呼叫 nav2 規劃器）-> path_id
         #       -> /follow_taught_path（純追蹤執行，含貼牆排斥與脫困）
-        # 任何一步不成就**自動退回 nav2/MPPI**，不會比原本更糟。
+        # 任何一步不成就**自動退回 nav2 navigate_to_pose**，不會比原本更糟。
+        #
+        # ★ 2026-11-03：nav2 的控制器已從 MPPI 換成 RPP（見 nav2_senior_akm_cc.yaml FollowPath）。
+        #   上面 8/03~8/10 的判斷是針對 MPPI 的歷史紀錄。現在兩條路的差別：
+        #     先試    /plan_taught_path（Hybrid-A* 逐段規劃）+ path_teach 純追蹤執行
+        #     退回    /navigate_to_pose -> bt_navigator（同一個 Hybrid-A* 規劃）+ controller_server RPP 循跡
+        #   兩條都經過 Hybrid-A*，差別只在「誰來執行」與「誰負責重新規劃」。
         self.declare_parameter("prefer_taught_path", True)
         self.declare_parameter("taught_plan_timeout_sec", 30.0)
         # 成功後把這條臨時路徑刪掉，否則每按一次導航就多一條，paths.json 會長爆。
@@ -176,7 +182,9 @@ class NavigationActionCcNode(Node):
         #   重試前也不清障礙層（keep_new_obstacles_on_replan），新路線才會繞開它。
         #   10/28 晚上貴賓室那趟：路線一直規劃得出來（所以從沒進「等通道」、從沒開口），3 次都撞同一處。
         self.declare_parameter("new_obstacle_speech", "不好意思，請讓我過一下。")
-        self.declare_parameter("new_obstacle_speech_wait_sec", 4.0)      # 講完等幾秒再重新規劃（0＝不等）
+        # ★ 2026-11-03：4.0 -> 1.0。走到這裡時 path_teach 已經講過「請借過」並等了 new_obstacle_wait_sec，
+        #   對方都沒讓；再等 4 秒多半不會有不同結果，只是讓客人乾等。留 1 秒讓這句話講出口再開始繞。
+        self.declare_parameter("new_obstacle_speech_wait_sec", 1.0)      # 講完等幾秒再重新規劃（0＝不等）
         self.declare_parameter("new_obstacle_speech_min_gap_sec", 20.0)  # 同一趟裡兩次請讓路至少隔幾秒
         self.declare_parameter("keep_new_obstacles_on_replan", True)
         # ★ 2026-10-27：出發前確認第一段行進方向淨空（客人講完話常站在車前；路徑三成先倒車）。見 depart_gate.py。
@@ -254,7 +262,11 @@ class NavigationActionCcNode(Node):
         #   map_service 取消時也發同一個話題）。
         self.unwedge_abort_pub = self.create_publisher(Empty, "unwedge_abort", 10)
         self._unwedge_goal = None        # 目前這次 /unwedge 呼叫所屬的 goal_handle（偵測取消用）
-        self._announce_start = True      # 這一次起跑要不要播「開始導航到 X」（見 _try_taught_path）
+        self._announce_start = True      # 這一次起跑要不要做出發前檢查（depart gate，見 _try_taught_path）
+        # ★ 2026-11-03：要不要播「開始導航到 X」。跟 _announce_start 拆開：
+        #   出發前檢查每次重新起跑都該做，但這句話一趟導航只講一次（以前每次重新規劃起跑都重播一次）；
+        #   goal.quiet（系統內部的移動）則一次都不講。
+        self._speak_start = True
         self._last_plan_fail_msg = ""    # 最近一次規劃失敗的原因（_wait_for_passage 用來認「起點被占用」）
         # 導航前清全域成本地圖的 obstacle 層（見參數宣告處的說明）
         self.clear_costmap_client = self.create_client(
@@ -408,12 +420,13 @@ class NavigationActionCcNode(Node):
             if abs(q.x) + abs(q.y) + abs(q.z) + abs(q.w) < 1e-6:
                 target_pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
 
-            # ★ 先試「nav2 規劃 + 純追蹤執行」，不成才退回 nav2/MPPI（見參數說明）
+            # ★ 先試「nav2 規劃 + 純追蹤執行」，不成才退回 nav2 navigate_to_pose（見參數說明）
             if self.prefer_taught_path:
                 taught = self._try_taught_path(goal_handle, target_pose, waypoint_name, result)
                 if taught is not None:
                     return taught
-                self.get_logger().warn("教導-重現路線不可用，退回 nav2/MPPI")
+                self.get_logger().warn(
+                    "nav2 規劃 + 純追蹤不可用，改交給 nav2 navigate_to_pose（Hybrid-A* 規劃 + RPP 循跡）")
 
             if not self.nav2_client.wait_for_server(timeout_sec=10.0):
                 return self._abort(goal_handle, result, "Nav2 導航伺服器不在線上，導航失敗")
@@ -439,7 +452,8 @@ class NavigationActionCcNode(Node):
             if not nav2_goal_handle.accepted:
                 return self._abort(goal_handle, result, "導航請求被拒絕，導航失敗")
 
-            self.speech_text_pub.publish(String(data=f"開始導航到 {waypoint_name}"))
+            if not getattr(request, "quiet", False):
+                self.speech_text_pub.publish(String(data=f"開始導航到 {waypoint_name}"))
             self.get_logger().info(f"開始導航到 {waypoint_name}")
             self.nav_active_pub.publish(Bool(data=True))
 
@@ -483,10 +497,10 @@ class NavigationActionCcNode(Node):
         """用「nav2 規劃 + 純追蹤執行」導航，**失敗會自動重新規劃再試**。
 
         回傳 `Navigate.Result` 代表這條路已經處理完（成功或失敗都算數）；
-        回傳 `None` 代表**第一次就根本沒能起跑**，呼叫端應該退回 nav2/MPPI。
+        回傳 `None` 代表**第一次就根本沒能起跑**，呼叫端應該退回 nav2 navigate_to_pose。
 
-        ★ 這個區分很重要：規劃不出路徑（服務沒開、目標不可達）要讓 MPPI 有機會試；
-          但**路徑跑到一半失敗**不該再讓 MPPI 跑一次——同一段路它只會更糟，
+        ★ 這個區分很重要：規劃不出路徑（服務沒開、目標不可達）要讓 nav2（RPP）有機會試；
+          但**路徑跑到一半失敗**不該再讓 nav2 跑一次——同一段路它只會更糟，
           而且車子已經不在起點了，再送一次會從奇怪的位置重新規劃。
 
         ## ★★ 2026-08-14：加入自動重新規劃（這是「能自己跑」的關鍵）★★
@@ -595,7 +609,7 @@ class NavigationActionCcNode(Node):
                 blocked_xy = None
             if plan is None:
                 # ★ 2026-10-09（審查 [6]）：規劃服務最長會阻塞 30 秒（含清成本地圖後的 2 秒等待），
-                #   這段期間按急停，回來之後要先看取消再決定要不要推車、要不要退回 nav2/MPPI。
+                #   這段期間按急停，回來之後要先看取消再決定要不要推車、要不要退回 nav2 navigate_to_pose。
                 if goal_handle.is_cancel_requested:
                     return self._canceled(goal_handle, result)
                 # ★★ 2026-08-17：規劃不出來時先試著把車子推開再規劃一次 ★★
@@ -623,7 +637,7 @@ class NavigationActionCcNode(Node):
                     return self._canceled(goal_handle, result)
             if plan is None:
                 if runs == 0:
-                    # 一次都沒跑過 -> 車子還在原地，讓 MPPI 有機會試
+                    # 一次都沒跑過 -> 車子還在原地，讓 nav2 navigate_to_pose（RPP）有機會試
                     return None
                 # ★ 2026-10-20：還有重試次數 -> 等一下、從當下位置再規劃一輪（見 replan_fail_retry_sec）。
                 #   回到迴圈開頭會 attempt += 1、清成本地圖，次數用完就由那裡的出口結束。
@@ -652,6 +666,7 @@ class NavigationActionCcNode(Node):
             #   （/navigation_active 的 True／False 發布時機刻意不動：整個迴圈維持 True 的話，
             #   任何一個漏掉的 return 出口都會讓相機再也不恢復。）
             self._announce_start = (runs == 1 or not last_dyn)
+            self._speak_start = runs == 1 and not getattr(goal_handle.request, "quiet", False)
             outcome, res, path_id = self._follow_taught_once(
                 goal_handle, plan, waypoint_name, deadline)
 
@@ -886,7 +901,7 @@ class NavigationActionCcNode(Node):
         self._last_plan_fail_msg = ""
         # 折返點數是這條路好不好走的最強預測指標：
         # 2026-08-10 十趟實測「0 折返 6 勝（誤差 11~12 cm）／多折返 5 敗」。
-        # 不因為有折返就放棄（它仍然比 MPPI 好），但要讓 log 說得出來。
+        # 不因為有折返就放棄（8/10 當時它仍然比 MPPI 好；換 RPP 後尚未重新比較），但要讓 log 說得出來。
         cusp_note = "（0 折返）" if plan.num_cusps == 0 else f"（★ {plan.num_cusps} 個折返，較易失敗）"
         self.get_logger().info(
             f"教導路徑規劃完成：{plan.num_points} 點、{plan.length_m:.2f} m {cusp_note}")
@@ -920,7 +935,7 @@ class NavigationActionCcNode(Node):
             self.get_logger().warn("重播請求被拒絕")
             return "reject", None, plan.path_id
 
-        if getattr(self, "_announce_start", True):
+        if getattr(self, "_speak_start", True):
             self.speech_text_pub.publish(String(data=f"開始導航到 {waypoint_name}"))
         self.get_logger().info(f"開始導航到 {waypoint_name}（純追蹤執行）")
         self.nav_active_pub.publish(Bool(data=True))
@@ -1039,7 +1054,7 @@ class NavigationActionCcNode(Node):
           後果是 HMI 按「取消導航」完全沒有作用 —— 動作伺服器收到取消請求、
           cancel_callback 也回了 ACCEPT，但車子照樣一路開到底。
 
-          nav2/MPPI 那條路早就有 `_monitor_navigation` 在輪詢取消，
+          nav2 navigate_to_pose 那條路早就有 `_monitor_navigation` 在輪詢取消，
           教導-重現這條沒有。同一台車兩個導航入口，只有一個煞得住，
           而 8/10 之後預設走的正是**煞不住的那一個**。
 
@@ -1128,7 +1143,7 @@ class NavigationActionCcNode(Node):
         """內層（nav2 或重播）結束之後，判斷這次是不是外層 /navigate 的取消
 
         ★ 2026-09-25（審查）：平板急停會幾乎同時對 /navigate_to_pose 與 /navigate 送「取消全部」
-          （nav2 排第一，自動探索與 MPPI 才停得住）。nav2 幾十毫秒就回 CANCELED，而監看迴圈每 0.5 秒
+          （nav2 排第一，自動探索與 nav2 控制器才停得住）。nav2 幾十毫秒就回 CANCELED，而監看迴圈每 0.5 秒
           才醒一次、醒來先看結果 —— 外層的取消旗標晚幾毫秒才設，於是被判成「失敗」。
           LLM 的提示詞要求「失敗先自動重試」，**車子就可能在急停之後又開出去**。
           所以：外層旗標已設就是取消；內層是 CANCELED 時最多再等 1 秒看外層旗標。

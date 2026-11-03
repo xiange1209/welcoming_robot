@@ -235,6 +235,7 @@ class NavArbiterNode(Node):
         nav_goal.use_target_pose = goal.use_target_pose
         nav_goal.target_pose = goal.target_pose
         nav_goal.target_name = goal.target_name or name
+        nav_goal.quiet = bool(getattr(goal, "quiet", False))
         nav_handle = self._await(self.navigate_client.send_goal_async(nav_goal), 10.0)
         if nav_handle is None or not nav_handle.accepted:
             goal_handle.abort()

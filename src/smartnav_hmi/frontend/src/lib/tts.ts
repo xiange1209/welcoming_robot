@@ -1,4 +1,5 @@
 import { forSpeech } from "./speechText";
+import { sessionStore } from "./session";
 import { createStore } from "./store";
 import { telemetryStore } from "./telemetry";
 import { toast } from "./toast";
@@ -213,7 +214,17 @@ export function onChatUpdate(items: ChatMessage[]): void {
   const k = keyOf(last);
   if (spoken.has(k)) return;
   spoken.add(k);
-  if (ttsStore.get().on) speak(last.text);
+  // ★ 2026-11-03：語音輸出切到「機器人」時平板不唸（機器人喇叭會唸），否則同一句會出兩次聲。
+  //   還沒收到設定（舊版後端）視為 browser＝改版前的行為。
+  // ★ 2026-11-03（使用者決定）：登入的平板是**另一台、放在別處給服務人員看的**——
+  //   不唸客人那一側的迎賓詞、LLM 回覆、導航播報；它只唸「出現貴賓 X／黑名單 X／訪客」（lib/staffAlert.ts）。
+  if (sessionStore.get().admin) return;
+  if (ttsStore.get().on && outputIsBrowser()) speak(last.text);
+}
+
+/** 全系統的語音輸出是不是交給平板（由機器人上的設定決定，見 VoicePage） */
+export function outputIsBrowser(): boolean {
+  return (telemetryStore.get().snap.system?.voice_output ?? "browser") === "browser";
 }
 
 /** 清除對話後要跟著重置，否則舊的去重鍵會讓重新產生的同一句話被靜音 */

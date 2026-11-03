@@ -23,7 +23,7 @@
   <depend>nav2_amcl</depend>
   <depend>nav2_map_server</depend>
   <depend>nav2_smac_planner</depend>
-  <depend>nav2_mppi_controller</depend>
+  <depend>nav2_regulated_pure_pursuit_controller</depend>
   <depend>slam_toolbox</depend>
   <depend>frontier_exploration_ros2</depend>
 

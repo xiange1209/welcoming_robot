@@ -127,11 +127,11 @@ def fake(values, no_progress=5.0):
     return o
 
 
-DEFAULTS = {"new_obstacle_wait_sec": 8.0, "escape_after_sec": 4.0, "laser_y_offset_m": 0.0}   # 2026-10-22 併入每趟重讀
+DEFAULTS = {"new_obstacle_wait_sec": 5.0, "escape_after_sec": 4.0, "laser_y_offset_m": 0.0}   # 2026-10-22 併入每趟重讀；11/03 新障礙 8 -> 5
 o = fake({"margin_resume_m": 0.03, "margin_resume_sec": 1.0, "margin_stop_timeout_sec": 0.0,
           "margin_block_suppress_stuck": True, **DEFAULTS})
 check(o.margin_stop_timeout == 10.0, f"逾時 0 → 沿用 no_progress × 2 = 10 s（實際 {o.margin_stop_timeout}）")
-check((o.new_obstacle_wait, o.escape_after, o.laser_y) == (8.0, 4.0, 0.0), "預設值沒變：新障礙等 8 s、脫困 4 s、雷射偏移 0")
+check((o.new_obstacle_wait, o.escape_after, o.laser_y) == (5.0, 4.0, 0.0), "預設值沒變：新障礙等 5 s、脫困 4 s、雷射偏移 0")
 o = fake({"margin_resume_m": -1.0, "margin_resume_sec": -2.0, "margin_stop_timeout_sec": 6.0,
           "margin_block_suppress_stuck": False, "new_obstacle_wait_sec": 3.0, "escape_after_sec": 2.0,
           "laser_y_offset_m": 0.5})

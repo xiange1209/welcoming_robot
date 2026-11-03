@@ -13,6 +13,7 @@ import { installTeleopGuards } from "./lib/teleop";
 import { startTelemetry } from "./lib/telemetry";
 import { toast } from "./lib/toast";
 import { startChatTts, startTts } from "./lib/tts";
+import { startStaffAlert } from "./lib/staffAlert";
 import { startRegistrationWatch } from "./lib/users";
 import { startVersionWatch } from "./lib/version";
 
@@ -36,6 +37,7 @@ export default function App() {
     startTelemetry();
     startMapLayer();
     startChatTts();
+    startStaffAlert();
     startTts();
     startRegistrationWatch();
     installTeleopGuards();

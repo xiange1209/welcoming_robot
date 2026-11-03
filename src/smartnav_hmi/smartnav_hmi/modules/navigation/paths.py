@@ -146,6 +146,11 @@ def build_router(node, admin_only) -> APIRouter:
         """重播教導路徑。與導航一樣走作業機制，進度在作業清單裡看。"""
         if not TAUGHT_PATH_AVAILABLE:
             return _taught_unavailable()
+        # ★ 2026-11-03：已經在導航／重播就拒絕（同 /api/navigate）
+        if any(jb.get("action") in ("navigate", "follow_taught_path", "global_localization") and jb.get("status") in ("pending", "running")
+               for jb in node.state.jobs_copy()) or (node.state.snapshot().get("system") or {}).get("navigating"):
+            return JSONResponse({"success": False,
+                                 "message": "正在導航中，請等目前的導航結束，或先按緊急停止／取消"}, status_code=409)
         goal = FollowTaughtPath.Goal()
         goal.path_id = req.path_id
         goal.reverse = bool(req.reverse)

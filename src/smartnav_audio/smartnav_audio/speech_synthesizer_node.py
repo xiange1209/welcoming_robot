@@ -12,9 +12,9 @@ import sherpa_onnx
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from smartnav_msgs.msg import AudioData
 from smartnav_audio.voice_utils import AudioCodec, get_model_path, validate_audio_data
@@ -71,6 +71,16 @@ class SpeechSynthesizerNode(Node):
         # 發佈器 - 發佈合成的音訊
         self.audio_pub = self.create_publisher(AudioData, audio_topic, audio_qos)
 
+        # ★ 2026-11-03：HMI 的「語音輸出」開關（latched）。browser = 平板自己唸，這裡不合成、不出聲，
+        #   否則平板跟機器人喇叭會同時講同一句。還沒收到（HMI 沒在跑）時照舊合成 = 改版前的行為。
+        self.output_mode = "robot"
+        latched = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.create_subscription(String, "voice_output_mode", self._mode_callback, latched)
+        # ★ 2026-11-03：「機器人朗讀」開關。關掉時連合成都不做（Pi 4 上一句要 20 幾秒、很吃 CPU）
+        self.tts_enabled = True
+        self.create_subscription(Bool, "robot_tts_enabled", self._enabled_callback, latched)
+
         self.get_logger().info("✓ 語音合成節點已初始化")
         self.get_logger().info(f"  訂閱話題: {text_topic}")
         self.get_logger().info(f"  發布話題: {audio_topic}")
@@ -120,6 +130,19 @@ class SpeechSynthesizerNode(Node):
         except Exception as e:
             self.get_logger().error(f"✗ 初始化 TTS 模型失敗: {e}")
 
+    def _mode_callback(self, msg: String) -> None:
+        mode = msg.data.strip().lower()
+        if mode not in ("browser", "robot") or mode == self.output_mode:
+            return
+        self.output_mode = mode
+        self.get_logger().info(
+            "語音輸出：機器人喇叭" if mode == "robot" else "語音輸出：平板（這裡不合成、不出聲）")
+
+    def _enabled_callback(self, msg: Bool) -> None:
+        if bool(msg.data) != self.tts_enabled:
+            self.tts_enabled = bool(msg.data)
+            self.get_logger().info("機器人朗讀：開" if self.tts_enabled else "機器人朗讀：關（不合成）")
+
     def _text_callback(self, msg: String) -> None:
         """文字輸入回呼函數
 
@@ -130,9 +153,16 @@ class SpeechSynthesizerNode(Node):
         if not text or not text.strip():
             self.get_logger().warning("接收到空文字")
             return
+        if self.output_mode == "browser":
+            self.get_logger().debug(f"語音輸出＝平板，略過：{text[:30]}")
+            return
+        if not self.tts_enabled:
+            self.get_logger().debug(f"機器人朗讀已關，略過：{text[:30]}")
+            return
 
         audio = self.synthesize_text(text)
-        if audio is not None:
+        # 合成要 20 幾秒：這段期間被關掉（或切回平板）就別放出來
+        if audio is not None and self.tts_enabled and self.output_mode == "robot":
             # 發佈音訊
             self._publish_audio(audio)
 

@@ -19,7 +19,7 @@ import { createStore } from "./store";
    ══════════════════════════════════════════════════════════════ */
 
 const SEND_INTERVAL_MS = 100; // 後端 20 Hz 補送，這裡只要跟得上手指
-const MAX_LINEAR = 0.18; // m/s，後端上限
+const MAX_LINEAR = 0.2; // m/s，後端上限（★ 2026-11-03 0.18 -> 0.20，與 teleop.py 一致）
 const MAX_ANGULAR = 0.45; // rad/s，後端上限
 
 export interface TeleopState {

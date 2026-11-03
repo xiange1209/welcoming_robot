@@ -8,6 +8,7 @@ string waypoint_id
 bool use_target_pose            # true 時直接導航到 target_pose
 geometry_msgs/Pose target_pose  # 目標座標（map frame）
 string target_name              # 目標顯示名稱（僅供語音播報，可留空）
+bool quiet                      # ★ 2026-11-03：true = 不播「開始導航到 X」（系統內部的移動，例如全域定位完開回起點）
 ---
 bool success                    # 是否成功
 string message                  # 訊息

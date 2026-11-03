@@ -81,8 +81,9 @@ class HardwareProbe:
             item("speaker", "喇叭",
                  "playback" in pcm,
                  "有播放裝置" if "playback" in pcm else "沒有播放裝置（正常）",
-                 "★ 車上刻意不裝喇叭（2026-08-07 決定）。語音輸出走平板瀏覽器，"
-                 "所以這一項紅色是**預期的**，不用處理"),
+                 "★ 2026-11-03：語音頁的「語音輸出」選「平板朗讀」時不需要喇叭。選「機器人喇叭」時才要接——"
+                 "注意 Pi 的耳機孔與 HDMI 永遠會被列成播放裝置，這一項綠色**不代表**有接喇叭"
+                 "（語音頁會分辨 USB 音效卡／只有耳機孔）"),
             item("serial", "序列埠（底盤／光達）",
                  bool(serials),
                  "、".join(serials) if serials else "找不到任何 ttyUSB/ttyACM",

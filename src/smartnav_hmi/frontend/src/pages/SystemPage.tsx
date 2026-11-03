@@ -229,7 +229,8 @@ export function SystemPage({ active }: { active: boolean }) {
        是 2.0 秒，跟 2000 ms 的輪詢打平，加上網路來回一定超過——那個快取
        **每一次都 miss**，等於沒有。4 秒讓它真的擋得住，而節點上下線這種事
        延遲 4 秒看到完全不影響操作。 */
-  const hasTransition = units.some((unit) => !!unit.transition);
+  // ★ 2026-11-03：「啟動中」（節點載入中）也算過渡期：輪詢加快、「已等 N 秒」要跳
+  const hasTransition = units.some((unit) => !!unit.transition || !!unit.starting);
   useVisibleInterval(refresh, hasTransition ? 1000 : 4000, active);
 
   // 「已等 N 秒」要自己跳，不能等下一輪輪詢（那是 4 秒一次，看起來像卡住）
@@ -326,7 +327,11 @@ export function SystemPage({ active }: { active: boolean }) {
             const waited = p
               ? Math.max(0, Math.round(now / 1000 - p.started_at))
               : 0;
-            const dot = p
+            const loading = !p && !!u.starting;
+            const loadingWaited = loading
+              ? Math.max(0, Math.round(now / 1000 - (u.starting_since ?? now / 1000)))
+              : 0;
+            const dot = p || loading
               ? "bg-blue"
               : u.running
                 ? "bg-green"
@@ -345,7 +350,7 @@ export function SystemPage({ active }: { active: boolean }) {
                   className={cx(
                     "size-2.5 flex-none rounded-full",
                     dot,
-                    p && "anim-pulse",
+                    (p || loading) && "anim-pulse",
                   )}
                 />
 
@@ -365,7 +370,17 @@ export function SystemPage({ active }: { active: boolean }) {
                         : "（請不要重複按）"}
                     </div>
                   )}
-                  {u.partial && !p && (
+                  {loading && (
+                    <div className="tnum text-[12px] text-blue">
+                      正在啟動中… 已等 {loadingWaited} 秒（節點載入中，好了會變綠燈）
+                    </div>
+                  )}
+                  {u.start_stuck && !p && (
+                    <div className="text-[12px] text-orange">
+                      啟動很久了還沒全部上線——看系統開關的 log，或按停止再重來
+                    </div>
+                  )}
+                  {u.partial && !p && !loading && !u.start_stuck && (
                     <div className="text-[12px] text-orange">
                       部分節點在跑，狀態不完整
                     </div>
@@ -390,7 +405,7 @@ export function SystemPage({ active }: { active: boolean }) {
                     <Button variant="danger" disabled>
                       {p.action === "stop" ? "關閉中…" : "啟動中…"}
                     </Button>
-                  ) : u.running || u.partial ? (
+                  ) : u.running || u.partial || loading || u.start_stuck ? (
                     <Button
                       variant="danger"
                       disabled={!!p}

@@ -99,6 +99,14 @@ def build_router(node, admin_only) -> APIRouter:
 
     @router.post("/api/navigate", dependencies=admin_only)
     async def api_navigate(req: NavigateRequest) -> JSONResponse:
+        # ★ 2026-11-03：已經在導航就直接回 409。以前會先回「導航已開始」，幾秒後作業才被 nav_arbiter 以 BUSY 擋下，
+        #   畫面看起來像按了沒反應。急停／取消不受影響（走別的端點）。
+        busy_job = next((jb for jb in node.state.jobs_copy()
+                         if jb.get("action") in ("navigate", "follow_taught_path", "global_localization")
+                         and jb.get("status") in ("pending", "running")), None)
+        if busy_job or (node.state.snapshot().get("system") or {}).get("navigating"):
+            return JSONResponse({"success": False,
+                                 "message": "正在導航中，請等目前的導航結束，或先按緊急停止／取消"}, status_code=409)
         goal = RequestNavigation.Goal()
         goal.source = RequestNavigation.Goal.SOURCE_OPERATOR  # 已登入的管理者（admin_only）；不受客人身分限制
         if req.waypoint_id:
@@ -119,6 +127,12 @@ def build_router(node, admin_only) -> APIRouter:
         ⚠️ 走廊裡不要用這支，用下面的 /api/localize/here。
         理由見 SetPoseRequest 的說明（沿軸歧義 ＋ 會繞圈撞牆）。
         """
+        # ★ 2026-11-03：全域定位會開車繞、收斂後還會開回起點 —— 導航中不能疊上去（兩邊會同時下指令）
+        if any(jb.get("action") in ("navigate", "follow_taught_path", "global_localization")
+               and jb.get("status") in ("pending", "running") for jb in node.state.jobs_copy()) \
+                or (node.state.snapshot().get("system") or {}).get("navigating"):
+            return JSONResponse({"success": False,
+                                 "message": "正在導航或全域定位中，請等它結束，或先按緊急停止"}, status_code=409)
         job_id = node.jobs.start_action("global_localization", GlobalLocalization.Goal(), "全域定位")
         return JSONResponse({"success": True, "message": "全域定位已開始", "job_id": job_id})
 

@@ -20,7 +20,9 @@ from rcl_interfaces.srv import SetParameters
 
 
 class TeleopController:
-    TELEOP_MAX_LINEAR = 0.18
+    # ★ 2026-11-03：0.18 -> 0.20（使用者決定；與自動探索的 explore_linear_speed 一致）。
+    #   slam 不做雷達去畸變，建圖時直線別再快：0.20 m/s 一圈掃描（約 0.1 秒）內只走 2 cm
+    TELEOP_MAX_LINEAR = 0.20
     TELEOP_MAX_ANGULAR = 0.45
 
     def __init__(self, node, teleop_pub, teleop_direct_pub, *, watchdog_sec: float, lidar_node_name_param: str):

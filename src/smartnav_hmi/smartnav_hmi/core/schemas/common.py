@@ -77,6 +77,8 @@ class CreateMapRequest(BaseModel):
     """POST /api/maps/create"""
 
     map_name: str
+    # ★ 2026-11-03：true = 一開始就自動探索（車子會自己跑）；false = 遙控
+    explore: bool = False
 
 
 class CreateWaypointRequest(BaseModel):

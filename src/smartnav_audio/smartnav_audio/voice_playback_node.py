@@ -79,6 +79,12 @@ class AudioPlaybackNode(Node):
         )
 
         self.playback_status_pub = self.create_publisher(Bool, "playback_status", status_qos)
+
+        # ★ 2026-11-03：HMI 的「機器人朗讀」開關（latched）。關 = 立刻停掉正在播的、之後收到的也不播。
+        #   還沒收到（HMI 沒在跑）時照播 = 改版前的行為。
+        self.tts_enabled = True
+        self.create_subscription(Bool, "robot_tts_enabled", self._tts_enabled_callback, status_qos,
+                                 callback_group=self.callback_group)
         self.playback_status_timer = self.create_timer(
             0.05, self._playback_status_timer_callback, callback_group=self.callback_group
         )
@@ -117,12 +123,23 @@ class AudioPlaybackNode(Node):
         except Exception as e:
             self.get_logger().error(f"✗ 停止音訊播放器失敗: {e}")
 
+    def _tts_enabled_callback(self, msg: Bool) -> None:
+        enabled = bool(msg.data)
+        if enabled == self.tts_enabled:
+            return
+        self.tts_enabled = enabled
+        if not enabled and self.audio_player:
+            self.audio_player.flush()
+        self.get_logger().info("機器人朗讀：開" if enabled else "機器人朗讀：關（已停止目前播放）")
+
     def _audio_callback(self, msg: AudioData) -> None:
         """音訊話題回呼函數 - 解碼並加入播放隊列
 
         Args:
             msg: 音訊訊息
         """
+        if not self.tts_enabled:
+            return
         try:
             if msg.format == "pcm_s16le":
                 audio = AudioCodec.decode_pcm_s16le(bytes(msg.data))

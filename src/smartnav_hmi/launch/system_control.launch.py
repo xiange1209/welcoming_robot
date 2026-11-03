@@ -28,22 +28,32 @@ def _actions(context):
                 "with_color": "false", "depth_width": "160", "depth_height": "120", "cloud_hz": "5.0", "pixel_step": "2",
             })]
     if unit == "nav":
+        # (start_mode, 啟動 explorer 節點, create_map 時自動開始探索)
+        # ★ 2026-11-03：「建圖（遙控）」與「建圖 + 自動探索」合成一個「建圖」：explorer 節點一律起來但待命，
+        #   遙控或自動探索在建圖頁選，建圖途中也能切換（/start_exploration、/stop_exploration），不用重開導航。
+        #   "explore" 留著給舊腳本／舊情境用（行為＝以前的建圖 + 自動探索），面板上不再列出。
+        # ★ 2026-11-03（第二次合併）：「建圖」與「定位 + 導航」也合成一個「啟動」（variant 空字串）：
+        #   start_mode=auto（有地圖就定位、沒有就建圖），explorer 待命。建圖／定位之間由 map_service 自己切
+        #  （開始建圖 -> 建圖模式，存檔 -> 回定位），不用重開導航。explorer 沒被 START 時連地圖都不訂閱
+        #  （frontier_explorer_node.cpp startExplorationRuntime 才建訂閱），帶位時不吃 CPU。
+        #   下面三個具名 variant 留給舊腳本（day_test.sh、hmi_unit.py 送 start:localization）。
         modes = {
-            "mapping": ("mapping", "false"),
-            "explore": ("mapping", "true"),
+            "": ("auto", "true", "false"),
+            "mapping": ("mapping", "true", "false"),
+            "explore": ("mapping", "true", "true"),
             # ★ 2026-09-29：true → false。定位模式一定要關探索，否則 explorer 帶 auto_start 一起起來，
             #   教導路徑／迎賓故事線的情境裡按「開始建圖」車子就自己開走（manager.py 9/25 註解）。
-            "localization": ("localization", "false"),
+            "localization": ("localization", "false", "false"),
         }
         if variant in modes:
-            mode, explore = modes[variant]
+            mode, explorer, auto_explore = modes[variant]
             # ★ 2026-10-29：導航仲裁跟導航堆疊一起起、一起停（以前是獨立單元，忘了開＝客人與管理者帶位一律被拒）。
             #   三種模式都起：建圖存檔後 map_service 會自己切到定位模式，那時候也要能帶位。節點名維持 nav_arbiter_node
             #   （HMI 的節點健康表 core/constants.py 認這個名字）。
             return [
                 _include("smartnav_navigation_cc", "nav_bringup_cc.launch.py", {
                     "use_sim_time": "false", "use_rviz": "false", "start_mode": mode,
-                    "use_exploration": explore, "auto_start_exploration": explore,
+                    "use_exploration": explorer, "auto_start_exploration": auto_explore,
                 }),
                 Node(package="smartnav_brain", executable="nav_arbiter", name="nav_arbiter_node", output="screen"),
             ]

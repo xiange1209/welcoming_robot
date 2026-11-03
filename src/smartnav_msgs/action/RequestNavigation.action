@@ -25,6 +25,7 @@ string waypoint_id
 bool use_target_pose            # true 時忽略 waypoint_id，導航到 target_pose（僅 OPERATOR）
 geometry_msgs/Pose target_pose  # 目標座標（map frame）
 string target_name              # 顯示名稱（僅供語音播報，可留空）
+bool quiet                      # ★ 2026-11-03：true = 不播「開始導航到 X」（轉給 Navigate.quiet）
 ---
 uint8 OUTCOME_SUCCEEDED = 0
 uint8 OUTCOME_FAILED = 1            # 底層導航失敗（路徑被擋、定位丟失…）

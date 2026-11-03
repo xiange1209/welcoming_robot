@@ -7,6 +7,7 @@ import { useFetch } from "../hooks/useFetch";
 import { useVisibleInterval } from "../hooks/useVisibleInterval";
 import { api, del, post, run } from "../lib/api";
 import { confirmDialog } from "../lib/dialog";
+import { useNavBusy } from "../lib/navBusy";
 import * as teleop from "../lib/teleop";
 import { toast } from "../lib/toast";
 import type { ApiResult, MapEntry, MapStatus, TaughtPath } from "../lib/types";
@@ -159,6 +160,9 @@ function MappingStatus({ status }: { status: MapStatus | null }) {
       {status.mapping_job ? (
         <div className="text-green">
           ● 建圖作業進行中：{status.mapping_job.label || ""}
+          <div className={status.exploring ? "text-orange" : "text-label-2"}>
+            {status.exploring ? "⚠ 自動探索中——車子會自己跑" : "遙控中——用右邊的方向鍵開"}
+          </div>
         </div>
       ) : status.last_failed_job ? (
         <div className="text-red">
@@ -169,7 +173,9 @@ function MappingStatus({ status }: { status: MapStatus | null }) {
         </div>
       ) : (
         <div className="text-label-3">
-          沒有建圖作業在跑 —— 要建圖請先按「開始建圖」
+          {status.mode === "mapping" || status.mode === "localization"
+            ? "沒有建圖作業在跑 —— 按「開始建圖（遙控）」或「開始建圖（自動探索）」（新圖從空白開始，存檔後自動回定位）"
+            : "導航堆疊沒有在跑 —— 先到「系統開關」啟動導航堆疊"}
         </div>
       )}
     </div>
@@ -190,6 +196,10 @@ export function TeleopPage({ active }: { active: boolean }) {
     () => api<MapStatus>("/api/maps/status"),
     null,
   );
+
+  // ★ 2026-11-03：建圖中每 3 秒更新一次——自動探索可能自己結束並存圖（完成／停滯／卡住），
+  //   切換鈕不能停在舊狀態。沒有建圖作業時不輪詢（/api/maps/status 會問 /get_nav_mode）。
+  useVisibleInterval(refreshStatus, 3000, active && !!status?.mapping_job, false);
 
   const [maps, refreshMapList] = useFetch<MapEntry[]>(
     async () => (await api<{ maps?: MapEntry[] }>("/api/maps")).maps || [],
@@ -264,10 +274,33 @@ export function TeleopPage({ active }: { active: boolean }) {
     false,
   );
 
-  const startMapping = async () => {
+  // ★ 2026-11-03：「建圖」合成一個導航模式之後，遙控／自動探索在這裡選，途中也能切換
+  const confirmExplore = () =>
+    confirmDialog({
+      title: "交給自動探索？",
+      message:
+        "車子會自己找沒去過的地方開過去，旁邊要有人顧著。上方列的「緊急停止」隨時可以中止；" +
+        "也可以隨時按「停止自動探索」改回遙控（地圖保留）。",
+      confirmLabel: "開始自動探索",
+    });
+
+  const navBusy = useNavBusy();
+  // ★ 2026-11-03：導航只剩一種啟動（start_mode=auto），定位模式下也能直接開始建圖（map_service 會自己切過去）
+  const navUp = status?.mode === "mapping" || status?.mode === "localization";
+
+  const startMapping = async (explore: boolean) => {
+    if (explore && !(await confirmExplore())) return;
     const name = mapName.trim() || `map_${Date.now()}`;
-    await run(post("/api/maps/create", { map_name: name }), () => {
+    await run(post("/api/maps/create", { map_name: name, explore }), () => {
       setTimeout(refreshStatus, 4000);
+    });
+  };
+
+  const switchExplore = async (on: boolean) => {
+    if (on && !(await confirmExplore())) return;
+    if (on) teleop.stop(); // 交給探索前先放開遙控，免得兩邊同時下指令
+    await run(post(on ? "/api/maps/explore/start" : "/api/maps/explore/stop", {}), () => {
+      setTimeout(refreshStatus, 1500);
     });
   };
 
@@ -319,9 +352,33 @@ export function TeleopPage({ active }: { active: boolean }) {
             value={mapName}
             onChange={(e) => setMapName(e.target.value)}
           />
-          <Button variant="primary" onClick={startMapping}>
-            開始建圖
-          </Button>
+          {status?.mapping_job ? (
+            status.exploring ? (
+              <Button variant="danger" onClick={() => void switchExplore(false)}>
+                停止自動探索（改遙控）
+              </Button>
+            ) : (
+              <Button onClick={() => void switchExplore(true)}>交給自動探索</Button>
+            )
+          ) : (
+            <>
+              <Button
+                variant="primary"
+                disabled={!navUp}
+                title={navUp ? undefined : "先在「系統開關」啟動導航堆疊"}
+                onClick={() => void startMapping(false)}
+              >
+                開始建圖（遙控）
+              </Button>
+              <Button
+                disabled={!navUp}
+                title={navUp ? undefined : "先在「系統開關」啟動導航堆疊"}
+                onClick={() => void startMapping(true)}
+              >
+                開始建圖（自動探索）
+              </Button>
+            </>
+          )}
           <Button onClick={finishMapping}>完成存檔</Button>
         </div>
 
@@ -507,14 +564,16 @@ export function TeleopPage({ active }: { active: boolean }) {
                 </span>
                 <Button
                   variant="primary"
+                  disabled={navBusy}
                   onClick={() => void followPath(p, false)}
                 >
-                  重播
+                  {navBusy ? "導航中…" : "重播"}
                 </Button>
                 {/* 反向重播 = 原路折返回起點。展示時「送客人過去再自己回來」就靠這個，
                     而且不需要掉頭（阿克曼車在 0.99 m 走廊掉不了頭）。 */}
                 <Button
                   title="原路折返回起點（不需要掉頭）"
+                  disabled={navBusy}
                   onClick={() => void followPath(p, true)}
                 >
                   反向
@@ -568,7 +627,7 @@ export function TeleopPage({ active }: { active: boolean }) {
             }
           />
           <span className="tnum w-14 text-right text-[12px] text-label-3">
-            {(speed * 0.18).toFixed(2)} m/s
+            {(speed * 0.2).toFixed(2)} m/s
           </span>
         </div>
 

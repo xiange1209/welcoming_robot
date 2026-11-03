@@ -1,6 +1,8 @@
 # 建立地圖服務
 
 string map_name                 # 地圖名稱
+bool explore                    # ★ 2026-11-03：true = 一開始就自動探索；false = 遙控（途中可用 /start_exploration 交給探索）
+                                #   舊呼叫端只給 map_name 時是 false -> map_service 改用 launch 的 auto_start_exploration
 ---
 MapInfo map_info
 bool success                    # 是否成功

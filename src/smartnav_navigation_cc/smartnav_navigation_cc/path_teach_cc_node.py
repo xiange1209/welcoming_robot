@@ -260,8 +260,24 @@ class PathTeachNode(Node):
         self.declare_parameter("merge_min_segment_m", 0.35)
 
         # 重播
-        self.declare_parameter("follow_speed", 0.15)
+        # ★★ 2026-11-03：follow_speed 0.15 -> 0.40（使用者要求「越快越好」）★★
+        #   原廠導航設定上限 0.5，取 0.40 給 0.99 m 走廊與行人留餘裕。倒車 reverse_speed 維持 0.10（車尾半盲）。
+        #   ⚠ 8/10~10/27 的實測（到點誤差 11~12 cm、A/B 4/4 等）都是在 0.15 下量的，**提速後要重新驗收**。
+        #   前視距離 L_d = lookahead_k × v + lookahead_min 會自動跟著拉長（0.40 -> 0.78 m，上限 0.80）。
+        #   0.15 時一路滿速開到折返點／終點再停沒有問題；0.40 時光煞車就 8 cm 以上，
+        #   所以同時加了 approach_slow_m（接近折返點／終點減速）。
+        #   退路：-p follow_speed:=0.15（approach_slow_m 在 0.15 下只影響最後 0.2 m，可不動）。
+        self.declare_parameter("follow_speed", 0.40)
         self.declare_parameter("reverse_speed", 0.10)
+        # ★ 2026-11-03：距離「下一個折返點或終點」(沿路徑弧長) 小於這個值時線性減速，
+        #   到點時降到 min_move_speed（0.10，底盤死區之上）。0 = 關閉（舊行為：滿速開到點才停）。
+        #   0.60：從 0.40 降到 0.10 有 0.6 m 可用，平均減速度約 0.13 m/s²，遠低於底盤的 1.0。
+        #   每趟重播開始時重讀（ros2 param set 下一趟生效）。
+        self.declare_parameter("approach_slow_m", 0.60)
+        # ★ 2026-11-03：脫困／解卡（/unwedge）／橫移置中這些「貼著障礙、或開固定秒數」的動作
+        #   原本直接用 follow_speed。follow_speed 提到 0.40 後若跟著變快，貼牆時衝擊變大、
+        #   定時動作走的距離也變成 2.7 倍，所以拆出來固定在提速前的 0.15 —— 這些動作的行為完全不變。
+        self.declare_parameter("maneuver_speed", 0.15)
         # ★★ 2026-08-17：底盤有低速死區，實測值 ★★
         #
         # 逐段掃描（tools_0817/odom_feedback_check.py，電池 23.7 V、車子平放走廊）：
@@ -668,7 +684,12 @@ class PathTeachNode(Node):
         # tol 0.15 m = AMCL 誤差（收斂後數公分）＋牆厚＋格子量化；
         # 寧可把靠牆的人當成牆（走原流程），不要把牆當成人（傻等）。
         self.declare_parameter("new_obstacle_enabled", True)
-        self.declare_parameter("new_obstacle_wait_sec", 8.0)
+        # ★ 2026-11-03：8.0 -> 5.0。這是「最多等」：人一讓開就照原路線繼續，不受這個值影響；
+        #   只有對方不讓時才縮短（停車到開始繞路：8+4=12 秒 -> 5+1=6 秒，見 navigation_action
+        #   的 new_obstacle_speech_wait_sec）。10/28「重新規劃又穿過人」的根因是規劃前清了障礙層，
+        #   已由 keep_new_obstacles_on_replan 修掉，跟等多久無關。不要再壓到 2~3 秒以下：
+        #   阿克曼繞過一個人常要多幾次折返，人只是慢慢走開時太早繞路反而更慢。
+        self.declare_parameter("new_obstacle_wait_sec", 5.0)
         self.declare_parameter("new_obstacle_map_tol_m", 0.15)
         self.declare_parameter("new_obstacle_min_ratio", 0.6)
         self.declare_parameter("new_obstacle_map_topic", "/map")
@@ -890,6 +911,7 @@ class PathTeachNode(Node):
         self.record_angle = float(p("record_angle_rad").value)
         self.max_points = int(p("max_points").value)
         self.follow_speed = float(p("follow_speed").value)
+        self.maneuver_speed = float(p("maneuver_speed").value)
         self.reverse_speed = float(p("reverse_speed").value)
         self.min_move_speed = abs(float(p("min_move_speed").value))
         self.deadband_stop_ratio = abs(float(p("deadband_stop_ratio").value))
@@ -3186,6 +3208,15 @@ class PathTeachNode(Node):
         for i in range(1, len(pts)):
             path_s[i] = path_s[i - 1] + math.hypot(pts[i].x - pts[i - 1].x,
                                                    pts[i].y - pts[i - 1].y)
+        # ★ 2026-11-03：每個點所在那一段的「段尾弧長」（段尾 = 下一個折返點，最後一段是終點），
+        #   給 approach_slow_m 算「離折返點／終點還有多遠」。折返點本身算下一段的起點
+        #   （主迴圈走到 pts[i].direction != cur_dir 那一點才換向）。
+        seg_end_s = [path_s[-1]] * len(pts)
+        _end = path_s[-1]
+        for i in range(len(pts) - 2, -1, -1):
+            if pts[i + 1].direction != pts[i].direction:
+                _end = path_s[i + 1]
+            seg_end_s[i] = _end
         prog_s = -1.0
         self._escape_steer = None
         # ★ 2026-08-29 零進展脫困的追蹤狀態（見 escape_stall_max 的說明）
@@ -4150,6 +4181,14 @@ class PathTeachNode(Node):
                         f"貼牆（左 {sl:.2f} m、右 {sr:.2f} m），"
                         f"目標往{'左' if wall_push > 0 else '右'}推 {abs(wall_push)*100:.0f} cm")
 
+            # ── 接近折返點／終點減速（★ 2026-11-03，見 approach_slow_m）──
+            # 跟其他減速取最小（乘在已經減過的 speed 上），走 _slow 不會減進死區。
+            # 放在純追蹤之前：前視距離跟著實際速度縮短，靠近折返點時追得更緊。
+            if self._approach_slow > 0.0:
+                _remain = seg_end_s[idx] - path_s[idx]
+                if _remain < self._approach_slow:
+                    speed = self._slow(speed, max(0.0, _remain / self._approach_slow))
+
             # ── 純追蹤 ──
             # 倒車放大前視以阻尼振盪（見 lookahead_reverse_scale 的說明）
             _la_scale = self.la_rev_scale if cur_dir < 0 else 1.0
@@ -4243,7 +4282,7 @@ class PathTeachNode(Node):
         """硬停事件的四個參數（★ 2026-10-20，見 margin_resume_m）。__init__ 與每趟重播開始時讀。
 
         ★ 2026-10-22：同一個「每趟重讀」機制再加三個要在現場 A/B 的參數——
-          new_obstacle_wait_sec（新障礙停車等多久才交回導航層，預設 8 s）、
+          new_obstacle_wait_sec（新障礙停車等多久才交回導航層，預設 5 s；11/03 前是 8 s）、
           escape_after_sec（等這麼久還沒通就試脫困，預設 4 s）、
           laser_y_offset_m（雷射左右偏移，預設 0.0）。
           這三個原本只在 __init__ 讀一次，ros2 param set 沒有效果；預設值都沒變。
@@ -4268,6 +4307,7 @@ class PathTeachNode(Node):
         self._xi_dist = max(0.2, abs(float(p("xte_integral_dist_m").value)))
         self._xi_max = max(0.0, abs(float(p("xte_integral_max_curv").value)))
         self._xi_gate = max(0.0, abs(float(p("xte_integral_gate_m").value)))
+        self._approach_slow = max(0.0, float(p("approach_slow_m").value))
 
     @staticmethod
     def _margin_release(now: float, clear_t: float, margin: float, stop_m: float,
@@ -4538,7 +4578,7 @@ class PathTeachNode(Node):
                 return False, (f"四種曲率（滿舵到直行）前後都沒有 {need:.2f} m 的空間，"
                                f"第 {leg} 段放棄。要人工介入")
 
-            speed = self.reverse_speed if direction < 0 else self.follow_speed
+            speed = self.reverse_speed if direction < 0 else self.maneuver_speed
             moved = self._unwedge_leg(direction, curv, speed)
             moved_total += moved
             self.get_logger().info(
@@ -4578,7 +4618,7 @@ class PathTeachNode(Node):
             if room < need:
                 return False, (f"車頭／車尾貼著障礙（前 {f_gap:.2f} / 後 {r_gap:.2f} m），"
                                f"往{word}只有 {room:.2f} m（需要 {need:.2f}）—— 要人工介入")
-            speed = self.reverse_speed if direction < 0 else self.follow_speed
+            speed = self.reverse_speed if direction < 0 else self.maneuver_speed
             moved = self._unwedge_leg(direction, 0.0, speed)
             moved_total += moved
             self.get_logger().info(
@@ -4884,7 +4924,7 @@ class PathTeachNode(Node):
             f"左側淨空 {left:.2f} m、右側 {right:.2f} m）"
         )
 
-        speed = (self.follow_speed if back_dir > 0 else self.reverse_speed) * 0.6
+        speed = (self.maneuver_speed if back_dir > 0 else self.reverse_speed) * 0.6
         # 打滿舵 —— 但「滿」在左右是不同的量（左 0.95 / 右 0.80）。
         # 用對稱值的話，往左脫困時會發出舵機到不了的曲率：指令看起來更急，
         # 車子卻轉得一樣多，於是「已轉角度」的判定會一直不達標而空轉。
@@ -4970,7 +5010,7 @@ class PathTeachNode(Node):
                         f"脫困：{'前方' if back_dir > 0 else '後方'}車身外緣只剩 "
                         f"{_bm * 100:.0f} cm，中止這一段")
                     break
-                v0 = (self.follow_speed if back_dir > 0 else self.reverse_speed) * 0.5
+                v0 = (self.maneuver_speed if back_dir > 0 else self.reverse_speed) * 0.5
                 self._publish_cmd(v0 if back_dir > 0 else -v0, 0.0)
                 self._send_feedback(goal_handle, idx, len(pts), 0.0, "escaping",
                                     f"脫困中（直線{'前進' if back_dir > 0 else '後退'}拉開距離）")
@@ -5003,7 +5043,7 @@ class PathTeachNode(Node):
                 self.get_logger().info(
                     f"橫移置中：左 {s_left:.2f} / 右 {s_right:.2f} m，"
                     f"往{side_txt}橫移（前進打{side_txt} -> 回打反向）")
-                v_c = self._slow(self.follow_speed, 0.5)   # 橫移置中（見 _slow）
+                v_c = self._slow(self.maneuver_speed, 0.5)   # 橫移置中（見 _slow）
                 for leg, (sgn, dur) in enumerate((
                         (away, self.centre_leg_sec),
                         (-away, self.centre_leg_sec * self.centre_back_ratio))):

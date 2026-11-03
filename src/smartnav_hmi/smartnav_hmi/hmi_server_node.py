@@ -29,6 +29,8 @@
                                  modules/<topic>/router.py
 """
 
+import asyncio
+from collections import deque
 import time
 import uvicorn
 import threading
@@ -45,11 +47,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
-from std_msgs.msg import Bool, Empty, Float32, String
+from std_msgs.msg import Bool, Empty, Float32, Float32MultiArray, String
 from std_srvs.srv import Trigger
 from nav_msgs.msg import Path as RosPath
 
-from smartnav_msgs.msg import RegistrationProgress, UserIdentity
+from smartnav_msgs.msg import AudioData, RegistrationProgress, UserIdentity
 from smartnav_msgs.srv import (
     CreateWaypoint,
     DeleteMap,
@@ -74,6 +76,9 @@ from .api.main import build_app
 from .core.auth import AdminAuth, resolve_password
 from .core.constants import USER_TYPE_NAMES
 from .core.state import HmiState
+from .core.tls import ensure_self_signed
+from .modules.voice import audio_hw
+from .modules.voice.settings import VoiceSettings
 from .modules.chat.tracker import ChatTracker
 from .modules.hardware.hardware import HardwareProbe
 from .modules.imaging.map_render import MapRenderer
@@ -100,6 +105,12 @@ class HmiServerNode(Node):
         # ── 參數 ──────────────────────────────────────────
         self.declare_parameter("host", "0.0.0.0", ParameterDescriptor(description="HTTP 綁定位址"))
         self.declare_parameter("port", 8080, ParameterDescriptor(description="HTTP 連接埠"))
+        # ★ 2026-11-03：https（自簽憑證）。平板錄音（語音輸入＝browser）只能在 https 下拿到麥克風。
+        #   http 8080 照舊全功能（本機工具、舊書籤都不受影響）；0 = 不開 https。
+        self.declare_parameter("https_port", 8443, ParameterDescriptor(description="HTTPS 連接埠（0＝關閉）"))
+        self.declare_parameter(
+            "tls_dir", str(Path.home() / ".smartnav" / "hmi_tls"),
+            ParameterDescriptor(description="自簽憑證目錄（cert.pem / key.pem，沒有會自動產生）"))
         self.declare_parameter("admin_username", "admin", ParameterDescriptor(description="管理者帳號"))
         # 預設留空，密碼不寫死在原始碼裡 —— 這個 repo 是公開的，寫死等於公開密碼。
         # 取得順序：launch 參數 > 環境變數 SMARTNAV_ADMIN_PASSWORD > 隨機生成。
@@ -203,6 +214,9 @@ class HmiServerNode(Node):
 
         self.host = self.get_parameter("host").get_parameter_value().string_value
         self.port = self.get_parameter("port").get_parameter_value().integer_value
+        self.https_port = self.get_parameter("https_port").get_parameter_value().integer_value
+        self.tls_dir = Path(self.get_parameter("tls_dir").get_parameter_value().string_value)
+        self._tls_files = None      # (cert, key)；_run_server 產生，失敗就維持 None（只開 http）
         # 登入整組交給 AdminAuth：權杖表、到期、帳密比對都在那裡，
         # 這個節點只負責把參數餵給它（見 core/auth.py 對「這是操作閘門不是資安機制」的說明）
         admin_username = self.get_parameter("admin_username").get_parameter_value().string_value
@@ -373,6 +387,49 @@ class HmiServerNode(Node):
         #   map_service 取消時也發同一個話題）；Empty、相對名稱、depth 10 是三邊共用的合約。
         self.unwedge_abort_pub = self.create_publisher(Empty, "unwedge_abort", 10)
 
+        # ── 語音輸出／輸入切換（★ 2026-11-03，見 modules/voice/settings.py）──
+        #   latched：speech_synthesizer／voice_trigger 比 HMI 晚啟動也拿得到目前設定
+        self.voice = VoiceSettings(logger=self.get_logger())
+        self.voice_output_pub = self.create_publisher(String, "voice_output_mode", latched_qos)
+        self.voice_input_pub = self.create_publisher(String, "voice_input_mode", latched_qos)
+        self.robot_tts_pub = self.create_publisher(Bool, "robot_tts_enabled", latched_qos)
+        # 平板錄音 -> voice_trigger。BEST_EFFORT：掉一塊音訊比塞住整條好（跟 /audio_in 一致）
+        self.remote_mic_pub = self.create_publisher(
+            AudioData, "remote_mic_audio",
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10))
+        # voice_trigger 回報收音來源的實際狀態（例如「機器人麥克風開不起來」），latched
+        self.create_subscription(String, "voice_input_status", self._voice_status_cb, latched_qos, callback_group=cb)
+        # ★ 2026-11-03：只給行員聽的語音（黑名單提示）。不進對話清單（那份每台平板都會唸）；
+        #   放在 system.staff_alert，前端只有登入的平板才唸（lib/staffAlert.ts）。seq 讓同一句話每次都唸。
+        self._staff_alert_seq = 0
+
+        def _on_staff_alert(m: String) -> None:
+            self._staff_alert_seq += 1
+            self.state.set_system(staff_alert={"seq": self._staff_alert_seq, "text": m.data, "ts": time.time()})
+
+        self.create_subscription(String, "staff_alert_speech", _on_staff_alert, 10, callback_group=cb)
+        # ★ 2026-11-03：自動探索是否進行中（map_service 發的 latched 話題），建圖頁的切換鈕用
+        self.create_subscription(
+            Bool, "exploration_active", lambda m: self.state.set_system(exploring=bool(m.data)),
+            latched_qos, callback_group=cb)
+        self._mic_lock = threading.Lock()
+        self._mic_owner = None       # (連線編號, websocket)
+        self._voice_input_status = ""
+        self._publish_voice_modes()
+        # ★ 2026-11-03：機器人本機的麥克風／喇叭偵測（語音頁切到「機器人」時提示用），5 秒一次、只讀 /proc
+        self._audio_hw = None
+        self._audio_hw_tick()
+        self.create_timer(5.0, self._audio_hw_tick, callback_group=cb)
+        # ★ 2026-11-03：語音輸入波形。voice_trigger 每 4 塊（約 128 ms）發一則：每塊 [峰值, VAD 有聲, 收句中]。
+        #   留最近約 12 秒給語音頁的 /ws/voice_monitor（剛連上的平板也看得到前面一段）
+        self._monitor_lock = threading.Lock()
+        self._monitor_seq = 0
+        self._monitor = deque(maxlen=375)            # (seq, peak, vad, command)
+        self.create_subscription(
+            Float32MultiArray, "voice_input_monitor", self._voice_monitor_cb,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20),
+            callback_group=cb)
+
         # ── 遙控建圖 ──────────────────────────────────────
         #
         # 發到 cmd_vel_trimmed 而不是 cmd_vel：這樣指令仍然會經過
@@ -436,6 +493,9 @@ class HmiServerNode(Node):
                 "get_nav_mode": self.create_client(Trigger, "/get_nav_mode", callback_group=cb),
                 # 遙控建圖用：沒有 /exploration_complete 事件，要由操作者手動結束
                 "finish_map": self.create_client(Trigger, "/finish_map", callback_group=cb),
+                # ★ 2026-11-03：建圖途中切換 遙控 <-> 自動探索
+                "start_exploration": self.create_client(Trigger, "/start_exploration", callback_group=cb),
+                "stop_exploration": self.create_client(Trigger, "/stop_exploration", callback_group=cb),
                 "create_waypoint": self.create_client(CreateWaypoint, "create_waypoint", callback_group=cb),
                 "list_waypoints": self.create_client(ListWaypoints, "list_waypoints", callback_group=cb),
                 "list_guide_destinations": self.create_client(
@@ -627,29 +687,144 @@ class HmiServerNode(Node):
             self.video.release()
 
     def access_urls(self) -> List[str]:
-        """平板可以打開的網址清單"""
-        if self.host not in ("0.0.0.0", "::", ""):
-            return [f"http://{self.host}:{self.port}"]
-        return [f"http://{ip}:{self.port}" for ip in detect_lan_ips()]
+        """平板可以打開的網址清單（有 https 時 https 排前面：平板錄音只能走 https）"""
+        hosts = [self.host] if self.host not in ("0.0.0.0", "::", "") else detect_lan_ips()
+        urls = []
+        if self.https_port > 0:
+            urls += [f"https://{h}:{self.https_port}" for h in hosts]
+        urls += [f"http://{h}:{self.port}" for h in hosts]
+        return urls
+
+    # ── 語音輸出／輸入切換（★ 2026-11-03）──────────────────
+
+    def voice_payload(self) -> Dict[str, Any]:
+        data = self.voice.get()
+        return {
+            "output": data["output"],
+            "input": data["input"],
+            "robot_tts": data["robot_tts"],
+            "input_status": self._voice_input_status,
+            "mic_connected": self._mic_owner is not None,
+            "https_port": self.https_port if self._tls_files else 0,
+        }
+
+    def set_voice_modes(self, output=None, input_=None, robot_tts=None) -> Dict[str, Any]:
+        before = self.voice.get()["input"]
+        self.voice.update(output=output, input_=input_, robot_tts=robot_tts)
+        if self.voice.get()["input"] != before:
+            # ★ 換了收音來源就清掉舊波形：兩種來源的音量基準不同，留著會誤以為新來源已經有聲音
+            with self._monitor_lock:
+                self._monitor.clear()
+        self._publish_voice_modes()
+        self.get_logger().info(f"語音設定：輸出={self.voice.get()['output']}、輸入={self.voice.get()['input']}")
+        return self.voice_payload()
+
+    def _publish_voice_modes(self) -> None:
+        data = self.voice.get()
+        self.voice_output_pub.publish(String(data=data["output"]))
+        self.voice_input_pub.publish(String(data=data["input"]))
+        self.robot_tts_pub.publish(Bool(data=bool(data["robot_tts"])))
+        self.state.set_system(voice_output=data["output"], voice_input=data["input"],
+                              robot_tts_on=bool(data["robot_tts"]))
+
+    def _audio_hw_tick(self) -> None:
+        hw = audio_hw.probe()
+        if hw != self._audio_hw:                     # 沒變就不碰 state（避免每 5 秒白白推播一次）
+            self._audio_hw = hw
+            self.state.set_system(audio_hw=hw)
+
+    def _voice_monitor_cb(self, msg: Float32MultiArray) -> None:
+        data = list(msg.data)
+        with self._monitor_lock:
+            for i in range(0, len(data) - 2, 3):
+                self._monitor_seq += 1
+                self._monitor.append((self._monitor_seq, data[i], data[i + 1], data[i + 2]))
+
+    def voice_monitor_since(self, seq: int):
+        """回傳 seq 之後的波形點 [(seq, peak, vad, command)]"""
+        with self._monitor_lock:
+            return [m for m in self._monitor if m[0] > seq]
+
+    def _voice_status_cb(self, msg: String) -> None:
+        self._voice_input_status = msg.data
+        self.state.set_system(voice_input_status=msg.data)
+
+    def claim_mic(self, conn_id: int, websocket):
+        """登記成為目前唯一的平板麥克風，回傳被取代的舊連線（沒有就 None）"""
+        with self._mic_lock:
+            old = self._mic_owner[1] if self._mic_owner else None
+            self._mic_owner = (conn_id, websocket)
+        self.state.set_system(mic_connected=True)
+        return old
+
+    def mic_owner_is(self, conn_id: int) -> bool:
+        with self._mic_lock:
+            return self._mic_owner is not None and self._mic_owner[0] == conn_id
+
+    def release_mic(self, conn_id: int) -> None:
+        with self._mic_lock:
+            if self._mic_owner is not None and self._mic_owner[0] == conn_id:
+                self._mic_owner = None
+                released = True
+            else:
+                released = False
+        if released:
+            self.state.set_system(mic_connected=False)
+
+    def publish_remote_mic(self, pcm_s16le: bytes) -> None:
+        msg = AudioData()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "tablet_microphone"
+        msg.data = pcm_s16le
+        msg.format = "pcm_s16le"
+        msg.sample_rate = 16000
+        msg.channels = 1
+        msg.is_final = False
+        self.remote_mic_pub.publish(msg)
 
     # ── FastAPI 伺服器 ────────────────────────────────────
 
-    def _run_server(self) -> None:
-        """啟動 uvicorn"""
-        config = uvicorn.Config(
+    def _uvicorn_config(self, port: int, tls=None) -> "uvicorn.Config":
+        return uvicorn.Config(
             self.app,
             host=self.host,
-            port=self.port,
+            port=port,
             log_level="warning",
             ws_ping_interval=self.ws_ping_interval if self.ws_ping_interval > 0 else None,
             ws_ping_timeout=self.ws_ping_timeout if self.ws_ping_timeout > 0 else None,
             timeout_keep_alive=15,
+            ssl_certfile=tls[0] if tls else None,
+            ssl_keyfile=tls[1] if tls else None,
         )
-        server = uvicorn.Server(config)
+
+    def _run_server(self) -> None:
+        """啟動 uvicorn：http（一定開）＋ https（★ 2026-11-03，有憑證才開），同一個 event loop"""
+        if self.https_port > 0:
+            try:
+                self._tls_files = ensure_self_signed(self.tls_dir, detect_lan_ips(), self.get_logger())
+            except Exception as e:  # noqa: BLE001 —— 憑證出問題不能拖垮 http
+                self.get_logger().error(f"產生 https 憑證失敗（只開 http）：{e}")
+                self._tls_files = None
+        # 平板要知道 https 開在哪個埠，才能在 http 頁面上給出「請改用 https」的連結
+        self.state.set_system(https_port=self.https_port if self._tls_files else 0)
+
+        async def serve_https() -> None:
+            # ★ 隔離：https 起不來（連接埠被占用時 uvicorn 會 sys.exit）不能連帶把 http 收掉
+            try:
+                await uvicorn.Server(self._uvicorn_config(self.https_port, self._tls_files)).serve()
+            except BaseException as e:  # noqa: BLE001
+                self.get_logger().error(f"https 伺服器結束（http 不受影響）：{e!r}")
+
+        async def serve_all() -> None:
+            tasks = [uvicorn.Server(self._uvicorn_config(self.port)).serve()]
+            if self._tls_files:
+                tasks.append(serve_https())
+            await asyncio.gather(*tasks)
+
         try:
-            server.run()
-        except Exception as e:
-            self.get_logger().error(f"HMI 伺服器結束: {e}")
+            asyncio.run(serve_all())
+        except BaseException as e:  # noqa: BLE001
+            self.get_logger().error(f"HMI 伺服器結束: {e!r}")
 
 
 def main(args=None):

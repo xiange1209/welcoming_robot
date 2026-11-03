@@ -21,6 +21,7 @@ from ..modules.stats import router as stats_router
 from ..modules.system import router as system_router
 from ..modules.system_control import router as system_control_router
 from ..modules.users import router as users_router
+from ..modules.voice import router as voice_router
 
 
 def build_app(node) -> FastAPI:
@@ -92,6 +93,7 @@ def build_app(node) -> FastAPI:
     app.include_router(jobs_router.build_router(node, admin_only))
     app.include_router(users_router.build_router(node, admin_only))
     app.include_router(chat_router.build_router(node, admin_only))
+    app.include_router(voice_router.build_router(node, admin_only))
     # ★ 2026-10-22：迎賓頁的帶位（不用登入，依人臉身分決定能去哪裡，規則在 smartnav_brain 的 access_policy.py，由 nav_arbiter 判斷）
     app.include_router(guide_router.build_router(node, admin_only))
 

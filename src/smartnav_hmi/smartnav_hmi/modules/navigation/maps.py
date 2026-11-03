@@ -6,6 +6,8 @@
 node.system_control.query_nav_mode()。
 """
 
+import asyncio
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from std_srvs.srv import Trigger
@@ -50,8 +52,36 @@ def build_router(node, admin_only) -> APIRouter:
             return JSONResponse({"success": False, "message": "請提供地圖名稱"}, status_code=400)
         goal = CreateMap.Goal()
         goal.map_name = req.map_name.strip()
-        job_id = node.jobs.start_action("create_map", goal, f"建立地圖「{goal.map_name}」")
-        return JSONResponse({"success": True, "message": "建圖已開始", "job_id": job_id})
+        goal.explore = bool(req.explore)
+        how = "自動探索" if goal.explore else "遙控"
+        job_id = node.jobs.start_action("create_map", goal, f"建立地圖「{goal.map_name}」（{how}）")
+        return JSONResponse({"success": True, "message": f"建圖已開始（{how}）", "job_id": job_id})
+
+    async def _mapping_trigger(name: str) -> JSONResponse:
+        client = node.service_clients.get(name)
+        if client is None or not client.wait_for_service(timeout_sec=3.0):
+            return JSONResponse(
+                {"success": False, "message": f"/{name} 服務不存在（導航堆疊沒啟動？）"}, status_code=503)
+        try:
+            # ★ 不能直接在 event loop 裡等：start_exploration 會改規劃半徑（Smac 重建查找表約 5 秒）＋叫 explorer，
+            #   最多十幾秒，期間整個 HMI（含其他平板的推播、急停）都會卡住
+            res = await asyncio.to_thread(
+                node.jobs.await_future, client.call_async(Trigger.Request()), 30.0)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"success": False, "message": f"失敗：{exc}"}, status_code=500)
+        ok = bool(res and res.success)
+        return JSONResponse({"success": ok, "message": res.message if res else "無回應"},
+                            status_code=200 if ok else 409)
+
+    @router.post("/api/maps/explore/start", dependencies=admin_only)
+    async def api_explore_start() -> JSONResponse:
+        """★ 2026-11-03：建圖途中把後續交給自動探索（車子會自己跑）"""
+        return await _mapping_trigger("start_exploration")
+
+    @router.post("/api/maps/explore/stop", dependencies=admin_only)
+    async def api_explore_stop() -> JSONResponse:
+        """★ 2026-11-03：停止自動探索、改用遙控繼續（地圖保留、不存檔）"""
+        return await _mapping_trigger("stop_exploration")
 
     # ── 地點與導航 ────────────────────────────────────
 
@@ -137,6 +167,8 @@ def build_router(node, admin_only) -> APIRouter:
                 "mode": mode,                       # mapping / localization / unknown
                 "current_map": (node.state.snapshot().get("system") or {}).get("map_id"),
                 "mapping_job": mapping_job,         # None 表示沒有建圖作業在跑
+                # ★ 2026-11-03：建圖中是不是自動探索（false＝遙控），建圖頁切換鈕用
+                "exploring": bool((node.state.snapshot().get("system") or {}).get("exploring")),
                 "last_failed_job": last_failed,     # 最近一次失敗，讓畫面講得出原因
                 "map_meta": meta,                   # 寬高、解析度、原點
                 "known_cells": known,

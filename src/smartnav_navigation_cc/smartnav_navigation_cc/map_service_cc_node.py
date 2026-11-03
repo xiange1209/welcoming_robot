@@ -181,9 +181,34 @@ class MapServiceCcNode(Node):
         self.declare_parameter("align_search_xy_m", 0.30)
         # 單次對齊允許的最大角度修正。超過就拒絕 —— 見 _align_pose_with_scan 的說明。
         self.declare_parameter("align_max_correction_deg", 45.0)
+        # ★★ 2026-11-03：開機初始位姿（使用者要求「開機一律當作在原點」）★★
+        #   "origin" = 開機一律當作車子停在「建圖起點」。
+        #              ★ 2026-11-03 更正：起點優先用 maps_db 裡這張圖記下的 start_pose（建圖時自動記錄）。
+        #              地圖的 (0,0) 其實是 EKF 開機的位置，開機後車子被移動過再建圖，(0,0) 就不是起點。
+        #              舊地圖沒有 start_pose 時才用 startup_origin_pose（地圖座標 x, y, 朝向「度」）。
+        #              ⚠ 前提是每次關機前把車停回那裡。停得偏一點沒關係：雷射對位會在
+        #              ±align_search_xy_m（0.30 m）、±align_search_yaw_deg（50°）內修正。
+        #   "last"   = 舊行為：沿用上次存的位姿（每 30 秒存一次）。
+        #   ★ 退路（不是可有可無）：origin 模式下對位吻合度低於 startup_origin_min_match，
+        #     代表車子多半不在原點 —— 改試「上次位姿」，比較好的那個才拿去 seed AMCL；
+        #     兩個都對不上就照用原點並警告「請執行全域定位」。
+        #     沒有這個退路的話，一次沒停回原點，整天的定位就是錯的（規劃器會把牆算進路徑）。
+        #   ⚠ 2026-11-03 檢查：目前地圖 map_7a024e8d9176 的 (0,0) 是空地、離牆 1.06 m，適合當停車點；
+        #     但 map_79a3793e6c07 的 (0,0) 離牆只有 0.15 m、map_6aa732f181c6 的 (0,0) 在未知區 ——
+        #     換到那些地圖要另外設 startup_origin_pose。
+        # 建圖開始時重置 slam 後，最多等這麼久拿到第一張新的 /map（見 _start_fresh_mapping）
+        self.declare_parameter("fresh_map_timeout_sec", 10.0)
+        self.declare_parameter("startup_pose_mode", "origin")
+        self.declare_parameter("startup_origin_pose", [0.0, 0.0, 0.0])
+        # 對位吻合度（雷射點落在牆上的比例）。實測：位姿錯 38° 時 28%、正確時 99.8%；
+        # 有人站在旁邊會吃掉一些，0.60 留了餘裕。
+        self.declare_parameter("startup_origin_min_match", 0.60)
 
         self.start_mode = self.get_parameter("start_mode").value
         self.use_exploration = bool(self.get_parameter("use_exploration").value)
+        # ★ 2026-11-03：每趟 create_map 開始時回到這個預設。以前 /start_exploration 把 use_exploration 設成 True
+        #   之後就一直留著 —— 上一趟中途開過探索，下一趟「開始建圖」車子就自己開走。
+        self._auto_explore_default = self.use_exploration
         self.nav2_lcm = self.get_parameter("nav2_lifecycle_manager").value
         self.exploration_timeout_sec = float(self.get_parameter("exploration_timeout_sec").value)
         self.exploration_stall_timeout_sec = float(
@@ -203,6 +228,12 @@ class MapServiceCcNode(Node):
         self.align_search_yaw_deg = float(self.get_parameter("align_search_yaw_deg").value)
         self.align_search_xy_m = float(self.get_parameter("align_search_xy_m").value)
         self.align_max_correction_deg = float(self.get_parameter("align_max_correction_deg").value)
+        self.fresh_map_timeout_sec = float(self.get_parameter("fresh_map_timeout_sec").value)
+        self.startup_pose_mode = str(self.get_parameter("startup_pose_mode").value).strip().lower()
+        _o = list(self.get_parameter("startup_origin_pose").value) + [0.0, 0.0, 0.0]
+        self.startup_origin_pose = (float(_o[0]), float(_o[1]), math.radians(float(_o[2])))
+        self.startup_origin_min_match = float(self.get_parameter("startup_origin_min_match").value)
+        self._last_align_score = None
         transition_timeout = float(self.get_parameter("lifecycle_transition_timeout_sec").value)
 
         # ------------------------------------------------------------------
@@ -241,6 +272,14 @@ class MapServiceCcNode(Node):
             SetParameters, "/planner_server/set_parameters", callback_group=self.client_cb_group
         )
         self._planner_radius_saved: Optional[float] = None
+        # ★ 2026-11-03：自動探索期間暫時降 RPP 速度（見 explore_linear_speed）
+        self.controller_get_params_client = self.create_client(
+            GetParameters, "/controller_server/get_parameters", callback_group=self.client_cb_group
+        )
+        self.controller_set_params_client = self.create_client(
+            SetParameters, "/controller_server/set_parameters", callback_group=self.client_cb_group
+        )
+        self._explore_speed_saved: Optional[float] = None
         # 逼 amcl 就地更新一次並發布 /amcl_pose (不移動的話它預設不會發)
         self.nomotion_update_client = self.create_client(
             EmptySrv, "/request_nomotion_update", callback_group=self.client_cb_group
@@ -329,6 +368,11 @@ class MapServiceCcNode(Node):
         #   「no valid path found」38 次、遠一點的目標幾乎都規劃不出來，使用者：「大部分都是我手動遙控的」。
         #   探索在乎的是「到得了」，不是循跡精度（MPPI 自己有阿克曼限制），所以探索期間退回 10/24 以前的 0.95。
         self.declare_parameter("explore_planner_radius_m", 0.95)
+        # ★ 2026-11-03：自動探索時把 RPP 的 desired_linear_vel 暫時降到這個值，探索結束設回（0＝不動）。
+        #   帶位提速到 0.40 後探索也跟著變快，但 slam 不做雷達去畸變：一圈掃描約 0.1 秒，
+        #   0.40 m/s 直線一圈內車子走 4 cm（快一格 5 cm），轉彎時遠處的牆偏更多 -> 邊界歪、牆變兩層。
+        #   0.20 與遙控建圖的上限一致（HMI TeleopController.TELEOP_MAX_LINEAR）。帶位速度不受影響。
+        self.declare_parameter("explore_linear_speed", 0.20)
         self._tf = LazyTf(self, idle_sec=float(self.get_parameter("tf_idle_sec").value), qos=20)   # 靜態 TF 用 LazyTf 的標準 QoS（★ 10/24）
         # 存位姿用：AMCL 自己發的定位結果（只在更新時發，便宜；車子不動時最後一則仍然有效）
         self._last_amcl_pose = None
@@ -368,6 +412,13 @@ class MapServiceCcNode(Node):
             self._start_exploration_callback,
             callback_group=self.client_cb_group,
         )
+        # ★ 2026-11-03：「建圖」合成一個模式後的另一半：自動探索中途停下，改用遙控繼續（地圖保留、不存檔）
+        self.create_service(
+            Trigger,
+            "stop_exploration",
+            self._stop_exploration_callback,
+            callback_group=self.client_cb_group,
+        )
         self.create_map_action = ActionServer(
             self,
             CreateMap,
@@ -396,6 +447,8 @@ class MapServiceCcNode(Node):
         # 探索完成事件的過濾用：只認「本輪開始之後」收到的事件
         self._last_map_info = None
         self._last_map = None
+        self._map_msg_count = 0
+        self._mapping_start_pose = None   # ★ 2026-11-03：這一趟建圖開始時車子在新地圖裡的位姿
         self._last_scan = None
         self._exploration_epoch = 0
         self._exploration_active = False
@@ -488,12 +541,25 @@ class MapServiceCcNode(Node):
                 # 用上次記錄的位姿開機。沒有的話 _enter_localization_mode 會退而
                 # 求其次用地圖中心 —— 就是不能用 (0,0)，那多半在地圖外。
                 startup_pose = self._load_last_pose()
-                if startup_pose is not None:
+                fallback_pose = None
+                if self.startup_pose_mode == "origin":
+                    # ★ 2026-11-03：開機一律當作在原點；上次位姿降為「車子不在原點」時的退路
+                    #   「原點」優先用這張圖建圖時記下的起點（maps_db 的 start_pose）——地圖的 (0,0) 是
+                    #   EKF 開機的位置，不一定是建圖起點。舊地圖沒有記錄才用 startup_origin_pose 參數。
+                    fallback_pose = startup_pose
+                    startup_pose = self._map_start_pose(target_map) or self.startup_origin_pose
+                    self.get_logger().info(
+                        f"開機位姿：原點 ({startup_pose[0]:.2f}, {startup_pose[1]:.2f}, "
+                        f"{math.degrees(startup_pose[2]):.0f}°)（startup_pose_mode=origin；"
+                        f"對不上時改試上次位姿）"
+                    )
+                elif startup_pose is not None:
                     self.get_logger().info(
                         f"沿用上次位姿 ({startup_pose[0]:.2f}, {startup_pose[1]:.2f}, "
                         f"{math.degrees(startup_pose[2]):.0f}°)"
                     )
-                if not self._enter_localization_mode(target_map, initial_pose=startup_pose):
+                if not self._enter_localization_mode(target_map, initial_pose=startup_pose,
+                                                     fallback_pose=fallback_pose):
                     self.get_logger().warn("進入定位模式失敗，退回建圖模式待命")
                     self._enter_mapping_mode()
 
@@ -545,6 +611,47 @@ class MapServiceCcNode(Node):
     # ==================================================================
     # 模式切換
     # ==================================================================
+    def _start_fresh_mapping(self) -> bool:
+        """★ 2026-11-03：每一趟建圖都從空白開始。
+
+        舊行為：已經在建圖模式（沒有任何已存地圖時取消建圖、或開機就進建圖模式）時，
+        _enter_mapping_mode 直接返回，slam_toolbox 手上的舊圖原封不動 ——
+        下一趟會疊在上一趟（或開機後一路收的掃描）上繼續畫；車子中間被推過的話還會疊出錯位的牆。
+
+        做法：一律先把 slam_toolbox 退到 **unconfigured**（mapper、掃描資料、/map 發布者全部銷毀，
+        /map 上 transient_local 的舊圖也跟著消失），再走正常的 _enter_mapping_mode 重新 configure／activate。
+        slam 設定沒有 map_file_name，configure 不會載回任何位姿圖 → 保證空白。
+        這跟「定位 -> 建圖」每次都走的是同一條路，不是新路徑。
+
+        接著等 slam 發出**重置後的第一張** /map 才回傳：在那之前 global_costmap 與 explorer 手上
+        還是舊圖，探索若先開始會對著舊圖選目標。
+        """
+        with self._mode_lock:
+            if self.mode == MODE_MAPPING:
+                self.get_logger().info("已在建圖模式：先重置 slam_toolbox（清掉上一趟／開機後累積的圖）")
+                if not self.lc_slam.ensure_state(UNCONFIGURED):
+                    self.get_logger().error("slam_toolbox 無法退到 unconfigured，中止建圖")
+                    return False
+                self.mode = MODE_UNKNOWN
+        before = self._map_msg_count
+        if not self._enter_mapping_mode():
+            return False
+        deadline = time.monotonic() + self.fresh_map_timeout_sec
+        while self._map_msg_count == before and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if self._map_msg_count == before:
+            # 不致命：slam 已經是新的，只是 costmap／explorer 可能多看幾秒舊圖
+            self.get_logger().warn(
+                f"重置後 {self.fresh_map_timeout_sec:.0f} 秒內沒收到新的 /map（雷達沒資料？），照樣開始建圖")
+        # 記下車子在新地圖裡的起點：存圖時寫進 maps_db，給「開機當作在原點」用。
+        # ★ 新地圖的 (0,0) 是 odom_combined 的原點（EKF 開機的位置），**不是**車子現在的位置 ——
+        #   開機後車子被移動過就差很多，所以不能假設建圖起點就是 (0,0)。
+        self._mapping_start_pose = self._current_robot_pose()
+        if self._mapping_start_pose is not None:
+            x, y, yaw = self._mapping_start_pose
+            self.get_logger().info(f"建圖起點（新地圖座標）：({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+        return True
+
     def _enter_mapping_mode(self) -> bool:
         """進入建圖模式：只有 slam_toolbox 在發 /map 與 map -> odom_combined"""
         with self._mode_lock:
@@ -578,7 +685,7 @@ class MapServiceCcNode(Node):
             self.get_logger().info("✓ 已進入建圖模式")
             return True
 
-    def _enter_localization_mode(self, map_id: str, initial_pose=None) -> bool:
+    def _enter_localization_mode(self, map_id: str, initial_pose=None, fallback_pose=None) -> bool:
         """進入定位模式：只有 map_server 發 /map、只有 amcl 發 map -> odom_combined
 
         Args:
@@ -637,6 +744,28 @@ class MapServiceCcNode(Node):
                 aligned = self._align_pose_with_scan((x, y, yaw))
                 if aligned is not None:
                     x, y, yaw = aligned
+                # ★ 2026-11-03：開機「當作在原點」但雷射對不上 -> 車子多半不在原點，改試上次位姿
+                sc = self._last_align_score
+                if fallback_pose is not None and sc is not None and sc < self.startup_origin_min_match:
+                    self.get_logger().warn(
+                        f"原點對位吻合度只有 {sc * 100:.0f}%（門檻 {self.startup_origin_min_match * 100:.0f}%），"
+                        f"車子可能沒停回原點 —— 改試上次位姿 ({fallback_pose[0]:.2f}, {fallback_pose[1]:.2f})")
+                    fb = self._align_pose_with_scan(tuple(fallback_pose))
+                    fsc = self._last_align_score
+                    if fsc is not None and fsc > sc + 0.05:
+                        x, y, yaw = fb if fb is not None else fallback_pose
+                        self.get_logger().warn(
+                            f"改用上次位姿（吻合度 {fsc * 100:.0f}% > 原點 {sc * 100:.0f}%）："
+                            f"({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+                        if fsc < self.startup_origin_min_match:
+                            self.get_logger().warn("上次位姿也不夠吻合，建議執行全域定位")
+                    else:
+                        self.get_logger().warn(
+                            f"上次位姿也對不上（{'無法對位' if fsc is None else f'{fsc * 100:.0f}%'}），"
+                            "照用原點。車子若不在原點，請執行全域定位")
+                        # 兩個都沒把握：用寬協方差 seed，別讓 AMCL 對一個可能錯的位置過度自信
+                        # （導航端的 0.15 定位門檻會擋住出發，直到全域定位收斂）
+                        pose_known = False
 
             # 用話題再送一次初始位姿並逼 amcl 立刻回報。
             # 參數只能決定「位置」，協方差一律是 amcl 內建的寬值 (norm ≈ 0.354)，
@@ -888,7 +1017,11 @@ class MapServiceCcNode(Node):
         deadline = time.monotonic() + self.exploration_timeout_sec
 
         try:
-            if not self._enter_mapping_mode():
+            self._mapping_start_pose = None
+            # 這一趟要不要一開始就自動探索：goal 明講 explore=true 就探索；否則照 launch 的預設
+            #（舊腳本 create_map_cc.sh 只給 map_name，配 variant:=explore 時照舊自動探索）
+            self.use_exploration = bool(getattr(request, "explore", False)) or self._auto_explore_default
+            if not self._start_fresh_mapping():
                 return self._abort(goal_handle, result, "無法切換到建圖模式，地圖建立失敗")
 
             self._finish_requested = False
@@ -934,6 +1067,9 @@ class MapServiceCcNode(Node):
 
             with self._db_lock:
                 self.maps_db[map_id] = {"name": request.map_name}
+                if self._mapping_start_pose is not None:
+                    sx, sy, syaw = self._mapping_start_pose
+                    self.maps_db[map_id]["start_pose"] = {"x": sx, "y": sy, "yaw": syaw}
                 self._save_maps_db()
 
             if not self._enter_localization_mode(map_id, initial_pose=end_pose):
@@ -1054,7 +1190,8 @@ class MapServiceCcNode(Node):
         self._unwedge_goal = None
 
         if not self.use_exploration:
-            self.get_logger().info("未啟用自動探索，請用遙控把環境走一遍，完成後呼叫 /finish_map")
+            self.get_logger().info(
+                "遙控建圖：請用遙控把環境走一遍，完成後呼叫 /finish_map（要交給自動探索可呼叫 /start_exploration）")
             return True
 
         if not self.control_exploration_client.wait_for_service(timeout_sec=15.0):
@@ -1122,7 +1259,60 @@ class MapServiceCcNode(Node):
             self.get_logger().warn(f"讀／改規劃半徑失敗：{exc}")
             return None
 
+    def _controller_param(self, name: str, value: Optional[float] = None) -> Optional[float]:
+        """讀／改 controller_server 的 double 參數（RPP 的參數都可以動態改）。失敗回 None"""
+        try:
+            if value is None:
+                if not self.controller_get_params_client.wait_for_service(timeout_sec=2.0):
+                    return None
+                req = GetParameters.Request()
+                req.names = [name]
+                res = wait_for_future(self.controller_get_params_client.call_async(req), timeout_sec=5.0)
+                if res is None or not res.values or res.values[0].type != ParameterType.PARAMETER_DOUBLE:
+                    return None
+                return float(res.values[0].double_value)
+            if not self.controller_set_params_client.wait_for_service(timeout_sec=2.0):
+                return None
+            req = SetParameters.Request()
+            req.parameters = [Parameter(name=name, value=ParameterValue(
+                type=ParameterType.PARAMETER_DOUBLE, double_value=float(value)))]
+            res = wait_for_future(self.controller_set_params_client.call_async(req), timeout_sec=5.0)
+            if res is None or not all(r.successful for r in res.results):
+                return None
+            return float(value)
+        except Exception as exc:  # noqa: BLE001 —— 速度改不了不能擋住探索
+            self.get_logger().warn(f"讀／改 {name} 失敗：{exc}")
+            return None
+
+    def _apply_explore_speed(self) -> None:
+        target = float(self.get_parameter("explore_linear_speed").value or 0.0)
+        if target <= 0.0 or self._explore_speed_saved is not None:
+            return
+        name = "FollowPath.desired_linear_vel"
+        orig = self._controller_param(name)
+        if orig is None:
+            self.get_logger().warn("自動探索：讀不到 controller_server 的速度，維持原值")
+            return
+        if abs(orig - target) < 1e-3:
+            return
+        if self._controller_param(name, target) is None:
+            self.get_logger().warn(f"自動探索：速度改不成 {target:.2f} m/s，維持 {orig:.2f} m/s")
+            return
+        self._explore_speed_saved = orig
+        self.get_logger().info(f"自動探索：速度 {orig:.2f} → {target:.2f} m/s（建圖品質；探索結束設回）")
+
+    def _restore_explore_speed(self) -> None:
+        orig, self._explore_speed_saved = self._explore_speed_saved, None
+        if orig is None:
+            return
+        if self._controller_param("FollowPath.desired_linear_vel", orig) is None:
+            self.get_logger().error(
+                f"⚠ 探索結束，但速度設不回 {orig:.2f} m/s —— 帶位會比較慢，重開導航堆疊就會回到 yaml 的值")
+        else:
+            self.get_logger().info(f"探索結束：速度設回 {orig:.2f} m/s")
+
     def _apply_explore_planner_radius(self) -> None:
+        self._apply_explore_speed()                # ★ 2026-11-03：同一組呼叫點（開始／結束探索）
         target = float(self.get_parameter("explore_planner_radius_m").value or 0.0)
         if target <= 0.0 or self._planner_radius_saved is not None:
             return
@@ -1139,6 +1329,7 @@ class MapServiceCcNode(Node):
         self.get_logger().info(f"自動探索：規劃半徑 {orig:.2f} → {target:.2f} m（探索結束設回）")
 
     def _restore_planner_radius(self) -> None:
+        self._restore_explore_speed()              # ★ 2026-11-03
         orig, self._planner_radius_saved = self._planner_radius_saved, None
         if orig is None:
             return
@@ -1202,6 +1393,9 @@ class MapServiceCcNode(Node):
         搜尋策略是粗掃再細掃，避免在 Pi 4 上算太久：
         先用大步距掃過整個範圍，再在最佳解附近用小步距收斂。
         """
+        # ★ 2026-11-03：最後一次對位的吻合度（0~1），None = 沒能對（沒地圖／沒雷射／點太少）。
+        #   開機「當作在原點」時用它判斷車子是不是真的停在原點（見 startup_pose_mode）。
+        self._last_align_score = None
         grid = self._last_map
         scan = self._last_scan
         if grid is None or scan is None or pose is None:
@@ -1278,6 +1472,7 @@ class MapServiceCcNode(Node):
 
         if best[0] < base_score + 0.05:
             self.get_logger().info(f"位姿對齊：維持原值 (吻合度 {base_score * 100:.0f}%)")
+            self._last_align_score = base_score
             return pose
 
         # 角度修正量的合理性檢查。
@@ -1297,11 +1492,13 @@ class MapServiceCcNode(Node):
                 f"{self.align_max_correction_deg:.0f}°，判定為走廊前後對稱造成的誤匹配，"
                 "維持原值。若車子確實被搬動過，請執行全域定位。"
             )
+            self._last_align_score = base_score
             return pose
 
         self.get_logger().info(
             f"位姿對齊：吻合度 {base_score * 100:.0f}% -> {best[0] * 100:.0f}%，" f"角度修正 {delta:+.1f}°"
         )
+        self._last_align_score = best[0]
         return best[1], best[2], best[3]
 
     def _amcl_refresh_tick(self) -> None:
@@ -1354,6 +1551,7 @@ class MapServiceCcNode(Node):
     def _map_info_callback(self, msg: OccupancyGrid) -> None:
         self._last_map_info = msg.info
         self._last_map = msg
+        self._map_msg_count += 1
 
         # 停滯看門狗只在自動探索進行中才計算。遙控建圖沒有 explorer，人在開，
         # 停下來看一看是正常的，不能被判成停滯而提早存圖。
@@ -1598,10 +1796,28 @@ class MapServiceCcNode(Node):
             response.message = "目前不在建圖中，無法啟動探索"
             return response
 
+        if self.use_exploration:
+            response.success = True
+            response.message = "已經在自動探索中"
+            return response
+
         if not self.control_exploration_client.wait_for_service(timeout_sec=10.0):
             response.success = False
             response.message = "/control_exploration 服務不存在 (frontier_explorer 沒啟動?)"
             return response
+
+        # ★ 2026-11-03：遙控一段之後才交給探索（或停過再開）：看門狗要從現在算起。
+        #   不清的話，遙控期間地圖「沒有自動長大」會被停滯看門狗當成 4 分鐘沒進展而立刻存圖；
+        #   停止探索時 explorer 可能發過一次完成事件，也會讓這次一開始就被判成「探索完成」。
+        with self._stall_lock:
+            self._area_at_last_gain_m2 = self._known_area_m2
+            self._last_gain_time = None
+            self._stuck_events = []
+            self._stuck_end = None
+        self._exploration_done_epoch = -1
+        self._unwedge_count = 0
+        self._motion_anchor = None
+        self._tight_since = None
 
         self._apply_explore_planner_radius()      # ★ 2026-10-28（見 explore_planner_radius_m）
         req = ControlExploration.Request()
@@ -1629,6 +1845,35 @@ class MapServiceCcNode(Node):
         self.get_logger().info("✓ 已手動啟動自動探索")
         response.success = True
         response.message = "自動探索已開始，完成後會自動存檔"
+        return response
+
+    def _stop_exploration_callback(self, _request, response):
+        """★ 2026-11-03：建圖進行中停掉自動探索，改用遙控繼續（不存檔、不結束建圖）"""
+        if self.mode != MODE_MAPPING or not self._exploration_active:
+            response.success = False
+            response.message = "目前不在建圖中"
+            return response
+        if not self.use_exploration:
+            response.success = True
+            response.message = "目前沒有在自動探索（已經是遙控建圖）"
+            return response
+        # 先把旗標放下：看門狗（停滯／卡住／脫困）與完成事件馬上不再作用，不會在停的過程中觸發存圖
+        self.use_exploration = False
+        self.exploration_active_pub.publish(Bool(data=False))
+        if self.control_exploration_client.service_is_ready():
+            req = ControlExploration.Request()
+            req.action = ControlExploration.Request.ACTION_STOP
+            try:
+                wait_for_future(self.control_exploration_client.call_async(req), timeout_sec=10.0)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"停止探索失敗: {exc}")
+        # 跟 _stop_exploration 一樣：STOP 成不成功都送「取消全部」，確保車子停下來
+        self._cancel_all_nav_goals()
+        self._restore_planner_radius()            # 連速度一起設回（遙控不經過 nav2，但帶位不能留著探索的值）
+        self._exploration_done_epoch = -1
+        self.get_logger().info("✓ 已停止自動探索，改用遙控繼續建圖")
+        response.success = True
+        response.message = "已停止自動探索，地圖保留，請用遙控繼續；走完按「完成存檔」"
         return response
 
     def _finish_map_callback(self, _request, response):
@@ -1905,6 +2150,15 @@ class MapServiceCcNode(Node):
                 return json.load(fp).get("last_active_map")
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"載入目前地圖狀態失敗: {exc}")
+            return None
+
+    def _map_start_pose(self, map_id: str):
+        """這張圖建圖時記下的起點 (x, y, yaw)；沒有就回 None"""
+        with self._db_lock:
+            p = (self.maps_db.get(map_id) or {}).get("start_pose")
+        try:
+            return (float(p["x"]), float(p["y"]), float(p["yaw"])) if p else None
+        except (KeyError, TypeError, ValueError):
             return None
 
     def _load_last_pose(self):

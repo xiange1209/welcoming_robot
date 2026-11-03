@@ -240,6 +240,12 @@ class AudioPlayer:
             has_queue = not self._queue.empty()
             return has_buffer or has_queue
 
+    def flush(self) -> None:
+        """★ 2026-11-03：立刻停掉正在播的與排隊中的音訊（HMI 關掉「機器人朗讀」時用），播放器本身不關"""
+        with self._lock:
+            self._buffer = self._buffer[:0]
+            self._clear_queue()
+
     def _clear_queue(self) -> None:
         """清空播放隊列
 

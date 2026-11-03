@@ -7,6 +7,7 @@
 
 import importlib.util
 import os
+import time
 from typing import Dict, Optional
 
 from std_srvs.srv import Trigger
@@ -87,24 +88,12 @@ class SystemControlManager:
         "nav": {
             "label": "導航堆疊",
             "detect": ["map_service_cc"],
-            "start_hint": "啟動約需 60 秒。模式請看建圖頁的狀態列。★ 導航仲裁（身分／權限，帶位的唯一入口）跟著一起起、一起停",
-            "variants": {
-                "mapping": {
-                    "label": "建圖（遙控）",
-                },
-                "explore": {
-                    "label": "建圖 + 自動探索",
-                    "warn": "車子會自己跑動",
-                },
-                "localization": {
-                    "label": "定位 + 導航",
-                    # ★ 2026-09-25：第二個參數一定要明寫 false。run_nav_cc.sh 的預設是
-                    #   USE_EXPLORATION="${2:-true}"，只給 localization 會連 frontier explorer
-                    #   一起起、而且 auto_start=true —— 之後在建圖頁按「開始建圖」車子就自己開走，
-                    #   平白也多吃 CPU。README「兩個參數都要給」講的就是這個。
-                    "cmd": ["/home/user/maprun/run_nav_cc.sh", "localization", "false"],
-                },
-            },
+            "start_hint": "啟動約需 60 秒。有地圖就進定位模式（可帶位），沒有就進建圖模式；"
+            "要建新圖直接到「遙控建圖」分頁按開始建圖，存檔後自動回定位。★ 導航仲裁（帶位的唯一入口）跟著一起起、一起停",
+            # ★ 2026-11-03：不再分「建圖」「定位 + 導航」—— 一顆啟動（start_mode=auto：有地圖就定位、沒有就建圖），
+            #   建圖／定位之間由 map_service 自己切。舊腳本送的 start:mapping／explore／localization 仍然接受
+            #  （system_control.launch.py 照舊對應），面板上不列。
+            "legacy_variants": ("mapping", "explore", "localization"),
         },
         # ── 迎賓流程的功能模組 ──────────────────────────
         # 流程：待機（人臉辨識）-> 認出貴賓 -> LLM 對話 -> 觸發導航 -> 到達 -> 恢復辨識
@@ -212,6 +201,8 @@ class SystemControlManager:
             "note": "不需要底盤與雷達。導航一定要關 —— 導航中人臉節點完全不推論，"
             "註冊採樣會逾時然後把剛註冊的人回滾刪掉",
         },
+        # ★ 2026-11-03：又合回一個「建圖」—— explorer 現在一律待命，遙控／自動探索在建圖頁選、途中可切換，
+        #   下面 9/24 拆開的理由（遙控模式根本沒有 explorer）已經不存在。
         # ★ 2026-09-24：原本只有一個叫「建圖」的情境，但它起的是 nav:mapping ——
         #   run_nav_cc.sh mapping **false**，frontier explorer 根本不會啟動，
         #   按了「開始建圖」車子也不會自己動（create_map 會退回遙控建圖）。
@@ -223,33 +214,26 @@ class SystemControlManager:
         #   導航其實還停在舊模式，步驟列表只多一行「已經在執行中」，很容易看漏。
         #   先停再用正確的模式啟動，代價是每次多等約 60 秒。
         "mapping": {
-            "label": "建圖（遙控）",
-            "why": "底盤雷達 + 導航堆疊（建圖模式）。人用遙控把環境走一遍。其餘全關，把 CPU 讓出來",
+            "label": "建圖",
+            "why": "底盤雷達 + 導航堆疊（自動探索待命）。其餘全關，把 CPU 讓出來",
             "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
-            "start": ["sensors", "nav:mapping"],
-            "note": "導航堆疊會先停掉、再用建圖模式重啟（換模式一定要重啟）。"
-            "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；"
-            "導航堆疊再約 60 秒。人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗。"
-            "全綠後到「遙控建圖」分頁按「開始建圖」，遙控走完一圈再按「完成存檔」",
-        },
-        "auto_mapping": {
-            "label": "建圖（自動探索）",
-            "why": "同上，但啟動 frontier explorer，車子會自己找沒去過的地方開過去",
-            "stop": ["face", "user_auth", "bank_reception", "llm", "asr_chain", "camera", "nav"],
-            "start": ["sensors", "nav:explore"],
-            "note": "⚠ 車子會自己跑動，旁邊要有人顧著。導航堆疊會先停掉、再用探索模式重啟；"
-            "全綠後（約 80 秒）到「遙控建圖」分頁按「開始建圖」才會開始探索。"
-            "四種情況會自動存圖：探索完成、4 分鐘地圖沒有長大、同一處卡住 3 次（疑似有低於雷達的障礙，清掉再建）、30 分鐘上限。"
-            "想提早結束按同一頁的「完成存檔」（會存圖；「取消」會丟掉這張圖）。"
-            "★ 緊急狀況照樣直接按緊急停止 —— 安全優先，圖可以重建。"
-            "結束後在 SSH 跑 python3 ~/welcoming_robot_ws/src/smartnav_ws/maprun/tools_1020/explore_summary.py 看這趟卡在哪一類",
+            "start": ["sensors", "nav"],
+            "note": "導航堆疊會先停掉再重啟（有舊地圖時會先進定位模式，按開始建圖才切到建圖，新圖從空白開始）。"
+            "感測器啟動後約 20 秒 IMU 零偏校準，期間車子必須靜止；導航堆疊再約 60 秒。"
+            "人臉一定要關：建圖時 idle 掉到 0.4% 會讓 TF 出現空窗。"
+            "全綠後到「遙控建圖」分頁：按「開始建圖（遙控）」自己開，或「開始建圖（自動探索）」讓車子自己找路；"
+            "途中可以隨時切換（例如窄走廊先遙控、進到大廳再交給自動探索，卡住了再停下來用遙控補）。"
+            "⚠ 自動探索時車子會自己跑動，旁邊要有人顧著。"
+            "結束按「完成存檔」（會存圖；「取消」會丟掉這張圖）。"
+            "自動探索中有四種情況會自動存圖：探索完成、4 分鐘地圖沒有長大、同一處卡住 3 次、30 分鐘上限。"
+            "★ 緊急狀況照樣直接按緊急停止 —— 安全優先，圖可以重建。",
         },
         "teach": {
             "label": "教導路徑 錄製 / 重播",
             "why": "底盤雷達 + 導航堆疊（定位模式）。path_teach 隨導航堆疊自動起",
             "stop": ["face", "llm", "asr_chain", "camera", "nav"],
-            "start": ["sensors", "nav:localization"],
-            "note": "需要 map→base_footprint 的 TF，所以導航堆疊一定要起（會先停再用定位模式重啟）。"
+            "start": ["sensors", "nav"],
+            "note": "需要 map→base_footprint 的 TF，所以導航堆疊一定要起（會先停再重啟；有地圖就是定位模式）。"
             "換過地圖的話舊路徑會被擋下來，那是正確行為不是壞掉",
         },
         "voice": {
@@ -273,11 +257,11 @@ class SystemControlManager:
         "demo": {
             "label": "完整迎賓故事線",
             "why": "全鏈路。順序照 demo.launch.py 的分階段：感測 → 導航 → 視覺 → 語音 → LLM",
-            # 只停導航：它若停在建圖模式，nav:localization 會被拒絕，整場演示跑在錯的模式（見上方 9/25 註解）
+            # 只停導航：重啟後 start_mode=auto 會用最近的地圖進定位模式（停在建圖途中的話，那張未存的圖不要了）
             "stop": ["nav"],
             "start": [
                 "sensors",
-                "nav:localization",
+                "nav",
                 "camera:face",
                 "face",
                 "user_auth",
@@ -296,7 +280,7 @@ class SystemControlManager:
             "stop": ["nav", "face"],
             "start": [
                 "sensors",
-                "nav:localization",
+                "nav",
                 "camera:face",
                 "face:eco",
                 "user_auth",
@@ -492,14 +476,26 @@ class SystemControlManager:
                     else "B 板（感知板）離線或還沒就緒：看網路線、B 的 smartnav-perception 服務（DDS 發現約 10 秒）"
                 )
                 hint = "雙板：這個單元在 B 板；燈號＝B 的節點在 ROS 網路上看得到"
+            # ★ 2026-11-03：「啟動中」＝受管 launch 還活著、節點還沒全部上線、也不在 start 操作本身（transition）裡。
+            #   以前這段期間面板會跳回「啟動」鈕（transition 在 launch 行程出現 0.5 秒後就結束了），
+            #   等節點上線才變「停止」。超過 start_timeout_sec 還沒全上線就不再當「啟動中」，回到
+            #   原本的 partial／未執行顯示（卡住了要讓人看得出來）。
+            running = len(found) == len(needles)
+            transition = self._supervisor.transition(key)
+            started_at = None if (is_remote or running or transition) else self._supervisor.session_started_at(key)
+            starting = started_at is not None and time.time() - started_at < spec.get("start_timeout_sec", 150)
             units.append(
                 {
                     "key": key,
                     "label": spec["label"],
                     "mode": mode,
                     "remote": "B" if is_remote else "",
-                    "running": len(found) == len(needles),
+                    "running": running,
                     "partial": 0 < len(found) < len(needles),
+                    "starting": starting,
+                    "starting_since": started_at if starting else None,
+                    # 受管 launch 還活著但超過時限仍沒全上線：面板要標成卡住（停止鈕照樣給）
+                    "start_stuck": started_at is not None and not starting,
                     "hint": hint,
                     # 缺什麼就先講，不要讓操作者按了沒反應才去翻 log
                     "blocked": blocked,
@@ -508,7 +504,7 @@ class SystemControlManager:
                         {"key": vk, "label": v["label"], "warn": v.get("warn", "")}
                         for vk, v in spec.get("variants", {}).items()
                     ],
-                    "transition": self._supervisor.transition(key),
+                    "transition": transition,
                 }
             )
         return units
@@ -534,7 +530,7 @@ class SystemControlManager:
             variant = spec["variants"].get(variant_key)
             if variant is None:
                 return False, {"message": f"未知的啟動方式：{variant_key}"}
-        elif variant_key is not None:
+        elif variant_key is not None and variant_key not in spec.get("legacy_variants", ()):
             return False, {"message": f"{spec['label']} 不支援啟動方式 {variant_key}"}
 
         # 重複啟動的防呆。
@@ -551,6 +547,8 @@ class SystemControlManager:
                     continue
                 if u["running"]:
                     return False, {"message": f"{spec['label']} 已經在執行中，不需要再啟動一次"}
+                if u.get("starting"):
+                    return False, {"message": f"{spec['label']} 正在啟動中（節點載入中），請稍候，不要重複按啟動"}
                 if u["partial"]:
                     return False, {
                         "message": f"{spec['label']} 正在啟動或只起來一半，請先按停止再重新啟動，不要重複按啟動"
@@ -561,7 +559,7 @@ class SystemControlManager:
             self._forget_camera_if([unit])
             what = spec["label"]
             if variant_key:
-                what += f" — {spec['variants'][variant_key]['label']}"
+                what += f" — {spec.get('variants', {}).get(variant_key, {}).get('label', variant_key)}"
             operation["message"] = f"已排入{'啟動' if action == 'start' else '停止'} {what}"
         return ok, operation
 
