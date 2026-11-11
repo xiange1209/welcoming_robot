@@ -6,7 +6,7 @@ import { Button, Card, Field, Hint, Select } from "../components/ui";
 import { cx } from "../lib/cx";
 import { useStoreSelector, useStoreValue } from "../hooks/useStore";
 import { useVideoStream } from "../hooks/useVideoStream";
-import { useVisibleInterval } from "../hooks/useVisibleInterval";
+import { useHeartbeat, useVisibleInterval } from "../hooks/useVisibleInterval";
 import { post, run } from "../lib/api";
 import { confirmDialog } from "../lib/dialog";
 import { resetCachedMessages, telemetryStore } from "../lib/telemetry";
@@ -50,9 +50,8 @@ function StatsLine({ stats }: { stats: ChatStats }) {
 function Bubble({ message }: { message: ChatMessage }) {
   const mine = message.role === "user";
 
-  /* 對話框只放客人說的話與 LLM 的回覆。黑名單公告、「我要倒車…」這類非 LLM 的語音
-     平板照樣會唸（朗讀讀的是 messages 清單，見 tts.ts），只是不畫成泡泡。 */
-  if (message.hidden) return null;
+  /* ★ 2026-11-10 使用者要求改回：只要有說話就顯示文字。43164ba 曾讓黑名單公告、「我要倒車…」、
+     迎賓詞這類非 LLM 的語音不畫成泡泡（後端仍標 hidden，朗讀照常，見 tts.ts）；現在一律顯示。 */
 
   return (
     <div className={cx("flex flex-col", mine ? "items-end" : "items-start")}>
@@ -416,6 +415,10 @@ function savePip(p: PipState) {
 
 function LiveView({ active }: { active: boolean }) {
   const navigating = useStoreSelector(telemetryStore, (t) => !!t.snap.system?.navigating);
+  /* ★ 2026-11-10：帶位中左卡換成地圖，也要打「有人在看地圖」的心跳。原本只有地圖／遙控分頁會打
+     （App.tsx），後端 12 秒沒心跳就把位姿清成 null，迎賓頁上的車子圖示就時有時無。
+     只在帶位中打：平常停在迎賓頁仍然不訂位姿，省 CPU 的設計不變。 */
+  useHeartbeat("/api/map/watch", 5000, active && navigating);
   const [routeView, setRouteView] = useState(true); // true＝放大到路線、false＝整張地圖
   const [pip, setPip] = useState<PipState>(loadPip);
   const videoRef = useVideoStream(active && !(navigating && pip.hidden));

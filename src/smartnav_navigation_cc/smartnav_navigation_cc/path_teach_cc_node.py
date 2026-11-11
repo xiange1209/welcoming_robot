@@ -267,7 +267,11 @@ class PathTeachNode(Node):
         #   0.15 時一路滿速開到折返點／終點再停沒有問題；0.40 時光煞車就 8 cm 以上，
         #   所以同時加了 approach_slow_m（接近折返點／終點減速）。
         #   退路：-p follow_speed:=0.15（approach_slow_m 在 0.15 下只影響最後 0.2 m，可不動）。
-        self.declare_parameter("follow_speed", 0.40)
+        # ★★ 2026-11-04：改回 0.15（使用者：「還是原本的速度就好…這樣又安全」）★★
+        #   11/04 實測 0.40：快到櫃台時擦到椅腳（側向只警告不煞停，見 8/20 那段），
+        #   轉彎時定位跳約 15° 偏離 63 cm 停車重規劃。0.15 是 8/10~10/27 驗收時的速度。
+        #   approach_slow_m 留著（0.15 下只影響最後一小段）；要再提速改這裡。
+        self.declare_parameter("follow_speed", 0.15)
         self.declare_parameter("reverse_speed", 0.10)
         # ★ 2026-11-03：距離「下一個折返點或終點」(沿路徑弧長) 小於這個值時線性減速，
         #   到點時降到 min_move_speed（0.10，底盤死區之上）。0 = 關閉（舊行為：滿速開到點才停）。

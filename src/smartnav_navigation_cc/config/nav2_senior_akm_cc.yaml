@@ -281,11 +281,12 @@ controller_server:
       # ── 速度 ──
       # 0.25 -> 0.40（2026-11-03，使用者要求「越快越好」；原廠導航設定上限 0.5，
       # 留餘裕給 0.99 m 走廊與行人）。path_teach 的 follow_speed 同步為 0.40。
+      # ★ 2026-11-04：改回 0.25（使用者：原本的速度比較安全；path_teach 同步改回 0.15）。
       # ⚠ RPP 沒有獨立的倒車速度（倒車就是 -desired_linear_vel）。
       #   倒車限速改由 velocity_smoother 的 min_velocity -0.15 夾住，
       #   scale_velocities: true 會把 wz 等比例縮，曲率不變。
       #   要慢的理由與舊 MPPI vx_min 相同：車尾只有 0.11 m 高的雷達，倒車半盲。
-      desired_linear_vel: 0.40
+      desired_linear_vel: 0.25
 
       # ── 前視距離 ──
       # ★ 2026-11-03 提速到 0.40 後改成「隨速度拉長、但有 0.60 下限」：
@@ -985,6 +986,7 @@ velocity_smoother:
     feedback: "OPEN_LOOP"
     # ★ 2026-11-03 配合 RPP（見 controller_server FollowPath）：
     #   前進 0.25 -> 0.40：使用者要求提速（同 RPP desired_linear_vel）。
+    #   ★ 2026-11-04：前進改回 0.25（使用者：原本的速度比較安全）；倒車與角速度維持 11/03 的值。
     #   倒車 -0.25 -> -0.15：RPP 沒有獨立倒車速度，倒車限速只能在這裡做
     #     （等同舊 MPPI 的 vx_min -0.15；車尾半盲）。
     #   角速度 ±1.0 -> ±0.55：RPP 不知道阿克曼轉彎半徑，修正偏差時可能要求
@@ -992,7 +994,7 @@ velocity_smoother:
     #   scale_velocities: true 會把被夾的那一軸跟其他軸等比例縮，曲率 k = wz/vx 不變，
     #   所以超限時效果是「同一條弧線、開慢一點」，不是走出更直的線。
     #   path_teach（發 cmd_vel_smoothed）、HMI 遙控（發 cmd_vel_trimmed）不經過這裡，不受影響。
-    max_velocity: [0.40, 0.0, 0.55]
+    max_velocity: [0.25, 0.0, 0.55]
     min_velocity: [-0.15, 0.0, -0.55]
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0

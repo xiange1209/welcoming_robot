@@ -65,6 +65,8 @@ def _preflight(context):
         audio_latency = float(audio_latency)
     except ValueError:
         pass
+    # ★ 2026-11-10：觸發後「不判斷靜音」的初始等待（毫秒），理由見 generate_launch_description。
+    initial_wait_ms = int(float(context.perform_substitution(LaunchConfiguration("command_initial_wait_ms")) or 1000))
     last_error = "Astra S 錄音裝置不存在"
     for delay in (1, 2, 4):
         try:
@@ -137,6 +139,7 @@ def _preflight(context):
                         "vad_num_threads": 1,
                         "mic_mode": context.perform_substitution(LaunchConfiguration("mic_mode")),
                         "audio_latency": audio_latency,
+                        "command_initial_wait_timeout": initial_wait_ms,
                     }
                 ],
             )
@@ -206,6 +209,15 @@ def generate_launch_description():
             #   只有程式被卡住時才會用到多的緩衝。這個值開不起來時 voice_trigger 會自己退回 "high"。
             DeclareLaunchArgument(
                 "audio_latency", default_value=EnvironmentVariable("ASR_AUDIO_LATENCY", default_value="0.2")
+            ),
+            # ★ 2026-11-10：voice_trigger 觸發後前 N 毫秒「不判斷靜音」（command_initial_wait_timeout），節點預設 3000。
+            #   這條鏈是講話本身觸發（不是喚醒詞），3 秒等於強迫短句錄滿 3 秒：11/10 實車平板收音 10 句，
+            #   短句「最後一次出字 → 最終結果」2.0～2.6 秒，超過 3 秒的長句只要 0.6～0.8 秒（＝500 ms 靜音＋辨識）。
+            #   改 1000：短句也約 0.6～0.8 秒收尾。代價：說完第一個詞後停超過 0.5 秒會被切成兩句（3 秒以後本來就是這樣）。
+            #   要恢復舊行為：ASR_COMMAND_INITIAL_WAIT_MS=3000。
+            DeclareLaunchArgument(
+                "command_initial_wait_ms",
+                default_value=EnvironmentVariable("ASR_COMMAND_INITIAL_WAIT_MS", default_value="1000"),
             ),
             OpaqueFunction(function=_preflight),
         ]
