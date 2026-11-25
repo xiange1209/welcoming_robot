@@ -353,20 +353,23 @@ class SystemControlManager:
           - 已經在跑、模式也對 → 不再下「啟動」（以前會多一行紅字「單元已由受管 launch 執行中」）；
           - 在跑但模式不對（相機在避障模式、人臉在省電模式）或只起來一半 → 先停，再用對的模式啟動；
           - keep_if_localization 的單元（導航）已在定位模式 → 不停也不重開；問不到模式就照舊先停再開。
+        ★ 2026-11-25：「啟動中」也當成已經開了。以前等不及再按一次「全部開啟」：啟動中的單元會被再下一次啟動
+          （失敗），只起來一半的會被停掉重開，導航因為還問不到模式也被停掉重開（多等 60 秒）。
+          超過時限仍沒起來（start_stuck）不算啟動中，照舊先停再開；要停的情境（建圖、全部關閉）照樣停得掉。
         """
         status = {u["key"]: u for u in self.system_status()}
-        live = {k for k, u in status.items() if u.get("running") or u.get("partial")}
-        keep = {
-            unit for unit in spec.get("keep_if_localization", ())
-            if status.get(unit, {}).get("running") and self._nav_mode_safe() == "localization"
-        }
+        starting = {k for k, u in status.items() if u.get("starting") and not u.get("start_stuck")}
+        live = {k for k, u in status.items()
+                if u.get("running") or u.get("partial") or u.get("starting") or u.get("start_stuck")}
+        keep = {unit for unit in spec.get("keep_if_localization", ())
+                if unit in starting or self._nav_worth_keeping(unit, status.get(unit, {}))}
         stops = [unit for unit in spec["stop"] if unit in live and unit not in keep]
         starts = []
         for item in spec["start"]:
             unit, _, variant = item.partition(":")
             st = status.get(unit, {})
-            if unit not in stops and st.get("running") and self._mode_matches(unit, variant, st):
-                continue                         # 已經在跑、模式也對
+            if unit not in stops and (st.get("running") or unit in starting) and self._mode_matches(unit, variant, st):
+                continue                         # 已經在跑（或正在啟動）、模式也對
             if unit in live and unit not in stops:
                 stops.append(unit)               # 模式不對或只起來一半 → 先停
             starts.append((unit, variant or None))
@@ -378,6 +381,21 @@ class SystemControlManager:
         detect = spec.get("variant_detect") or {}
         want = spec.get("variants", {}).get(variant, {}).get("label", variant) if variant in detect else ""
         return (st.get("mode") or "") == want
+
+    # 導航行程一出現就算 running，但 /get_nav_mode 要等 Nav2 起來才回得了（車上約 60 秒）；這段時間問不到模式是正常的
+    NAV_SETTLE_SEC = 150.0
+
+    def _nav_worth_keeping(self, unit: str, st: dict) -> bool:
+        """「全部開啟」時導航要不要留著：已在定位模式，或剛啟動還沒辦法回答模式"""
+        if not st.get("running"):
+            return False
+        mode = self._nav_mode_safe()
+        if mode == "localization":
+            return True
+        if mode not in ("", "unknown"):
+            return False                         # 明確是建圖模式 → 照舊重開
+        started = self._supervisor.session_started_at(unit)
+        return started is not None and time.time() - started < self.NAV_SETTLE_SEC
 
     def _nav_mode_safe(self) -> str:
         try:

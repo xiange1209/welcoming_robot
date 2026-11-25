@@ -16,8 +16,8 @@ def tier(current, last_vip, now, policy=POLICY):
 VIP_AT_0 = ident(0.0)
 
 
-def test_default_is_30_seconds():
-    assert ap.DEFAULT["vip_grace_sec"] == 30.0
+def test_default_is_off():
+    assert ap.DEFAULT["vip_grace_sec"] == 0.0        # ★ 2026-11-25：預設關閉（原因寫在 access_policy.DEFAULT）
 
 
 def test_unrecognized_within_grace_is_vip():
@@ -58,4 +58,4 @@ def test_policy_file_without_key_gets_default(tmp_path, monkeypatch):
     p = tmp_path / "access_policy.json"
     p.write_text('{"vip_only_waypoints": ["貴賓室"], "identity_fresh_sec": 10.0}', encoding="utf-8")
     monkeypatch.setattr(ap, "POLICY_PATH", p)
-    assert ap.load_policy()["vip_grace_sec"] == 30.0
+    assert ap.load_policy()["vip_grace_sec"] == ap.DEFAULT["vip_grace_sec"]

@@ -67,6 +67,8 @@ def _preflight(context):
         pass
     # ★ 2026-11-10：觸發後「不判斷靜音」的初始等待（毫秒），理由見 generate_launch_description。
     initial_wait_ms = int(float(context.perform_substitution(LaunchConfiguration("command_initial_wait_ms")) or 1000))
+    # ★ 2026-11-25：收音距離閘門開關（展場人多、客人不一定站在車頭前，要關得掉），理由見 generate_launch_description。
+    presence_gate = _truthy(context.perform_substitution(LaunchConfiguration("presence_gate")))
     def _nodes(index: int, desc: str) -> list:
         """建立 speech_recognizer 與 voice_trigger（index＝Astra S 的 sounddevice 編號；-1＝沒有本機麥克風）"""
         recognizer = Node(
@@ -98,6 +100,7 @@ def _preflight(context):
                     "audio_latency": audio_latency,
                     "command_initial_wait_timeout": initial_wait_ms,
                     "vad_threshold": _vad_threshold_for_input(),
+                    "presence_gate_enable": presence_gate,
                 }
             ],
         )
@@ -121,6 +124,7 @@ def _preflight(context):
                     f"、mute_during_tts={mute_during_tts}"
                     f"、debug_wav_dir={debug_wav_dir or '（關）'}"
                     f"、audio_latency={audio_latency}"
+                    f"、presence_gate={'開' if presence_gate else '關'}"
                 )
             ),
             recognizer,
@@ -258,6 +262,12 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "command_initial_wait_ms",
                 default_value=EnvironmentVariable("ASR_COMMAND_INITIAL_WAIT_MS", default_value="1000"),
+            ),
+            # ★ 2026-11-25：收音距離閘門（車頭前方 1 公尺有人才收音，presence_gate.py）。預設開。
+            #   從平板啟動也要關得掉：smartnav-hmi 的 systemd drop-in 加 Environment=SMARTNAV_PRESENCE_GATE=0；
+            #   不重啟就關：ros2 param set /voice_trigger_node presence_gate_enable false。
+            DeclareLaunchArgument(
+                "presence_gate", default_value=EnvironmentVariable("SMARTNAV_PRESENCE_GATE", default_value="1")
             ),
             OpaqueFunction(function=_preflight),
         ]

@@ -24,9 +24,15 @@ DEFAULT = {
     "guest_menu_exclude": ["起點"],
     # 身分多久沒更新就當成「沒有人／一般訪客」（人臉每 2 秒推論一次，人走掉 user_auth 也會清掉身分）
     "identity_fresh_sec": 10.0,
-    # ★ 2026-11-24（使用者同意，先 30 秒）：認出貴賓後這麼多秒內，「認不出」或「沒人」仍算同一位貴賓。
-    #   11/24 貴賓室帶位被拒 4 次 —— 等級 VIP↔一般 一小時跳 73 次，客人一轉頭就掉回一般。0 = 關閉。
-    "vip_grace_sec": 30.0,
+    # ★ 2026-11-24（使用者同意，先 30 秒）：認出貴賓後這麼多秒內，「認不出」仍算同一位貴賓。0 = 關閉。
+    #   11/24 貴賓室帶位被拒 4 次 —— 等級 VIP↔一般 一小時跳 73 次，客人一轉頭就掉回一般。
+    # ★ 2026-11-25：預設改 0（關閉）。程式分不出「貴賓角度不好」和「貴賓走開、陌生人馬上接上」，
+    #   寬限期內陌生人會被帶去貴賓室；而那 4 次被拒離上次認出 13～177 秒，8 秒一次都救不回來、30 秒只救回 1 次。
+    #   要用就在 ~/.smartnav/access_policy.json 寫秒數，並接受上述風險。
+    "vip_grace_sec": 0.0,
+    # ★ 2026-11-25：寬限只補「同一張臉暫時認不出」。鏡頭前沒有人（user_auth 發的「無人」）就結束寬限；
+    #   false = 沒有人也繼續算（11/24 原本的行為）。
+    "vip_grace_clear_on_absent": True,
 }
 
 TIER_GUEST = "guest"
@@ -81,7 +87,21 @@ def with_vip_grace(identity: Optional[dict], last_vip: Optional[dict], policy: d
         return identity
     if now - float(last_vip.get("stamp", -1e9)) > grace:
         return identity
-    return {**last_vip, "stamp": now, "vip_grace": True}
+    return {**last_vip, "stamp": now, "vip_grace": True, "vip_grace_age": now - float(last_vip.get("stamp", now))}
+
+
+def next_last_vip(last_vip: Optional[dict], identity: Optional[dict], absent: bool, policy: dict) -> Optional[dict]:
+    """收到一則身分之後，「寬限用的最後一位貴賓」該變成什麼 —— 寬限不可以跨人。
+
+    認出貴賓／員工 → 換成這一位；認出別人（一般註冊者、黑名單）→ 清掉；
+    沒有人 → 依 vip_grace_clear_on_absent 清掉；有臉但認不出 → 不變。
+    ★ 2026-11-25：原本從來不清，「貴賓 → 黑名單 → 黑名單轉頭認不出」會變回貴賓。
+    """
+    if identity and identity.get("recognized"):
+        return dict(identity) if identity.get("user_type") in ("VIP", "ADMIN") else None
+    if absent and policy.get("vip_grace_clear_on_absent", True):
+        return None
+    return last_vip
 
 
 def navigation_denial(tier: str, waypoint_name: str, policy: dict) -> Optional[str]:

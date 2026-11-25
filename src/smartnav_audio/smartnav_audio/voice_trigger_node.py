@@ -17,7 +17,7 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from rcl_interfaces.msg import ParameterDescriptor
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, String
 
@@ -301,18 +301,26 @@ class VoiceTriggerNode(Node):
         self.declare_parameter("presence_min_points", 3)
         self.declare_parameter("presence_hold_sec", 3.0)
         self.declare_parameter("presence_scan_topic", "/scan")
-        self._gate: Optional[PresenceGate] = None
+        # ★ 2026-11-25：收句中門連續關這麼久就收尾（送去辨識）。原本只在「開始收音」那一刻看門，
+        #   進入收句後會場人聲不斷就會一直收下去。0 = 不收尾（原本的行為）。
+        self.declare_parameter("presence_cut_sec", 2.5)
+        self._gate_cut_sec = float(self.get_parameter("presence_cut_sec").value)
+        self._gate_closed_since: Optional[float] = None
+        self._nav_flag = False
         self._gate_blocked = 0
         self._gate_last_log = 0.0
-        if bool(self.get_parameter("presence_gate_enable").value):
-            def gp(name):
-                return self.get_parameter(name).value
-            self._gate = PresenceGate(
-                distance_m=float(gp("presence_distance_m")), front_offset_m=float(gp("presence_front_offset_m")),
-                half_width_m=float(gp("presence_half_width_m")), min_points=int(gp("presence_min_points")),
-                hold_sec=float(gp("presence_hold_sec")))
-            self.create_subscription(LaserScan, str(gp("presence_scan_topic")), self._scan_cb, qos_profile_sensor_data)
-            self.create_subscription(Bool, "/navigation_active", self._nav_active_cb, latched)
+        # ★ 2026-11-25：閘門物件一律建好，用 _gate_enabled 決定要不要擋 —— 現場才能不重啟就切換
+        self._gate_enabled = bool(self.get_parameter("presence_gate_enable").value)
+
+        def gp(name):
+            return self.get_parameter(name).value
+        self._gate: Optional[PresenceGate] = PresenceGate(
+            distance_m=float(gp("presence_distance_m")), front_offset_m=float(gp("presence_front_offset_m")),
+            half_width_m=float(gp("presence_half_width_m")), min_points=int(gp("presence_min_points")),
+            hold_sec=float(gp("presence_hold_sec")))
+        self.create_subscription(LaserScan, str(gp("presence_scan_topic")), self._scan_cb, qos_profile_sensor_data)
+        self.create_subscription(Bool, self.NAV_ACTIVE_TOPIC, self._nav_active_cb, latched)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         wait = float(self.get_parameter("input_mode_wait_sec").value)
         deadline = time.monotonic() + max(0.0, wait)
@@ -325,7 +333,7 @@ class VoiceTriggerNode(Node):
         self._apply_input_mode(mode, fail_loud=True)
 
         self.get_logger().info("✓ 語音喚醒觸發節點已初始化")
-        if self._gate is not None:
+        if self._gate_enabled:
             g = self._gate
             self.get_logger().info(
                 f"  收音距離閘門：車頭前方 {g.distance_m:.1f} m、左右 {g.half_width_m:.1f} m 內有人才觸發"
@@ -586,7 +594,24 @@ class VoiceTriggerNode(Node):
             buf = buf[n:]
         self._remote_buf = buf
 
+    def _nav_watchdog(self) -> None:
+        """導航在「帶位中」掛掉時沒有人會再發 False，閘門會以為還在帶位而一直開著 → 發布端不見就復位
+
+        做法比照 smartnav_vision 的 face_embedding_node._nav_watchdog。
+        """
+        if not self._nav_flag:
+            return
+        try:
+            if self.count_publishers(self.NAV_ACTIVE_TOPIC) > 0:
+                return
+        except Exception:  # noqa: BLE001 —— 查不到就當作正常
+            return
+        self._nav_flag = False
+        self._gate.set_navigating(False)
+        self.get_logger().warning("⚠ /navigation_active 的發布端消失（導航節點掛了？）→ 收音距離閘門恢復正常判斷")
+
     def _remote_watchdog(self) -> None:
+        self._nav_watchdog()
         if self._active_mode != "browser" or self._remote_last == 0.0:
             return
         if time.monotonic() - self._remote_last > self._remote_timeout:
@@ -621,13 +646,42 @@ class VoiceTriggerNode(Node):
     def _scan_cb(self, msg: LaserScan) -> None:
         self._gate.on_scan(msg.angle_min, msg.angle_increment, msg.ranges, msg.range_min, msg.range_max)
 
+    NAV_ACTIVE_TOPIC = "/navigation_active"
+
     def _nav_active_cb(self, msg: Bool) -> None:
+        self._nav_flag = bool(msg.data)
         self._gate.set_navigating(msg.data)
+
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """現場可調：閘門開關、距離、收尾秒數（改了就真的生效，不只是 param get 變）"""
+        for p in params:
+            if p.name == "presence_gate_enable":
+                self._gate_enabled = bool(p.value)
+                self._gate_closed_since = None
+                self.get_logger().info(f"收音距離閘門：{'開' if self._gate_enabled else '關（不限距離）'}")
+            elif p.name == "presence_distance_m":
+                self._gate.distance_m = float(p.value)
+                self.get_logger().info(f"收音距離閘門：{self._gate.distance_m:.1f} m")
+            elif p.name == "presence_cut_sec":
+                self._gate_cut_sec = float(p.value)
+        return SetParametersResult(successful=True)
+
+    def _gate_should_cut(self) -> bool:
+        """正在收句，而門已經連續關了 presence_cut_sec → 該收尾了（帶位中、沒有雷射資料時門本來就是開的）"""
+        if not getattr(self, "_gate_enabled", False) or self._gate_cut_sec <= 0:
+            return False
+        if self._gate.is_open()[0]:
+            self._gate_closed_since = None
+            return False
+        now = time.monotonic()
+        if self._gate_closed_since is None:
+            self._gate_closed_since = now
+        return now - self._gate_closed_since >= self._gate_cut_sec
 
     def _gate_allows(self) -> bool:
         """收音距離閘門開著嗎（沒啟用＝開著）。擋下時累計，log 每 10 秒最多一行。"""
         gate = getattr(self, "_gate", None)
-        if gate is None:
+        if gate is None or not getattr(self, "_gate_enabled", False):
             return True
         ok, why = gate.is_open()
         if ok:
@@ -673,6 +727,7 @@ class VoiceTriggerNode(Node):
             self._command_wait_frames = 0
             self._in_command_initial_wait = False
         elif state == TriggerState.COMMAND:
+            self._gate_closed_since = None
             self._silence_frames = 0
             self._command_wait_frames = 0
             self._in_command_initial_wait = True
@@ -796,6 +851,12 @@ class VoiceTriggerNode(Node):
         # Command 階段
         with self._lock:
             current_state = self._state
+
+        if current_state == TriggerState.COMMAND and not just_triggered and self._gate_should_cut():
+            self._publish_audio(audio, is_final=True)
+            self._set_state(TriggerState.IDLE)
+            self.get_logger().info(f"🔇 前方已沒人 {self._gate_cut_sec:.1f} 秒，這句收尾送去辨識")
+            return triggered
 
         if current_state == TriggerState.COMMAND:
             if self._in_command_initial_wait:

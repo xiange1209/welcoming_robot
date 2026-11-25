@@ -11,6 +11,7 @@
 
 import json
 import re
+import httpx
 import requests
 import threading
 import time
@@ -32,7 +33,7 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from std_msgs.msg import Empty, String
 from action_msgs.msg import GoalStatus
 
-from smartnav_msgs.srv import ListWaypoints
+from smartnav_msgs.srv import ListGuideDestinations, ListWaypoints
 from smartnav_msgs.msg import AccessContext
 from smartnav_msgs.action import RequestNavigation
 from smartnav_llm.llm_utils import get_config_path
@@ -261,6 +262,7 @@ class LLMServiceNode(Node):
         self._requested_model = self.model_name           # 目前「想要」的模型（實際用的可能是同系列的另一版）
         self._param_candidates = list(self.ollama_candidates)
         self._llm_switch_lock = threading.RLock()         # 換主機（背景找主機）與換模型（平板）可能同時發生
+        self._wanted_spec = None    # 切換失敗、還在等它開的那個選擇（_wait_for_wanted_host）
         self._profile_key, self._profile_label = "auto", "自動"
         self._llm_ready_for_profile = False
         self._pending_profile = None
@@ -360,6 +362,12 @@ class LLMServiceNode(Node):
         # "-1" = 常駐到 Ollama 重啟（測試／展示日筆電專門跑這個）；也可給 "60m" 這類時間；"" = 用 Ollama 預設。
         # 要釋放顯存：執行 Ollama 的那台機器上跑 `ollama stop llama3.1:8b`。
         self.keep_alive = self.declare_parameter("keep_alive", "-1").get_parameter_value().string_value
+        # ★ 2026-11-25：連線與讀取逾時。沒設的話主機半路斷線會卡住兩分多鐘，期間每句話都被略過（is_agent_running）。
+        #   讀取逾時是「兩個字之間」最長等多久。第一次從硬碟載入模型實測 46.83 秒（見下面），所以對話 60 秒、
+        #   啟動暖機另給 180 秒；換成更大的模型或更慢的主機要重量。
+        self.llm_connect_timeout_sec = float(self.declare_parameter("llm_connect_timeout_sec", 3.0).value)
+        self.llm_read_timeout_sec = float(self.declare_parameter("llm_read_timeout_sec", 60.0).value)
+        self.llm_warmup_timeout_sec = float(self.declare_parameter("llm_warmup_timeout_sec", 180.0).value)
         # 節點啟動後在背景先問一次（結果丟掉），把模型與系統提示載進顯存，第一位客人不用等 47 秒。
         self.warmup_on_start = self.declare_parameter("warmup_on_start", True).get_parameter_value().bool_value
         # ★★ 2026-10-28：提示快取保溫（keep_warm_sec，<=0 關閉）★★
@@ -425,6 +433,10 @@ class LLMServiceNode(Node):
 
         # 建立服務/動作/客戶端（唯讀的地點查詢；導航一律經 nav_arbiter）
         self.list_waypoints_client = self.create_client(ListWaypoints, "list_waypoints", callback_group=self.cb_group)
+        # 這位客人能去哪些地點（nav_arbiter 依身分算好的）——回答「可以去哪裡」用，不在這裡重寫規則
+        self.list_destinations_client = self.create_client(
+            ListGuideDestinations, "list_guide_destinations", callback_group=self.cb_group
+        )
 
         # 對話行為
         # direct_nav：明確的帶路要求由程式直接送給 nav_arbiter（見 nav_intent.py）；
@@ -756,6 +768,15 @@ class LLMServiceNode(Node):
         except ValueError:
             return {"keep_alive": ka}
 
+    def _ollama_client_kwargs(self, read_timeout: float = 0.0) -> dict:
+        """HTTP 逾時（只給 ChatOllama；keep_warm 用的是 requests，另有自己的逾時）"""
+        fields = getattr(ChatOllama, "model_fields", None) or getattr(ChatOllama, "__fields__", None) or {}
+        if "client_kwargs" not in fields:
+            self.get_logger().warning("這版 langchain_ollama 的 ChatOllama 不能設逾時，主機斷線時最久會卡兩分多鐘")
+            return {}
+        return {"client_kwargs": {"timeout": httpx.Timeout(read_timeout or self.llm_read_timeout_sec,
+                                                           connect=self.llm_connect_timeout_sec)}}
+
     def _on_ollama_url(self, url: str) -> None:
         """自動找到（或換網路後重新找到）Ollama：之後建的 ChatOllama、保溫請求、知識庫向量都改用這個位址。"""
         with self._llm_switch_lock:
@@ -802,6 +823,8 @@ class LLMServiceNode(Node):
     def _switch_profile(self, spec: dict) -> None:
         """執行中換主機／模型：重新找主機、重建對話模型、背景暖機。不用重開 LLM。"""
         with self._llm_switch_lock:
+            self._wanted_spec = None             # 有新的選擇：上一個「等它開了再換」作廢
+            before = self._profile_state()
             model_changed, hosts_changed = self._apply_profile_fields(spec)
             if not (model_changed or hosts_changed):
                 return
@@ -813,6 +836,11 @@ class LLMServiceNode(Node):
                     self.ollama_candidates, self._on_ollama_url,
                     self.get_logger().info, self.get_logger().warning)
                 if not self._ollama_locator.resolve_now():
+                    if self._host_alive(before[5]):
+                        # ★ 2026-11-25：原本只換了模型名稱、主機還是舊的 → 拿新模型名去問舊主機，每題都 404。
+                        #   原本那台還好好的就整組還原，等新主機開了再按一次。
+                        self._restore_profile(before, spec)
+                        return
                     self.get_logger().warning(
                         f"Ollama：「{self._profile_label}」的主機目前都連不到（{self.ollama_candidates}），背景每 15 秒重找")
                 self._ollama_locator.start_background()
@@ -820,6 +848,54 @@ class LLMServiceNode(Node):
                 self._ensure_model(self.ollama_base_url)
             self._rebuild_llm()
         threading.Thread(target=self._warmup_llm, daemon=True).start()
+
+    def _profile_state(self) -> tuple:
+        return (self._profile_key, self._profile_label, self._requested_model, self.model_name,
+                list(self.ollama_candidates), self.ollama_base_url)
+
+    @staticmethod
+    def _host_alive(url: str) -> bool:
+        try:
+            requests.get(f"{url.rstrip('/')}/api/tags", timeout=2.0).json()
+            return True
+        except Exception:  # noqa: BLE001 —— 連不到、回的不是 JSON 都算沒有
+            return False
+
+    def _restore_profile(self, before: tuple, spec: dict) -> None:
+        """切換失敗：主機、模型、找主機的執行緒整組還原，平板的「目前使用」顯示原因 15 秒"""
+        wanted = str(spec.get("label") or spec.get("key") or "")
+        (self._profile_key, self._profile_label, self._requested_model, self.model_name,
+         self.ollama_candidates, self.ollama_base_url) = before
+        if self._ollama_locator is not None:
+            self._ollama_locator.stop()
+            self._ollama_locator = OllamaLocator(
+                self.ollama_candidates, self._on_ollama_url, self.get_logger().info, self.get_logger().warning)
+            self._ollama_locator.start_background()
+        self.get_logger().warning(
+            f"Ollama：「{wanted}」的主機都連不到，沿用「{self._profile_label}」（{self.ollama_base_url}、{self.model_name}）")
+        pub = getattr(self, "llm_model_pub", None)
+        if pub is not None:
+            pub.publish(String(data=f"{self.model_name}（{wanted}連不到，沿用原本的主機，開了會自動換）"))
+            timer = threading.Timer(30.0, lambda: pub.publish(String(data=self.model_name)))
+            timer.daemon = True
+            timer.start()
+        # 平板的選擇還停在新的那個、再按一次不會重送（前端 key === current 就不送）→ 這裡自己等它開
+        self._wanted_spec = spec
+        threading.Thread(target=self._wait_for_wanted_host, args=(spec,), daemon=True).start()
+
+    WANTED_RETRY_SEC = 15.0
+
+    def _wait_for_wanted_host(self, spec: dict) -> None:
+        """切換失敗後在背景等那台主機開起來，開了就自動換過去；期間平板改選別的就作廢"""
+        while self._wanted_spec is spec and rclpy.ok():
+            time.sleep(self.WANTED_RETRY_SEC)
+            if self._wanted_spec is not spec:
+                return
+            hosts = [str(h) for h in (spec.get("hosts") or []) if str(h).strip()] or list(self._param_candidates)
+            if any(self._host_alive(u) for u in (candidate_url(h) for h in hosts) if u):
+                self.get_logger().info(f"Ollama：「{spec.get('label') or spec.get('key')}」的主機開了，自動換過去")
+                self._switch_profile(spec)
+                return
 
     def _ensure_model(self, url: str) -> bool:
         """主機上有沒有要的模型；沒有就改用同系列（qwen2.5:3b → qwen2.5:7b）。回傳 model_name 有沒有變"""
@@ -849,7 +925,7 @@ class LLMServiceNode(Node):
         if pub is not None:
             pub.publish(String(data=self.model_name))      # 平板顯示「目前使用」
 
-    def _make_chat_llm(self, callbacks: list):
+    def _make_chat_llm(self, callbacks: list, read_timeout: float = 0.0):
         """唯一的 ChatOllama 建構處（主迴圈與暖機共用：參數一致，暖機才會把同一份提示載進去）"""
         return ChatOllama(
             base_url=self.ollama_base_url,
@@ -859,6 +935,7 @@ class LLMServiceNode(Node):
             num_ctx=self.num_ctx,  # ★ 上下文長度，見宣告處（Ollama 在 4 GB 顯存的預設只有 4096）
             callbacks=callbacks,
             **self._ollama_extra_kwargs(),
+            **self._ollama_client_kwargs(read_timeout),
         )
 
     def _warmup_llm(self) -> None:
@@ -866,7 +943,7 @@ class LLMServiceNode(Node):
         try:
             time.sleep(2.0)  # 讓節點其他部分先起來
             t0 = time.monotonic()
-            llm = self._make_chat_llm([]).bind_tools(list(self.tools_map.values()))
+            llm = self._make_chat_llm([], self.llm_warmup_timeout_sec).bind_tools(list(self.tools_map.values()))
             chain = RunnablePassthrough() | self.prompt_template | llm
             chain.invoke(
                 {"system_prompt": self._load_system_prompt(), "history": [], "input": "你好", "agent_scratchpad": []}
@@ -987,6 +1064,85 @@ class LLMServiceNode(Node):
             self.get_logger().warning(f"帶位判斷：查地點失敗（交給模型）: {exc}")
             return {}
 
+    def _guide_destinations(self):
+        """nav_arbiter 說這位客人能去的 [(地點ID, 名稱)]；問不到回 None"""
+        try:
+            if not self.list_destinations_client.service_is_ready():
+                return None
+            res = self._wait_for_future(self.list_destinations_client.call_async(ListGuideDestinations.Request()), 3.0)
+            if res is None or not res.success:
+                return None
+            return [(d.waypoint_id, d.name) for d in res.destinations]
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"查可前往的地點失敗: {exc}")
+            return None
+
+    def _allowed_destination_ids(self):
+        """給 list_waypoints_tool 用：能去的地點 ID 集合；問不到回 None（照舊全列，能不能去仍由 nav_arbiter 擋）"""
+        dests = self._guide_destinations()
+        return None if dests is None else {wid for wid, _name in dests}
+
+    def _fixed_answer(self, user_input: str):
+        """答案固定的問題由程式回答（★ 2026-11-25，11/24 錄影模型實際答錯的那幾題）；不是這幾類回 None"""
+        if nav_intent.mentions_fraud(user_input) or tool_gate.needs_help(user_input):
+            return None                          # 求助要走會通報行員的路，不能只回營業時間
+        if nav_intent.asks_destinations(user_input):
+            dests = self._guide_destinations()
+            if dests is None:
+                return None
+            if not dests:
+                return "目前沒有可以帶您過去的地點，需要的話請洽詢櫃檯行員。"
+            return "我可以帶您去" + "、".join(name for _wid, name in dests) + "。"
+        if nav_intent.asks_business_hours(user_input):
+            hours = nav_intent.faq_business_hours(self.knowledge.full_text)
+            return f"本行的營業時間是{hours}" if hours else None
+        if nav_intent.asks_food(user_input):
+            return "這裡沒有用餐或購物的資訊，需要的話請洽詢櫃檯行員。"
+        return None
+
+    def _answer_directly(self, user_input: str, reply: str) -> None:
+        self.get_logger().info(f"📌 固定答案（程式回答，不經模型）：'{user_input}'")
+        self.get_logger().info(f"🤖 Agent 最終決策回應: {reply}")
+        with self.memory_lock:
+            self.memory.add_message(HumanMessage(content=user_input))
+            self.memory.add_message(AIMessage(content=reply))
+        self._publish_reply(reply)
+
+    SORRY_REPLY = "抱歉，我現在沒辦法回答，請稍後再試，或洽櫃檯行員。"
+
+    def _fail_turn(self, user_input: str = "", staff_notified: bool = False) -> None:
+        """這一輪做不下去：清掉畫面上的半截字、丟掉扣住的旁白，對客人只說一句客氣話（原因已寫進 log）
+
+        ★ 客人在求助（被騙、找真人、不舒服）而模型連不上時，由程式通知行員 —— 這種話不能因為模型壞了就漏掉。
+        """
+        try:
+            self.stream_handler.drop_held()
+            self.llm_stream_reset_pub.publish(Empty())
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"清除半截回覆失敗: {exc}")
+        reply = self.SORRY_REPLY
+        if tool_gate.needs_help(user_input) or nav_intent.mentions_fraud(user_input):
+            try:
+                staff_notified = staff_notified or str(
+                    self.tools_map[tool_gate.NOTIFY].invoke({})).startswith("執行結果: 成功")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f"✗ 通知行員失敗: {exc}")
+            if staff_notified:
+                reply = "我已經通知行員過來協助您，請稍候。"
+        if nav_intent.mentions_fraud(user_input):
+            reply = reply.rstrip("。") + "。也可以撥打 165 反詐騙專線。"
+        self._publish_reply(reply)
+
+    @staticmethod
+    def _polish_reply(user_input: str, reply: str, staff_notified: bool):
+        """最後一道：照唸指示就換掉；被詐騙一定要提 165。回傳要換成的句子，不用換回 None"""
+        new = None
+        if nav_intent.leaks_instruction(reply):
+            new = "我已經通知行員，請您稍候。" if staff_notified else "抱歉，這個我現在沒辦法處理，請洽詢櫃檯行員協助。"
+        if nav_intent.mentions_fraud(user_input) and "165" not in (new or reply):
+            new = (new or reply).rstrip("。.！! ") + "。也可以撥打 165 反詐騙專線。"
+        return new
+
     def _try_direct_navigation(self, user_input: str, force_intent: bool = False) -> bool:
         """明確的帶路要求、又對得到唯一地點 → 程式直接導航並回話。回 True 表示已處理完這一輪。
 
@@ -1083,7 +1239,7 @@ class LLMServiceNode(Node):
         """附在系統提示最後的「目前的客人」。brain 沒回報或太久沒更新就當一般訪客（不個人化）。"""
         entry = self._access_context
         if entry is None or time.monotonic() - entry[1] > self.access_context_stale_sec:
-            return ""
+            return customer_prompt.prompt_context("guest", "", "")
         ctx = entry[0]
         return customer_prompt.prompt_context(ctx.tier, ctx.user_name, ctx.description)
 
@@ -1150,6 +1306,7 @@ class LLMServiceNode(Node):
     def _run_agent_loop(self, user_input: str) -> None:
         """ReAct 自主思考迴圈"""
         self.current_user_text = user_input  # 通報行員時用客人的原句（見 tools.notify_staff_tool）
+        staff_notified = False  # 這一輪有沒有真的通知到行員（給最後的用字檢查、失敗時的補救用）
 
         try:
             # 準備工作也要在 try 裡：任何例外都必須走到 finally 清除 is_agent_running，否則節點之後每句話都回「正在處理上一個指令」
@@ -1160,8 +1317,17 @@ class LLMServiceNode(Node):
             with self.memory_lock:
                 chat_history = self.memory.get_history_messages()
 
-            # 檢索會呼叫遠端 Ollama，所以放在這條 agent 執行緒裡（不是 ROS callback）
             self.stream_handler.start_turn()
+            # ★ 2026-10-21：明確的帶路要求交給程式（10/20「帶我去門口」×5，模型零次呼叫導航）
+            # ★ 2026-11-25：移到檢索之前 —— 這兩條都不用知識庫檢索，主機斷線時也不必先等檢索失敗
+            if self.direct_nav and self._try_direct_navigation(user_input):
+                return
+            fixed = self._fixed_answer(user_input)
+            if fixed:
+                self._answer_directly(user_input, fixed)
+                return
+
+            # 檢索會呼叫遠端 Ollama，所以放在這條 agent 執行緒裡（不是 ROS callback）
             t_retrieve = time.monotonic()
             knowledge_section = self._knowledge_section(user_input, chat_history)
             retrieve_sec = time.monotonic() - t_retrieve
@@ -1175,10 +1341,6 @@ class LLMServiceNode(Node):
             max_iterations = 10
             nav_called = False  # 這一輪有沒有呼叫過會讓車移動的工具（給帶位防呆用）
             self.get_logger().info("🧠 LLM 開始進入多步驟決策鏈...")
-
-            # ★ 2026-10-21：明確的帶路要求交給程式（10/20「帶我去門口」×5，模型零次呼叫導航）
-            if self.direct_nav and self._try_direct_navigation(user_input):
-                return
 
             for iteration in range(max_iterations):
                 # ★ 2026-08-17：每一輪都扣。8/17 log 證實 iteration 1 也會
@@ -1245,7 +1407,14 @@ class LLMServiceNode(Node):
                             return
                         final_reply = "抱歉，我現在沒辦法帶您過去，請洽詢櫃檯人員協助。"
                     else:
-                        self.stream_handler.flush_held()
+                        polished = self._polish_reply(user_input, final_reply, staff_notified)
+                        if polished:
+                            # 換掉的句子不能先被送去唸（和上面幾種防呆同一個做法）
+                            self.stream_handler.drop_held()
+                            self.get_logger().warning(f"⚠️ 回覆已調整：{final_reply} → {polished}")
+                            final_reply = polished
+                        else:
+                            self.stream_handler.flush_held()
                     self.get_logger().info(f"🤖 Agent 最終決策回應: {final_reply}")
 
                     with self.memory_lock:
@@ -1304,6 +1473,8 @@ class LLMServiceNode(Node):
                         counts_toward_first_token = not self.stream_handler.seen_token
                         try:
                             tool_result = self.tools_map[tool_name].invoke(tool_args)
+                            if tool_name == tool_gate.NOTIFY and str(tool_result).startswith("執行結果: 成功"):
+                                staff_notified = True
                         except Exception as exc:  # noqa: BLE001
                             self.get_logger().error(f"✗ 工具 {tool_name} 呼叫失敗（參數={tool_args}）: {exc}")
                             tool_result = (
@@ -1328,13 +1499,14 @@ class LLMServiceNode(Node):
                     )
 
             # 超過最大步數
-            timeout_msg = "任務執行步驟過多，已強制中止防止機器人發生異常"
-            self._publish_reply(timeout_msg)
+            self.get_logger().error(f"✗ 超過 {max_iterations} 步仍沒有結論，中止這一輪: {user_input}")
+            self._fail_turn(user_input, staff_notified)
 
-        except Exception as e:
-            error_msg = f"✗ Agent 執行時發生異常: {str(e)}"
-            self.get_logger().error(error_msg)
-            self._publish_reply(error_msg)
+        except Exception as e:  # noqa: BLE001
+            # ★ 2026-11-25：原始錯誤只進 log。11/24 17:46 平板顯示並唸出
+            #   「✗ Agent 執行時發生異常: Server disconnected without sending a response.」
+            self.get_logger().error(f"✗ Agent 執行時發生異常: {type(e).__name__}: {e}")
+            self._fail_turn(user_input, staff_notified)
         finally:
             with self.agent_busy_lock:
                 self.is_agent_running = False

@@ -5,7 +5,7 @@
 
 
 def prompt_context(tier: str, user_name: str, description: str) -> str:
-    """只有 VIP 會拿到姓名；黑名單只給中性的服務限制、不說原因；一般訪客不附加。"""
+    """只有 VIP 會拿到姓名；黑名單只給中性的服務限制、不說原因；一般訪客只提醒不要介紹貴賓專屬的地點。"""
     if tier == "vip":
         name = (user_name or "").strip()
         desc = (description or "").strip()
@@ -18,4 +18,6 @@ def prompt_context(tier: str, user_name: str, description: str) -> str:
     if tier == "blocked":
         return ("\n\n---\n\n# 目前的服務限制\n- 這位客人目前不提供帶位服務。客人要求帶路時，說「需要協助的話，行員馬上會過來為您服務」。\n"
                 "- 不可以提到原因、身分、名單或辨識；其他一般問題照常回答。")
-    return ""
+    # ★ 2026-11-25：11/24 一般訪客問「那我能去哪裡」，模型回「您可以前往貴賓室」（帶位有被擋，但話說錯了）
+    return ("\n\n---\n\n# 目前的客人\n- 這位是一般訪客。貴賓室是貴賓專屬：不要主動介紹，也不要說可以前往；"
+            "客人問起或要去時，說「貴賓室是貴賓專屬的區域，需要的話請洽櫃檯行員協助」。")

@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+import types
 
 import pytest
 
@@ -90,6 +91,7 @@ def test_target_nice(unit, mode, base, floor, obst, want):
     assert cs.target_nice(unit, mode, base, floor, obst) == want
 
 
+@pytest.mark.skipif(_floor_here() > 0, reason="這個環境連 nice 0 都回不去（RLIMIT_NICE=0，例如 WSL）：行程會被略過，不是程式的問題")
 def test_apply_and_restore_all_threads_and_grandchildren():
     proc = _spawn("spawn")
     dummy = _spawn()                     # 代替 HMI 自己，免得把 pytest 的優先權改掉
@@ -162,3 +164,118 @@ def test_unknown_session_is_ignored():
         assert st["processes"] == 0
     finally:
         _kill(dummy)
+
+
+# ── ★ 2026-11-25 ───────────────────────────────────────────────
+def _fake_found(monkeypatch, unit, nice, floor=-10):
+    """假裝 /proc 上有一個行程：第一次看到時 nice 是多少。回傳「被設成多少」的紀錄"""
+    applied = []
+    monkeypatch.setattr(cs, "processes_by_session", lambda m: {unit: [(4242, nice, 1)]})
+    monkeypatch.setattr(cs, "nice_floor_of", lambda pid: floor)
+    monkeypatch.setattr(cs, "apply_nice", lambda pid, target: applied.append((pid, target)) or (1, 0))
+    return applied
+
+
+def test_unit_started_while_guiding_comes_back_to_zero(monkeypatch):
+    applied = _fake_found(monkeypatch, "camera", nice=19)          # 帶位中才啟動：繼承了 launch 的 +19
+    core = cs.CpuShareCore(self_pid=1)
+    core.apply(cs.NAV, {"camera": {"sid": 1}})
+    assert (4242, 19) in applied
+    applied.clear()
+    core.apply(cs.GREET, {"camera": {"sid": 1}})
+    assert (4242, 0) in applied
+
+
+def test_nav_launch_prefix_is_still_respected(monkeypatch):
+    applied = _fake_found(monkeypatch, "nav", nice=10)
+    cs.CpuShareCore(self_pid=1).apply(cs.NAV, {"nav": {"sid": 1}})
+    assert (4242, 10) in applied
+
+
+class _Node:
+    def __init__(self, publishers=1):
+        self.publishers, self.warnings, self.params = publishers, [], {}
+        self.state = types.SimpleNamespace(set_system=lambda **kw: None)
+
+    def declare_parameter(self, name, value):
+        self.params[name] = value
+
+    def get_parameter(self, name):
+        return types.SimpleNamespace(value=self.params[name])
+
+    def create_subscription(self, *a, **k):
+        pass
+
+    def create_timer(self, *a, **k):
+        pass
+
+    def count_publishers(self, topic):
+        assert topic == "/navigation_active"
+        return self.publishers
+
+    def get_logger(self):
+        return types.SimpleNamespace(info=lambda t: None, warning=self.warnings.append)
+
+
+def _sharing(monkeypatch, node, stats):
+    sup = types.SimpleNamespace(managed_sessions=lambda units: {})
+    sh = cs.CpuTimeSharing(node, sup, ["nav"])
+    sh.modes = []
+    sh._core = types.SimpleNamespace(apply=lambda mode, sessions: sh.modes.append(mode) or dict(stats),
+                                     restore=lambda: dict(stats))
+    return sh
+
+
+OK_STATS = {"processes": 3, "changed": 0, "denied": 0, "skipped": 0}
+
+
+def test_mode_falls_back_when_navigation_node_dies(monkeypatch):
+    pytest.importorskip("rclpy")
+    t = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(cs.time, "monotonic", lambda: t.now)
+    node = _Node(publishers=1)
+    sh = _sharing(monkeypatch, node, OK_STATS)
+    sh._on_nav(types.SimpleNamespace(data=True))
+    sh._tick_inner()
+    assert sh.modes[-1] == cs.NAV
+    node.publishers = 0
+    t.now += 1; sh._tick_inner()
+    t.now += 10; sh._tick_inner()
+    assert sh.modes[-1] == cs.GREET and any("發布端消失" in w for w in node.warnings)
+
+
+def test_mode_stays_while_publisher_is_alive(monkeypatch):
+    pytest.importorskip("rclpy")
+    t = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(cs.time, "monotonic", lambda: t.now)
+    sh = _sharing(monkeypatch, _Node(publishers=1), OK_STATS)
+    sh._on_nav(types.SimpleNamespace(data=True))
+    for _ in range(5):
+        sh._tick_inner(); t.now += 6
+    assert set(sh.modes) == {cs.NAV}
+
+
+def test_everything_skipped_is_reported(monkeypatch):
+    pytest.importorskip("rclpy")
+    node = _Node()
+    _sharing(monkeypatch, node, {"processes": 0, "changed": 0, "denied": 0, "skipped": 9})._tick_inner()
+    assert any("沒有作用" in w and "20-asr-priority.conf" in w for w in node.warnings)
+
+
+def test_priority_drop_in_is_in_the_repo():
+    from pathlib import Path
+    conf = Path(__file__).resolve().parents[2] / "smartnav_bringup/systemd/smartnav-hmi.service.d/20-asr-priority.conf"
+    if not conf.parents[2].exists():
+        pytest.skip("只複製了部分套件")
+    text = conf.read_text(encoding="utf-8")
+    assert "LimitNICE=-10" in text and "LimitRTPRIO=30" in text
+
+
+def test_negative_nice_set_by_the_node_itself_is_restored(monkeypatch):
+    applied = _fake_found(monkeypatch, "asr_chain", nice=-10)      # 語音辨識自己設的 -10
+    core = cs.CpuShareCore(self_pid=1)
+    core.apply(cs.NAV, {"asr_chain": {"sid": 1}})
+    monkeypatch.setattr(cs, "read_stat", lambda pid: (1, -10, 1))
+    applied.clear()
+    core.restore()
+    assert (4242, -10) in applied

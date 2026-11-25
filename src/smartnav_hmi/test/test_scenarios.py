@@ -3,6 +3,7 @@
 ★ 2026-11-24：只留「全部開啟／建圖／全部關閉」；全部開啟要跳過已經開著的、導航在定位模式不重開。
 """
 
+import time
 import types
 
 import pytest
@@ -15,7 +16,7 @@ OBSTACLE_LABEL = Mgr.SYSTEM_UNITS["camera"]["variants"]["obstacle"]["label"]
 ECO_LABEL = Mgr.SYSTEM_UNITS["face"]["variants"]["eco"]["label"]
 
 
-def make(running=(), partial=(), modes=None, nav_mode="localization"):
+def make(running=(), partial=(), modes=None, nav_mode="localization", starting=(), stuck=(), started_ago=None):
     """running/partial：單元 key；modes：{unit: system_status 回報的模式名稱}；nav_mode 可以是例外（問不到）"""
     m = object.__new__(Mgr)
     m.nav_camera = types.SimpleNamespace(paused=lambda: False, forget=lambda: None)
@@ -23,10 +24,16 @@ def make(running=(), partial=(), modes=None, nav_mode="localization"):
     m._supervisor = types.SimpleNamespace(
         run_unit_sync=lambda unit, action, variant=None: calls.append((unit, action, variant)) or (True, "ok"),
         request_scenario=lambda key, steps: requests.append((key, list(steps))) or (True, {"steps": list(steps)}),
+        session_started_at=lambda unit: None if started_ago is None else time.time() - started_ago,
     )
     modes = modes or {}
     status = [{"key": u, "running": True, "partial": False, "mode": modes.get(u, "")} for u in running]
     status += [{"key": u, "running": False, "partial": True, "mode": ""} for u in partial]
+    for u in status:                                       # 啟動中可以同時是 partial（只起來一半）
+        u["starting"], u["start_stuck"] = u["key"] in starting, u["key"] in stuck
+    known = {u["key"] for u in status}
+    status += [{"key": u, "running": False, "partial": False, "mode": modes.get(u, ""), "starting": u in starting,
+                "start_stuck": u in stuck} for u in list(starting) + list(stuck) if u not in known]
     m.system_status = lambda: status
 
     def query():
@@ -132,3 +139,45 @@ def test_scenario_list_shapes(key):
     m.SYSTEM_UNITS = Mgr.SYSTEM_UNITS
     item = next(s for s in m.scenario_list() if s["key"] == key)
     assert item["label"] and item["why"]
+
+
+# ── ★ 2026-11-25：「全部開啟」按兩次 ─────────────────────────────
+def test_all_on_twice_while_everything_is_starting_does_nothing():
+    assert plan(starting=DEMO_START, modes={"camera": FACE_LABEL}) == []
+
+
+def test_half_up_but_still_starting_is_left_alone():
+    steps = plan(running=["sensors", "nav"], partial=["asr_chain"], starting=["asr_chain", "camera"],
+                 modes={"camera": FACE_LABEL})
+    units = [u for u, _a, _v in steps]
+    assert "asr_chain" not in units and "camera" not in units and ("nav", "stop", None) not in steps
+
+
+def test_nav_that_cannot_answer_yet_is_kept_when_recently_started():
+    steps = plan(running=["nav"], nav_mode=RuntimeError("服務還沒起來"), started_ago=40)
+    assert ("nav", "stop", None) not in steps and "nav" not in [u for u, _a, _v in steps]
+
+
+def test_nav_that_never_answers_is_restarted_after_the_settle_time():
+    steps = plan(running=["nav"], nav_mode=RuntimeError("壞了"), started_ago=Mgr.NAV_SETTLE_SEC + 5)
+    assert steps[0] == ("nav", "stop", None) and ("nav", "start", None) in steps
+
+
+def test_recent_nav_in_mapping_mode_is_still_restarted():
+    steps = plan(running=["nav"], nav_mode="mapping", started_ago=10)
+    assert steps[0] == ("nav", "stop", None)
+
+
+def test_stuck_unit_is_stopped_then_started():
+    steps = plan(running=["sensors", "nav"], stuck=["llm"])
+    assert ("llm", "stop", None) in steps and ("llm", "start", None) in steps
+
+
+def test_starting_with_wrong_variant_is_replaced():
+    steps = plan(running=["sensors", "nav"], starting=["camera"], modes={"camera": OBSTACLE_LABEL})
+    assert ("camera", "stop", None) in steps and ("camera", "start", "face") in steps
+
+
+def test_all_off_also_stops_units_that_are_still_starting():
+    steps = plan("all_off", running=["sensors"], starting=["nav", "llm"], stuck=["camera"])
+    assert [u for u, a, _v in steps if a == "stop"] == ["llm", "camera", "nav", "sensors"]

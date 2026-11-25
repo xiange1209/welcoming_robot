@@ -67,6 +67,9 @@ def node(monkeypatch):
     n.ollama_candidates = list(PARAM_HOSTS)
     n._llm_switch_lock = threading.RLock()
     n._profile_key, n._profile_label = "auto", "自動"
+    n._wanted_spec = None
+    waiting = []
+    monkeypatch.setattr(mod.LLMServiceNode, "_wait_for_wanted_host", lambda self, spec: waiting.append(spec))
     n._llm_ready_for_profile, n._pending_profile = True, None
     n.ollama_base_url = "http://192.168.11.76:11434"
     n._embedder = None
@@ -79,7 +82,7 @@ def node(monkeypatch):
                                 error=lambda t: logs.append(("error", t)), warn=lambda t: logs.append(("warn", t)))
     n.get_logger = lambda: log
     n._warmup_llm = lambda: None
-    n.t = types.SimpleNamespace(built=built, published=published, logs=logs, tags=tags)
+    n.t = types.SimpleNamespace(built=built, published=published, logs=logs, tags=tags, waiting=waiting)
     return n
 
 
@@ -125,6 +128,35 @@ def test_unreachable_hosts_keep_looking_in_background(node):
     assert any("都連不到" in t for _k, t in node.t.logs)
 
 
+def test_unreachable_choice_restores_host_and_model_together(node):
+    """★ 2026-11-25：同學電腦用得好好的、按「我的筆電」但沒開 → 不可以變成「舊主機＋新模型」"""
+    FakeLocator.url = None
+    node._switch_profile(MINE)
+    assert node.model_name == "llama3.1:8b" and node.ollama_base_url == "http://192.168.11.76:11434"
+    assert node.ollama_candidates == PARAM_HOSTS and node._profile_key == "auto"
+    assert node._ollama_locator.cands == PARAM_HOSTS and node._ollama_locator.started
+    assert "我的筆電" in node.t.published[-1] and node.t.published[-1].startswith("llama3.1:8b")
+    assert node.t.built == []                                            # 沒有用錯的組合重建對話模型
+
+
+def test_when_both_hosts_are_down_the_new_choice_is_kept(node, monkeypatch):
+    FakeLocator.url = None
+
+    def down(url, timeout=0):
+        raise OSError("down")
+    monkeypatch.setattr(mod.requests, "get", down)
+    node._switch_profile(MINE)
+    assert node.ollama_candidates == MINE["hosts"] and node._ollama_locator.started
+
+
+def test_choice_can_be_made_again_after_a_failed_switch(node):
+    FakeLocator.url = None
+    node._switch_profile(MINE)
+    FakeLocator.url = "http://192.168.11.74:11434"
+    node._switch_profile(MINE)
+    assert node.ollama_base_url == "http://192.168.11.74:11434" and node.model_name == "qwen2.5:7b"
+
+
 def test_message_during_startup_is_deferred(node):
     node._llm_ready_for_profile = False
     node._on_llm_profile_msg(types.SimpleNamespace(data='{"key": "mine", "model": "qwen2.5:3b", "hosts": ["h"]}'))
@@ -135,3 +167,37 @@ def test_message_during_startup_is_deferred(node):
 def test_bad_json_is_ignored(node):
     node._on_llm_profile_msg(types.SimpleNamespace(data="not json"))
     assert node.model_name == "llama3.1:8b" and node.t.built == []
+
+
+def test_failed_switch_keeps_waiting_for_the_wanted_host(node):
+    FakeLocator.url = None
+    node._switch_profile(MINE)
+    for _ in range(50):
+        if node.t.waiting:
+            break
+        threading.Event().wait(0.02)
+    assert node.t.waiting == [MINE] and node._wanted_spec is MINE
+    node._switch_profile(AUTO)                                           # 平板改選別的 → 不再等
+    assert node._wanted_spec is None
+
+
+def test_waiting_switches_automatically_when_the_host_comes_up(monkeypatch):
+    n = object.__new__(mod.LLMServiceNode)
+    n._wanted_spec, n._param_candidates, n.WANTED_RETRY_SEC = MINE, [], 0.0
+    alive = iter([False, False, False, False, False, True, True, True, True, True, True, True])
+    switched = []
+    n._host_alive = lambda url: next(alive)
+    n._switch_profile = switched.append
+    n.get_logger = lambda: types.SimpleNamespace(info=lambda t: None)
+    monkeypatch.setattr(mod.rclpy, "ok", lambda: True)
+    monkeypatch.setattr(mod, "candidate_url", lambda h: f"http://{h}:11434")
+    n._wait_for_wanted_host(MINE)
+    assert switched == [MINE]
+
+
+def test_waiting_stops_when_another_choice_is_made(monkeypatch):
+    n = object.__new__(mod.LLMServiceNode)
+    n._wanted_spec, n._param_candidates, n.WANTED_RETRY_SEC = None, [], 0.0
+    n._switch_profile = lambda spec: (_ for _ in ()).throw(AssertionError("不該切換"))
+    monkeypatch.setattr(mod.rclpy, "ok", lambda: True)
+    n._wait_for_wanted_host(MINE)

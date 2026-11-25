@@ -51,6 +51,12 @@ PROFILES: Dict[str, Dict[str, int]] = {
 CAMERA_OBSTACLE_NAV = -5       # 避障模式的相機是導航的一部分
 SELF_NICE = -5                 # HMI 自己：平板畫面、遙控與急停都經過它
 NICE_FLOOR = -10               # 不比 drop-in 給的上限更激進
+# ★ 2026-11-25：launch 檔自己會帶 nice 前綴的單元（導航的 map_service_cc、waypoint_service 是 +10）。
+#   其他單元由 supervisor 保證從 0 開始，正的原值一律當 0：帶位中才啟動的單元，launch 先被排到 +19、之後生出來的
+#   節點繼承 +19，把它記成「原值」就永遠停在 +19（相機、人臉、LLM 變慢，而且沒有任何錯誤訊息）。
+#   負的是節點自己設的（語音辨識 -10），要留著，關掉分時才還原得回去。
+OWN_NICE_UNITS = ("nav",)
+NAV_ACTIVE_TOPIC = "/navigation_active"
 MODE_TEXT = {GREET: "迎賓優先", NAV: "帶位優先", "off": "關閉"}
 
 
@@ -159,7 +165,7 @@ class CpuShareCore:
                 rec = self._seen.get(key)
                 if rec is None:
                     floor = nice_floor_of(pid)
-                    rec = {"unit": unit, "baseline": nice, "floor": floor}
+                    rec = {"unit": unit, "baseline": nice if unit in OWN_NICE_UNITS else min(nice, 0), "floor": floor}
                     self._seen[key] = rec
                 if rec["floor"] is None or rec["floor"] > 0:
                     stats["skipped"] += 1          # 讀不到上限、或連 0 都回不去：不碰
@@ -235,7 +241,7 @@ class CpuTimeSharing:
         self._last_scan = 0.0
         self._warned = ""
         node.create_subscription(
-            Bool, "/navigation_active", self._on_nav,
+            Bool, NAV_ACTIVE_TOPIC, self._on_nav,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE))
         node.create_timer(0.5, self._tick)
 
@@ -247,6 +253,24 @@ class CpuTimeSharing:
                 self._nav = nav
                 if not nav:
                     self._nav_off_at = time.monotonic()
+
+    def _drop_dead_nav(self) -> None:
+        """導航在「帶位中」掛掉時沒有人會再發 False，會一直停在帶位優先 → 發布端不見就當作沒在帶位
+
+        做法比照 smartnav_vision 的 face_embedding_node._nav_watchdog。
+        """
+        with self._lock:
+            if not self._nav:
+                return
+        try:
+            if self._node.count_publishers(NAV_ACTIVE_TOPIC) > 0:
+                return
+        except Exception:  # noqa: BLE001 — 查不到就當作正常
+            return
+        with self._lock:
+            self._nav = False
+            self._nav_off_at = time.monotonic()
+        self._node.get_logger().warning("處理器分時：/navigation_active 的發布端消失（導航節點掛了？）→ 回到迎賓分配")
 
     def _param(self, name: str, default):
         # ★ 每拍用 .value 重讀（「設了沒用的參數」與 .integer_value 讀成 0 的教訓）
@@ -270,6 +294,7 @@ class CpuTimeSharing:
                 self._set_state("off")
                 self._node.get_logger().info(f"處理器分時已關閉：還原 {st['processes']} 個行程、{st['changed']} 條執行緒")
             return
+        self._drop_dead_nav()
         with self._lock:
             nav, off_at = self._nav, self._nav_off_at
         delay = max(0.0, float(self._param("cpu_share_back_delay_sec", 3.0)))
@@ -289,7 +314,12 @@ class CpuTimeSharing:
                 f"（{st['processes']} 個行程、調整 {st['changed']} 條執行緒）")
             self._mode = want
             self._set_state(want)
-        if st["denied"]:
+        if st["skipped"] and not st["processes"]:
+            # 沒有 20-asr-priority.conf 時每個行程都「連 0 都回不去」，全部被略過、也沒有 denied → 以前完全沒有訊息
+            self._warn_once(f"處理器分時沒有作用：{st['skipped']} 個行程都沒有權限調整優先權"
+                            "（HMI 服務缺 LimitNICE=-10；把 smartnav_bringup/systemd/smartnav-hmi.service.d/"
+                            "20-asr-priority.conf 裝到 /etc/systemd/system/smartnav-hmi.service.d/ 後重啟服務）")
+        elif st["denied"]:
             self._warn_once(f"處理器分時：有 {st['denied']} 條執行緒沒有權限調高優先權"
                             "（HMI 服務需要 LimitNICE=-10，見 20-asr-priority.conf）；降低優先權的部分照樣生效")
 

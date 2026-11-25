@@ -214,3 +214,61 @@ def is_robot_echo(user_text: str, robot_said: Iterable[str], overlap: float = 0.
         if len(got_bg) >= 3 and len(got_bg & _bigrams(ref)) / len(got_bg) >= overlap:
             return True
     return False
+
+
+# ── ★ 2026-11-25：答案固定、或答錯代價高的問題由程式回答（11/24 錄影實際答錯的那幾題）──────────
+#   「我能去哪裡」對一般訪客列出貴賓室、營業時間答成星期二到五、「肚子餓」編出不存在的食堂。
+_BUSINESS = re.compile(r"(開戶|換錢|換匯|兌換|存款|存錢|提款|領錢|匯款|轉帳|貸款|借錢|繳費|繳錢|信用卡|保險|掛失|辦理|辦卡|申請)")
+# 「那裡」是指代（可以帶我去那裡嗎），不是在問有哪些地方 → 只收「哪」；語音把「哪」聽成「那」時只收整句就是這個問題的
+_ASK_PLACES = re.compile(
+    r"((可以|能|能夠)(帶我|帶你|帶您)?(去|到)哪(裡|裏|些|邊|兒)|"
+    r"(有|去)(哪些|哪幾個|什麼|甚麼)(地方|地點)(是)?(我)?(可以|能)(去|到|帶)|有(哪些|哪幾個)(地方|地點)$|"
+    r"(哪裡|哪些地方|什麼地方)(是)?(我)?(可以|能)(去|到)(呢|呀|啊)?$|"
+    r"^(那|請問)?(我|你|您)?(可以|能)(去|到)那(裡|些地方)(呢|呀|啊|阿)?$)"
+)
+_ASK_HOURS = re.compile(
+    r"(營業時間|營業到|幾點(開|關|營業|打烊|休息|下班|上班)|(開|營業)到幾點|什麼時候(開門|關門|營業|打烊)|"
+    r"(有|會)?(開門|營業|上班)嗎|幾點關|打烊)"
+)
+_NOT_BANK_HOURS = re.compile(r"(atm|提款機|停車|網銀|捷運|公車)")
+_ASK_FOOD = re.compile(r"(肚子餓|好餓|餓了|想吃|要吃|吃飯|吃東西|用餐|餐廳|食堂|便利商店|超商|咖啡廳|買飲料)")
+_FRAUD = re.compile(r"(詐騙|被騙|騙走|騙了我|騙我|可疑的?(電話|簡訊|訊息))")
+# 寫給模型看的指示被照唸（11/24：「請告知客戶行員即將前來」）
+_INSTRUCTION_LEAK = re.compile(
+    r"(請?(告知|告訴|轉告)(客戶|客人|顧客)|對(客戶|客人|顧客)說|執行結果|詳細信息|不可重試)"
+)
+
+
+def asks_destinations(text: str) -> bool:
+    """在問「可以去哪些地方」（不是問某一項業務要去哪裡辦）"""
+    s = normalize(text)
+    return bool(_ASK_PLACES.search(s)) and not _BUSINESS.search(s)
+
+
+def asks_business_hours(text: str) -> bool:
+    """在問本行的營業時間"""
+    s = normalize(text)
+    return bool(_ASK_HOURS.search(s)) and not _NOT_BANK_HOURS.search(s)
+
+
+def asks_food(text: str) -> bool:
+    return bool(_ASK_FOOD.search(normalize(text)))
+
+
+def mentions_fraud(text: str) -> bool:
+    return bool(_FRAUD.search(normalize(text)))
+
+
+def leaks_instruction(reply: str) -> bool:
+    """回覆裡有沒有把「給模型看的指示或工具結果」照唸出來"""
+    return bool(reply) and bool(_INSTRUCTION_LEAK.search(reply))
+
+
+def faq_business_hours(faq_text: str) -> Optional[str]:
+    """從知識庫「營業時間」那一節取第一句（照抄，不改寫）；沒有那一節回 None"""
+    m = re.search(r"^##\s*營業時間[^\n]*\n(.+?)(?=^##|\Z)", faq_text or "", re.MULTILINE | re.DOTALL)
+    if not m:
+        return None
+    line = next((ln.strip().lstrip("-").strip() for ln in m.group(1).splitlines() if ln.strip()), "")
+    first = line.split("。")[0].strip()
+    return first + "。" if first else None

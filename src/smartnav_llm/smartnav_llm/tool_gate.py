@@ -45,6 +45,11 @@ def is_social(text: str) -> bool:
     return bool(_SOCIAL.match(_PUNCT.sub("", text or "")))
 
 
+def needs_help(text: str) -> bool:
+    """句子有求助意圖（真人、被騙、不舒服…）：要交給會通報行員的那條路，不可以被固定答案攔下"""
+    return bool(_HELP.search(text or ""))
+
+
 def allowed_tools(text: str, available: Iterable[str]) -> List[str]:
     """依客人這句話，回傳這一輪可以給模型的工具名稱（保持 available 的順序）"""
     available = list(available)

@@ -49,6 +49,7 @@
 """
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -94,6 +95,11 @@ class BankReceptionNode(Node):
         # 認不出的臉要連續出現這麼久才用一般迎賓詞：貴賓走近時常先「認不出」、下一幀才認出，
         # 不等的話會先說「您好歡迎光臨」、緊接著又說「某某貴賓您好」
         self.visitor_confirm_sec = float(self.declare_parameter("visitor_confirm_sec", 4.0).value)
+        # ★ 2026-11-25：黑名單的「行員通知」和「問候」分開算。問候照 regreet_absent_sec（180 秒）；通知改成
+        #   「離開鏡頭 blacklist_absent_sec 再出現＝新的一次到訪，每次到訪通知一次」，兩次通知至少隔
+        #   blacklist_notify_sec。原本共用 180 秒的判斷，黑名單 3 分鐘內再走進來 Telegram 也不會發。
+        self.blacklist_absent_sec = float(self.declare_parameter("blacklist_absent_sec", 30.0).value)
+        self.blacklist_notify_sec = float(self.declare_parameter("blacklist_notify_sec", 60.0).value)
         # 額外的保守門檻。user_auth_node 的 recognized 已經判斷過一次，
         # 這裡只是再收緊一點，避免遠距離的低品質辨識觸發劇本。
         self.min_confidence = self.declare_parameter("min_confidence", 0.5).get_parameter_value().double_value
@@ -101,6 +107,9 @@ class BankReceptionNode(Node):
         #   黑名單與 VIP 一樣只看 user_auth_node 的 recognition_threshold（0.70）——
         #   全系統只有一個辨識門檻，要調就調那一個。
         #   0.80 的實測問題：黑名單本人站在鏡頭前相似度 0.747~0.795，一次都沒通報。
+
+        # ★ 2026-11-25：從平板啟動時沒有參數可帶 → 展示當天要調秒數就寫 ~/.smartnav/bank_reception.json
+        self._apply_overrides(self._load_overrides())
 
         self.notify_backend = self.declare_parameter("notify_backend", "none").get_parameter_value().string_value
         self.telegram_bot_token = self.declare_parameter("telegram_bot_token", "").get_parameter_value().string_value
@@ -164,6 +173,9 @@ class BankReceptionNode(Node):
         # ── 狀態 ──────────────────────────────────────────────
         self._last_seen: dict = {}        # key → 最後一次「問候」（訪客共用 "visitor"）
         self._seen_at: dict = {}          # 貴賓／黑名單 key → 最後一次「看到」（每一則都更新）
+        self._notified_at: dict = {}      # 黑名單 key → 最後一次通知行員的時間
+        self._visit_notified: dict = {}   # 黑名單 key → 這次到訪通知過了沒
+        self._visit_greeted: dict = {}    # 貴賓／黑名單 key → 這次到訪問候過了沒
         self._last_face_at = -1e9         # 任何一張臉最後出現的時間
         self._last_vip_at = -1e9          # 最後一次認出貴賓
         self._last_talk_at = -1e9         # 最後一次有人講話（語音觸發／辨識出句子）或 LLM 回答
@@ -192,6 +204,40 @@ class BankReceptionNode(Node):
             f"通報後端 {self.notify_backend}"
             f"{'（dry-run，只印 log 不實際送出）' if self.notify_backend != 'telegram' else ''}"
         )
+
+    # ── 現場可調的秒數 ────────────────────────────────────────
+    OVERRIDES_PATH = Path.home() / ".smartnav" / "bank_reception.json"
+    OVERRIDE_KEYS = (
+        "cooldown_sec", "visitor_cooldown_sec", "regreet_absent_sec", "vip_shadow_sec", "visitor_absent_reset_sec",
+        "quiet_after_talk_sec", "greet_pending_max_sec", "visitor_confirm_sec", "blacklist_absent_sec",
+        "blacklist_notify_sec",
+    )
+
+    def _load_overrides(self) -> dict:
+        if not self.OVERRIDES_PATH.is_file():
+            return {}
+        try:
+            # utf-8-sig：Windows 記事本存的檔案開頭有 BOM
+            data = json.loads(self.OVERRIDES_PATH.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            self.get_logger().warning(f"⚠ {self.OVERRIDES_PATH} 讀不懂，全部用預設值：{exc}")
+            return {}
+        if not isinstance(data, dict):
+            self.get_logger().warning(f"⚠ {self.OVERRIDES_PATH} 的內容要是 {{...}}，全部用預設值")
+            return {}
+        return data
+
+    def _apply_overrides(self, data: dict) -> None:
+        """只收上面列的秒數；寫錯的略過並講出來（寫錯檔案不能讓迎賓起不來，也不能讓人以為生效了）"""
+        for key, value in data.items():
+            if key not in self.OVERRIDE_KEYS:
+                self.get_logger().warning(f"⚠ {self.OVERRIDES_PATH.name}：不認得 {key}，略過（可用：{', '.join(self.OVERRIDE_KEYS)}）")
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                self.get_logger().warning(f"⚠ {self.OVERRIDES_PATH.name}：{key} 要是 0 以上的數字，{value!r} 略過")
+                continue
+            setattr(self, key, float(value))
+            self.get_logger().info(f"⚙ {key} = {float(value):g}（{self.OVERRIDES_PATH.name}）")
 
     # ── 密鑰檔 ────────────────────────────────────────────────
     SECRETS_PATH = Path.home() / ".smartnav" / "secrets" / "bank_reception.yaml"
@@ -319,7 +365,19 @@ class BankReceptionNode(Node):
 
         person = (msg.user_uuid or name) if ptype in ("VIP", "BLACKLIST") else "visitor"
         self._flush_pending(person, now)
-        if not self._should_greet(ptype, person, now):
+        seen_gap = now - self._seen_at.get(person, -1e9)     # 要在 _should_greet 更新 _seen_at 之前取
+        greet = self._should_greet(ptype, person, now)
+        if ptype == "BLACKLIST" and self._should_notify_blacklist(person, seen_gap, now):
+            # ★ 2026-11-03：以前現場播中性的「已通知行員前來協助」（speech_text，客人聽得到）。
+            #   使用者決定改成「出現黑名單」、而且只在已登入（行員）的平板上唸 —— 客人那一側完全不出聲：
+            #   當著本人的面播報會讓情況升溫，對誤判的人也是冒犯，所以絕不能走 speech_text／機器人喇叭。
+            self._staff_alert(self.staff_alert_blacklist, name)
+            # 送不出去就把「這次到訪通知過了」收回，60 秒冷卻後人還在會再通知一次
+            self._send_notification(
+                f"⚠️ 偵測到黑名單人員：{name}（相似度 {msg.similarity:.2f}）請行員立即前往現場",
+                on_fail=lambda key=person: self._visit_notified.__setitem__(key, False))
+            self._emit_event("blacklist_alert", name, msg.similarity)
+        if not greet:
             return
         quiet = now - self._last_talk_at < self.quiet_after_talk_sec
 
@@ -330,18 +388,12 @@ class BankReceptionNode(Node):
             self._emit_event("vip_greeting", name, msg.similarity)
         elif ptype == "BLACKLIST":
             self._state = "ALERTING"
-            # ★ 2026-11-03：以前現場播中性的「已通知行員前來協助」（speech_text，客人聽得到）。
-            #   使用者決定改成「出現黑名單」、而且只在已登入（行員）的平板上唸 —— 客人那一側完全不出聲：
-            #   當著本人的面播報會讓情況升溫，對誤判的人也是冒犯，所以絕不能走 speech_text／機器人喇叭。
-            self._staff_alert(self.staff_alert_blacklist, name)
             # ★ 2026-11-03（使用者決定）：客人那一側要跟「未知訪客」聽起來一模一樣 ——
             #   播一般訪客的迎賓詞（speech_text：迎賓平板＋機器人喇叭），而且遵守同一個「visitor」冷卻：
             #   前一位訪客剛被問候過的 5 分鐘內就不播，跟一般陌生人的行為完全相同，旁人聽不出差別。
             if now - self._last_seen.get("visitor", -1e9) >= self.visitor_cooldown_sec:
                 self._last_seen["visitor"] = now
                 self._say_or_defer(self.visitor_greeting, person, now, quiet)
-            self._send_notification(f"⚠️ 偵測到黑名單人員：{name}（相似度 {msg.similarity:.2f}）" f"請行員立即前往現場")
-            self._emit_event("blacklist_alert", name, msg.similarity)
         else:
             self._state = "GREETING"
             self._say_or_defer(self.visitor_greeting, person, now, quiet)
@@ -365,10 +417,15 @@ class BankReceptionNode(Node):
             if ptype == "VIP":
                 self._last_vip_at = now
                 self._unknown_since = None   # 剛才認不出的多半就是這位
-            if gap < self.regreet_absent_sec:
+            if gap >= self.regreet_absent_sec:
+                self._visit_greeted[key] = False
+            if self._visit_greeted.get(key, False):
                 return False                 # 一直都在（中間沒離開夠久）→ 不再問候
+            # ★ 2026-11-25：冷卻中回來的不會整次到訪都漏掉 —— 冷卻一過、人還在就問候
+            #   （regreet_absent_sec 調得比 cooldown_sec 小時才會遇到，展示日的建議值就是）
             if now - self._last_seen.get(key, -1e9) < self.cooldown_sec:
                 return False
+            self._visit_greeted[key] = True
             self._last_seen[key] = now
             return True
         if now - self._last_vip_at < self.vip_shadow_sec:
@@ -380,6 +437,19 @@ class BankReceptionNode(Node):
         if now - self._last_seen.get("visitor", -1e9) < self.visitor_cooldown_sec:
             return False
         self._last_seen["visitor"] = now
+        return True
+
+    def _should_notify_blacklist(self, key: str, seen_gap: float, now: float) -> bool:
+        """黑名單要不要（再）通知行員：每次到訪一次，與有沒有被問候過無關。
+
+        冷卻中走進來的不會漏掉：這次到訪還沒通知過，冷卻一過、人還在就通知。
+        """
+        if seen_gap >= self.blacklist_absent_sec:
+            self._visit_notified[key] = False
+        if self._visit_notified.get(key, False) or now - self._notified_at.get(key, -1e9) < self.blacklist_notify_sec:
+            return False
+        self._visit_notified[key] = True
+        self._notified_at[key] = now
         return True
 
     def _say_or_defer(self, text: str, person: str, now: float, quiet: bool) -> None:
@@ -429,7 +499,7 @@ class BankReceptionNode(Node):
         )
         self.event_pub.publish(String(data=payload))
 
-    def _send_notification(self, text: str) -> None:
+    def _send_notification(self, text: str, on_fail=None) -> None:
         if self.notify_backend != "telegram":
             # dry-run 是刻意的預設：沒設 token 也能完整演一遍劇本，
             # log 裡看得到「本來會送出什麼」。
@@ -440,21 +510,29 @@ class BankReceptionNode(Node):
             return
         # 推播走獨立執行緒：網路慢也不能卡住辨識 callback，
         # 卡住的話後面的人臉事件會整個塞住。
-        threading.Thread(target=self._telegram_send, args=(text,), daemon=True).start()
+        threading.Thread(target=self._telegram_send, args=(text, on_fail), daemon=True).start()
 
-    def _telegram_send(self, text: str) -> None:
+    # 熱點瞬斷時重送：馬上、3 秒後、再 6 秒後
+    TELEGRAM_RETRY_DELAYS = (0.0, 3.0, 6.0)
+
+    def _telegram_send(self, text: str, on_fail=None) -> None:
         # 用標準庫的 urllib 而不是 requests：零新依賴，Pi 上不用再 pip install
         url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
         data = json.dumps({"chat_id": self.telegram_chat_id, "text": text}).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                if resp.status == 200:
-                    self.get_logger().info("✓ Telegram 通報已送出")
-                else:
-                    self.get_logger().error(f"✗ Telegram 回應異常: HTTP {resp.status}")
-        except Exception as e:
-            self.get_logger().error(f"✗ Telegram 通報失敗: {e}")
+        for i, delay in enumerate(self.TELEGRAM_RETRY_DELAYS, 1):
+            if delay:
+                time.sleep(delay)
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        self.get_logger().info("✓ Telegram 通報已送出")
+                        return
+                    self.get_logger().error(f"✗ Telegram 回應異常: HTTP {resp.status}（第 {i} 次）")
+            except Exception as e:
+                self.get_logger().error(f"✗ Telegram 通報失敗（第 {i} 次）: {e}")
+        if on_fail is not None:
+            on_fail()
 
     # ── 訪客記錄（SQLite）────────────────────────────────────
     def _init_visit_db(self) -> None:

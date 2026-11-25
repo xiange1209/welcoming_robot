@@ -86,6 +86,9 @@ class NavArbiterNode(Node):
 
     # ── 身分 ──────────────────────────────────────────────
     def _identity_cb(self, msg: UserIdentity) -> None:
+        policy = access_policy.load_policy()
+        # 「無人」是 user_auth 明確發的 bbox 全 0；有臉但認不出時 bbox 是真的框
+        absent = not msg.recognized and not any(float(v) for v in msg.bbox)
         with self._identity_lock:
             self._identity = {
                 "recognized": bool(msg.recognized),
@@ -94,8 +97,7 @@ class NavArbiterNode(Node):
                 "description": msg.description,
                 "stamp": time.monotonic(),
             }
-            if self._identity["recognized"] and self._identity["user_type"] in ("VIP", "ADMIN"):
-                self._last_vip = dict(self._identity)
+            self._last_vip = access_policy.next_last_vip(self._last_vip, self._identity, absent, policy)
 
     def _current(self):
         """（tier, identity, policy）"""
@@ -116,7 +118,8 @@ class NavArbiterNode(Node):
         key = (tier, msg.user_name)
         if key != self._last_context:
             self._last_context = key
-            self.get_logger().info(f"👤 客人等級：{tier}")
+            grace = f"（貴賓寬限，離上次認出 {identity.get('vip_grace_age', 0.0):.1f} 秒）" if identity.get("vip_grace") else ""
+            self.get_logger().info(f"👤 客人等級：{tier}{grace}")
 
     # ── 地點 ──────────────────────────────────────────────
     def _call(self, client, request, timeout: float):
@@ -198,11 +201,15 @@ class NavArbiterNode(Node):
         if operator:
             return None, name
 
-        tier, _identity, policy = self._current()
+        tier, identity, policy = self._current()
         deny = access_policy.navigation_denial(tier, name, policy)
         if deny:
             self.get_logger().info(f"🚫 帶位拒絕：{name}（來源 {goal.source}，等級 {tier}）")
             return self._result(Req.Result.OUTCOME_DENIED, deny), name
+        if identity.get("vip_grace"):
+            # 事後查得出「這一趟是靠寬限放行的」：認不出的那幾秒要不要算貴賓，靠這行看
+            self.get_logger().warning(
+                f"⏳ 靠貴賓寬限放行：{name}（離上次認出 {identity.get('vip_grace_age', 0.0):.1f} 秒）")
         return None, name
 
     def _execute(self, goal_handle):

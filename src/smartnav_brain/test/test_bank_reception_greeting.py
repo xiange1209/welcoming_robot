@@ -22,6 +22,8 @@ class Sim:
         n.regreet_absent_sec, n.vip_shadow_sec = 180.0, 60.0
         n.visitor_absent_reset_sec, n.quiet_after_talk_sec, n.visitor_confirm_sec = 30.0, 15.0, 4.0
         n.greet_pending_max_sec = 30.0
+        n.blacklist_absent_sec, n.blacklist_notify_sec = 30.0, 60.0
+        n._notified_at, n._visit_notified, n._visit_greeted = {}, {}, {}
         n.vip_greeting, n.visitor_greeting = "{name}貴賓您好", "您好歡迎光臨"
         n.staff_alert_vip, n.staff_alert_blacklist, n.staff_alert_visitor = "出現貴賓{name}", "出現黑名單{name}", "出現訪客"
         n._last_seen, n._seen_at = {}, {}
@@ -30,13 +32,15 @@ class Sim:
         n._unknown_since = None
         n._pending = None
         self.said, self.alerts, self.logged = [], [], []
+        self.notified = []
         n._say = self.said.append
         n._staff_alert = lambda tpl, name: self.alerts.append(tpl.format(name=name))
         n._emit_event = lambda *a: None
         n._log_visit = lambda msg, ptype: self.logged.append(ptype)
-        n._send_notification = lambda text: None
+        n._send_notification = lambda text, on_fail=None: self.notified.append(text)
+        self.warnings = []
         log = types.SimpleNamespace(info=lambda *a, **k: None, warn=lambda *a, **k: None,
-                                    warning=lambda *a, **k: None, error=lambda *a, **k: None)
+                                    warning=lambda t, *a, **k: self.warnings.append(t), error=lambda *a, **k: None)
         n.get_logger = lambda: log
         self.n = n
 
@@ -179,3 +183,142 @@ def test_talk_callbacks_update_time(sim):
     assert sim.n._last_talk_at == sim.t - 5
     sim.n._on_voice_triggered(types.SimpleNamespace(data=True))
     assert sim.n._last_talk_at == sim.t
+
+
+# ── ★ 2026-11-25：黑名單通知和問候分開 ────────────────────────────
+def test_blacklist_notifies_again_after_cooldown_even_within_regreet_window(sim):
+    sim.face(BLACKLIST)
+    assert len(sim.notified) == 1 and len(sim.alerts) == 1
+    sim.t += 90                       # 還在 180 秒「不重複問候」內，但已過通知冷卻
+    sim.face(BLACKLIST)
+    assert len(sim.notified) == 2 and len(sim.alerts) == 2
+    assert len(sim.logged) == 1       # 來訪紀錄與問候照舊，不因為再次通知而多記一筆
+    assert len(sim.visitor_greetings()) <= 1
+
+
+def test_blacklist_standing_still_is_not_spammed(sim):
+    sim.run(300, 2, lambda: sim.face(BLACKLIST))
+    assert len(sim.notified) == 1
+
+
+def test_blacklist_brief_dropout_is_the_same_visit(sim):
+    sim.face(BLACKLIST)
+    for _ in range(10):               # 每次消失 20 秒又出現（轉頭、沒認到），還是同一次到訪
+        sim.t += 20
+        sim.face(BLACKLIST)
+    assert len(sim.notified) == 1
+
+
+def test_blacklist_back_during_cooldown_is_notified_when_it_ends(sim):
+    sim.face(BLACKLIST)
+    sim.t += 35                       # 離開 35 秒 → 新的到訪，但冷卻（60 秒）還沒過
+    sim.run(40, 2, lambda: sim.face(BLACKLIST))
+    assert len(sim.notified) == 2     # 冷卻一過就通知，不會整次到訪都漏掉
+
+
+def test_blacklist_notify_cooldown_is_per_person(sim):
+    sim.face(BLACKLIST, name="X", uuid="u-x")
+    sim.face(BLACKLIST, name="Y", uuid="u-y")
+    assert len(sim.notified) == 2
+
+
+def test_vip_and_visitor_never_notify(sim):
+    sim.run(200, 5, lambda: sim.face(VIP))
+    sim.run(60, 2, lambda: sim.face(GUEST))
+    assert sim.notified == []
+
+
+def test_overrides_change_only_known_numbers(sim, tmp_path, monkeypatch):
+    f = tmp_path / "bank_reception.json"
+    f.write_text('{"regreet_absent_sec": 40, "vip_shadow_sec": 12.5, "cooldown_sec": -1, "quiet_after_talk_sec": "5", '
+                 '"visitor_cooldown_sec": true, "min_confidence": 0.1}', encoding="utf-8")
+    monkeypatch.setattr(brn.BankReceptionNode, "OVERRIDES_PATH", f)
+    sim.n._apply_overrides(sim.n._load_overrides())
+    assert (sim.n.regreet_absent_sec, sim.n.vip_shadow_sec) == (40.0, 12.5)
+    assert (sim.n.cooldown_sec, sim.n.quiet_after_talk_sec, sim.n.visitor_cooldown_sec) == (60.0, 15.0, 300.0)
+    assert sim.n.min_confidence == 0.5
+    assert len(sim.warnings) == 4                # 負的、字串、布林、不認得的鍵：都要講出來
+
+
+def test_broken_override_file_is_ignored(sim, tmp_path, monkeypatch):
+    f = tmp_path / "bank_reception.json"
+    f.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(brn.BankReceptionNode, "OVERRIDES_PATH", f)
+    assert sim.n._load_overrides() == {}
+    f.write_text("[1, 2]", encoding="utf-8")
+    assert sim.n._load_overrides() == {} and len(sim.warnings) == 2
+
+
+def test_override_file_saved_by_notepad_with_bom_works(sim, tmp_path, monkeypatch):
+    f = tmp_path / "bank_reception.json"
+    f.write_bytes(b"\xef\xbb\xbf" + b'{"regreet_absent_sec": 35}')
+    monkeypatch.setattr(brn.BankReceptionNode, "OVERRIDES_PATH", f)
+    sim.n._apply_overrides(sim.n._load_overrides())
+    assert sim.n.regreet_absent_sec == 35.0 and sim.warnings == []
+
+
+def test_nan_is_rejected(sim):
+    sim.n._apply_overrides({"regreet_absent_sec": float("nan"), "cooldown_sec": float("inf")})
+    assert sim.n.regreet_absent_sec == 180.0 and sim.n.cooldown_sec == 60.0
+
+
+def test_vip_coming_back_during_cooldown_is_greeted_when_it_ends(sim):
+    """展示日把 regreet 調到 30（小於 cooldown 60）：冷卻中回來不能整次到訪都不問候"""
+    sim.n.regreet_absent_sec = 30.0
+    sim.face(VIP)
+    sim.t += 40
+    sim.run(40, 2, lambda: sim.face(VIP))
+    assert len(sim.vip_greetings()) == 2
+    sim.run(300, 2, lambda: sim.face(VIP))       # 之後一直站著不再重講
+    assert len(sim.vip_greetings()) == 2
+
+
+def _telegram_node(monkeypatch, outcomes):
+    n = object.__new__(brn.BankReceptionNode)
+    n.telegram_bot_token, n.telegram_chat_id = "t", "c"
+    n.get_logger = lambda: types.SimpleNamespace(info=lambda *a: None, error=lambda *a: None)
+    calls = []
+
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout=0):
+        calls.append(1)
+        r = outcomes.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return Resp()
+    monkeypatch.setattr(brn.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(brn.time, "sleep", lambda s: None)
+    return n, calls
+
+
+def test_telegram_retries_after_a_short_outage(monkeypatch):
+    failed = []
+    n, calls = _telegram_node(monkeypatch, [OSError("斷線"), True])
+    n._telegram_send("x", lambda: failed.append(1))
+    assert len(calls) == 2 and failed == []
+
+
+def test_telegram_gives_up_and_reports(monkeypatch):
+    failed = []
+    n, calls = _telegram_node(monkeypatch, [OSError("斷線")] * 3)
+    n._telegram_send("x", lambda: failed.append(1))
+    assert len(calls) == 3 and failed == [1]
+
+
+def test_blacklist_is_notified_again_when_sending_failed(sim):
+    sent = []
+
+    def fail(text, on_fail=None):
+        sent.append(text)
+        on_fail()
+    sim.n._send_notification = fail
+    sim.run(130, 2, lambda: sim.face(BLACKLIST))
+    assert len(sent) >= 2                        # 站著不動，但上一則沒送出去 → 冷卻後再送

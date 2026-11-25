@@ -35,12 +35,18 @@ def make_tools(node, enable_realtime_info: bool) -> dict:
             res = node._wait_for_future(node.list_waypoints_client.call_async(ListWaypoints.Request()), 5.0)
             if not res.success:
                 return f"執行結果: 失敗, 詳細信息: {res.message}"
+            # ★ 2026-11-25：只列這位客人能去的（一般訪客看不到貴賓室）。判斷仍在 nav_arbiter；問不到就照列
+            allowed = node._allowed_destination_ids()
             rows = [
                 (wp.waypoint_id, wp.waypoint_name, wp.map_id, (wp.pose.position.x, wp.pose.position.y))
                 for wp in res.waypoints_info
+                if allowed is None or wp.waypoint_id in allowed
             ]
+            note = ""
+            if allowed is not None and len(rows) < len(res.waypoints_info):
+                note = "；清單以外的地點這位客人不能前往（貴賓室是貴賓專屬），客人要去時請對方洽櫃檯行員"
             return (
-                f"執行結果: 成功, 地點列表信息(包含地點ID、地點名稱、地圖ID、地點座標): {rows}, 詳細信息: {res.message}"
+                f"執行結果: 成功, 地點列表信息(包含地點ID、地點名稱、地圖ID、地點座標): {rows}, 詳細信息: {res.message}{note}"
             )
         except Exception as e:
             return f"執行結果: 失敗, 詳細信息: {str(e)}"
@@ -48,7 +54,7 @@ def make_tools(node, enable_realtime_info: bool) -> dict:
     @tool
     def navigate_tool(waypoint_id: str) -> str:
         """帶客戶走到特定地點（機器人會實際開過去帶路），請提供地點ID而非座標。
-        不知道地點ID時，先呼叫 list_waypoints_tool 查詢；貴賓室也是一般地點，用這個工具帶過去"""
+        不知道地點ID時，先呼叫 list_waypoints_tool 查詢；貴賓室也用這個工具，能不能去由系統判斷"""
         # 地點是否存在、這位客人能不能去，都由 nav_arbiter 判斷；被拒絕時結果裡會帶要對客人說的話
         try:
             return node._navigate_to(waypoint_id)
@@ -65,7 +71,7 @@ def make_tools(node, enable_realtime_info: bool) -> dict:
             # 而這段文字會直接送到行員的手機（bank_reception_node → Telegram）
             said = (node.current_user_text or "").strip() or "（未取得客戶原話）"
             node.staff_notify_pub.publish(String(data=f"🔔 機器人通報：客戶說「{said}」"))
-            return "執行結果: 成功, 詳細信息: 已送出行員通報，請告知客戶行員即將前來"
+            return "執行結果: 成功, 詳細信息: 行員已收到通知，正在前來"
         except Exception as e:
             return f"執行結果: 失敗, 詳細信息: {str(e)}"
 
