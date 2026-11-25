@@ -43,6 +43,7 @@ class HmiState:
             "camera_fps": 0.0,
             "started_at": time.time(),
             "llm_model": "",
+            "llm_profile": "",  # ★ 2026-11-24：平板選的 LLM 主機（auto／classmate／mine，見 modules/chat/llm_profile.py）
             "charging": None,  # 底盤 robot_charging_flag
             "charge_current": None,  # 底盤 robot_charging_current（安培）
             "speed": None,  # /odom 的前進速度（m/s，帶正負號）

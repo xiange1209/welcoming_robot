@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Card, Hint } from "../components/ui";
+import { Button, Card, Hint, Segmented } from "../components/ui";
 import { cx } from "../lib/cx";
 import { useVisibleInterval } from "../hooks/useVisibleInterval";
+import { useStoreSelector } from "../hooks/useStore";
 import { api, post, run } from "../lib/api";
+import { telemetryStore } from "../lib/telemetry";
+import { toast } from "../lib/toast";
 import { confirmDialog } from "../lib/dialog";
 import type { ApiResult, Scenario, SysUnit } from "../lib/types";
 
@@ -79,11 +82,11 @@ function ScenarioCard({
   if (!list.length) return null;
 
   return (
-    <Card title="測試情境" className="flex-none">
+    <Card title="快捷開啟" className="flex-none">
+      {/* ★ 2026-11-24：只剩「全部開啟／建圖／全部關閉」三顆（後端 SCENARIOS），標題與說明跟著改 */}
       <Hint className="mb-2.5">
-        不確定要開哪些的時候按這裡：該開的開、該關的關。
-        <b className="text-label-2">點名稱可以先看它會做什麼</b>
-        ——有幾條「要關掉」的理由不直覺。
+        展示前按「全部開啟」，等狀態全綠就可以開始（已經開著的會跳過）。
+        <b className="text-label-2">點名稱可以先看它會做什麼</b>。
       </Hint>
 
       <div className="flex flex-col gap-1.5">
@@ -178,6 +181,69 @@ function PowerCard() {
         </Button>
         <Button onClick={() => void act("reboot")}>重新開機</Button>
       </div>
+    </Card>
+  );
+}
+
+/* ── LLM 主機（★ 2026-11-24）──────────────────────────────
+   使用者：「LLM 那邊可以選擇我要開哪個模型嗎？可能是同學的 llama3.1 或是我的千問 2.5」。
+   選了就存在機器人上（~/.smartnav/llm_settings.json），LLM 不用重開、下一句就換。
+   「目前使用」是 LLM 回報的實際模型：主機上沒有指定版本時它會改用同系列（例如 qwen2.5:7b）。
+   目前選哪個以 telemetry 的 llm_profile 為準 —— 另一台平板切換時這裡也會跟著變。 */
+type LlmProfile = { key: string; label: string; detail: string; model: string };
+
+function LlmProfileCard({ active }: { active: boolean }) {
+  const [profiles, setProfiles] = useState<LlmProfile[]>([]);
+  const [picked, setPicked] = useState("");
+  const [busy, setBusy] = useState(false);
+  const live = useStoreSelector(telemetryStore, (t) => t.snap.system?.llm_profile);
+  const inUse = useStoreSelector(telemetryStore, (t) => t.snap.system?.llm_model);
+
+  useEffect(() => {
+    if (!active) return;
+    void api<ApiResult & { profiles?: LlmProfile[]; current?: string }>(
+      "/api/llm/profile",
+    ).then((r) => {
+      if (r.success && r.profiles) {
+        setProfiles(r.profiles);
+        setPicked(r.current || "");
+      }
+    });
+  }, [active]);
+
+  // 後端是舊版（沒有 /api/llm/profile）就整張卡不畫
+  if (!profiles.length) return null;
+  const current = live || picked;
+  const cur = profiles.find((p) => p.key === current);
+
+  const choose = async (key: string) => {
+    if (key === current || busy) return;
+    setBusy(true);
+    const r = await post<ApiResult & { current?: string }>("/api/llm/profile", {
+      key,
+    });
+    setBusy(false);
+    if (r.success) {
+      setPicked(r.current || key);
+      const p = profiles.find((x) => x.key === key);
+      toast.success(`LLM 改用「${p?.label}」（${p?.detail}），下一句就生效`);
+    } else {
+      toast.error(r.message || "切換失敗");
+    }
+  };
+
+  return (
+    <Card title="LLM 主機" className="flex-none">
+      <Segmented
+        value={current}
+        options={profiles.map((p) => ({ value: p.key, label: p.label }))}
+        onChange={(k) => void choose(k)}
+      />
+      <Hint className="mt-2">
+        {cur ? `${cur.detail}。` : ""}目前使用：
+        <b className="text-label-2">{inUse || "— LLM 沒開或還沒連上"}</b>
+        。切換不用重開 LLM，下一句就用新的主機。
+      </Hint>
     </Card>
   );
 }
@@ -290,6 +356,7 @@ export function SystemPage({ active }: { active: boolean }) {
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto xl:grid xl:grid-cols-[1fr_1.15fr] xl:grid-rows-[minmax(0,1fr)] xl:overflow-hidden portrait:max-xl:grid portrait:max-xl:grid-cols-[1fr_1.15fr] portrait:max-xl:grid-rows-[minmax(0,1fr)] portrait:max-xl:overflow-hidden">
       <div className="flex flex-none flex-col gap-3 empty:hidden xl:min-h-0 xl:overflow-y-auto portrait:max-xl:min-h-0 portrait:max-xl:overflow-y-auto">
         <ScenarioCard active={active} onApplied={() => void refresh()} />
+        <LlmProfileCard active={active} />
         <PowerCard />
       </div>
 

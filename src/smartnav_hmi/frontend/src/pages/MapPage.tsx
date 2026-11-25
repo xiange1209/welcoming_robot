@@ -295,11 +295,20 @@ export function MapPage({ active }: { active: boolean }) {
               <Select
                 className="min-w-0 flex-1"
                 value={selectedMap}
+                disabled={!maps.length}
                 onChange={(e) => setSelectedMap(e.target.value)}
               >
+                {/* ★ 2026-11-24：清單是空的（導航沒開 → /api/maps 回 503）時以前只有一格空白，
+                    看起來像「字沒調顏色」。改成講清楚為什麼沒有選項。 */}
+                {!maps.length && (
+                  <option value="">
+                    讀不到地圖清單（導航堆疊沒開，或還沒建過圖）
+                  </option>
+                )}
                 {maps.map((m) => (
                   <option key={m.map_id} value={m.map_id}>
                     {m.map_name}
+                    {m.map_id === currentMapId ? "（使用中）" : ""}
                   </option>
                 ))}
               </Select>

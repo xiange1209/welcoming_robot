@@ -122,6 +122,7 @@ def spin_resilient(executor, node, max_errors=50):
         except _rclpy.InvalidHandle as exc:
             errors += 1
             node.get_logger().warn(
-                f"執行器碰到正在拆除的實體（LazyTf 拆監聽的競態），繼續執行（第 {errors} 次）：{exc}")
+                f"執行器碰到正在拆除的實體（動態拆訂閱的競態，例如 LazyTf 拆監聽、出發前淨空檢查拆 /scan），"
+                f"繼續執行（第 {errors} 次）：{exc}")
             if errors >= max_errors:
                 raise

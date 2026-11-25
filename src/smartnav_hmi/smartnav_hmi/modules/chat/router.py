@@ -51,6 +51,23 @@ def build_router(node, admin_only) -> APIRouter:
         node.speech_text_pub.publish(String(data=text))
         return JSONResponse({"success": True, "message": "已送出"})
 
+    # ── LLM 主機／模型（★ 2026-11-24）──
+    @router.get("/api/llm/profile")
+    async def api_llm_profile() -> JSONResponse:
+        return JSONResponse({"success": True, **node.llm_profile_payload()})
+
+    @router.post("/api/llm/profile", dependencies=admin_only)
+    async def api_llm_profile_set(req: Request) -> JSONResponse:
+        try:
+            body = await req.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        try:
+            data = node.set_llm_profile(str(body.get("key", "")))
+        except ValueError as exc:
+            return JSONResponse({"success": False, "message": str(exc)}, status_code=400)
+        return JSONResponse({"success": True, **data})
+
     @router.post("/api/chat/clear")
     async def api_chat_clear() -> JSONResponse:
         """清除所有對話

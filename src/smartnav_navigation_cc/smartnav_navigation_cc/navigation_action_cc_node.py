@@ -45,6 +45,7 @@ from smartnav_msgs.action import FollowTaughtPath, Navigate
 from smartnav_msgs.srv import DeleteTaughtPath, GetWaypoint, PlanTaughtPath
 
 from smartnav_navigation_cc import depart_gate
+from smartnav_navigation_cc.lazy_tf import spin_resilient
 
 # 內層導航被別人取消（平板急停、卡住偵測），外層卻沒收到取消時的結果訊息。
 # ★ 「請勿自動重試」是寫給 LLM 看的：它的提示詞要求失敗先自動重試，
@@ -1179,7 +1180,12 @@ def main(args=None):
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
-        executor.spin()
+        # ★ 2026-11-24：出發前淨空檢查（_depart_gate）每趟都臨時訂閱 /scan、用完 destroy_subscription。
+        #   多執行緒執行器剛好在組等待集合時，會在 event_handler.add_to_wait_set 丟 InvalidHandle，
+        #   executor.spin() 直接結束 → 整個導航伺服器死掉。11/24 17:23 帶位（廁所）途中真的發生：
+        #   /navigate 消失、path_teach 自己把路開完，之後不能再帶位，直到 18:07 重開導航。
+        #   跟 map_service／waypoint／path_teach 一樣用 spin_resilient 接住繼續跑（當天那兩個節點各接住 1 次，沒事）。
+        spin_resilient(executor, node)
     except KeyboardInterrupt:
         pass
     finally:

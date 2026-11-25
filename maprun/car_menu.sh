@@ -83,7 +83,7 @@ while true; do
    2) 開工檢查 V0（沒接周邊時電池、底盤、相機、麥克風會 FAIL，屬正常）
    3) 最近一趟導航結果（多候選規劃、循跡修正、成功／失敗、偏離統計）
  ── 開關（等同平板「系統開關」）────────────────────────────────
-   4) 開「完整迎賓故事線」   5) 開「完整迎賓故事線（人臉省電）」   6) 全部關閉
+   4) 全部開啟（同平板「全部開啟」）   6) 全部關閉
  ── 測試（下週清單）───────────────────────────────────────────
    7) 量 CPU／負載 30 分鐘（清單第 3 節；開情境、跑故事線時一起量）
    8) 語音錯字率（清單 2-1：先印稿，再錄 180 秒唸 10 句；會先關 LLM）
@@ -106,7 +106,6 @@ EOF
     2) /home/user/maprun/verify/verify_0_preflight.sh; pause ;;
     3) nav_last; pause ;;
     4) hmi scenario demo sensors nav llm; pause ;;
-    5) hmi scenario demo_eco sensors nav llm; pause ;;
     6) hmi scenario all_off; pause ;;
     7) read -rp "這組叫什麼（例：單板全開、單板省電）：" lab
        echo "每 10 秒一列、量 30 分鐘；要提早結束按 Ctrl-C（已量的會存下來）。"

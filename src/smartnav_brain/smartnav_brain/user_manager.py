@@ -307,8 +307,11 @@ class UserManager:
         try:
             if user_name:
                 user_name = user_name.strip()
-                for user_uuid, meta in self.user_registry.items():
-                    if user_uuid != user_uuid and meta["user_name"] == user_name:
+                # ★ 2026-11-24 修正：以前迴圈變數也叫 user_uuid，把參數蓋掉 → 迴圈跑完 user_uuid 變成
+                #   「最後一位註冊的人」，名稱／身分／描述全部改到他身上（HMI 編輯會改到錯的人），
+                #   而且 user_uuid != user_uuid 永遠是假，重名檢查從來沒有作用。
+                for other_uuid, meta in self.user_registry.items():
+                    if other_uuid != user_uuid and meta.get("user_name") == user_name:
                         raise ValueError(f"使用者名稱已存在: {user_name}")
                 self.user_registry[user_uuid]["user_name"] = user_name
 

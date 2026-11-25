@@ -44,6 +44,30 @@ def write_wav_int16(path, audio, sample_rate: int) -> float:
     return len(pcm) / float(sample_rate)
 
 
+
+def drain_batch(q, first, max_chunks):
+    """從佇列多取幾塊合成一批（★ 2026-11-24，見 audio_queue_size 的說明）。
+
+    first：已經用 get() 取出的那一塊 (audio, is_final)，不可以是 None。
+    只在佇列裡「已經有」的塊才合併（不等待），遇到句尾（is_final）就停在那一塊，
+    遇到結束哨兵 None 也停下並回報 stop。
+    回傳 (音訊陣列清單, 這批是否句尾, 這次一共取出幾項（task_done 要呼叫幾次）, 是否收到結束哨兵)。
+    """
+    audio, is_final = first
+    parts, taken, stop = [audio], 1, False
+    while not is_final and len(parts) < max_chunks:
+        try:
+            item = q.get_nowait()
+        except queue.Empty:
+            break
+        taken += 1
+        if item is None:
+            stop = True
+            break
+        parts.append(item[0])
+        is_final = bool(item[1])
+    return parts, is_final, taken, stop
+
 class SpeechRecognizerNode(Node):
     """語音辨識節點
 
@@ -130,7 +154,17 @@ class SpeechRecognizerNode(Node):
         # 佇列積壓警告門檻。RTF 實測 0.76，餘裕只有 24%，導航/相機一忙就會
         # 超過 1.0 -> 佇列愈積愈多 -> 延遲愈來愈大，而**這件事原本完全看不見**。
         self.declare_parameter(
-            "queue_warn_depth", 20, ParameterDescriptor(description="音訊佇列積壓超過這個數就警告（上限 50）")
+            "queue_warn_depth", 20, ParameterDescriptor(description="音訊佇列積壓超過這個數就警告")
+        )
+        # ★ 2026-11-24：11/24 錄影時「音訊處理佇列已滿」1400～2400 次／半小時（全天 1 萬多次）。
+        #   原因：每塊 32 ms 都要做一整套（解碼、端點判斷、取結果、簡轉繁），處理器一忙就追不上，
+        #   佇列只有 50 塊（1.6 秒）一下就滿。改成：積壓時一次取多塊合成一段再辨識（固定開銷少很多），
+        #   佇列加大吸收觸發瞬間連發的預錄塊。沒有積壓時行為跟以前一樣（一次一塊）。
+        self.declare_parameter(
+            "audio_queue_size", 150, ParameterDescriptor(description="音訊佇列容量（塊；一塊 32 ms）")
+        )
+        self.declare_parameter(
+            "max_batch_chunks", 16, ParameterDescriptor(description="積壓時一次最多合併幾塊再辨識（1＝不合併）")
         )
 
         # ── ★★ 2026-08-17（筆電端）：接上 sherpa 自己的端點偵測 ★★ ─────────
@@ -301,6 +335,8 @@ class SpeechRecognizerNode(Node):
 
         self.max_utterance_sec = self.get_parameter("max_utterance_sec").get_parameter_value().double_value
         self.queue_warn_depth = self.get_parameter("queue_warn_depth").get_parameter_value().integer_value
+        self.audio_queue_size = max(10, int(self.get_parameter("audio_queue_size").value))
+        self.max_batch_chunks = max(1, int(self.get_parameter("max_batch_chunks").value))
         self._stream_samples = 0  # 目前這個 stream 已經吃進多少取樣點
         self._queue_warned = False
 
@@ -394,7 +430,7 @@ class SpeechRecognizerNode(Node):
         self.last_partial_result = None
 
         # 多線程處理隊列
-        self.audio_queue = queue.Queue(maxsize=50)
+        self.audio_queue = queue.Queue(maxsize=self.audio_queue_size)
         self.is_running = True
         self.worker_thread = threading.Thread(target=self._process_audio_queue, daemon=True)
         self.worker_thread.start()
@@ -777,16 +813,18 @@ class SpeechRecognizerNode(Node):
                     self.audio_queue.task_done()
                     break
 
-                audio, is_final = queue_item
+                parts, is_final, taken, stop = drain_batch(self.audio_queue, queue_item, self.max_batch_chunks)
 
                 self._tts_expire()
                 with self._playing_lock:
-                    if self.is_playing:
-                        self.audio_queue.task_done()
-                        continue
-
-                self.recognize_audio(audio, is_final=is_final)
-                self.audio_queue.task_done()
+                    playing = self.is_playing
+                if not playing and parts:
+                    audio = parts[0] if len(parts) == 1 else np.concatenate(parts)
+                    self.recognize_audio(audio, is_final=is_final)
+                for _ in range(taken):
+                    self.audio_queue.task_done()
+                if stop:
+                    break
             except queue.Empty:
                 continue
             except Exception as e:

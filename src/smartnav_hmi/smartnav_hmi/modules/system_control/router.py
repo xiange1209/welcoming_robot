@@ -10,6 +10,7 @@
   這裡把它接回真正在用的 router，恢復成可用狀態。
 """
 
+import asyncio
 import subprocess
 import threading
 import time
@@ -53,7 +54,8 @@ def build_router(node, admin_only) -> APIRouter:
 
     @router.post("/api/scenarios/{key}", dependencies=admin_only)
     async def api_scenario_apply(key: str) -> JSONResponse:
-        ok, result = node.system_control.scenario_request(key)
+        # ★ 2026-11-24：「全部開啟」可能要問導航模式（最多約 6 秒）→ 丟到執行緒，不卡住網頁伺服器
+        ok, result = await asyncio.to_thread(node.system_control.scenario_request, key)
         return JSONResponse({"success": ok, **result}, status_code=202 if ok else 400)
 
     # ── 電源（★ 2026-10-22）──────────────────────────

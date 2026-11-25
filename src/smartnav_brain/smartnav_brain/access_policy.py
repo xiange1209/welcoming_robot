@@ -24,6 +24,9 @@ DEFAULT = {
     "guest_menu_exclude": ["起點"],
     # 身分多久沒更新就當成「沒有人／一般訪客」（人臉每 2 秒推論一次，人走掉 user_auth 也會清掉身分）
     "identity_fresh_sec": 10.0,
+    # ★ 2026-11-24（使用者同意，先 30 秒）：認出貴賓後這麼多秒內，「認不出」或「沒人」仍算同一位貴賓。
+    #   11/24 貴賓室帶位被拒 4 次 —— 等級 VIP↔一般 一小時跳 73 次，客人一轉頭就掉回一般。0 = 關閉。
+    "vip_grace_sec": 30.0,
 }
 
 TIER_GUEST = "guest"
@@ -61,6 +64,24 @@ def tier_of(identity: Optional[dict], policy: dict, now: Optional[float] = None)
     if kind in ("VIP", "ADMIN"):
         return TIER_VIP
     return TIER_GUEST
+
+
+def with_vip_grace(identity: Optional[dict], last_vip: Optional[dict], policy: dict,
+                   now: Optional[float] = None) -> Optional[dict]:
+    """認出貴賓後 vip_grace_sec 內，把「認不出／沒人」換成那位貴賓（給 tier_of 用）。
+
+    認得出是別人（其他註冊者、黑名單）時以這一刻為準 —— 寬限只補「認不出」，不蓋掉「認得出」。
+    last_vip：最後一次認出 VIP／ADMIN 的那則身分（含 stamp＝收到時的 time.monotonic()）。
+    """
+    now = time.monotonic() if now is None else now
+    grace = float(policy.get("vip_grace_sec", 0) or 0)
+    if grace <= 0 or not last_vip:
+        return identity
+    if identity and identity.get("recognized"):
+        return identity
+    if now - float(last_vip.get("stamp", -1e9)) > grace:
+        return identity
+    return {**last_vip, "stamp": now, "vip_grace": True}
 
 
 def navigation_denial(tier: str, waypoint_name: str, policy: dict) -> Optional[str]:

@@ -14,6 +14,7 @@ from std_srvs.srv import Trigger
 
 from ..system.procinfo import proc_cmdlines
 from .nav_camera import NavCameraPause
+from .cpu_share import CpuTimeSharing
 from .supervisor import LaunchSupervisor, remote_units
 
 # ★ 2026-10-22 雙板：B 板單元在 A 的面板上要看「ROS 節點圖」，不能看本機行程（A 看不到 B 的行程）。
@@ -193,13 +194,30 @@ class SystemControlManager:
     #
     # stop 先做、start 後做，且 start 照順序（感測器要 20 秒 IMU 校準、導航要 60 秒）。
     SCENARIOS = {
-        "face": {
-            "label": "測人臉辨識 / 註冊",
-            "why": "只開彩色相機 + 人臉 + 認證。註冊與辨識都靠同一條鏈",
-            "stop": ["nav", "asr_chain"],
-            "start": ["camera:face", "face", "user_auth"],
-            "note": "不需要底盤與雷達。導航一定要關 —— 導航中人臉節點完全不推論，"
-            "註冊採樣會逾時然後把剛註冊的人回滾刪掉",
+        # ★ 2026-11-24 專題收尾：使用者要「一個直接把所有功能打開然後就好的按鈕」「其他不用的舊刪掉」。
+        #   刪掉：測人臉辨識／註冊、教導路徑、測語音／LLM、完整迎賓故事線（人臉省電）——全開時人臉註冊
+        #   （不在帶位中）、教導路徑、語音都照常能用。只留「全部開啟／建圖／全部關閉」，順序＝按鈕順序。
+        #   key 沿用 "demo"：car_menu.sh、day_test.sh、hmi_unit.py 照樣能叫。
+        #   已經開著（模式也對）的單元直接跳過；導航已在定位模式就不重開 —— 見 _plan_steps。
+        "demo": {
+            "label": "全部開啟",
+            "why": "展示用：所有功能依序開好（底盤雷達 → 導航 → 相機人臉 → 認證迎賓 → 語音 → LLM），已經開著的會跳過",
+            # 導航在建圖模式（或問不到模式）才先停再開：重啟後 start_mode=auto 會用最近的地圖進定位模式
+            "stop": ["nav"],
+            "keep_if_localization": ["nav"],
+            "start": [
+                "sensors",
+                "nav",
+                "camera:face",
+                "face",
+                "user_auth",
+                "bank_reception",
+                "asr_chain",
+                "llm",
+            ],
+            "note": "全部起完約 90 秒，請等狀態全綠再開始。導航已經在定位模式就不重開；"
+            "在建圖模式的話會先停掉、用最新的地圖重開（還沒存的圖會丟掉——建圖請先按「完成存檔」）。"
+            "全開時照樣可以註冊人臉、測語音；帶位時處理器分時會自動讓導航優先。",
         },
         # ★ 2026-11-03：又合回一個「建圖」—— explorer 現在一律待命，遙控／自動探索在建圖頁選、途中可切換，
         #   下面 9/24 拆開的理由（遙控模式根本沒有 explorer）已經不存在。
@@ -228,22 +246,6 @@ class SystemControlManager:
             "自動探索中有四種情況會自動存圖：探索完成、4 分鐘地圖沒有長大、同一處卡住 3 次、30 分鐘上限。"
             "★ 緊急狀況照樣直接按緊急停止 —— 安全優先，圖可以重建。",
         },
-        "teach": {
-            "label": "教導路徑 錄製 / 重播",
-            "why": "底盤雷達 + 導航堆疊（定位模式）。path_teach 隨導航堆疊自動起",
-            "stop": ["face", "llm", "asr_chain", "camera", "nav"],
-            "start": ["sensors", "nav"],
-            "note": "需要 map→base_footprint 的 TF，所以導航堆疊一定要起（會先停再重啟；有地圖就是定位模式）。"
-            "換過地圖的話舊路徑會被擋下來，那是正確行為不是壞掉",
-        },
-        "voice": {
-            "label": "測語音 / LLM 對話",
-            "why": "語音輸入 + LLM。出聲走平板瀏覽器，車上沒喇叭",
-            "stop": ["face", "nav", "camera"],
-            "start": ["asr_chain", "llm"],
-            "note": "★ 人臉一定要關：實測音訊破碎 703 次，直接死因就是人臉推論"
-            "吃光 CPU、音訊執行緒排不進去。另外平板要先在畫面上點一下解鎖朗讀",
-        },
         # ★ 2026-10-22：展示結束／換情境前一鍵全關（以前要 SSH 進去跑停止腳本）。順序是「上層先關」：
         #   LLM／語音 → 迎賓／認證／人臉 → 相機 → 導航 → 底盤。本來就沒開的會被 scenario_request 跳過。
         "all_off": {
@@ -253,42 +255,6 @@ class SystemControlManager:
                      "face", "camera", "nav", "sensors"],
             "start": [],
             "note": "本來就沒開的單元會直接跳過。要關機請用下方「電源」卡（關機前也會先做這一步）",
-        },
-        "demo": {
-            "label": "完整迎賓故事線",
-            "why": "全鏈路。順序照 demo.launch.py 的分階段：感測 → 導航 → 視覺 → 語音 → LLM",
-            # 只停導航：重啟後 start_mode=auto 會用最近的地圖進定位模式（停在建圖途中的話，那張未存的圖不要了）
-            "stop": ["nav"],
-            "start": [
-                "sensors",
-                "nav",
-                "camera:face",
-                "face",
-                "user_auth",
-                "bank_reception",
-                "asr_chain",
-                "llm",
-            ],
-            "note": "⚠ 這是唯一近乎全開的情境，CPU 帳已逼近 400%。全部起完約需 90 秒，請等狀態全綠再開始演",
-        },
-        # ★ 2026-10-23：單板 A/B 用。跟上面一模一樣，只差人臉改用省電模式（沒人時每 4 秒推論一次）。
-        #   靜態量測：沒人時人臉 CPU 43% → 25%（單核計）；代價是客人剛走近時迎賓慢一點（中位 1.6 → 約 2.4～3.2 秒）。
-        #   下週照雙板判斷表（verify_out/dualboard_unified_design_20261023.md §0）兩個情境各跑幾輪再決定預設用哪個。
-        "demo_eco": {
-            "label": "完整迎賓故事線（人臉省電）",
-            "why": "同「完整迎賓故事線」，但人臉沒人時每 4 秒才推論一次，把 CPU 讓給導航與語音",
-            "stop": ["nav", "face"],
-            "start": [
-                "sensors",
-                "nav",
-                "camera:face",
-                "face:eco",
-                "user_auth",
-                "bank_reception",
-                "asr_chain",
-                "llm",
-            ],
-            "note": "單板 CPU 吃緊時用這個。人臉若已經用一般模式開著，會先停掉再用省電模式重開",
         },
     }
 
@@ -303,6 +269,8 @@ class SystemControlManager:
         # ★ 2026-10-28：導航中暫停人臉相機（單板全開時帶位 CPU 不夠；說明在 nav_camera.py）
         self.nav_camera = NavCameraPause(node, self._supervisor,
                                          self.SYSTEM_UNITS["camera"]["variant_detect"]["face"])
+        # ★ 2026-11-24：處理器分時——帶位時導航優先、平常迎賓時語音優先（說明在 cpu_share.py）
+        self.cpu_share = CpuTimeSharing(node, self._supervisor, list(self.SYSTEM_UNITS.keys()))
 
     def _forget_camera_if(self, units) -> None:
         """操作者自己動到相機（單元開關或情境）→ 導航中暫停相機的「自動開回來」作廢，以人為準。"""
@@ -355,38 +323,67 @@ class SystemControlManager:
         self._forget_camera_if(list(spec["stop"]) + list(spec["start"]))
         steps = []
         ok_all = True
-        live = {u["key"] for u in self.system_status() if u.get("running") or u.get("partial")}
-        for unit in spec["stop"]:
-            if unit not in live:
-                continue
-            ok, msg = self._supervisor.run_unit_sync(unit, "stop")
-            steps.append(f"{'✓' if ok else '✗'} 停止 {unit}：{msg}")
-            ok_all = ok_all and ok
-        for item in spec["start"]:
-            unit, _, variant = item.partition(":")
-            ok, msg = self._supervisor.run_unit_sync(unit, "start", variant or None)
-            steps.append(f"{'✓' if ok else '✗'} 啟動 {item}：{msg}")
+        for unit, action, variant in self._plan_steps(spec):
+            if action == "stop":
+                ok, msg = self._supervisor.run_unit_sync(unit, "stop")
+                steps.append(f"{'✓' if ok else '✗'} 停止 {unit}：{msg}")
+            else:
+                ok, msg = self._supervisor.run_unit_sync(unit, "start", variant)
+                steps.append(f"{'✓' if ok else '✗'} 啟動 {unit}{':' + variant if variant else ''}：{msg}")
             ok_all = ok_all and ok
         return ok_all, steps
 
     def scenario_request(self, key: str) -> tuple[bool, dict]:
-        """排入情境套用，避免 HTTP request 等待每個單元的完整關閉流程。"""
+        """排入情境套用，避免 HTTP request 等待每個單元的完整關閉流程。
+
+        ★ 可能要問導航模式（最多約 6 秒）：router 用 asyncio.to_thread 呼叫，不要卡住網頁伺服器。
+        """
         spec = self.SCENARIOS.get(key)
         if spec is None:
             return False, {"message": f"未知的情境：{key}"}
         self._forget_camera_if(list(spec["stop"]) + list(spec["start"]))
-        steps = []
-        # ★ 2026-10-22：跳過本來就沒開的單元——對沒在跑的單元下「停止」會被記成「操作失敗」
-        #   （_stop 找不到受管 launch），「全部關閉」會滿畫面紅字。有任何行程在（partial）照樣去停。
-        live = {u["key"] for u in self.system_status() if u.get("running") or u.get("partial")}
-        for unit in spec["stop"]:
-            if unit not in live:
-                continue
-            steps.append((unit, "stop", None))
+        return self._supervisor.request_scenario(key, self._plan_steps(spec))
+
+    def _plan_steps(self, spec: dict) -> list:
+        """情境 → 實際要做的步驟 [(unit, "stop"|"start", variant)]，停止全部排在啟動前面。
+
+        ★ 2026-10-22：本來就沒開的單元不下「停止」——對沒在跑的單元下停止會被記成「操作失敗」
+          （_stop 找不到受管 launch），「全部關閉」會滿畫面紅字。有任何行程在（partial）照樣去停。
+        ★ 2026-11-24「全部開啟」：
+          - 已經在跑、模式也對 → 不再下「啟動」（以前會多一行紅字「單元已由受管 launch 執行中」）；
+          - 在跑但模式不對（相機在避障模式、人臉在省電模式）或只起來一半 → 先停，再用對的模式啟動；
+          - keep_if_localization 的單元（導航）已在定位模式 → 不停也不重開；問不到模式就照舊先停再開。
+        """
+        status = {u["key"]: u for u in self.system_status()}
+        live = {k for k, u in status.items() if u.get("running") or u.get("partial")}
+        keep = {
+            unit for unit in spec.get("keep_if_localization", ())
+            if status.get(unit, {}).get("running") and self._nav_mode_safe() == "localization"
+        }
+        stops = [unit for unit in spec["stop"] if unit in live and unit not in keep]
+        starts = []
         for item in spec["start"]:
             unit, _, variant = item.partition(":")
-            steps.append((unit, "start", variant or None))
-        return self._supervisor.request_scenario(key, steps)
+            st = status.get(unit, {})
+            if unit not in stops and st.get("running") and self._mode_matches(unit, variant, st):
+                continue                         # 已經在跑、模式也對
+            if unit in live and unit not in stops:
+                stops.append(unit)               # 模式不對或只起來一半 → 先停
+            starts.append((unit, variant or None))
+        return [(unit, "stop", None) for unit in stops] + [(unit, "start", v) for unit, v in starts]
+
+    def _mode_matches(self, unit: str, variant: str, st: dict) -> bool:
+        """system_status 回報的模式（variant_detect 認得的模式名稱，認不出＝空字串）是不是要的那個"""
+        spec = self.SYSTEM_UNITS.get(unit, {})
+        detect = spec.get("variant_detect") or {}
+        want = spec.get("variants", {}).get(variant, {}).get("label", variant) if variant in detect else ""
+        return (st.get("mode") or "") == want
+
+    def _nav_mode_safe(self) -> str:
+        try:
+            return self.query_nav_mode()
+        except Exception:  # noqa: BLE001 — 問不到就當 unknown：照舊先停再開（安全的那一邊）
+            return "unknown"
 
     def operation(self, operation_id: str) -> Optional[dict]:
         return self._supervisor.operation(operation_id)

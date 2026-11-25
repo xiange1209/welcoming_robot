@@ -59,6 +59,8 @@ export interface SystemStats {
   cpu_load?: number;
   map_id?: string;
   llm_model?: string;
+  /** ★ 2026-11-24 平板選的 LLM 主機：auto／classmate／mine（後端 modules/chat/llm_profile.py） */
+  llm_profile?: string;
   /** ★ 2026-11-03 語音輸出：browser＝平板 speechSynthesis、robot＝機器人 TTS 模型＋喇叭（全系統一致，存在機器人上） */
   voice_output?: VoiceMode;
   /** ★ 2026-11-03 語音輸入：robot＝機器人麥克風、browser＝平板錄音（辨識一律在機器人上） */

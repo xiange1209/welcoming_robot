@@ -56,6 +56,7 @@ class NavArbiterNode(Node):
 
         self.cb_group = ReentrantCallbackGroup()
         self._identity: dict = {}
+        self._last_vip: Optional[dict] = None   # ★ 11/24：最後一次認出的貴賓（寬限用，見 access_policy.with_vip_grace）
         self._identity_lock = threading.Lock()
         # 進行中的導航（None = 閒置）。取得／釋放都在鎖內，BUSY 才不會有兩個同時通過
         self._active: Optional[str] = None
@@ -93,12 +94,14 @@ class NavArbiterNode(Node):
                 "description": msg.description,
                 "stamp": time.monotonic(),
             }
+            if self._identity["recognized"] and self._identity["user_type"] in ("VIP", "ADMIN"):
+                self._last_vip = dict(self._identity)
 
     def _current(self):
         """（tier, identity, policy）"""
         policy = access_policy.load_policy()
         with self._identity_lock:
-            identity = dict(self._identity)
+            identity = access_policy.with_vip_grace(dict(self._identity), self._last_vip, policy)
         return access_policy.tier_of(identity, policy), identity, policy
 
     def _publish_context(self) -> None:

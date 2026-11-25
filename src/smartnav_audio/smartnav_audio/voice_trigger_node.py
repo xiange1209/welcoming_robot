@@ -16,13 +16,15 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rcl_interfaces.msg import ParameterDescriptor
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, String
 
 from smartnav_msgs.msg import AudioData
 from smartnav_audio.voice_utils import AudioCodec, get_model_path, validate_audio_data
 from smartnav_audio.audio_recorder import AudioRecorder
+from smartnav_audio.presence_gate import PresenceGate
 from smartnav_audio.mic_array import (
     DEFAULT_COEFFS,
     DEFAULT_GAIN,
@@ -290,6 +292,28 @@ class VoiceTriggerNode(Node):
         self.create_subscription(AudioData, "remote_mic_audio", self._remote_audio_cb, audio_qos)
         self.create_timer(0.5, self._remote_watchdog)
 
+        # ★ 2026-11-24：收音距離閘門 —— 車頭前方 1 公尺內有人才觸發（說明在 presence_gate.py）。
+        #   ★ 一定要在 _apply_input_mode 之前建好：開始收音後，音訊執行緒馬上就會用到它。
+        self.declare_parameter("presence_gate_enable", True)
+        self.declare_parameter("presence_distance_m", 1.0)
+        self.declare_parameter("presence_front_offset_m", 0.31)    # senior_akm：雷射在後輪軸前 0.089 m、車頭在 0.40 m
+        self.declare_parameter("presence_half_width_m", 0.6)
+        self.declare_parameter("presence_min_points", 3)
+        self.declare_parameter("presence_hold_sec", 3.0)
+        self.declare_parameter("presence_scan_topic", "/scan")
+        self._gate: Optional[PresenceGate] = None
+        self._gate_blocked = 0
+        self._gate_last_log = 0.0
+        if bool(self.get_parameter("presence_gate_enable").value):
+            def gp(name):
+                return self.get_parameter(name).value
+            self._gate = PresenceGate(
+                distance_m=float(gp("presence_distance_m")), front_offset_m=float(gp("presence_front_offset_m")),
+                half_width_m=float(gp("presence_half_width_m")), min_points=int(gp("presence_min_points")),
+                hold_sec=float(gp("presence_hold_sec")))
+            self.create_subscription(LaserScan, str(gp("presence_scan_topic")), self._scan_cb, qos_profile_sensor_data)
+            self.create_subscription(Bool, "/navigation_active", self._nav_active_cb, latched)
+
         wait = float(self.get_parameter("input_mode_wait_sec").value)
         deadline = time.monotonic() + max(0.0, wait)
         while self._input_mode is None and time.monotonic() < deadline and rclpy.ok():
@@ -301,6 +325,13 @@ class VoiceTriggerNode(Node):
         self._apply_input_mode(mode, fail_loud=True)
 
         self.get_logger().info("✓ 語音喚醒觸發節點已初始化")
+        if self._gate is not None:
+            g = self._gate
+            self.get_logger().info(
+                f"  收音距離閘門：車頭前方 {g.distance_m:.1f} m、左右 {g.half_width_m:.1f} m 內有人才觸發"
+                f"（帶位中、沒有雷射資料時不限；presence_gate_enable:=false 關掉）")
+        else:
+            self.get_logger().info("  收音距離閘門：關閉（不限距離）")
         self.get_logger().info(f"  發布話題: {audio_topic}")
         self.get_logger().info(f"  發布話題: {triggered_topic}")
         self.get_logger().info(f"  採樣率: {self.sample_rate} Hz")
@@ -587,6 +618,27 @@ class VoiceTriggerNode(Node):
             self._publish_audio(np.zeros(512, dtype=np.float32), is_final=True)
             self._set_state(TriggerState.IDLE)
 
+    def _scan_cb(self, msg: LaserScan) -> None:
+        self._gate.on_scan(msg.angle_min, msg.angle_increment, msg.ranges, msg.range_min, msg.range_max)
+
+    def _nav_active_cb(self, msg: Bool) -> None:
+        self._gate.set_navigating(msg.data)
+
+    def _gate_allows(self) -> bool:
+        """收音距離閘門開著嗎（沒啟用＝開著）。擋下時累計，log 每 10 秒最多一行。"""
+        gate = getattr(self, "_gate", None)
+        if gate is None:
+            return True
+        ok, why = gate.is_open()
+        if ok:
+            return True
+        self._gate_blocked += 1
+        now = time.monotonic()
+        if now - self._gate_last_log >= 10.0:
+            self._gate_last_log = now
+            self.get_logger().info(f"🔇 有人聲但{why}：不收（累計 {self._gate_blocked} 次）")
+        return False
+
     def _set_state(self, new_state: TriggerState) -> None:
         """轉移到新狀態
 
@@ -724,7 +776,9 @@ class VoiceTriggerNode(Node):
             if speech_detected:
                 self._vad_positive_frames += 1
                 self.get_logger().debug(f"[IDLE] VAD 正幀計數: {self._vad_positive_frames}/{self.speech_start_frames}")
-                if self._vad_positive_frames >= self.speech_start_frames:
+                if self._vad_positive_frames >= self.speech_start_frames and not self._gate_allows():
+                    self._vad_positive_frames = 0       # 前方沒人：這段人聲不收（預錄緩衝照樣滾動）
+                elif self._vad_positive_frames >= self.speech_start_frames:
                     # VAD 連續正幀達到閾值，轉入 Command 階段
                     self._set_state(TriggerState.COMMAND)
 

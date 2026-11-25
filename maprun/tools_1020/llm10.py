@@ -43,7 +43,7 @@ QUESTIONS = [
     (10, "請帶我去大廳。", "導航到大廳", True),
 ]
 BUSY_TXT = "系統目前正在處理上一個指令"
-OLLAMA = "http://192.168.137.1:11434/api/tags"
+OLLAMA = "http://192.168.11.76:11434/api/tags"  # 2026-11-24：LLM 主機改在 192.168.11.76（熱點時是 192.168.137.1）
 LLM_LOG_DIR = os.path.expanduser("~/.smartnav/logs/system_control")
 TOOL_MARK = "🛠️ LLM 決定呼叫服務:"
 NAV_NODES = ("path_teach_cc_node", "navigation_action_cc_node", "controller_server", "bt_navigator")

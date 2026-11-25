@@ -78,6 +78,12 @@
     height: 100%;
   }
 
+  /* ★ 2026-11-24：告訴瀏覽器這是深色頁面 —— 原生控制項（下拉清單、日期選擇、捲軸）才會用深底淺字。
+     沒有這行時，桌機瀏覽器的下拉清單是預設白底，選項卻沿用選單的淺色字 → 白底白字（地圖管理回報「字沒調顏色」）。 */
+  html {
+    color-scheme: dark;
+  }
+
   body {
     margin: 0;
     background: var(--color-ink);
@@ -160,7 +166,25 @@
   .field:focus {
     outline: none;
     border-color: var(--color-blue);
-    background: var(--color-well);
+    /* 只換底色：用 background 簡寫會把下拉選單的箭頭（background-image）一起清掉 */
+    background-color: var(--color-well);
+  }
+
+  /* ★ 2026-11-24：下拉選單（ui.tsx 的 Select：地圖管理、人員的身分別、迎賓頁）
+     ① 選項明寫深底淺字（上面 color-scheme 之外再保險一次，舊瀏覽器也看得到）；
+     ② appearance-none 拿掉了原生箭頭，看不出是下拉選單 → 補一個箭頭。 */
+  select.field {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23a0a4ab' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 13px center;
+  }
+  select.field option,
+  select.field optgroup {
+    background-color: var(--color-surface-strong);
+    color: var(--color-label);
+  }
+  select.field:disabled {
+    color: var(--color-label-3);
   }
 
   /* 分段控制（iOS Segmented Control）：滑動的白色丸子 */

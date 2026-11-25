@@ -67,6 +67,68 @@ def _preflight(context):
         pass
     # ★ 2026-11-10：觸發後「不判斷靜音」的初始等待（毫秒），理由見 generate_launch_description。
     initial_wait_ms = int(float(context.perform_substitution(LaunchConfiguration("command_initial_wait_ms")) or 1000))
+    def _nodes(index: int, desc: str) -> list:
+        """建立 speech_recognizer 與 voice_trigger（index＝Astra S 的 sounddevice 編號；-1＝沒有本機麥克風）"""
+        recognizer = Node(
+            package="smartnav_audio",
+            executable="speech_recognizer",
+            name="speech_recognizer_node",
+            output="screen",
+            parameters=[
+                {
+                    "num_threads": 2,
+                    "hotwords_file": hotwords_file,
+                    "mute_during_tts": mute_during_tts,
+                    "debug_wav_dir": debug_wav_dir,
+                }
+            ],
+        )
+        trigger = Node(
+            package="smartnav_audio",
+            executable="voice_trigger",
+            name="voice_trigger_node",
+            output="screen",
+            parameters=[
+                {
+                    "device": index,
+                    "device_name_match": "ASTRA",
+                    "device_open_retries": 3,
+                    "vad_num_threads": 1,
+                    "mic_mode": context.perform_substitution(LaunchConfiguration("mic_mode")),
+                    "audio_latency": audio_latency,
+                    "command_initial_wait_timeout": initial_wait_ms,
+                    "vad_threshold": _vad_threshold_for_input(),
+                }
+            ],
+        )
+        stop_trigger = RegisterEventHandler(
+            OnProcessExit(
+                target_action=trigger,
+                on_exit=[EmitEvent(event=Shutdown(reason="voice_trigger 已退出，關閉 ASR chain"))],
+            )
+        )
+        stop_recognizer = RegisterEventHandler(
+            OnProcessExit(
+                target_action=recognizer,
+                on_exit=[EmitEvent(event=Shutdown(reason="speech_recognizer 已退出，關閉 ASR chain"))],
+            )
+        )
+        return [
+            LogInfo(msg=f"ASR 使用 {desc}"),
+            LogInfo(
+                msg=(
+                    f"ASR 參數：hotwords_file={hotwords_file or '（空，交給節點自己找）'}"
+                    f"、mute_during_tts={mute_during_tts}"
+                    f"、debug_wav_dir={debug_wav_dir or '（關）'}"
+                    f"、audio_latency={audio_latency}"
+                )
+            ),
+            recognizer,
+            trigger,
+            stop_trigger,
+            stop_recognizer,
+        ]
+
     last_error = "Astra S 錄音裝置不存在"
     for delay in (1, 2, 4):
         try:
@@ -112,68 +174,46 @@ def _preflight(context):
             index = _device_index()
             if index is None:
                 raise RuntimeError("sounddevice 找不到 Astra S")
-            recognizer = Node(
-                package="smartnav_audio",
-                executable="speech_recognizer",
-                name="speech_recognizer_node",
-                output="screen",
-                parameters=[
-                    {
-                        "num_threads": 2,
-                        "hotwords_file": hotwords_file,
-                        "mute_during_tts": mute_during_tts,
-                        "debug_wav_dir": debug_wav_dir,
-                    }
-                ],
-            )
-            trigger = Node(
-                package="smartnav_audio",
-                executable="voice_trigger",
-                name="voice_trigger_node",
-                output="screen",
-                parameters=[
-                    {
-                        "device": index,
-                        "device_name_match": "ASTRA",
-                        "device_open_retries": 3,
-                        "vad_num_threads": 1,
-                        "mic_mode": context.perform_substitution(LaunchConfiguration("mic_mode")),
-                        "audio_latency": audio_latency,
-                        "command_initial_wait_timeout": initial_wait_ms,
-                    }
-                ],
-            )
-            stop_trigger = RegisterEventHandler(
-                OnProcessExit(
-                    target_action=trigger,
-                    on_exit=[EmitEvent(event=Shutdown(reason="voice_trigger 已退出，關閉 ASR chain"))],
-                )
-            )
-            stop_recognizer = RegisterEventHandler(
-                OnProcessExit(
-                    target_action=recognizer,
-                    on_exit=[EmitEvent(event=Shutdown(reason="speech_recognizer 已退出，關閉 ASR chain"))],
-                )
-            )
-            return [
-                LogInfo(msg=f"ASR 使用 Astra S ALSA card={card}, sounddevice={index}"),
-                LogInfo(
-                    msg=(
-                        f"ASR 參數：hotwords_file={hotwords_file or '（空，交給節點自己找）'}"
-                        f"、mute_during_tts={mute_during_tts}"
-                        f"、debug_wav_dir={debug_wav_dir or '（關）'}"
-                        f"、audio_latency={audio_latency}"
-                    )
-                ),
-                recognizer,
-                trigger,
-                stop_trigger,
-                stop_recognizer,
-            ]
+            return _nodes(index, f"Astra S ALSA card={card}, sounddevice={index}")
         except (OSError, RuntimeError, subprocess.TimeoutExpired, ImportError) as exc:
             last_error = str(exc)
             time.sleep(delay)
+    # ★ 2026-11-24：平板收音（預設）根本用不到 Astra 的麥克風，以前照樣要求 Astra 存在 →
+    #   車子重開後相機沒抓到（Astra S 要手動插拔）時，語音輸入整條起不來（11/24 18:13～18:17 連 4 次失敗）。
+    #   平板模式改成警告後照常啟動；之後在語音頁切到相機麥克風時，voice_trigger 自己會回報「開不起來」。
+    if _voice_input_mode() == "browser":
+        return [LogInfo(msg=f"⚠ 找不到 Astra S（{last_error}）；目前是平板收音，照常啟動（相機麥克風模式暫時不能用）")] + _nodes(
+            -1, "平板收音（沒有 Astra S）")
     raise RuntimeError(f"ASR preflight 失敗（已重試 3 次）：{last_error}")
+
+
+def _vad_threshold_for_input() -> float:
+    """語音觸發門檻（Silero VAD 機率）：依啟動當下的收音來源決定。
+
+    ★ 2026-11-24：平板收音開著自動增益，遠處、旁人的話也被放大到觸發；原本的 0.25 是為了相機麥克風
+      聲音小才調低的（voice_trigger_node.py 的說明）。離線測試：乾淨人聲在 0.25 和 0.5 的語音比例幾乎一樣
+      （82%→81%、95%→95%），擋掉的主要是雜音與悶、遠的人聲。
+    依 ~/.smartnav/voice_settings.json 的 input：browser（平板，預設）→ 0.5；robot（相機麥克風）→ 0.25。
+    在語音頁中途切換來源後，要把「語音輸入」停掉再開才會換門檻。環境變數 ASR_VAD_THRESHOLD 可直接指定。
+    """
+    env = os.environ.get("ASR_VAD_THRESHOLD", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    return 0.25 if _voice_input_mode() == "robot" else 0.5
+
+
+def _voice_input_mode() -> str:
+    """~/.smartnav/voice_settings.json 的 input：browser（平板，預設）或 robot（相機麥克風）。"""
+    try:
+        import json
+        from pathlib import Path
+        data = json.loads((Path.home() / ".smartnav" / "voice_settings.json").read_text(encoding="utf-8"))
+        return str(data.get("input", "browser"))
+    except (OSError, ValueError):
+        return "browser"
 
 
 def generate_launch_description():

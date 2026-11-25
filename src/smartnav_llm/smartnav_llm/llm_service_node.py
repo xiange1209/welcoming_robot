@@ -38,7 +38,7 @@ from smartnav_msgs.action import RequestNavigation
 from smartnav_llm.llm_utils import get_config_path
 from smartnav_llm import customer_prompt, nav_intent, tool_gate
 from smartnav_llm.knowledge_base import KnowledgeBase, OllamaEmbedder
-from smartnav_llm.ollama_locator import OllamaLocator, candidate_url
+from smartnav_llm.ollama_locator import OllamaLocator, candidate_url, pick_model
 from smartnav_llm.tools import make_tools
 
 
@@ -245,8 +245,39 @@ class LLMServiceNode(Node):
         )
         #   MSI＝筆電的電腦名稱：Windows 熱點把它登記成 MSI.mshome.net（車上實測），其他網路靠 mDNS 的 MSI.local；
         #   gateway＝車子目前的預設閘道（開筆電熱點時就是筆電）；最後是用過的固定 IP。
+        # ★ 2026-11-24：LLM 主機改在 192.168.11.76（使用者指定），放最前面＝連得到就優先用它；其他候選保留給熱點。
+        #   第二順位的 127.0.0.1 給「反向 SSH 通道」用：LLM 主機的防火牆擋住連入時，在主機上執行
+        #   `ssh -N -R 11434:127.0.0.1:11434 user@<車子IP>`，車上的 127.0.0.1:11434 就會轉到主機的 Ollama
+        #   （主機不用改防火牆、Ollama 也不用聽 0.0.0.0）。11/24 實測同學電腦就是這樣連上的。
+        #   車上沒有自己的 Ollama，只有刻意開了通道才會有回應，所以排在 MSI 前面（MSI 的 Ollama 時通時不通）。
         self.ollama_candidates = list(self.declare_parameter(
-            "ollama_candidates", ["MSI.mshome.net", "MSI.local", "gateway", "192.168.137.1", "192.168.11.156"]).value)
+            "ollama_candidates",
+            ["192.168.11.76", "127.0.0.1", "MSI.mshome.net", "MSI.local", "gateway", "192.168.137.1",
+             "192.168.11.156"]).value)
+        # ★ 2026-11-24：model_name 提前到「找 Ollama」之前宣告 —— 找到主機時就要檢查它有沒有這個模型
+        #   （沒有就改用同系列，見 _ensure_model）。下方原本宣告的地方留了註解。
+        self.model_name = self.declare_parameter("model_name", "llama3.1:8b").get_parameter_value().string_value
+        self._param_model = self.model_name               # 參數給的預設（平板選「自動」時用）
+        self._requested_model = self.model_name           # 目前「想要」的模型（實際用的可能是同系列的另一版）
+        self._param_candidates = list(self.ollama_candidates)
+        self._llm_switch_lock = threading.RLock()         # 換主機（背景找主機）與換模型（平板）可能同時發生
+        self._profile_key, self._profile_label = "auto", "自動"
+        self._llm_ready_for_profile = False
+        self._pending_profile = None
+        # ★ 2026-11-24：平板選的 LLM 主機／模型（HMI 的 latched 話題 llm_profile；smartnav_hmi modules/chat/llm_profile.py）。
+        #   先等它最多 llm_profile_wait_sec 秒再去找主機 —— 不然會先連預設的那台、暖機完才又換，白跑一趟。
+        profile_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                                 reliability=QoSReliabilityPolicy.RELIABLE)
+        self.create_subscription(String, "llm_profile", self._on_llm_profile_msg, profile_qos)
+        wait = float(self.declare_parameter("llm_profile_wait_sec", 3.0).value)
+        deadline = time.monotonic() + max(0.0, wait)
+        while self._pending_profile is None and time.monotonic() < deadline and rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self._pending_profile is not None:
+            self._apply_profile_fields(self._pending_profile)
+            self._pending_profile = None
+            self.get_logger().info(
+                f"✓ 平板選的 LLM：「{self._profile_label}」（模型 {self.model_name}，主機候選 {self.ollama_candidates}）")
         self._embedder = None
         self._ollama_locator = None
         if self.ollama_base_url.lower() == "auto":
@@ -269,7 +300,7 @@ class LLMServiceNode(Node):
         # 192.168.11.156）：帶位、權限、FAQ、通報、時間查詢的流程都通；已知的行為問題是「你好」會多叫
         # list_waypoints_tool 並把地點 ID 唸出來、「幾點關門」會誤叫時間工具、通報原因會亂碼。
         # 先前用過的 qwen2.5:3b 與 orieg/gemma3-tools 的比較（延遲、工具觸發）已不適用，不再保留。
-        self.model_name = self.declare_parameter("model_name", "llama3.1:8b").get_parameter_value().string_value
+        # （model_name 已在上面、找 Ollama 之前宣告；平板可以即時切換，見 _on_llm_profile_msg）
         self.temperature = self.declare_parameter("temperature", 0.0).get_parameter_value().double_value
         # ★★ 2026-08-19：限制回覆長度 ★★
         #
@@ -489,6 +520,7 @@ class LLMServiceNode(Node):
             f"({'已找到' if get_config_path(self.SYSTEM_PROMPT_FILE) else '★找不到，會用內建預設'})"
         )
         self.get_logger().info(f"✓ LLM 對話服務節點已初始化 (模型: {self.model_name})")
+        self._llm_ready_for_profile = True      # 之後平板再切換就即時換（_switch_profile）
         self.get_logger().info(
             f"✓ 對話設定：知識庫檢索={'開（' + self.embed_model + '）' if self.enable_rag else '關（整份 FAQ）'}、"
             f"程式端帶位={self.direct_nav}、帶位防呆={self.nav_guard}、回音擋 {self.robot_echo_sec:.0f} 秒"
@@ -726,10 +758,96 @@ class LLMServiceNode(Node):
 
     def _on_ollama_url(self, url: str) -> None:
         """自動找到（或換網路後重新找到）Ollama：之後建的 ChatOllama、保溫請求、知識庫向量都改用這個位址。"""
-        self.ollama_base_url = url
-        emb = getattr(self, "_embedder", None)
-        if emb is not None:
-            emb.base_url = url.rstrip("/")
+        with self._llm_switch_lock:
+            changed = url != self.ollama_base_url
+            self.ollama_base_url = url
+            emb = getattr(self, "_embedder", None)
+            if emb is not None:
+                emb.base_url = url.rstrip("/")
+            model_changed = self._ensure_model(url)
+            # ★ 2026-11-24：主迴圈的 ChatOllama 是啟動時建好的（_init_modern_llm_tools），以前換位址時沒有重建 →
+            #   啟動時 Ollama 還沒開、之後才找到的話，每一題都還在連舊位址（被防火牆擋＝每題卡 2 分多鐘、沒有回覆）。
+            #   重建後下一題就用新位址；進行中的那一題用舊的物件跑完。
+            if changed or model_changed:
+                self._rebuild_llm()
+                if getattr(self, "_raw_llm", None) is not None:
+                    self.get_logger().info(f"Ollama 位址換成 {url}（模型 {self.model_name}）：對話模型已改用新位址")
+
+    # ── 平板選 LLM 主機／模型（★ 2026-11-24）────────────────────
+    def _on_llm_profile_msg(self, msg: String) -> None:
+        try:
+            spec = json.loads(msg.data)
+        except ValueError:
+            self.get_logger().warning(f"llm_profile 不是 JSON，忽略：{msg.data[:80]}")
+            return
+        if not self._llm_ready_for_profile:
+            self._pending_profile = spec          # 還在啟動：交給 __init__ 處理
+            return
+        # 找主機最久約 3 秒，不能卡住 ROS 執行器
+        threading.Thread(target=self._switch_profile, args=(spec,), daemon=True).start()
+
+    def _apply_profile_fields(self, spec: dict) -> tuple:
+        """只改欄位（要哪個模型、去哪些主機找）。model／hosts 留空＝用參數給的預設。回傳 (模型變了, 主機清單變了)"""
+        model = str(spec.get("model") or "").strip() or self._param_model
+        hosts = [str(h) for h in (spec.get("hosts") or []) if str(h).strip()] or list(self._param_candidates)
+        self._profile_key = str(spec.get("key") or "auto")
+        self._profile_label = str(spec.get("label") or self._profile_key)
+        model_changed = model != self._requested_model
+        hosts_changed = hosts != list(self.ollama_candidates)
+        self._requested_model = model
+        self.model_name = model
+        self.ollama_candidates = hosts
+        return model_changed, hosts_changed
+
+    def _switch_profile(self, spec: dict) -> None:
+        """執行中換主機／模型：重新找主機、重建對話模型、背景暖機。不用重開 LLM。"""
+        with self._llm_switch_lock:
+            model_changed, hosts_changed = self._apply_profile_fields(spec)
+            if not (model_changed or hosts_changed):
+                return
+            self.get_logger().info(
+                f"🔁 LLM 換成「{self._profile_label}」：模型 {self.model_name}，主機候選 {self.ollama_candidates}")
+            if self._ollama_locator is not None and hosts_changed:
+                self._ollama_locator.stop()
+                self._ollama_locator = OllamaLocator(
+                    self.ollama_candidates, self._on_ollama_url,
+                    self.get_logger().info, self.get_logger().warning)
+                if not self._ollama_locator.resolve_now():
+                    self.get_logger().warning(
+                        f"Ollama：「{self._profile_label}」的主機目前都連不到（{self.ollama_candidates}），背景每 15 秒重找")
+                self._ollama_locator.start_background()
+            else:
+                self._ensure_model(self.ollama_base_url)
+            self._rebuild_llm()
+        threading.Thread(target=self._warmup_llm, daemon=True).start()
+
+    def _ensure_model(self, url: str) -> bool:
+        """主機上有沒有要的模型；沒有就改用同系列（qwen2.5:3b → qwen2.5:7b）。回傳 model_name 有沒有變"""
+        want = self._requested_model
+        try:
+            tags = requests.get(f"{url.rstrip('/')}/api/tags", timeout=3.0).json()
+            names = [m.get("name", "") for m in tags.get("models", [])]
+        except Exception:  # noqa: BLE001 —— 問不到就照原本的名字（真的請求失敗時會有清楚的錯誤）
+            return False
+        pick = pick_model(want, names)
+        if pick is None:
+            self.get_logger().error(
+                f"Ollama {url} 上沒有 {want}，也沒有同系列的模型（有：{', '.join(names) or '無'}）—— "
+                f"對話會失敗，請在那台執行 `ollama pull {want}`")
+            pick = want
+        elif pick != want:
+            self.get_logger().warning(f"Ollama {url} 上沒有 {want}，改用同系列的 {pick}")
+        changed = pick != self.model_name
+        self.model_name = pick
+        return changed
+
+    def _rebuild_llm(self) -> None:
+        if getattr(self, "_raw_llm", None) is not None:
+            self._raw_llm = self._make_chat_llm([self.stream_handler])
+            self._chains = {}
+        pub = getattr(self, "llm_model_pub", None)
+        if pub is not None:
+            pub.publish(String(data=self.model_name))      # 平板顯示「目前使用」
 
     def _make_chat_llm(self, callbacks: list):
         """唯一的 ChatOllama 建構處（主迴圈與暖機共用：參數一致，暖機才會把同一份提示載進去）"""
@@ -993,9 +1111,9 @@ class LLMServiceNode(Node):
                             self.get_logger().error(f"✗ 送取消指令失敗: {exc}")
                     self.get_logger().warn(f"🛑 客人在帶位途中說「{user_input}」→ 取消 {len(moving)} 個進行中的目標")
                     return
-                warning_msg = "系統目前正在處理上一個指令，請稍後再試..."
-                self.get_logger().warn(warning_msg)
-                self._publish_reply(warning_msg)
+                # ★ 2026-11-24：不再把「系統目前正在處理上一個指令」唸出來——旁人隨口一句就讓機器人開口，
+                #   朗讀又讓收音靜音、句子被切掉（11/24 上午 4 次）；上一題的回答幾秒內就會到，只記 log。
+                self.get_logger().warn(f"⏳ 上一題還在處理，這句先略過（不朗讀）: {user_input}")
                 return
             self.is_agent_running = True
 

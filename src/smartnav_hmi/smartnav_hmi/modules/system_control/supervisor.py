@@ -131,6 +131,24 @@ class LaunchSupervisor:
         except (OSError, PermissionError, ProcessLookupError, RuntimeError, KeyError, ValueError):
             return None
 
+    def managed_sessions(self, units) -> dict:
+        """{單元: 狀態} —— 只列出狀態檔存在、而且那個 launch PID 還通過身分驗證的單元。
+
+        ★ 2026-11-24：給處理器分時（cpu_share.py）每幾秒呼叫一次用。跟 session_started_at 一樣
+          只讀狀態檔＋驗證那一個 PID，**不掃 /proc 找可接管的 launch**（managed_state 沒有狀態檔時會整個掃）。
+        """
+        out = {}
+        for unit in units:
+            data = self._read_state(unit)
+            if not data:
+                continue
+            try:
+                self._validate(data, unit, None)
+            except (OSError, PermissionError, ProcessLookupError, RuntimeError, KeyError, ValueError):
+                continue
+            out[unit] = data
+        return out
+
     def run_unit_sync(self, unit: str, action: str, variant: str | None = None) -> tuple[bool, str]:
         """供 scenario worker 使用；不要直接從 HTTP request 呼叫。"""
         op = self._new_operation("unit", unit, action, variant)
@@ -339,6 +357,12 @@ class LaunchSupervisor:
         command = ["ros2", "launch", "smartnav_hmi", "system_control.launch.py", f"unit:={unit}"]
         if variant:
             command.append(f"variant:={variant}")
+        # ★ 2026-11-24：處理器分時（cpu_share.py）把 HMI 自己調成 nice -5，子行程會繼承 →
+        #   單元一律從 0 開始（launch 裡相對的 nice 前綴才是原本的意思），之後由分時統一調整。
+        #   把 nice 調大不需要權限；argv 裡仍有 launch／unit:= 等字，身分驗證照常通過。
+        current_nice = os.getpriority(os.PRIO_PROCESS, 0)
+        if current_nice < 0:
+            command = ["nice", "-n", str(-current_nice)] + command
         stamp = time.strftime("%Y%m%d_%H%M%S")
         log_path = self._log_dir / f"{unit}_{stamp}.log"
         with log_path.open("ab", buffering=0) as log:

@@ -151,8 +151,13 @@ step_v0() {
     newer=$(find /home/user/welcoming_robot_ws/src/smartnav_hmi/smartnav_hmi -name '*.py' -newermt "@$hstart" 2>/dev/null | head -3)
     [ -n "$newer" ] && say "⚠ HMI 比程式更新還早啟動（還在跑舊版）：平板「電源」→ 重新開機，或 SSH 打 sudo systemctl restart smartnav-hmi（等 1 分鐘）"
   fi
-  if curl -s -m 3 http://192.168.137.1:11434/api/tags >/dev/null; then say "✓ 筆電 Ollama 連得到"
-  else say "⚠ 筆電 Ollama 連不到（LLM 那幾步會失敗）：筆電開 Ollama、連同一個熱點"; fi
+  # ★ 2026-11-24：LLM 主機改在 192.168.11.76；熱點的 192.168.137.1 留著當第二順位
+  ollama_ok=""
+  for oh in 192.168.11.76 192.168.137.1; do
+    if curl -s -m 3 "http://$oh:11434/api/tags" >/dev/null; then ollama_ok=$oh; break; fi
+  done
+  if [ -n "$ollama_ok" ]; then say "✓ LLM 主機 Ollama 連得到（$ollama_ok）"
+  else say "⚠ LLM 主機 Ollama 連不到（LLM 那幾步會失敗）：主機開 Ollama（OLLAMA_HOST=0.0.0.0）、防火牆開 11434、和車子同一個網路"; fi
   # ★ 2026-10-27：電池電壓要底盤節點在跑才讀得到——第一次上機沒開底盤，V0 印「讀不到」（WARN）卻記成全過。
   #   先開「底盤＋雷達＋IMU」（已經開著就不動）；剛開的話 IMU 要靜止校準約 20 秒，這段時間不要碰車。
   # ★ 10/27 12:29：開機後馬上跑 → HMI 還沒起來（服務要等 60 秒）→ 底盤開不了 → 電池讀不到。先等 HMI。
@@ -310,8 +315,6 @@ step_story() {
   # ★ 10/28：預設改回完整版。HMI 現在「導航中自動暫停人臉相機、到點恢復」（smartnav_hmi/modules/system_control/nav_camera.py）：
   #   10/27 完整版帶位去櫃台 289 秒逾時，人臉推論其實已經停了，剩下吃 CPU 的是相機＋JPEG（約 80%，以單核計）；
   #   10/20 對照：全開沒人臉 → 閒置 1%，再關相機 → 42%。今天要驗證的就是完整版能不能帶位成功。
-  ask sc "哪一種故事線？ 1＝完整（預設：驗證導航中暫停相機）  2＝人臉省電："
-  [ "$sc" = "2" ] && key=demo_eco
   tag="${key}_$(date +%H%M)"   # ★ 10/27：重跑不要蓋掉上一次的 CPU／延遲紀錄
   say "開情境 $key（等單元起來，最多約 2 分鐘）…"
   hmi scenario "$key" sensors nav llm
@@ -428,11 +431,11 @@ step_llm() {
 # ── 7 人臉×距離 ─────────────────────────────────────────────────
 step_face() {
   local a dist
-  say "會切到「測人臉辨識／註冊」情境：導航會關掉（導航中人臉不推論）。"
+  say "會先全部關閉，再只開相機（人臉模式）＋人臉＋認證：導航會關掉（導航中人臉不推論）。"
   confirm "可以關導航嗎？" || return
   hmi scenario all_off
   sleep 8
-  hmi scenario face camera face user_auth
+  hmi start camera:face face user_auth   # ★ 11/24：「測人臉」情境已刪（只留全部開啟／建圖／全部關閉）
   sleep 15
   ask a "要先多角度重新註冊嗎？要的話輸入 y，再去平板按「開始註冊」（註冊完按 Ctrl-C 回來）："
   if [ "$a" = "y" ]; then soft_on; python3 "$T/face_test.py" --watch-registration 2>&1 | teeq "$D/face_test.txt"; soft_off; fi   # 註冊完按 Ctrl-C 回來

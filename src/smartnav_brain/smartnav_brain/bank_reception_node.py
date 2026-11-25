@@ -57,7 +57,7 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from smartnav_msgs.msg import UserIdentity
 
@@ -75,6 +75,25 @@ class BankReceptionNode(Node):
         self.visitor_cooldown_sec = (
             self.declare_parameter("visitor_cooldown_sec", 300.0).get_parameter_value().double_value
         )
+        # ★ 2026-11-24 使用者：「迎賓詞太容易觸發了 一直說某某貴賓你好 打斷我們講話」。
+        #   11/24 17:04～18:09（65 分）實測：VIP 迎賓 23 次（間隔中位數 85 秒）、一般迎賓 19 次。原因：
+        #   ① 冷卻算的是「上次問候」不是「上次看到」→ 貴賓一直站著，每 60 秒就重問一次；
+        #   ② 貴賓角度不好、沒過門檻的那幾幀被當成陌生訪客 → 播一般迎賓詞；
+        #   ③ 鏡頭 10 秒沒看到臉（user_auth 的「無人」）就解除訪客冷卻，講話時一轉頭就會發生。
+        #   改成（_should_greet）：同一位貴賓／黑名單要「離開鏡頭」regreet_absent_sec 才再問候；
+        #   剛認出貴賓 vip_shadow_sec 內認不出的臉當成同一位、不另外問候；鏡頭前完全沒有臉
+        #   visitor_absent_reset_sec 才算新訪客；最近 quiet_after_talk_sec 內有人講話／LLM 剛回答 → 不出聲
+        #   （行員通知、事件、來訪紀錄照常）。cooldown_sec 仍是同一人兩次問候的最短間隔。
+        self.regreet_absent_sec = float(self.declare_parameter("regreet_absent_sec", 180.0).value)
+        self.vip_shadow_sec = float(self.declare_parameter("vip_shadow_sec", 60.0).value)
+        self.visitor_absent_reset_sec = float(self.declare_parameter("visitor_absent_reset_sec", 30.0).value)
+        self.quiet_after_talk_sec = float(self.declare_parameter("quiet_after_talk_sec", 15.0).value)
+        # 對話中「延後」不是取消：先記著，安靜 quiet_after_talk_sec 後人還在就補講；一直講超過這麼久就不補了
+        #   （重播 11/24 17:04～18:09：直接取消的話 65 分鐘只剩 1 次貴賓迎賓 —— 旁人講話也會擋掉真的貴賓）
+        self.greet_pending_max_sec = float(self.declare_parameter("greet_pending_max_sec", 30.0).value)
+        # 認不出的臉要連續出現這麼久才用一般迎賓詞：貴賓走近時常先「認不出」、下一幀才認出，
+        # 不等的話會先說「您好歡迎光臨」、緊接著又說「某某貴賓您好」
+        self.visitor_confirm_sec = float(self.declare_parameter("visitor_confirm_sec", 4.0).value)
         # 額外的保守門檻。user_auth_node 的 recognized 已經判斷過一次，
         # 這裡只是再收緊一點，避免遠距離的低品質辨識觸發劇本。
         self.min_confidence = self.declare_parameter("min_confidence", 0.5).get_parameter_value().double_value
@@ -143,7 +162,13 @@ class BankReceptionNode(Node):
         )
 
         # ── 狀態 ──────────────────────────────────────────────
-        self._last_seen: dict = {}
+        self._last_seen: dict = {}        # key → 最後一次「問候」（訪客共用 "visitor"）
+        self._seen_at: dict = {}          # 貴賓／黑名單 key → 最後一次「看到」（每一則都更新）
+        self._last_face_at = -1e9         # 任何一張臉最後出現的時間
+        self._last_vip_at = -1e9          # 最後一次認出貴賓
+        self._last_talk_at = -1e9         # 最後一次有人講話（語音觸發／辨識出句子）或 LLM 回答
+        self._unknown_since = None        # 這一輪「認不出的臉」從什麼時候開始出現
+        self._pending = None              # 對話中延後的迎賓詞 (文字, 人的 key, 開始等的時間)
         self._state = "IDLE"
         self._db_lock = threading.Lock()
         self._init_visit_db()
@@ -157,6 +182,10 @@ class BankReceptionNode(Node):
         self.identity_sub = self.create_subscription(UserIdentity, self.identity_topic, self.identity_callback, 10)
         # LLM 的通報工具走這個話題進來，讓「通報」只有一個出口
         self.notify_sub = self.create_subscription(String, "staff_notify_request", self.notify_callback, 10)
+        # ★ 2026-11-24：對話中不出聲迎賓 —— 看語音辨識結果、LLM 回答、語音開始收音
+        self.create_subscription(String, "/user_text", self._on_talk, 10)
+        self.create_subscription(String, "llm_response", self._on_talk, 10)
+        self.create_subscription(Bool, "/voice_triggered", self._on_voice_triggered, 10)
 
         self.get_logger().info(
             f"銀行迎賓劇本啟動：訂閱 {self.identity_topic}，"
@@ -259,8 +288,16 @@ class BankReceptionNode(Node):
             # 「無人」訊息是 user_auth 連續 identity_timeout 秒沒看到臉才發的，
             # 代表上一位已經離開 —— 下一位出現就是新訪客，應該要問候。
             # 有人一直站在鏡頭前時不會發「無人」，300 秒冷卻照樣擋住重複問候。
-            self._last_seen.pop("visitor", None)
+            # ★ 2026-11-24：「無人」只要 10 秒，講話時客人一轉頭就會發 → 改成看「鏡頭前完全沒臉多久」
+            #   （下一張臉出現時，距離上一張臉 ≥ visitor_absent_reset_sec 才解除訪客冷卻，見 identity_callback）。
             return
+
+        now = time.monotonic()
+        face_gap = now - self._last_face_at
+        self._last_face_at = now
+        if face_gap >= self.visitor_absent_reset_sec:
+            self._last_seen.pop("visitor", None)       # 鏡頭前空了一陣子 → 這是新來的客人
+            self._unknown_since = None
 
         name = msg.user_name or "Unknown"
         try:
@@ -280,20 +317,15 @@ class BankReceptionNode(Node):
         if ptype == "VIP" and msg.similarity < self.min_confidence:
             return
 
-        cooldown_key = msg.user_uuid or name
-        cooldown = self.cooldown_sec
-        if ptype not in ("VIP", "BLACKLIST"):
-            cooldown_key = "visitor"  # 訪客不分人，統一冷卻
-            cooldown = self.visitor_cooldown_sec
-
-        now = time.monotonic()
-        if now - self._last_seen.get(cooldown_key, -1e9) < cooldown:
+        person = (msg.user_uuid or name) if ptype in ("VIP", "BLACKLIST") else "visitor"
+        self._flush_pending(person, now)
+        if not self._should_greet(ptype, person, now):
             return
-        self._last_seen[cooldown_key] = now
+        quiet = now - self._last_talk_at < self.quiet_after_talk_sec
 
         if ptype == "VIP":
             self._state = "GREETING"
-            self._say(self.vip_greeting.format(name=name))
+            self._say_or_defer(self.vip_greeting.format(name=name), person, now, quiet)
             self._staff_alert(self.staff_alert_vip, name)
             self._emit_event("vip_greeting", name, msg.similarity)
         elif ptype == "BLACKLIST":
@@ -307,12 +339,12 @@ class BankReceptionNode(Node):
             #   前一位訪客剛被問候過的 5 分鐘內就不播，跟一般陌生人的行為完全相同，旁人聽不出差別。
             if now - self._last_seen.get("visitor", -1e9) >= self.visitor_cooldown_sec:
                 self._last_seen["visitor"] = now
-                self._say(self.visitor_greeting)
+                self._say_or_defer(self.visitor_greeting, person, now, quiet)
             self._send_notification(f"⚠️ 偵測到黑名單人員：{name}（相似度 {msg.similarity:.2f}）" f"請行員立即前往現場")
             self._emit_event("blacklist_alert", name, msg.similarity)
         else:
             self._state = "GREETING"
-            self._say(self.visitor_greeting)
+            self._say_or_defer(self.visitor_greeting, person, now, quiet)
             self._staff_alert(self.staff_alert_visitor, name)
             self._emit_event("visitor_greeting", name, msg.similarity)
 
@@ -325,6 +357,59 @@ class BankReceptionNode(Node):
         self._send_notification(msg.data)
 
     # ── 動作實作 ──────────────────────────────────────────────
+    def _should_greet(self, ptype: str, key: str, now: float) -> bool:
+        """這一張臉要不要觸發迎賓（含行員通知、事件、來訪紀錄）。同時更新「看到」與「問候」的時間。"""
+        if ptype in ("VIP", "BLACKLIST"):
+            gap = now - self._seen_at.get(key, -1e9)
+            self._seen_at[key] = now
+            if ptype == "VIP":
+                self._last_vip_at = now
+                self._unknown_since = None   # 剛才認不出的多半就是這位
+            if gap < self.regreet_absent_sec:
+                return False                 # 一直都在（中間沒離開夠久）→ 不再問候
+            if now - self._last_seen.get(key, -1e9) < self.cooldown_sec:
+                return False
+            self._last_seen[key] = now
+            return True
+        if now - self._last_vip_at < self.vip_shadow_sec:
+            return False                     # 剛認出貴賓：多半是同一位角度不好，不當新訪客問候
+        if self._unknown_since is None:
+            self._unknown_since = now
+        if now - self._unknown_since < self.visitor_confirm_sec:
+            return False                     # 先等幾秒，給辨識一個機會認出是貴賓
+        if now - self._last_seen.get("visitor", -1e9) < self.visitor_cooldown_sec:
+            return False
+        self._last_seen["visitor"] = now
+        return True
+
+    def _say_or_defer(self, text: str, person: str, now: float, quiet: bool) -> None:
+        if not quiet:
+            self._say(text)
+            return
+        self._pending = (text, person, now)
+        self.get_logger().info(
+            f"🤫 {now - self._last_talk_at:.0f} 秒前有人講話／LLM 剛回答：迎賓詞先不講，安靜 "
+            f"{self.quiet_after_talk_sec:.0f} 秒後人還在就補（最多等 {self.greet_pending_max_sec:.0f} 秒）")
+
+    def _flush_pending(self, person: str, now: float) -> None:
+        """延後的迎賓詞：同一個人還在鏡頭前、而且已經安靜夠久 → 補講；等太久（一直在講話）→ 不講了。"""
+        if self._pending is None:
+            return
+        text, who, since = self._pending
+        if now - since > self.greet_pending_max_sec:
+            self._pending = None
+            self.get_logger().info("🤫 一直在對話，延後的迎賓詞不補了")
+        elif who == person and now - self._last_talk_at >= self.quiet_after_talk_sec:
+            self._pending = None
+            self._say(text)
+
+    def _on_talk(self, _msg) -> None:
+        self._last_talk_at = time.monotonic()
+
+    def _on_voice_triggered(self, msg: Bool) -> None:
+        if msg.data:
+            self._last_talk_at = time.monotonic()
+
     def _say(self, text: str) -> None:
         self.speech_pub.publish(String(data=text))
         self.get_logger().info(f"🗣️ 迎賓語音: {text}")

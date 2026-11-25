@@ -135,3 +135,14 @@ class OllamaLocator:
             elif not warned:
                 self._warn(f"Ollama：目前連不到，背景每 {self._retry:.0f} 秒重找一次（筆電的 Ollama 有開嗎？）")
                 warned = True
+
+
+def pick_model(want: str, available: list):
+    """主機上有 want 就用 want；沒寫 tag 時試 :latest；否則用同系列（冒號前相同）的第一個；都沒有回 None。"""
+    if want in available:
+        return want
+    if ":" not in want and f"{want}:latest" in available:
+        return f"{want}:latest"
+    family = want.split(":", 1)[0]
+    same = [n for n in available if n.split(":", 1)[0] == family]
+    return same[0] if same else None

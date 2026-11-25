@@ -80,6 +80,7 @@ from .core.tls import ensure_self_signed
 from .modules.voice import audio_hw
 from .modules.voice.settings import VoiceSettings
 from .modules.chat.tracker import ChatTracker
+from .modules.chat.llm_profile import LlmProfileSettings
 from .modules.hardware.hardware import HardwareProbe
 from .modules.imaging.map_render import MapRenderer
 from .modules.imaging.pose import PoseTracker
@@ -416,6 +417,11 @@ class HmiServerNode(Node):
         self._mic_owner = None       # (連線編號, websocket)
         self._voice_input_status = ""
         self._publish_voice_modes()
+        # ── LLM 主機／模型（★ 2026-11-24，見 modules/chat/llm_profile.py）──
+        #   latched：llm_service 比 HMI 晚啟動也拿得到；它啟動時會先等這一則（最多 3 秒）再去找主機
+        self.llm_profile = LlmProfileSettings(logger=self.get_logger())
+        self.llm_profile_pub = self.create_publisher(String, "llm_profile", latched_qos)
+        self._publish_llm_profile()
         # ★ 2026-11-03：機器人本機的麥克風／喇叭偵測（語音頁切到「機器人」時提示用），5 秒一次、只讀 /proc
         self._audio_hw = None
         self._audio_hw_tick()
@@ -718,6 +724,24 @@ class HmiServerNode(Node):
         self._publish_voice_modes()
         self.get_logger().info(f"語音設定：輸出={self.voice.get()['output']}、輸入={self.voice.get()['input']}")
         return self.voice_payload()
+
+    def llm_profile_payload(self) -> Dict[str, Any]:
+        return {
+            "profiles": [{k: p[k] for k in ("key", "label", "detail", "model")} for p in self.llm_profile.profiles],
+            "current": self.llm_profile.current()["key"],
+        }
+
+    def set_llm_profile(self, key: str) -> Dict[str, Any]:
+        cur = self.llm_profile.select(key)          # 不認得的 key → ValueError
+        self._publish_llm_profile()
+        self.get_logger().info(f"LLM 主機：{cur['label']}（{cur['detail']}）")
+        return self.llm_profile_payload()
+
+    def _publish_llm_profile(self) -> None:
+        import json
+        cur = self.llm_profile.current()
+        self.llm_profile_pub.publish(String(data=json.dumps(cur, ensure_ascii=False)))
+        self.state.set_system(llm_profile=cur["key"])
 
     def _publish_voice_modes(self) -> None:
         data = self.voice.get()
